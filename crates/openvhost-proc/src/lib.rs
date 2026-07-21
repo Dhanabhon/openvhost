@@ -7,8 +7,12 @@
 //! v0 scope per spec 2026-07-21-p03-supervisor-design.md.
 
 mod error;
+pub mod events;
+mod log;
 pub mod platform;
+mod state;
 pub mod testchild;
 
 pub use error::ProcError;
+pub use events::{LogLevel, LogLine, ServiceState, ServiceStatus, StreamSource, SupervisorEvent};
 pub use platform::{OutputStream, ProcessDriver, SpawnSpec, SpawnedChild, default_driver};
