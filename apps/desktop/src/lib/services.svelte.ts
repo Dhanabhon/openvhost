@@ -30,7 +30,9 @@ export class ServicesStore {
 
 	applyState(ev: ServiceStateEvent): void {
 		this.services = this.services.map((s) =>
-			s.id === ev.id ? { ...s, state: ev.state, pid: ev.state.kind === 'running' ? s.pid : null } : s
+			s.id === ev.id
+				? { ...s, state: ev.state, pid: ev.state.kind === 'running' ? s.pid : null }
+				: s
 		);
 	}
 

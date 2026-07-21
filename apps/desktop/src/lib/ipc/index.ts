@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // The ONLY module allowed to touch Tauri IPC (master plan §5).
 import { commands, events } from './bindings';
-import type { CoreInfo, IpcError, LogLine, ServiceLogEvent, ServiceStateEvent, ServiceStatus } from './bindings';
+import type {
+	CoreInfo,
+	IpcError,
+	LogLine,
+	ServiceLogEvent,
+	ServiceStateEvent,
+	ServiceStatus
+} from './bindings';
 
 export type { CoreInfo, IpcError, LogLine, ServiceLogEvent, ServiceStateEvent, ServiceStatus };
 

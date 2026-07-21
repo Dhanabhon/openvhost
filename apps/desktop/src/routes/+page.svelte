@@ -53,7 +53,11 @@
 	<h1 class="text-xl font-semibold">Services</h1>
 
 	{#if error}
-		<div class="mt-3 rounded border border-red-400 bg-red-50 p-3 text-red-800" role="alert" data-testid="error-banner">
+		<div
+			class="mt-3 rounded border border-red-400 bg-red-50 p-3 text-red-800"
+			role="alert"
+			data-testid="error-banner"
+		>
 			<strong>Command failed ({error.kind})</strong>
 			<span>{'message' in error ? error.message : ''}</span>
 		</div>
@@ -64,7 +68,9 @@
 			<div class="flex items-center gap-4 p-3">
 				<div class="min-w-0 flex-1">
 					<div class="font-semibold">{s.displayName}</div>
-					{#if s.endpoint}<div class="truncate font-mono text-xs text-neutral-500">{s.endpoint}</div>{/if}
+					{#if s.endpoint}<div class="truncate font-mono text-xs text-neutral-500">
+							{s.endpoint}
+						</div>{/if}
 				</div>
 				<span
 					class="rounded-full border px-2.5 py-0.5 text-xs font-semibold"
@@ -77,11 +83,20 @@
 					● {s.state.kind}
 				</span>
 				{#if s.state.kind === 'stopped'}
-					<button class="rounded border px-3 py-1 text-sm font-medium" onclick={() => act(startService, s.id)}>Start</button>
+					<button
+						class="rounded border px-3 py-1 text-sm font-medium"
+						onclick={() => act(startService, s.id)}>Start</button
+					>
 				{:else if s.state.kind === 'failed'}
-					<button class="rounded border px-3 py-1 text-sm font-medium" onclick={() => act(startService, s.id)}>Retry</button>
+					<button
+						class="rounded border px-3 py-1 text-sm font-medium"
+						onclick={() => act(startService, s.id)}>Retry</button
+					>
 				{:else}
-					<button class="rounded border px-3 py-1 text-sm font-medium" onclick={() => act(stopService, s.id)}>Stop</button>
+					<button
+						class="rounded border px-3 py-1 text-sm font-medium"
+						onclick={() => act(stopService, s.id)}>Stop</button
+					>
 				{/if}
 			</div>
 			{#if s.state.kind === 'failed'}
@@ -89,14 +104,20 @@
 					<div class="font-semibold text-red-700">
 						{s.displayName} failed{#if s.state.exit != null}&nbsp;(exit {s.state.exit}){/if}
 					</div>
-					<pre class="mt-2 overflow-x-auto rounded border bg-white p-2 font-mono text-xs">{s.state.stderrTail.join('\n')}</pre>
+					<pre
+						class="mt-2 overflow-x-auto rounded border bg-white p-2 font-mono text-xs">{s.state.stderrTail.join(
+							'\n'
+						)}</pre>
 				</div>
 			{/if}
 		{/each}
 	</section>
 
 	<h2 class="mt-6 text-xs font-semibold tracking-wide text-neutral-500 uppercase">Log</h2>
-	<div class="mt-2 flex-1 overflow-auto rounded border bg-neutral-50 p-2 font-mono text-xs leading-6" data-testid="log">
+	<div
+		class="mt-2 flex-1 overflow-auto rounded border bg-neutral-50 p-2 font-mono text-xs leading-6"
+		data-testid="log"
+	>
 		{#each store.logs as l, i (i)}
 			<div class="grid grid-cols-[70px_44px_1fr] gap-2">
 				<span class="text-neutral-400 tabular-nums">{fmtTs(l.tsMs)}</span>
@@ -108,7 +129,8 @@
 
 	{#if info}
 		<p class="mt-3 text-xs text-neutral-500">
-			OpenVHost {info.appVersion} · {info.os}/{info.arch} · <span class="font-mono">{info.openvhostHome}</span>
+			OpenVHost {info.appVersion} · {info.os}/{info.arch} ·
+			<span class="font-mono">{info.openvhostHome}</span>
 		</p>
 	{/if}
 </main>
