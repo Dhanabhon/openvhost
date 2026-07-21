@@ -39,7 +39,7 @@ Toolchain: Rust stable (pinned in `rust-toolchain.toml`), pnpm + Node LTS (pinne
 cargo build --workspace && pnpm -C apps/desktop build   # build everything
 cargo test --workspace && pnpm -C apps/desktop test     # run tests
 cargo fmt --check && cargo clippy --workspace -- -D warnings   # lint gate
-pnpm -C apps/desktop run tauri dev                      # run the app
+./scripts/dev.sh                                        # run the app (one command; installs deps on first run)
 ```
 
 Before a change merges, the full gate suite must pass: fmt, clippy `-D warnings`, tests, `cargo deny check licenses advisories`, the SPDX header check (`scripts/check-spdx.sh`), eslint, svelte-check, vitest, and the frontend build. Commits follow Conventional Commits and are DCO-signed (`git commit -s`).
