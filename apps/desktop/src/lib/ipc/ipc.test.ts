@@ -7,6 +7,8 @@ vi.mock('@tauri-apps/api/core', () => ({
 }));
 
 import { coreInfo } from './index';
+import type { ServiceStatus } from './index';
+import { ServicesStore } from '../services.svelte';
 
 const sample = {
 	appVersion: '0.1.0',
@@ -46,5 +48,38 @@ describe('coreInfo', () => {
 	it('normalizes a plain-string rejection into a core-variant IpcError', async () => {
 		invokeMock.mockRejectedValueOnce('transport down');
 		await expect(coreInfo()).rejects.toEqual({ kind: 'core', message: 'transport down' });
+	});
+});
+
+const svc = (id: string, kind: 'stopped' | 'running'): ServiceStatus =>
+	({ id, displayName: id, endpoint: null, pid: null, state: { kind } }) as ServiceStatus;
+
+describe('ServicesStore', () => {
+	const api = {
+		listServices: async () => [svc('demo-ticker', 'stopped')],
+		serviceLogTail: async () => [{ tsMs: 1, level: 'info', line: 'seed' }] as never[]
+	};
+
+	it('init seeds services and log tail', async () => {
+		const store = new ServicesStore(api as never);
+		await store.init();
+		expect(store.services).toHaveLength(1);
+		expect(store.logs[0]?.line).toBe('seed');
+	});
+
+	it('applyState replaces the matching service state', async () => {
+		const store = new ServicesStore(api as never);
+		await store.init();
+		store.applyState({ id: 'demo-ticker', state: { kind: 'running' }, detail: null } as never);
+		expect(store.services[0]?.state.kind).toBe('running');
+	});
+
+	it('applyLog caps the feed at 50', async () => {
+		const store = new ServicesStore(api as never);
+		for (let i = 0; i < 60; i++) {
+			store.applyLog({ id: 'x', tsMs: i, level: 'info', line: `l${i}` } as never);
+		}
+		expect(store.logs).toHaveLength(50);
+		expect(store.logs[0]?.line).toBe('l10');
 	});
 });
