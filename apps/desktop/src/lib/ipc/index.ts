@@ -5,9 +5,22 @@ import type { CoreInfo, IpcError } from './bindings';
 
 export type { CoreInfo, IpcError };
 
-/** Fetch CoreInfo from the Rust core. Throws IpcError on failure. */
+function isIpcError(e: unknown): e is IpcError {
+	return typeof e === 'object' && e !== null && typeof (e as { kind?: unknown }).kind === 'string';
+}
+
+/**
+ * Fetch CoreInfo from the Rust core. Failures always throw an `IpcError`:
+ * anything else escaping the invoke layer (transport errors, plain strings)
+ * is normalized to the `core` variant so the UI never renders "undefined".
+ */
 export async function coreInfo(simulateError = false): Promise<CoreInfo> {
-	const result = await commands.coreInfo(simulateError ? true : null);
-	if (result.status === 'error') throw result.error;
-	return result.data;
+	try {
+		const result = await commands.coreInfo(simulateError ? true : null);
+		if (result.status === 'error') throw result.error;
+		return result.data;
+	} catch (e) {
+		if (isIpcError(e)) throw e;
+		throw { kind: 'core', message: String(e) } satisfies IpcError;
+	}
 }

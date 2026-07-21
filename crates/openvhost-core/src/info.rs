@@ -8,7 +8,6 @@ use crate::home::resolve_home;
 /// commands stay thin per master plan §5).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 #[serde(rename_all = "camelCase")]
 pub struct CoreInfo {
     /// Version of the calling application (desktop app or CLI).

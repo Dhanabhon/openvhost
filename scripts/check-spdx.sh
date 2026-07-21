@@ -6,7 +6,7 @@ set -euo pipefail
 offenders=()
 while IFS= read -r f; do
   case "$f" in
-    apps/desktop/src/lib/ipc/bindings.ts|apps/desktop/src/lib/ipc/gen/*|apps/desktop/src-tauri/gen/*) continue ;;
+    apps/desktop/src/lib/ipc/bindings.ts|apps/desktop/src-tauri/gen/*) continue ;;
   esac
   if ! head -n 3 "$f" | grep -q 'SPDX-License-Identifier: GPL-3.0-or-later'; then
     offenders+=("$f")
