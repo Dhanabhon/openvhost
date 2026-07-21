@@ -1,7 +1,8 @@
 # OpenServ — Development Master Plan & Claude Code Handoff Document
 > **Purpose of this document:** This is the single source of truth for the OpenServ project, written to be consumed by Claude Code (and human contributors). It contains the product definition, confirmed technical decisions, architecture, phased roadmap, and a complete subagent allocation plan with ready-to-use agent definitions.
 >
-> **Document status:** v1.1 — 2026-07-21 (license decision recorded)
+> **Document status:** v1.2 — 2026-07-21 (license decision recorded · brand guidelines linked)
+> **Companion documents:** `docs/OPENSERV_BRAND_GUIDELINES.md` v1.0 — brand foundation, color/typography tokens, voice & microcopy, trademark summary; the input spec for tauri-frontend-engineer UI work and for `TRADEMARK.md` (OQ#8).
 > **Decision legend:** ✅ DECIDED · 🟡 PROPOSED (default unless overridden) · ❓ OPEN (needs human decision)
 ---
 ## 1. Project Overview
@@ -362,6 +363,9 @@ Hard rules:
 - i18n: from Phase 2 every user-visible string goes through the i18n
   layer (EN + TH first); until then, keep strings centralized to ease
   extraction.
+- Design tokens, colors, typography, and microcopy follow
+  docs/OPENSERV_BRAND_GUIDELINES.md (tokens.css becomes the single
+  source of truth once it lands) — read it before any user-visible work.
 ```
 #### `.claude/agents/config-template-engineer.md`
 ```markdown
