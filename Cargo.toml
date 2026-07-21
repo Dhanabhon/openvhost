@@ -6,6 +6,7 @@ members = [
     "crates/openserv-pkg",
     "crates/openserv-conf",
     "apps/cli",
+    "apps/desktop/src-tauri",
 ]
 
 [workspace.package]
