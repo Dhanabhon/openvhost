@@ -35,6 +35,11 @@ fn specta_builder() -> Builder<tauri::Wry> {
         // a native `bigint`. Casting the TS type to `number` matches runtime
         // reality; ts_ms is milliseconds-since-epoch, far below
         // Number.MAX_SAFE_INTEGER for a very long time.
+        // WARNING: this flag is BUILDER-GLOBAL — it remaps every u64/i64/
+        // usize/isize across the whole exported command/event surface, not
+        // just ts_ms. Any future large-integer field (byte totals, counters)
+        // must be consciously checked to stay < 2^53, or use a lossless
+        // encoding (string) instead of relying on this cast.
         .dangerously_cast_bigints_to_number()
 }
 
