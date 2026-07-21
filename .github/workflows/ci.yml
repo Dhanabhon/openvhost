@@ -38,6 +38,8 @@ jobs:
           cargo fmt --check
           cargo clippy --workspace --all-targets -- -D warnings
           cargo test --workspace
+      - name: Typed bindings are committed fresh
+        run: git diff --exit-code -- apps/desktop/src/lib/ipc/bindings.ts
       - name: Guard - openvhost-core must not depend on tauri
         run: |
           if cargo tree -p openvhost-core -e normal | grep -qi tauri; then

@@ -11,7 +11,7 @@
   },
   "app": {
     "windows": [{ "title": "OpenVHost", "width": 960, "height": 640 }],
-    "security": { "csp": null }
+    "security": { "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost" }
   },
   "bundle": {
     "active": true,
