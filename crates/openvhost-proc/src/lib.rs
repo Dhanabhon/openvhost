@@ -8,6 +8,7 @@
 
 mod error;
 pub mod platform;
+pub mod testchild;
 
 pub use error::ProcError;
 pub use platform::{OutputStream, ProcessDriver, SpawnSpec, SpawnedChild, default_driver};
