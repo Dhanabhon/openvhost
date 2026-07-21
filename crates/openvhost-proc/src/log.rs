@@ -101,5 +101,9 @@ mod tests {
             classify_level(StreamSource::Stderr, "hello"),
             LogLevel::Info
         );
+        assert_eq!(
+            classify_level(StreamSource::Stdout, "WARN then ERROR"),
+            LogLevel::Error
+        );
     }
 }

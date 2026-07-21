@@ -65,3 +65,49 @@ pub enum StreamSource {
     Stdout,
     Stderr,
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_state_serializes_with_kind_and_camel_case_tail() {
+        let s = ServiceState::Failed {
+            exit: Some(1),
+            stderr_tail: vec!["ERROR boom".into()],
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["kind"], "failed");
+        assert_eq!(v["exit"], 1);
+        assert_eq!(v["stderrTail"][0], "ERROR boom");
+    }
+
+    #[test]
+    fn running_state_serializes_kind_only() {
+        let v = serde_json::to_value(ServiceState::Running).unwrap();
+        assert_eq!(v, serde_json::json!({ "kind": "running" }));
+    }
+
+    #[test]
+    fn log_line_and_status_use_camel_case_fields() {
+        let line = LogLine {
+            ts_ms: 7,
+            level: LogLevel::Warn,
+            line: "w".into(),
+        };
+        let v = serde_json::to_value(&line).unwrap();
+        assert_eq!(v["tsMs"], 7);
+        assert_eq!(v["level"], "warn");
+        let status = ServiceStatus {
+            id: "a".into(),
+            display_name: "A".into(),
+            endpoint: None,
+            pid: None,
+            state: ServiceState::Stopped,
+        };
+        let v = serde_json::to_value(&status).unwrap();
+        assert_eq!(v["displayName"], "A");
+        assert_eq!(v["state"]["kind"], "stopped");
+    }
+}
