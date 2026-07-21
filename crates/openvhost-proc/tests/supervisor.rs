@@ -175,6 +175,113 @@ async fn instant_death_reports_failed_before_500ms_timer() {
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_start_spawns_exactly_once() {
+    let sup = Supervisor::new(default_driver());
+    sup.register(svc("t6", &["--lines", "50", "--interval-ms", "100"]));
+    let mut rx = sup.subscribe();
+
+    // Race two start() calls on separate OS threads. Post-fix, the
+    // guard-and-transition in `start()` is atomic under one lock
+    // acquisition, so exactly one of these ever gets past the no-op guard
+    // and spawns — deterministically, regardless of scheduling.
+    let sup_a = sup.clone();
+    let sup_b = sup.clone();
+    let ha = tokio::spawn(async move { sup_a.start("t6") });
+    let hb = tokio::spawn(async move { sup_b.start("t6") });
+    let (ra, rb) = tokio::join!(ha, hb);
+    ra.unwrap().unwrap();
+    rb.unwrap().unwrap();
+
+    wait_state(&mut rx, "t6", Duration::from_secs(2), |s| {
+        matches!(s, ServiceState::Running)
+    })
+    .await;
+
+    // Poll until quiescent: two consecutive equal reads of the "spawned
+    // pid" lines specifically, 100ms apart, bounded at 3s. The raw tail
+    // never settles on its own (the child logs a fresh tick line every
+    // 100ms for its whole 5s run), so we track the filtered spawn-line
+    // view — that's the signal that proves any stray second spawn (had
+    // the fix regressed) would have had time to log its own line before
+    // we assert the count.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut prev: Option<Vec<String>> = None;
+    let spawn_lines = loop {
+        let lines: Vec<String> = sup
+            .log_tail("t6", 100)
+            .unwrap()
+            .into_iter()
+            .map(|l| l.line)
+            .filter(|l| l.contains("spawned pid"))
+            .collect();
+        if prev.as_ref() == Some(&lines) {
+            break lines;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "'spawned pid' lines in log tail never quiesced within 3s: {lines:?}"
+        );
+        prev = Some(lines);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(
+        spawn_lines.len(),
+        1,
+        "expected exactly one 'spawned pid' line under concurrent start(), got {}: {spawn_lines:?}",
+        spawn_lines.len()
+    );
+
+    sup.stop("t6").unwrap();
+    wait_state(&mut rx, "t6", Duration::from_secs(3), |s| {
+        matches!(s, ServiceState::Stopped)
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn register_does_not_clobber_live_service() {
+    let sup = Supervisor::new(default_driver());
+    sup.register(svc("t7", &["--lines", "50", "--interval-ms", "100"]));
+    let mut rx = sup.subscribe();
+    sup.start("t7").unwrap();
+    wait_state(&mut rx, "t7", Duration::from_secs(2), |s| {
+        matches!(s, ServiceState::Running)
+    })
+    .await;
+
+    let before = sup.snapshot().into_iter().find(|s| s.id == "t7").unwrap();
+    assert_eq!(before.display_name, "t7");
+    let original_pid = before.pid;
+    assert!(original_pid.is_some(), "running service must report a pid");
+
+    // Re-register the same live id with a different display_name — must be
+    // a no-op, not an orphaning clobber of the already-running entry.
+    sup.register(ServiceSpec {
+        id: "t7".to_string(),
+        display_name: "clobbered".to_string(),
+        endpoint: None,
+        spawn: testchild_spec(&["--lines", "1", "--interval-ms", "1"]),
+    });
+
+    let after = sup.snapshot().into_iter().find(|s| s.id == "t7").unwrap();
+    assert_eq!(
+        after.display_name, "t7",
+        "register() must not clobber a live entry's display_name"
+    );
+    assert_eq!(
+        after.pid, original_pid,
+        "register() must not clobber a live entry's pid"
+    );
+    assert!(matches!(after.state, ServiceState::Running));
+
+    sup.stop("t7").unwrap();
+    wait_state(&mut rx, "t7", Duration::from_secs(3), |s| {
+        matches!(s, ServiceState::Stopped)
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn spawn_failure_is_failed_with_pointing_detail() {
     let sup = Supervisor::new(default_driver());

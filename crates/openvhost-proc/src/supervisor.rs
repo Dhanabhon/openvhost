@@ -62,19 +62,30 @@ impl Supervisor {
         }
     }
 
+    /// Register a service under `spec.id`.
+    ///
+    /// Re-registering a live service is a no-op; stop it first.
     pub fn register(&self, spec: ServiceSpec) {
         let id = spec.id.clone();
-        let entry = Entry {
-            spec,
-            state: ServiceState::Stopped,
-            pid: None,
-            logs: RingBuffer::new(RING_CAPACITY),
-            stderr_tail: VecDeque::new(),
-            stop_requested: Arc::new(AtomicBool::new(false)),
-            control: None,
-        };
         let mut entries = self.inner.entries.lock().unwrap_or_else(|e| e.into_inner());
-        entries.insert(id, entry);
+        let is_live = entries
+            .get(&id)
+            .is_some_and(|e| matches!(e.state, ServiceState::Starting | ServiceState::Running));
+        if is_live {
+            return;
+        }
+        entries.insert(
+            id,
+            Entry {
+                spec,
+                state: ServiceState::Stopped,
+                pid: None,
+                logs: RingBuffer::new(RING_CAPACITY),
+                stderr_tail: VecDeque::new(),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                control: None,
+            },
+        );
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<SupervisorEvent> {
@@ -117,9 +128,20 @@ impl Supervisor {
             e.stop_requested.store(false, Ordering::SeqCst);
             let (ctl_tx, ctl_rx) = mpsc::channel(1);
             e.control = Some(ctl_tx);
+            // The Starting write MUST happen inside this same locked block,
+            // right alongside the no-op guard above. If it were done via a
+            // second `entries.lock()` after this block ends (as a call to
+            // `Inner::set_state` used to do), a concurrent `start(id)` could
+            // acquire the lock in the gap, observe the still-stale
+            // pre-Starting state, pass the guard too, and spawn a second
+            // service_task for the same id (double-spawn).
+            e.state = ServiceState::Starting;
             (e.spec.spawn.clone(), Arc::clone(&e.stop_requested), ctl_rx)
         };
-        Inner::set_state(
+        // The state was already written above under the lock; only emit the
+        // notification here. Do NOT re-lock to "set" it again — that would
+        // reopen the exact TOCTOU window this split closes.
+        Inner::emit_state(
             &self.inner,
             id,
             ServiceState::Starting,
@@ -176,6 +198,23 @@ impl Inner {
                 }
             }
         }
+        Self::emit_state(inner, id, state, detail);
+    }
+
+    /// Broadcast a `StateChanged` event only — no entry-map write.
+    ///
+    /// For callers that already wrote the new state into the entry
+    /// themselves while holding the `entries` lock (currently just
+    /// `Supervisor::start`'s atomic guard-and-transition) so they never need
+    /// to re-lock purely to notify. Re-locking there would reopen the same
+    /// TOCTOU window that writing the state inside the original lock scope
+    /// was meant to close.
+    pub(crate) fn emit_state(
+        inner: &Arc<Inner>,
+        id: &str,
+        state: ServiceState,
+        detail: Option<String>,
+    ) {
         let _ = inner.tx.send(SupervisorEvent::StateChanged {
             id: id.to_string(),
             state,
