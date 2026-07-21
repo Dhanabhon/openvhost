@@ -1,0 +1,197 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* OpenVHost design tokens — prototype for apps/desktop/src/lib/tokens.css
+   Canonical values: docs/OPENVHOST_BRAND_GUIDELINES.md §4, §5, §7.1
+   Themes: light + dark, OS-following with [data-theme] override. */
+
+:root {
+  /* -- brand core (theme-invariant) ------------------------------------ */
+  --vh-ink: #171a21;
+  --vh-paper: #f7f6f2;
+  --vh-brand-600: #0e6e5c;
+  --vh-brand-700: #0a5346;
+  --vh-brand-400: #33b79e;
+  --vh-brand-100: #ddf1ec;
+  --vh-neutral-600: #5c636e;
+  --vh-neutral-400: #8a9099;
+  --vh-neutral-800: #22262f;
+
+  /* -- semantic state (fills / on-dark) -------------------------------- */
+  --vh-state-running: #3fb950;
+  --vh-state-starting: #d99a2b;
+  --vh-state-failed: #e5534b;
+  --vh-state-stopped: #8a9099;
+  /* text-safe on light */
+  --vh-state-running-text: #2e8b3d;
+  --vh-state-starting-text: #9a6b14;
+  --vh-state-failed-text: #c13832;
+  --vh-state-stopped-text: #5c636e;
+
+  /* -- type ------------------------------------------------------------- */
+  --vh-font-ui: 'IBM Plex Sans', 'IBM Plex Sans Thai Looped', 'Noto Sans Thai', system-ui, sans-serif;
+  --vh-font-display: 'Space Grotesk', 'IBM Plex Sans Thai', system-ui, sans-serif;
+  --vh-font-mono: 'JetBrains Mono', 'IBM Plex Mono', ui-monospace, monospace;
+  --vh-text-caption: 0.75rem;    /* 12 */
+  --vh-text-table: 0.8125rem;    /* 13 */
+  --vh-text-body: 0.875rem;      /* 14 — app body default */
+  --vh-text-section: 1rem;       /* 16 */
+  --vh-text-page: 1.25rem;       /* 20 */
+  --vh-text-display: 1.75rem;    /* 28 */
+  --vh-text-log: 0.8125rem;      /* 13 — logs/config */
+
+  /* -- shape / space ---------------------------------------------------- */
+  --vh-radius-control: 6px;
+  --vh-radius-card: 10px;
+  --vh-radius-pill: 999px;
+  --vh-space-1: 4px;
+  --vh-space-2: 8px;
+  --vh-space-3: 12px;
+  --vh-space-4: 16px;
+  --vh-space-6: 24px;
+  --vh-space-8: 32px;
+
+  /* -- motion ----------------------------------------------------------- */
+  --vh-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --vh-dur-fast: 150ms;
+  --vh-dur-normal: 200ms;
+
+  /* -- z scale ---------------------------------------------------------- */
+  --vh-z-sticky: 10;
+  --vh-z-drawer-backdrop: 40;
+  --vh-z-drawer: 50;
+  --vh-z-dialog-backdrop: 60;
+  --vh-z-dialog: 70;
+}
+
+/* ---------------------------------------------------------------------- */
+/* Light theme (default)                                                  */
+/* ---------------------------------------------------------------------- */
+:root,
+:root[data-theme='light'] {
+  color-scheme: light;
+  --vh-bg: var(--vh-paper);
+  --vh-surface: #ffffff;                                            /* content panels */
+  --vh-surface-2: color-mix(in oklab, var(--vh-ink) 4%, var(--vh-paper)); /* rail/toolbars */
+  --vh-text: var(--vh-ink);
+  --vh-text-2: var(--vh-neutral-600);
+  --vh-text-disabled: var(--vh-neutral-400);
+  --vh-border: color-mix(in oklab, var(--vh-ink) 14%, transparent);
+  --vh-border-strong: color-mix(in oklab, var(--vh-ink) 26%, transparent);
+  --vh-accent: var(--vh-brand-600);
+  --vh-accent-hover: var(--vh-brand-700);
+  --vh-accent-contrast: #ffffff;
+  --vh-link: var(--vh-brand-700);
+  --vh-selected: var(--vh-brand-100);
+  --vh-run: var(--vh-state-running-text);
+  --vh-start: var(--vh-state-starting-text);
+  --vh-fail: var(--vh-state-failed-text);
+  --vh-stop: var(--vh-state-stopped-text);
+  --vh-run-dot: var(--vh-state-running);
+  --vh-start-dot: var(--vh-state-starting);
+  --vh-fail-dot: var(--vh-state-failed);
+  --vh-stop-dot: var(--vh-state-stopped);
+  --vh-fail-tint: color-mix(in oklab, var(--vh-state-failed) 9%, var(--vh-surface));
+  --vh-add-tint: color-mix(in oklab, var(--vh-state-running) 12%, var(--vh-surface));
+  --vh-del-tint: color-mix(in oklab, var(--vh-state-failed) 10%, var(--vh-surface));
+  --vh-log-bg: #fdfdfb;
+  --vh-shadow-overlay: 0 12px 40px rgb(23 26 33 / 0.18), 0 2px 8px rgb(23 26 33 / 0.1);
+}
+
+/* ---------------------------------------------------------------------- */
+/* Dark theme                                                             */
+/* ---------------------------------------------------------------------- */
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --vh-bg: var(--vh-ink);
+  --vh-surface: var(--vh-neutral-800);
+  --vh-surface-2: color-mix(in oklab, var(--vh-paper) 3%, var(--vh-ink));
+  --vh-text: var(--vh-paper);
+  --vh-text-2: color-mix(in oklab, var(--vh-paper) 62%, var(--vh-ink));
+  --vh-text-disabled: var(--vh-neutral-400);
+  --vh-border: color-mix(in oklab, var(--vh-paper) 14%, transparent);
+  --vh-border-strong: color-mix(in oklab, var(--vh-paper) 28%, transparent);
+  --vh-accent: var(--vh-brand-400);
+  --vh-accent-hover: color-mix(in oklab, var(--vh-brand-400) 82%, var(--vh-paper));
+  --vh-accent-contrast: var(--vh-ink);
+  --vh-link: var(--vh-brand-400);
+  --vh-selected: color-mix(in oklab, var(--vh-brand-400) 21%, var(--vh-ink));
+  --vh-run: var(--vh-state-running);
+  --vh-start: var(--vh-state-starting);
+  --vh-fail: var(--vh-state-failed);
+  --vh-stop: var(--vh-state-stopped);
+  --vh-run-dot: var(--vh-state-running);
+  --vh-start-dot: var(--vh-state-starting);
+  --vh-fail-dot: var(--vh-state-failed);
+  --vh-stop-dot: var(--vh-state-stopped);
+  --vh-fail-tint: color-mix(in oklab, var(--vh-state-failed) 14%, var(--vh-surface));
+  --vh-add-tint: color-mix(in oklab, var(--vh-state-running) 16%, var(--vh-surface));
+  --vh-del-tint: color-mix(in oklab, var(--vh-state-failed) 15%, var(--vh-surface));
+  --vh-log-bg: color-mix(in oklab, var(--vh-ink) 55%, var(--vh-neutral-800));
+  --vh-shadow-overlay: 0 12px 40px rgb(0 0 0 / 0.5), 0 2px 8px rgb(0 0 0 / 0.35);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    color-scheme: dark;
+    --vh-bg: var(--vh-ink);
+    --vh-surface: var(--vh-neutral-800);
+    --vh-surface-2: color-mix(in oklab, var(--vh-paper) 3%, var(--vh-ink));
+    --vh-text: var(--vh-paper);
+    --vh-text-2: color-mix(in oklab, var(--vh-paper) 62%, var(--vh-ink));
+    --vh-text-disabled: var(--vh-neutral-400);
+    --vh-border: color-mix(in oklab, var(--vh-paper) 14%, transparent);
+    --vh-border-strong: color-mix(in oklab, var(--vh-paper) 28%, transparent);
+    --vh-accent: var(--vh-brand-400);
+    --vh-accent-hover: color-mix(in oklab, var(--vh-brand-400) 82%, var(--vh-paper));
+    --vh-accent-contrast: var(--vh-ink);
+    --vh-link: var(--vh-brand-400);
+    --vh-selected: color-mix(in oklab, var(--vh-brand-400) 21%, var(--vh-ink));
+    --vh-run: var(--vh-state-running);
+    --vh-start: var(--vh-state-starting);
+    --vh-fail: var(--vh-state-failed);
+    --vh-stop: var(--vh-state-stopped);
+    --vh-run-dot: var(--vh-state-running);
+    --vh-start-dot: var(--vh-state-starting);
+    --vh-fail-dot: var(--vh-state-failed);
+    --vh-stop-dot: var(--vh-state-stopped);
+    --vh-fail-tint: color-mix(in oklab, var(--vh-state-failed) 14%, var(--vh-surface));
+    --vh-add-tint: color-mix(in oklab, var(--vh-state-running) 16%, var(--vh-surface));
+    --vh-del-tint: color-mix(in oklab, var(--vh-state-failed) 15%, var(--vh-surface));
+    --vh-log-bg: color-mix(in oklab, var(--vh-ink) 55%, var(--vh-neutral-800));
+    --vh-shadow-overlay: 0 12px 40px rgb(0 0 0 / 0.5), 0 2px 8px rgb(0 0 0 / 0.35);
+  }
+}
+
+/* ---------------------------------------------------------------------- */
+/* Base                                                                   */
+/* ---------------------------------------------------------------------- */
+* { box-sizing: border-box; }
+html { font-size: 16px; }
+body {
+  margin: 0;
+  background: var(--vh-bg);
+  color: var(--vh-text);
+  font-family: var(--vh-font-ui);
+  font-size: var(--vh-text-body);
+  line-height: 1.5;
+  font-kerning: normal;
+  -webkit-font-smoothing: antialiased;
+}
+h1, h2, h3 { line-height: 1.2; margin: 0; text-wrap: balance; }
+code, pre, .mono {
+  font-family: var(--vh-font-mono);
+  font-variant-ligatures: none; /* config text must be unambiguous */
+}
+.num { font-variant-numeric: tabular-nums; }
+:focus-visible {
+  outline: 2px solid var(--vh-brand-400);
+  outline-offset: 1px;
+  border-radius: var(--vh-radius-control);
+}
+::placeholder { color: var(--vh-text-2); opacity: 1; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

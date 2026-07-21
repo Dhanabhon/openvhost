@@ -1,0 +1,149 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenVHost mock — site editor drawer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="mock.css">
+<script src="mock.js" defer></script>
+<style>
+  .btn-sm { padding: 4px 10px; font-size: var(--vh-text-table); }
+</style>
+</head>
+<body>
+<button class="theme-toggle" type="button">theme: system</button>
+
+<div class="viewport">
+<div class="window">
+  <div class="titlebar">
+    <div class="traffic"><span></span><span></span><span></span></div>
+    <div class="titlebar-name"><b>OpenVHost</b></div>
+    <span class="pill pill-running"><span class="dot"></span>3 running</span>
+  </div>
+
+  <div class="shell" style="position: relative;">
+    <nav class="rail" aria-label="Main">
+      <div class="rail-brand">
+        <svg width="24" height="24" viewBox="0 0 64 64" fill="none" aria-hidden="true">
+          <path d="M42 10 H26 A16 16 0 0 0 10 26 V38 A16 16 0 0 0 26 54 H42" stroke="var(--vh-accent)" stroke-width="9" stroke-linecap="round"/>
+          <circle cx="40" cy="32" r="8" fill="#3FB950"/>
+        </svg>
+        <span class="name">OpenVHost</span>
+      </div>
+      <a class="nav-item" href="#" aria-current="page">
+        <svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><rect x="2.5" y="3.5" width="13" height="11" rx="2"/><path d="M2.5 7h13"/></svg>
+        Sites
+      </a>
+      <a class="nav-item" href="#">
+        <svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 9.5h3l2-5 3 9 2-4h4"/></svg>
+        Services
+      </a>
+      <a class="nav-item" href="#">
+        <svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M3 4.5h12M3 9h12M3 13.5h7"/></svg>
+        Logs
+      </a>
+      <a class="nav-item" href="#">
+        <svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M3 5.5h12M3 12.5h12"/><circle cx="7" cy="5.5" r="1.8"/><circle cx="11" cy="12.5" r="1.8"/></svg>
+        Settings
+      </a>
+      <div class="rail-foot">
+        <span class="num">v0.1.0</span>
+        <a class="link" href="#">Stop all</a>
+      </div>
+    </nav>
+
+    <main class="content" aria-hidden="true">
+      <div class="page-head">
+        <div>
+          <h1>Sites</h1>
+          <p class="sub">4 sites · 3 running on <span class="mono num">:8080</span></p>
+        </div>
+        <div class="grow"></div>
+        <button class="btn btn-primary" type="button" tabindex="-1">Add site</button>
+      </div>
+      <section class="panel">
+        <div class="rowlist">
+          <div class="row site-row selected">
+            <div><div class="primary">myshop</div><div class="meta mono">myshop.localhost</div></div>
+            <div class="mono num">PHP 8.2</div>
+            <div class="meta">nginx</div>
+            <span class="pill pill-running"><span class="dot"></span>running</span>
+            <div class="row-actions"><button class="btn btn-quiet btn-sm" tabindex="-1" type="button">Open</button><button class="btn btn-quiet btn-sm" tabindex="-1" type="button">Edit</button></div>
+          </div>
+          <div class="row site-row">
+            <div><div class="primary">blog</div><div class="meta mono">blog.localhost</div></div>
+            <div class="mono num">PHP 8.2</div>
+            <div class="meta">nginx</div>
+            <span class="pill pill-running"><span class="dot"></span>running</span>
+            <div class="row-actions"><button class="btn btn-quiet btn-sm" tabindex="-1" type="button">Open</button><button class="btn btn-quiet btn-sm" tabindex="-1" type="button">Edit</button></div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <div class="drawer-backdrop"></div>
+    <aside class="drawer" role="dialog" aria-labelledby="drawer-title" aria-modal="true">
+      <div class="drawer-head">
+        <h2 id="drawer-title">Edit site — myshop</h2>
+        <button class="btn btn-quiet btn-icon" type="button" aria-label="Close">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M3 3l8 8M11 3l-8 8"/></svg>
+        </button>
+      </div>
+      <div class="drawer-body">
+        <div class="field">
+          <label for="f-name">Name</label>
+          <input class="input" id="f-name" value="myshop">
+        </div>
+        <div class="field">
+          <label for="f-domain">Domain</label>
+          <div class="input-group">
+            <input class="input mono" id="f-domain" value="myshop">
+            <span class="input-suffix">.localhost</span>
+          </div>
+          <p class="hint">Resolves in modern browsers without touching the hosts file.</p>
+        </div>
+        <div class="field">
+          <label for="f-root">Project folder</label>
+          <div class="input-group">
+            <input class="input mono" id="f-root" value="~/www/myshop">
+            <span class="input-suffix input-suffix--btn" role="button" tabindex="0">Browse</span>
+          </div>
+        </div>
+        <div class="field">
+          <label id="f-server-label">Web server</label>
+          <div class="seg" role="group" aria-labelledby="f-server-label">
+            <button type="button" aria-pressed="true">nginx</button>
+            <button type="button" aria-pressed="false">apache</button>
+          </div>
+        </div>
+        <div class="field">
+          <label for="f-php">PHP version</label>
+          <select class="input mono" id="f-php">
+            <option>8.3 (installed)</option>
+            <option selected>8.2 (installed)</option>
+            <option>8.1 — install first</option>
+          </select>
+          <p class="hint">Applies to this site only. Other sites keep their own version.</p>
+        </div>
+
+        <div class="danger-zone">
+          <h3 style="font-size: var(--vh-text-table); font-weight: 600; margin: 0;">Delete site</h3>
+          <p class="consequence">This removes the site from OpenVHost. Your project files in <span class="mono">~/www/myshop</span> are not touched.</p>
+          <button class="btn btn-danger" type="button">Delete site…</button>
+        </div>
+      </div>
+      <div class="drawer-foot">
+        <button class="btn btn-quiet" type="button">Cancel</button>
+        <button class="btn btn-primary" type="button">Save &amp; restart nginx</button>
+      </div>
+    </aside>
+  </div>
+</div>
+</div>
+</body>
+</html>
