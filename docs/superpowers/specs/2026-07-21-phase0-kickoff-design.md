@@ -95,6 +95,7 @@ open-serv/
 - **Spike (time-boxed ≤ half a day):** tauri-specta v2 against current Tauri 2.x. Success = TS types + command wrapper generate and compile in CI alongside Svelte 5 strict TS.
 - **Pre-decided fallback:** `ts-rs` derives the TS types; a ~30-line hand-written typed `invoke` wrapper provides the call surface.
 - Either way, **all IPC flows through `src/lib/ipc/`** — call sites are identical under both outcomes, so a later swap touches one module. No raw `invoke("string")` anywhere in the frontend, ever.
+- **Outcome (2026-07-21):** tauri-specta spike ACCEPTED; bindings generated on dev runs.
 
 ## 8. CI
 
