@@ -43,11 +43,13 @@ jobs:
           cargo test --workspace
       - name: Typed bindings are committed fresh
         run: git diff --exit-code -- apps/desktop/src/lib/ipc/bindings.ts
-      - name: Guard - openvhost-core must not depend on tauri
+      - name: Guard - core and proc must not depend on tauri
         run: |
-          if cargo tree -p openvhost-core -e normal --all-features | grep -qi tauri; then
-            echo "::error::openvhost-core depends on tauri"; exit 1
-          fi
+          for crate in openvhost-core openvhost-proc; do
+            if cargo tree -p "$crate" -e normal --all-features | grep -qi tauri; then
+              echo "::error::$crate depends on tauri"; exit 1
+            fi
+          done
       - name: License gate - cargo-deny
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:

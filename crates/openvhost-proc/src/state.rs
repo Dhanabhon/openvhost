@@ -7,7 +7,6 @@ use std::process::ExitStatus;
 
 use crate::events::ServiceState;
 
-#[allow(dead_code)]
 pub(crate) fn classify_exit(
     stop_requested: bool,
     status: Option<&ExitStatus>,

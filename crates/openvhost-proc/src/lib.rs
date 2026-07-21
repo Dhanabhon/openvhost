@@ -10,9 +10,12 @@ mod error;
 pub mod events;
 mod log;
 pub mod platform;
+mod service_task;
 mod state;
+mod supervisor;
 pub mod testchild;
 
 pub use error::ProcError;
 pub use events::{LogLevel, LogLine, ServiceState, ServiceStatus, StreamSource, SupervisorEvent};
 pub use platform::{OutputStream, ProcessDriver, SpawnSpec, SpawnedChild, default_driver};
+pub use supervisor::{ServiceSpec, Supervisor};
