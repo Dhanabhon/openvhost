@@ -5,5 +5,22 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+specta = { version = "2.0.0-rc.25", optional = true, features = ["derive"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading"] }
+
+[features]
+specta = ["dep:specta"]
+
+[dev-dependencies]
+
 [lints]
 workspace = true
