@@ -1,0 +1,14 @@
+# Package Managers
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+bun.lock
+bun.lockb
+
+# Miscellaneous
+/static/
+
+# Rust crate (own gates: cargo fmt / cargo clippy — not part of frontend lint scope)
+/src-tauri/
+src/lib/ipc/bindings.ts
+src/lib/ipc/gen/

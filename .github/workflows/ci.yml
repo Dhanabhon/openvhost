@@ -1,0 +1,101 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: CI
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quick:
+    name: quick
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Tauri system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          package_json_file: apps/desktop/package.json
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: apps/desktop/.nvmrc
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+      - run: pnpm -C apps/desktop install --frozen-lockfile
+      - name: Rust gates
+        run: |
+          cargo fmt --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+      - name: Typed bindings are committed fresh
+        run: git diff --exit-code -- apps/desktop/src/lib/ipc/bindings.ts
+      - name: Guard - openvhost-core must not depend on tauri
+        run: |
+          if cargo tree -p openvhost-core -e normal | grep -qi tauri; then
+            echo "::error::openvhost-core depends on tauri"; exit 1
+          fi
+      - name: License gate - cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check licenses
+      - name: License gate - npm
+        run: >
+          pnpm -C apps/desktop dlx license-checker-rseidelsohn --production
+          --excludePrivatePackages
+          --onlyAllow "MIT;Apache-2.0;ISC;BSD-2-Clause;BSD-3-Clause;0BSD;Zlib;MPL-2.0;Unlicense;CC0-1.0"
+      - name: License gate - SPDX headers
+        run: bash scripts/check-spdx.sh
+      - name: Frontend gates
+        run: |
+          pnpm -C apps/desktop lint
+          pnpm -C apps/desktop check
+          pnpm -C apps/desktop test
+          pnpm -C apps/desktop build
+
+  matrix:
+    name: matrix (${{ matrix.os }})
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          package_json_file: apps/desktop/package.json
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: apps/desktop/.nvmrc
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+      - run: pnpm -C apps/desktop install --frozen-lockfile
+      - run: cargo build --workspace
+      # Windows: the desktop lib's test exe links WebView2/wry and fails to
+      # load on the runner (STATUS_ENTRYPOINT_NOT_FOUND). Its tests (specta
+      # export) still run on ubuntu quick + macOS, so skip only that crate here.
+      - run: cargo test --workspace
+        if: runner.os != 'Windows'
+      - run: cargo test --workspace --exclude openvhost-desktop
+        if: runner.os == 'Windows'
+      - name: Build unsigned bundles
+        run: pnpm -C apps/desktop run tauri build
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bundles-${{ matrix.os }}
+          path: target/release/bundle/
+          if-no-files-found: error

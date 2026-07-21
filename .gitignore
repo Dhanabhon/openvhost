@@ -1,0 +1,11 @@
+/target
+node_modules/
+apps/desktop/build/
+apps/desktop/.svelte-kit/
+apps/desktop/src-tauri/gen/
+.DS_Store
+
+# AI-agent session scratch — never part of the repo
+.superpowers/
+.remember/
+.claude/settings.local.json
