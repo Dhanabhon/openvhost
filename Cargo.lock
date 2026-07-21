@@ -2053,6 +2053,7 @@ name = "openvhost-desktop"
 version = "0.1.0"
 dependencies = [
  "openvhost-core",
+ "openvhost-proc",
  "serde",
  "serde_json",
  "specta",
@@ -2061,6 +2062,7 @@ dependencies = [
  "tauri-build",
  "tauri-specta",
  "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]

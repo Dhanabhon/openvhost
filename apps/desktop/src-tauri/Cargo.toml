@@ -17,7 +17,9 @@ tauri = { version = "2", features = [] }
 serde.workspace = true
 serde_json = "1"
 thiserror.workspace = true
+tokio.workspace = true
 openvhost-core = { path = "../../../crates/openvhost-core", features = ["specta"] }
+openvhost-proc = { path = "../../../crates/openvhost-proc", features = ["specta"] }
 specta = { version = "2.0.0-rc.25", features = ["derive"] }
 specta-typescript = "0.0.12"
 tauri-specta = { version = "2.0.0-rc.25", features = ["derive", "typescript"] }
