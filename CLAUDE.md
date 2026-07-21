@@ -1,6 +1,8 @@
-# OpenServ — Claude Code Project Instructions
-Read docs/OPENSERV_MASTER_PLAN.md before any non-trivial task. It is the
+# OpenVHost — Claude Code Project Instructions
+
+Read docs/OPENVHOST_MASTER_PLAN.md before any non-trivial task. It is the
 source of truth for architecture, roadmap, and agent ownership.
+
 ## Golden rules
 1. Delegate by ownership map (§6.2 of the plan). Platform-#[cfg] code →
    platform specialists. UI → tauri-frontend-engineer. Templates →
@@ -11,8 +13,8 @@ source of truth for architecture, roadmap, and agent ownership.
 3. New cross-platform abstractions: get BOTH platform specialists to
    confirm feasibility BEFORE implementing (Windows has no PHP-FPM, no
    easy symlinks; design for the constraint, don't discover it later).
-4. openserv-core must never depend on tauri. All child processes go
-   through openserv-proc. All file writes are atomic. No unwrap outside
+4. openvhost-core must never depend on tauri. All child processes go
+   through openvhost-proc. All file writes are atomic. No unwrap outside
    tests.
 5. Both OSes green in CI or it doesn't merge.
 6. Never bundle service binaries into the installer — runtime download
@@ -22,6 +24,7 @@ source of truth for architecture, roadmap, and agent ownership.
    link native MySQL/MariaDB client libs (separate processes only).
 8. Anything listed in plan §7 (Open Questions) needs a human decision —
    stop and ask.
+
 ## Commands
 - Build all: `cargo build --workspace && pnpm -C apps/desktop build`
 - Test: `cargo test --workspace` · `pnpm -C apps/desktop test`

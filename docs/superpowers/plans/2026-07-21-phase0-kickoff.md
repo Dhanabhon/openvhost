@@ -10,6 +10,8 @@
 
 **Spec:** `docs/superpowers/specs/2026-07-21-phase0-kickoff-design.md` · **Source of truth:** `docs/OPENSERV_MASTER_PLAN.md` (v1.1)
 
+> **Rename note (2026-07-21):** product renamed **OpenServ → OpenVHost** mid-execution (source of truth is now `docs/OPENVHOST_MASTER_PLAN.md` v1.2). This plan is the historical execution record; `openserv*` identifiers it prescribes were renamed to `openvhost*` (CLI `openservctl` → `openvhost`) by the rename commits on `feat/p0-scaffold` after Task 6.
+
 ## Global Constraints
 
 Every task's requirements implicitly include all of these:

@@ -1,7 +1,7 @@
-# OpenServ — Brand Guidelines v1.0
+# OpenVHost — Brand Guidelines v1.1
 
-> Companion to `OPENSERV_MASTER_PLAN.md` (§1.3 licensing, OQ#8 trademark) and the input spec for `tauri-frontend-engineer` design tokens and `TRADEMARK.md`.
-> Status: v1.0 — 2026-07-21 · All specified typefaces are SIL OFL licensed (redistributable in a GPL project).
+> Companion to `OPENVHOST_MASTER_PLAN.md` (§1.3 licensing, OQ#8 registration actions) and the input spec for `tauri-frontend-engineer` design tokens and `TRADEMARK.md`.
+> Status: v1.1 — 2026-07-21 (renamed from OpenServ; tagline & descriptor finalized) · All specified typefaces are SIL OFL licensed (redistributable in a GPL project).
 
 ---
 
@@ -9,14 +9,15 @@
 
 ### 1.1 Essence
 
-**OpenServ is the local dev environment that can never be closed.**
+**OpenVHost is the local dev environment that can never be closed.**
 
-The license (GPL-3.0-or-later, DCO-only) makes it structurally impossible for anyone — including the project's own maintainers — to take OpenServ proprietary. The brand exists to make that promise *felt*, not just stated in a COPYING file.
+The license (GPL-3.0-or-later, DCO-only) makes it structurally impossible for anyone — including the project's own maintainers — to take OpenVHost proprietary. The brand exists to make that promise *felt*, not just stated in a COPYING file.
 
 | | |
 |---|---|
-| **Brand promise** | Open. Always. |
-| **Brand narrative** | *The bracket never closes.* Our mark is an opening bracket that is never paired with a closing one — the source stays open, permanently, by design. |
+| **Tagline** | **"Open. We host."** — the "V" is pronounced "vee", which reads as *we*: openness and community in three words. This is the official tagline for the social preview, website hero, and launch materials. |
+| **README descriptor** | **"Your friendly local host"** — double pun (*local* dev environment / welcoming *host*); English-only wordplay, used as the one-line description under the README header and in store/app listings. |
+| **Brand narrative** | *The bracket never closes.* Our mark is an opening bracket that is never paired with a closing one — the source stays open, permanently, by design. The letter **V** in the name carries the same story: an open shape that never seals shut. |
 | **Personality** | A senior dev on your team: direct, calm, technically honest, never salesy, quietly funny at most. Trustworthy before impressive. |
 | **What we are** | Fast, light, transparent, community-owned. |
 | **What we are not** | Corporate, gamified, mysterious about errors, hungry for accounts or data. |
@@ -31,16 +32,18 @@ The license (GPL-3.0-or-later, DCO-only) makes it structurally impossible for an
 | MAMP | Grey / blue |
 | DDEV | Blue / purple |
 
-The category is saturated with blue. OpenServ claims the **deep green** territory — motivated by the product itself (green = *running*, the happiest moment in this product's world) and by the license story (**Evergreen** = open in perpetuity). No major competitor owns it.
+The category is saturated with blue. OpenVHost claims the **deep green** territory — motivated by the product itself (green = *running*, the happiest moment in this product's world) and by the license story (**Evergreen** = open in perpetuity). No major competitor owns it.
 
 ---
 
 ## 2. Name & Wordmark
 
-- The name is written **OpenServ** — one word, capital O and S. Never "Openserv", "openServ", "Open Serv", or "OpenServe".
-- In prose, no article: "OpenServ manages your services", not "the OpenServ".
+- The name is written **OpenVHost** — one word, capitals O·V·H. The casing deliberately mirrors Apache's `<VirtualHost>` directive, the object this product tames. Never "Openvhost", "OpenVhost", "Open VHost", "OpenVHOST", or "openVHost".
+- **Pronunciation:** "open vee-host" (4 syllables · TH: โอ-เพน-วี-โฮสต์). The V is said as the letter "vee", never blended into "vost".
+- **No abbreviation exists.** Never shorten to "OVH" in any context — it collides with OVHcloud, the French hosting company. Write the name in full; the CLI is already short.
+- In prose, no article: "OpenVHost manages your services", not "the OpenVHost".
 - Wordmark: **Space Grotesk Medium**, tracking −1%, set in Terminal Ink (light backgrounds) or Plaintext (dark backgrounds). The wordmark is text-only; do not add gradients, outlines, or shadows.
-- CLI binary is lowercase by convention: `openservctl`. Config file: `openserv.yaml`. These are product artifacts, not the brand name, and follow code conventions instead.
+- CLI binary is lowercase by convention: `openvhost` (no `ctl` suffix, no aliases). Config file: `openvhost.yaml`. Data dir: `~/.openvhost`. These are product artifacts, not the brand name, and follow code conventions instead.
 
 ---
 
@@ -155,7 +158,7 @@ All families are SIL OFL — free to bundle, embed, and redistribute in a GPL pr
 
 1. **Dev-to-dev, plain verbs.** "Start PHP 8.3" not "Initialize runtime environment".
 2. **Errors explain and point forward.** Every failure states what happened, shows the evidence (stderr tail), and offers the next action. Errors never apologize, never blame, never say just "Something went wrong".
-3. **Honest about consequences.** Destructive dialogs state exactly what is and isn't affected — the flagship line, verbatim in the product: *"This removes the site from OpenServ. Your project files in `~/www/myproject` are not touched."*
+3. **Honest about consequences.** Destructive dialogs state exactly what is and isn't affected — the flagship line, verbatim in the product: *"This removes the site from OpenVHost. Your project files in `~/www/myproject` are not touched."*
 4. **No hype vocabulary.** Banned: "blazingly", "supercharge", "magical", "seamless", "revolutionary". Allowed superlative: measured numbers ("starts in 0.4s").
 5. **The license is a feature — say it plainly.** Marketing may state: "GPL-licensed. No one can ever close this source — including us." Never mock competitors by name.
 
@@ -167,7 +170,7 @@ All families are SIL OFL — free to bundle, embed, and redistribute in a GPL pr
 | Running toast | `nginx running on :8080` | `Success! 🎉` |
 | Failure | `MySQL failed to start — port 3306 is in use by another process. View log · Change port` | `Oops! Something went wrong.` |
 | Empty state | `No sites yet. Add your first site to map a domain to a project folder.` | `It's lonely in here…` |
-| Update | `OpenServ 1.2 available — changelog · Update` | `A shiny new version awaits!` |
+| Update | `OpenVHost 1.2 available — changelog · Update` | `A shiny new version awaits!` |
 
 ### 6.3 Bilingual (EN / TH)
 
@@ -181,7 +184,7 @@ All families are SIL OFL — free to bundle, embed, and redistribute in a GPL pr
 
 ### 7.1 App UI tokens
 
-Frontend implements §4 as CSS custom properties (`--os-brand-600`, `--os-state-running`, …) — single source of truth in `apps/desktop/src/lib/tokens.css`; no hex literals elsewhere. Radius scale: 6px controls, 10px cards, 999px status pills. Spacing: 4px base grid. Focus ring: 2px `brand-400` outer ring on all interactive elements, visible in both themes.
+Frontend implements §4 as CSS custom properties (`--vh-brand-600`, `--vh-state-running`, …) — single source of truth in `apps/desktop/src/lib/tokens.css`; no hex literals elsewhere. Radius scale: 6px controls, 10px cards, 999px status pills. Spacing: 4px base grid. Focus ring: 2px `brand-400` outer ring on all interactive elements, visible in both themes.
 
 ### 7.2 App icon
 
@@ -198,7 +201,8 @@ Frontend implements §4 as CSS custom properties (`--os-brand-600`, `--os-state-
 ### 7.4 GitHub & community surfaces
 
 - README header: horizontal lockup on Plaintext (light) with dark-mode `<picture>` swap; badges limited to build status, license (`GPL--3.0--or--later` badge in Evergreen `#0E6E5C`), and latest release — no badge walls.
-- Social preview (1280×640): Plaintext background, mark left, wordmark + "Open. Always." in Space Grotesk, nothing else.
+- Social preview (1280×640): Plaintext background, mark left, wordmark + "Open. We host." in Space Grotesk, nothing else.
+- README header: descriptor line "Your friendly local host" sits directly under the lockup, set in IBM Plex Sans, Slate.
 - Docs site: Plaintext/Ink themes, Evergreen links, JetBrains Mono code blocks with the state palette for diff/status highlighting.
 
 ---
@@ -207,10 +211,10 @@ Frontend implements §4 as CSS custom properties (`--os-brand-600`, `--os-state-
 
 Full policy lives in `TRADEMARK.md` (plan OQ#8); brand-level summary:
 
-- **The GPL grants the code, not the name.** Forks are welcome and must ship under a different name and mark once distributed publicly. The bracket mark and the name "OpenServ" identify this project and its official builds only.
-- **Allowed without asking:** "works with OpenServ", "built for OpenServ", "powered by OpenServ" in text; unmodified mark when referring to the project (news, tutorials, package lists).
-- **Not allowed:** using the mark/name in a way implying official status or endorsement; modified versions of the mark; the name in a fork's product name ("OpenServ Pro", "OpenServ Turbo").
-- Community meetups/content may use "OpenServ Community" with the unmodified mark.
+- **The GPL grants the code, not the name.** Forks are welcome and must ship under a different name and mark once distributed publicly. The bracket mark and the name "OpenVHost" identify this project and its official builds only.
+- **Allowed without asking:** "works with OpenVHost", "built for OpenVHost", "powered by OpenVHost" in text; unmodified mark when referring to the project (news, tutorials, package lists).
+- **Not allowed:** using the mark/name in a way implying official status or endorsement; modified versions of the mark; the name in a fork's product name ("OpenVHost Pro", "OpenVHost Turbo").
+- Community meetups/content may use "OpenVHost Community" with the unmodified mark.
 
 ---
 

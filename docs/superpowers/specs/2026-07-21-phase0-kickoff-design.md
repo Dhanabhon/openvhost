@@ -1,5 +1,7 @@
 # Phase 0 Kickoff — Bootstrap + Scaffold + Shell — Design
 
+> **Rename note (2026-07-21):** the product was renamed **OpenServ → OpenVHost** (master plan v1.2, brand guidelines v1.1) while this slice was executing. This document is kept as the historical design record; all `openserv*` identifiers below (crates, env var, bundle id, CLI name `openservctl`) were renamed to their `openvhost*` equivalents (CLI: `openvhost`) by the rename commits on `feat/p0-scaffold`.
+
 - **Date:** 2026-07-21
 - **Status:** Approved in brainstorming session; updated same day for master plan v1.1 (license decided: GPL-3.0-or-later); pending user review
 - **Source of truth:** `docs/OPENSERV_MASTER_PLAN.md` v1.1 (committed ahead of bootstrap when the v1.1 update arrived mid-review). This spec covers master-plan tasks **P0-1** and **P0-2** plus project bootstrap. It changes no master-plan decision.
