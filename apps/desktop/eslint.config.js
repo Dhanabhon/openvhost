@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 import prettier from 'eslint-config-prettier';
 import path from 'node:path';
 import js from '@eslint/js';
@@ -37,5 +38,9 @@ export default defineConfig(
 		// Override or add rule settings here, such as:
 		// 'svelte/button-has-type': 'error'
 		rules: {}
+	},
+	{
+		// Generated IPC artifacts (tauri-specta / ts-rs output) are not linted.
+		ignores: ['src/lib/ipc/bindings.ts', 'src/lib/ipc/gen/']
 	}
 );
