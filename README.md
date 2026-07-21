@@ -11,7 +11,19 @@ Open-source, cross-platform local development environment for web developers —
 
 ## Status
 
-Early development — Phase 0 (proof of concept). There is nothing to install yet. What exists today: a Tauri 2 + SvelteKit app shell with a typed IPC seam, a Rust workspace laid out for the real components, and a license-gated build pipeline. The full roadmap lives in [docs/OPENVHOST_MASTER_PLAN.md](docs/OPENVHOST_MASTER_PLAN.md).
+Early development — Phase 0 (proof of concept). There is nothing to install yet.
+
+Done so far: the first 2 of 9 Phase 0 tasks — a Tauri 2 + SvelteKit app shell with a typed IPC seam over a tauri-free Rust core, the full workspace layout, and a license-gated build pipeline. Next up: the process supervisor (`openvhost-proc`), the heart of the app. Running the dev app takes one command: `./scripts/dev.sh`.
+
+## Roadmap
+
+- **Phase 0 — proof of concept** (in progress): burn down the risky bits — process supervision, PHP on both OSes, download pipeline, config generation, E2E harness
+- **Phase 1 — MVP**: replace XAMPP for a PHP developer (see below)
+- **Phase 2 — daily driver**: phpMyAdmin/Adminer, CLI shims on PATH, metrics, EN + TH interface
+- **Phase 3 — competitive edge**: one-click HTTPS with a local CA, ports 80/443, wildcard DNS, Mailpit, backups, `openvhost.yaml` env-as-code
+- **Phase 4+**: PostgreSQL, Redis, MongoDB, Node.js/Python/Go runtimes, Linux support
+
+Details and decisions: [docs/OPENVHOST_MASTER_PLAN.md](docs/OPENVHOST_MASTER_PLAN.md).
 
 ## What it will do
 
@@ -42,9 +54,12 @@ cargo fmt --check && cargo clippy --workspace -- -D warnings   # lint gate
 ./scripts/dev.sh                                        # run the app (one command; installs deps on first run)
 ```
 
-Before a change merges, the full gate suite must pass: fmt, clippy `-D warnings`, tests, `cargo deny check licenses advisories`, the SPDX header check (`scripts/check-spdx.sh`), eslint, svelte-check, vitest, and the frontend build. Commits follow Conventional Commits and are DCO-signed (`git commit -s`).
+## Contributing
 
-Read `CLAUDE.md` and the master plan before non-trivial changes — architecture, ownership, and conventions are decided there.
+- Read `CLAUDE.md` and the master plan first — architecture, ownership, and conventions are decided there, not in PR threads.
+- Before a change merges, the full gate suite must pass: fmt, clippy `-D warnings`, tests, `cargo deny check licenses advisories`, the SPDX header check (`scripts/check-spdx.sh`), eslint, svelte-check, vitest, and the frontend build.
+- Commits follow Conventional Commits and are DCO-signed (`git commit -s`). New source files carry an SPDX `GPL-3.0-or-later` header.
+- Changes touching platform-specific code need both platform stories to hold — Windows has no PHP-FPM and no easy symlinks; design for the constraint.
 
 ## License
 
