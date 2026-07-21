@@ -102,7 +102,7 @@ fn install_ignore_stop() {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -146,21 +146,6 @@ mod tests {
         assert!(parse(&s(&["--nope"])).is_err());
     }
 
-    #[test]
-    fn bin_emits_lines_and_exit_code() {
-        // Use CARGO_BIN_EXE_proc_testchild if available (set by cargo test),
-        // otherwise fall back to the standard target directory.
-        let bin_path = std::env::var("CARGO_BIN_EXE_proc_testchild").unwrap_or_else(|_| {
-            // Fallback: construct the path from the manifest directory
-            let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
-            format!("{}/../../target/debug/proc_testchild", manifest_dir)
-        });
-        let out = std::process::Command::new(&bin_path)
-            .args(["--lines", "2", "--interval-ms", "1", "--exit", "3"])
-            .output()
-            .unwrap();
-        assert_eq!(out.status.code(), Some(3));
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(stdout.contains("tick 1/2") && stdout.contains("tick 2/2"));
-    }
+    // Binary-level behavior tests live in tests/testchild_bin.rs:
+    // CARGO_BIN_EXE_* is only provided when compiling integration tests.
 }
