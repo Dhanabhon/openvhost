@@ -1,0 +1,25 @@
+# cargo-deny configuration — license gate (master plan §1.3).
+# Only GPLv3-COMPATIBLE licenses may be allowed here. If `cargo deny` fails
+# on a new transitive dependency: verify the license is GPLv3-compatible
+# (gnu.org/licenses/license-list), add it below with a comment, and say so
+# in the commit message. Unknown licenses stay blocked — never bypassed.
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "CC0-1.0",
+    "BSL-1.0",          # Boost — GPL-compatible
+    "MPL-2.0",          # file-level copyleft, GPLv3-compatible as secondary license
+    "Unicode-3.0",      # unicode-ident and friends
+    "Unicode-DFS-2016", # older unicode-ident releases
+]
+
+[licenses.private]
+ignore = true  # our own GPL-3.0-or-later workspace crates are publish = false
