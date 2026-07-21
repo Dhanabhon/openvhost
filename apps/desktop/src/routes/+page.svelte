@@ -21,7 +21,7 @@
 </script>
 
 <main class="mx-auto max-w-xl p-8 font-sans">
-	<h1 class="text-2xl font-semibold">OpenServ — dev shell</h1>
+	<h1 class="text-2xl font-semibold">OpenVHost — dev shell</h1>
 	<p class="mt-1 text-sm opacity-70">Phase 0 slice: one typed IPC command.</p>
 
 	<div class="mt-6 flex gap-3">
@@ -62,8 +62,8 @@
 			<dd>{info.os}</dd>
 			<dt class="font-medium">Arch</dt>
 			<dd>{info.arch}</dd>
-			<dt class="font-medium">OpenServ home</dt>
-			<dd class="break-all">{info.openservHome}</dd>
+			<dt class="font-medium">OpenVHost home</dt>
+			<dd class="break-all">{info.openvhostHome}</dd>
 		</dl>
 	{/if}
 </main>

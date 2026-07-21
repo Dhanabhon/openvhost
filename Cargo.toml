@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/openserv-core",
-    "crates/openserv-proc",
-    "crates/openserv-pkg",
-    "crates/openserv-conf",
+    "crates/openvhost-core",
+    "crates/openvhost-proc",
+    "crates/openvhost-pkg",
+    "crates/openvhost-conf",
     "apps/cli",
     "apps/desktop/src-tauri",
 ]

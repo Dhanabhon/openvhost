@@ -38,10 +38,10 @@ jobs:
           cargo fmt --check
           cargo clippy --workspace --all-targets -- -D warnings
           cargo test --workspace
-      - name: Guard - openserv-core must not depend on tauri
+      - name: Guard - openvhost-core must not depend on tauri
         run: |
-          if cargo tree -p openserv-core -e normal | grep -qi tauri; then
-            echo "::error::openserv-core depends on tauri"; exit 1
+          if cargo tree -p openvhost-core -e normal | grep -qi tauri; then
+            echo "::error::openvhost-core depends on tauri"; exit 1
           fi
       - name: License gate - cargo-deny
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2

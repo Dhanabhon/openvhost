@@ -2023,11 +2023,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
-name = "openserv-conf"
+name = "openvhost"
 version = "0.1.0"
 
 [[package]]
-name = "openserv-core"
+name = "openvhost-conf"
+version = "0.1.0"
+
+[[package]]
+name = "openvhost-core"
 version = "0.1.0"
 dependencies = [
  "dirs",
@@ -2039,10 +2043,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "openserv-desktop"
+name = "openvhost-desktop"
 version = "0.1.0"
 dependencies = [
- "openserv-core",
+ "openvhost-core",
  "serde",
  "serde_json",
  "specta",
@@ -2054,15 +2058,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "openserv-pkg"
+name = "openvhost-pkg"
 version = "0.1.0"
 
 [[package]]
-name = "openserv-proc"
-version = "0.1.0"
-
-[[package]]
-name = "openservctl"
+name = "openvhost-proc"
 version = "0.1.0"
 
 [[package]]

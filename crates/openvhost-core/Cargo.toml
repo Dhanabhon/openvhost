@@ -1,5 +1,5 @@
 [package]
-name = "openserv-core"
+name = "openvhost-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

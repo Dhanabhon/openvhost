@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! OpenServ desktop — Tauri entry point with typed (tauri-specta) commands.
+//! OpenVHost desktop — Tauri entry point with typed (tauri-specta) commands.
 
 mod commands;
 
@@ -40,7 +40,7 @@ mod tests {
     use super::*;
 
     /// Regenerate the committed TS bindings headlessly (no GUI needed):
-    /// `cargo test -p openserv-desktop export_bindings`.
+    /// `cargo test -p openvhost-desktop export_bindings`.
     #[test]
     fn export_bindings() {
         specta_builder()

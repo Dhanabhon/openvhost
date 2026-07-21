@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Tauri command surface — thin validation + delegation to openserv-core
+//! Tauri command surface — thin validation + delegation to openvhost-core
 //! (business logic never lives here; master plan §5).
 
-use openserv_core::CoreInfo;
+use openvhost_core::CoreInfo;
 
 /// Serializable command error (spec §7.2). Establishes the pattern:
 /// every command returns `Result<_, IpcError>` and the UI renders failures.
@@ -12,13 +12,13 @@ pub enum IpcError {
     /// Dev-only simulated failure used to exercise the UI error path.
     #[error("simulated failure (dev only)")]
     Simulated,
-    /// An error bubbled up from openserv-core.
+    /// An error bubbled up from openvhost-core.
     #[error("{message}")]
     Core { message: String },
 }
 
-impl From<openserv_core::CoreError> for IpcError {
-    fn from(e: openserv_core::CoreError) -> Self {
+impl From<openvhost_core::CoreError> for IpcError {
+    fn from(e: openvhost_core::CoreError) -> Self {
         IpcError::Core {
             message: e.to_string(),
         }
@@ -32,5 +32,5 @@ pub fn core_info(simulate_error: Option<bool>) -> Result<CoreInfo, IpcError> {
     if cfg!(debug_assertions) && simulate_error.unwrap_or(false) {
         return Err(IpcError::Simulated);
     }
-    Ok(openserv_core::core_info(env!("CARGO_PKG_VERSION"))?)
+    Ok(openvhost_core::core_info(env!("CARGO_PKG_VERSION"))?)
 }

@@ -17,8 +17,8 @@ pub struct CoreInfo {
     pub os: String,
     /// CPU architecture, from `std::env::consts::ARCH` ("aarch64", "x86_64", …).
     pub arch: String,
-    /// Resolved OpenServ home directory, for display.
-    pub openserv_home: String,
+    /// Resolved OpenVHost home directory, for display.
+    pub openvhost_home: String,
 }
 
 /// Assemble [`CoreInfo`] for the given application version.
@@ -28,7 +28,7 @@ pub fn core_info(app_version: &str) -> Result<CoreInfo, CoreError> {
         app_version: app_version.to_owned(),
         os: std::env::consts::OS.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),
-        openserv_home: home.display().to_string(),
+        openvhost_home: home.display().to_string(),
     })
 }
 
@@ -43,7 +43,7 @@ mod tests {
         assert_eq!(info.app_version, "9.9.9");
         assert_eq!(info.os, std::env::consts::OS);
         assert_eq!(info.arch, std::env::consts::ARCH);
-        assert!(!info.openserv_home.is_empty());
+        assert!(!info.openvhost_home.is_empty());
     }
 
     #[test]
@@ -51,6 +51,6 @@ mod tests {
         let info = core_info("1.0.0").unwrap();
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("\"appVersion\""));
-        assert!(json.contains("\"openservHome\""));
+        assert!(json.contains("\"openvhostHome\""));
     }
 }

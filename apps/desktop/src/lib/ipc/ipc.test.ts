@@ -12,7 +12,7 @@ const sample = {
 	appVersion: '0.1.0',
 	os: 'macos',
 	arch: 'aarch64',
-	openservHome: '/Users/x/.openserv'
+	openvhostHome: '/Users/x/.openvhost'
 };
 
 describe('coreInfo', () => {

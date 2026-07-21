@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! OPENSERV_HOME resolution (master plan §3.2; spec §7.1).
+//! OPENVHOST_HOME resolution (master plan §3.2; spec §7.1).
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use crate::error::CoreError;
 
-/// Resolve the OpenServ home directory: `OPENSERV_HOME` env override wins,
-/// otherwise `<user home>/.openserv`. The override is what makes tests and
+/// Resolve the OpenVHost home directory: `OPENVHOST_HOME` env override wins,
+/// otherwise `<user home>/.openvhost`. The override is what makes tests and
 /// the future integration harness hermetic.
 pub fn resolve_home() -> Result<PathBuf, CoreError> {
     resolve_home_from(
-        std::env::var_os("OPENSERV_HOME").as_deref(),
+        std::env::var_os("OPENVHOST_HOME").as_deref(),
         dirs::home_dir().as_deref(),
     )
 }
@@ -25,7 +25,7 @@ pub(crate) fn resolve_home_from(
         return Ok(PathBuf::from(v));
     }
     home_dir
-        .map(|h| h.join(".openserv"))
+        .map(|h| h.join(".openvhost"))
         .ok_or(CoreError::HomeDirUnavailable)
 }
 
@@ -37,24 +37,24 @@ mod tests {
     #[test]
     fn env_override_wins() {
         let p = resolve_home_from(
-            Some(OsStr::new("/custom/openserv-home")),
+            Some(OsStr::new("/custom/openvhost-home")),
             Some(Path::new("/Users/x")),
         )
         .unwrap();
-        assert_eq!(p, PathBuf::from("/custom/openserv-home"));
+        assert_eq!(p, PathBuf::from("/custom/openvhost-home"));
     }
 
     #[test]
-    fn defaults_to_dot_openserv_under_home() {
+    fn defaults_to_dot_openvhost_under_home() {
         let p = resolve_home_from(None, Some(Path::new("/Users/x"))).unwrap();
         // Build expected via join so the separator is right on Windows too.
-        assert_eq!(p, Path::new("/Users/x").join(".openserv"));
+        assert_eq!(p, Path::new("/Users/x").join(".openvhost"));
     }
 
     #[test]
     fn empty_override_falls_back_to_default() {
         let p = resolve_home_from(Some(OsStr::new("")), Some(Path::new("/Users/x"))).unwrap();
-        assert_eq!(p, Path::new("/Users/x").join(".openserv"));
+        assert_eq!(p, Path::new("/Users/x").join(".openvhost"));
     }
 
     #[test]

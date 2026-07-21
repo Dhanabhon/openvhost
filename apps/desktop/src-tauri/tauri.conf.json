@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "OpenServ",
+  "productName": "OpenVHost",
   "version": "0.1.0",
-  "identifier": "dev.openserv.desktop",
+  "identifier": "dev.openvhost.desktop",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:5173",
@@ -10,7 +10,7 @@
     "frontendDist": "../build"
   },
   "app": {
-    "windows": [{ "title": "OpenServ", "width": 960, "height": 640 }],
+    "windows": [{ "title": "OpenVHost", "width": 960, "height": 640 }],
     "security": { "csp": null }
   },
   "bundle": {

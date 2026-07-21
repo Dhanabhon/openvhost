@@ -19,8 +19,8 @@ export type CoreInfo = {
 	os: string,
 	/**  CPU architecture, from `std::env::consts::ARCH` ("aarch64", "x86_64", …). */
 	arch: string,
-	/**  Resolved OpenServ home directory, for display. */
-	openservHome: string,
+	/**  Resolved OpenVHost home directory, for display. */
+	openvhostHome: string,
 };
 
 /**
@@ -30,7 +30,7 @@ export type CoreInfo = {
 export type IpcError = 
 /**  Dev-only simulated failure used to exercise the UI error path. */
 { kind: "simulated" } | 
-/**  An error bubbled up from openserv-core. */
+/**  An error bubbled up from openvhost-core. */
 { kind: "core"; message: string };
 
 /* Tauri Specta runtime */
