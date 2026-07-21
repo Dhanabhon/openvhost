@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <script lang="ts">
 	import './layout.css';
 	import favicon from '$lib/assets/favicon.svg';

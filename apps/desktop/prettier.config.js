@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 /** @type {import("prettier").Config} */
 const config = {
 	useTabs: true,

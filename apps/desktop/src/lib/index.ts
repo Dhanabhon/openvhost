@@ -1,1 +1,2 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // place files you want to import through the `$lib` alias in this folder.
