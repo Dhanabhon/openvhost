@@ -29,4 +29,22 @@ describe('coreInfo', () => {
 		await expect(coreInfo(true)).rejects.toEqual({ kind: 'simulated' });
 		expect(invokeMock).toHaveBeenCalledWith('core_info', { simulateError: true });
 	});
+
+	it('passes a core-variant IpcError through unchanged', async () => {
+		invokeMock.mockRejectedValueOnce({ kind: 'core', message: 'home dir unresolvable' });
+		await expect(coreInfo()).rejects.toEqual({ kind: 'core', message: 'home dir unresolvable' });
+	});
+
+	it('normalizes a non-IpcError throw into a core-variant IpcError', async () => {
+		invokeMock.mockRejectedValueOnce(new Error('ipc transport down'));
+		await expect(coreInfo()).rejects.toEqual({
+			kind: 'core',
+			message: 'Error: ipc transport down'
+		});
+	});
+
+	it('normalizes a plain-string rejection into a core-variant IpcError', async () => {
+		invokeMock.mockRejectedValueOnce('transport down');
+		await expect(coreInfo()).rejects.toEqual({ kind: 'core', message: 'transport down' });
+	});
 });

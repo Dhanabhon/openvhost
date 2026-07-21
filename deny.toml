@@ -4,6 +4,15 @@
 # (gnu.org/licenses/license-list), add it below with a comment, and say so
 # in the commit message. Unknown licenses stay blocked — never bypassed.
 
+# Advisory gate policy: RUSTSEC vulnerabilities are denied across the entire
+# tree (cargo-deny default) with NO ignored advisory IDs. `unmaintained` is
+# scoped to direct workspace dependencies only: Tauri 2's Linux stack pins the
+# gtk-rs GTK3 bindings (plus paste/proc-macro-error/unic-*), which are flagged
+# unmaintained upstream and are not actionable here — a tree-wide unmaintained
+# gate would be permanently red. Direct deps going unmaintained still fail.
+[advisories]
+unmaintained = "workspace"
+
 [licenses]
 allow = [
     "MIT",
