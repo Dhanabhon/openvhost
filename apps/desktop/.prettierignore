@@ -10,3 +10,5 @@ bun.lockb
 
 # Rust crate (own gates: cargo fmt / cargo clippy — not part of frontend lint scope)
 /src-tauri/
+src/lib/ipc/bindings.ts
+src/lib/ipc/gen/
