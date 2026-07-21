@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* OpenVHost design tokens — prototype for apps/desktop/src/lib/tokens.css
    Canonical values: docs/OPENVHOST_BRAND_GUIDELINES.md §4, §5, §7.1
-   Themes: light + dark, OS-following with [data-theme] override. */
+   Light theme only (owner decision 2026-07-21); brand §4.3 still specifies
+   a dark theme at launch — add it back as a [data-theme='dark'] block then. */
 
 :root {
   /* -- brand core (theme-invariant) ------------------------------------ */
@@ -65,8 +66,7 @@
 /* ---------------------------------------------------------------------- */
 /* Light theme (default)                                                  */
 /* ---------------------------------------------------------------------- */
-:root,
-:root[data-theme='light'] {
+:root {
   color-scheme: light;
   --vh-bg: var(--vh-paper);
   --vh-surface: #ffffff;                                            /* content panels */
@@ -96,70 +96,6 @@
   --vh-shadow-overlay: 0 12px 40px rgb(23 26 33 / 0.18), 0 2px 8px rgb(23 26 33 / 0.1);
 }
 
-/* ---------------------------------------------------------------------- */
-/* Dark theme                                                             */
-/* ---------------------------------------------------------------------- */
-:root[data-theme='dark'] {
-  color-scheme: dark;
-  --vh-bg: var(--vh-ink);
-  --vh-surface: var(--vh-neutral-800);
-  --vh-surface-2: color-mix(in oklab, var(--vh-paper) 3%, var(--vh-ink));
-  --vh-text: var(--vh-paper);
-  --vh-text-2: color-mix(in oklab, var(--vh-paper) 62%, var(--vh-ink));
-  --vh-text-disabled: var(--vh-neutral-400);
-  --vh-border: color-mix(in oklab, var(--vh-paper) 14%, transparent);
-  --vh-border-strong: color-mix(in oklab, var(--vh-paper) 28%, transparent);
-  --vh-accent: var(--vh-brand-400);
-  --vh-accent-hover: color-mix(in oklab, var(--vh-brand-400) 82%, var(--vh-paper));
-  --vh-accent-contrast: var(--vh-ink);
-  --vh-link: var(--vh-brand-400);
-  --vh-selected: color-mix(in oklab, var(--vh-brand-400) 21%, var(--vh-ink));
-  --vh-run: var(--vh-state-running);
-  --vh-start: var(--vh-state-starting);
-  --vh-fail: var(--vh-state-failed);
-  --vh-stop: var(--vh-state-stopped);
-  --vh-run-dot: var(--vh-state-running);
-  --vh-start-dot: var(--vh-state-starting);
-  --vh-fail-dot: var(--vh-state-failed);
-  --vh-stop-dot: var(--vh-state-stopped);
-  --vh-fail-tint: color-mix(in oklab, var(--vh-state-failed) 14%, var(--vh-surface));
-  --vh-add-tint: color-mix(in oklab, var(--vh-state-running) 16%, var(--vh-surface));
-  --vh-del-tint: color-mix(in oklab, var(--vh-state-failed) 15%, var(--vh-surface));
-  --vh-log-bg: color-mix(in oklab, var(--vh-ink) 55%, var(--vh-neutral-800));
-  --vh-shadow-overlay: 0 12px 40px rgb(0 0 0 / 0.5), 0 2px 8px rgb(0 0 0 / 0.35);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme]) {
-    color-scheme: dark;
-    --vh-bg: var(--vh-ink);
-    --vh-surface: var(--vh-neutral-800);
-    --vh-surface-2: color-mix(in oklab, var(--vh-paper) 3%, var(--vh-ink));
-    --vh-text: var(--vh-paper);
-    --vh-text-2: color-mix(in oklab, var(--vh-paper) 62%, var(--vh-ink));
-    --vh-text-disabled: var(--vh-neutral-400);
-    --vh-border: color-mix(in oklab, var(--vh-paper) 14%, transparent);
-    --vh-border-strong: color-mix(in oklab, var(--vh-paper) 28%, transparent);
-    --vh-accent: var(--vh-brand-400);
-    --vh-accent-hover: color-mix(in oklab, var(--vh-brand-400) 82%, var(--vh-paper));
-    --vh-accent-contrast: var(--vh-ink);
-    --vh-link: var(--vh-brand-400);
-    --vh-selected: color-mix(in oklab, var(--vh-brand-400) 21%, var(--vh-ink));
-    --vh-run: var(--vh-state-running);
-    --vh-start: var(--vh-state-starting);
-    --vh-fail: var(--vh-state-failed);
-    --vh-stop: var(--vh-state-stopped);
-    --vh-run-dot: var(--vh-state-running);
-    --vh-start-dot: var(--vh-state-starting);
-    --vh-fail-dot: var(--vh-state-failed);
-    --vh-stop-dot: var(--vh-state-stopped);
-    --vh-fail-tint: color-mix(in oklab, var(--vh-state-failed) 14%, var(--vh-surface));
-    --vh-add-tint: color-mix(in oklab, var(--vh-state-running) 16%, var(--vh-surface));
-    --vh-del-tint: color-mix(in oklab, var(--vh-state-failed) 15%, var(--vh-surface));
-    --vh-log-bg: color-mix(in oklab, var(--vh-ink) 55%, var(--vh-neutral-800));
-    --vh-shadow-overlay: 0 12px 40px rgb(0 0 0 / 0.5), 0 2px 8px rgb(0 0 0 / 0.35);
-  }
-}
 
 /* ---------------------------------------------------------------------- */
 /* Base                                                                   */

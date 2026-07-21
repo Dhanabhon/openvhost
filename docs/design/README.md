@@ -1,6 +1,6 @@
 # OpenVHost UI mockups
 
-Static HTML design mockups — open any file directly in a browser. Each page has a floating theme toggle (system → light → dark); both themes are first-class per the brand guidelines. These pages prototype the future `apps/desktop/src/lib/tokens.css`: `tokens.css` here is the token source of truth candidate, `mock.css` is throwaway chrome.
+Static HTML design mockups — open any file directly in a browser. **Light theme only** (owner decision, 2026-07-21); note that brand guidelines §4.3 still specify a dark theme shipping at launch, so a `[data-theme='dark']` block gets added back to the tokens when that work starts. These pages prototype the future `apps/desktop/src/lib/tokens.css`: `tokens.css` here is the token source of truth candidate, `mock.css` is throwaway chrome.
 
 | File | Screen | Shows |
 |---|---|---|

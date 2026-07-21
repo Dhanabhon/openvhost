@@ -4,7 +4,7 @@
 
 ## Theme
 
-Two themes, both first-class, following the OS (`prefers-color-scheme`) with a manual override later. Light mode: Plaintext surfaces with Terminal Ink text and Evergreen accents. Dark mode: Terminal Ink surfaces, Panel cards, Plaintext text, Evergreen Bright accents. Working surfaces stay quiet — color means either brand (one accent) or service state (four semantic colors), never decoration.
+Light mode is the working theme for now (owner decision, 2026-07-21): Plaintext surfaces, white content panels, Terminal Ink text, Evergreen accents. The brand guidelines (§4.3) still specify a dark theme shipping at launch (Terminal Ink surfaces, Panel cards, Evergreen Bright accents, OS-following) — design and build it when launch work starts, not before. Working surfaces stay quiet — color means either brand (one accent) or service state (four semantic colors), never decoration.
 
 ## Color
 

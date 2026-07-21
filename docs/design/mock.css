@@ -78,7 +78,6 @@
 }
 .nav-item:hover { background: color-mix(in oklab, var(--vh-text) 6%, transparent); color: var(--vh-text); }
 .nav-item[aria-current='page'] { background: var(--vh-selected); color: var(--vh-accent); }
-:root[data-theme='dark'] .nav-item[aria-current='page'] { color: var(--vh-brand-400); }
 .nav-item svg { flex: none; }
 .rail-foot {
   margin-top: auto;
@@ -436,21 +435,6 @@
 /* ---- services strip on main ------------------------------------------------------ */
 .strip-head { display: flex; align-items: baseline; }
 .strip-head .link { font-size: var(--vh-text-table); margin-right: var(--vh-space-6); }
-
-/* ---- theme toggle (mock chrome, not product UI) ----------------------------------- */
-.theme-toggle {
-  position: fixed;
-  top: 16px; right: 16px;
-  z-index: 100;
-  font: 500 var(--vh-text-caption) var(--vh-font-ui);
-  color: var(--vh-text-2);
-  background: var(--vh-surface);
-  border: 1px solid var(--vh-border-strong);
-  border-radius: var(--vh-radius-pill);
-  padding: 6px 12px;
-  cursor: pointer;
-}
-.theme-toggle:hover { color: var(--vh-text); }
 
 /* ---- empty state ------------------------------------------------------------------- */
 .empty {
