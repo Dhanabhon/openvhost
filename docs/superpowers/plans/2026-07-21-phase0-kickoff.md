@@ -1200,7 +1200,7 @@ Overwrite `apps/desktop/src/routes/+page.svelte`:
 
 	<div class="mt-6 flex gap-3">
 		<button
-			class="rounded bg-blue-600 px-4 py-2 text-white disabled:opacity-50"
+			class="rounded bg-emerald-700 px-4 py-2 text-white disabled:opacity-50"
 			onclick={() => load(false)}
 			disabled={loading}
 			data-testid="load-btn"
@@ -1242,6 +1242,8 @@ Overwrite `apps/desktop/src/routes/+page.svelte`:
 	{/if}
 </main>
 ```
+
+Color note: `emerald-700` and the red banner are interim Tailwind approximations of the brand's Evergreen accent and `state-failed` semantic color (brand guidelines §4). The real token system (`apps/desktop/src/lib/tokens.css`, guidelines §7.1) arrives with Phase 1 UI — deliberately no custom hexes in this slice, and never blue (competitor territory, guidelines §1.2).
 
 - [ ] **Step 6: Full verification (automated + manual)**
 

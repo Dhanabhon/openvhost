@@ -16,7 +16,7 @@ The repository holds only documentation so far (README, this spec, and the commi
 
 ## 3. Non-goals
 
-Process supervisor (P0-3), platform PHP proofs (P0-4/P0-5), download pipeline (P0-6), Tera templates (P0-7), orphan cleanup (P0-8), E2E harness (P0-9), Tauri events, tray menu, shadcn-svelte, signing/notarization, auto-update, i18n, branch protection, `openserv/manifests` work, `TRADEMARK.md` (blocked on plan OQ#8 brand check), the in-app "Open Source Licenses" page (needs real UI, Phase 1+), CI enforcement of DCO sign-offs (plan OQ#1 — needed before the first external PR).
+Process supervisor (P0-3), platform PHP proofs (P0-4/P0-5), download pipeline (P0-6), Tera templates (P0-7), orphan cleanup (P0-8), E2E harness (P0-9), Tauri events, tray menu, shadcn-svelte, signing/notarization, auto-update, i18n, branch protection, `openserv/manifests` work, `TRADEMARK.md` (blocked on plan OQ#8 brand check), the in-app "Open Source Licenses" page (needs real UI, Phase 1+), CI enforcement of DCO sign-offs (plan OQ#1 — needed before the first external PR), brand-asset production — final logomark, app/tray icons, `tokens.css`, font bundle (see `docs/OPENSERV_BRAND_GUIDELINES.md` §9; lands with Phase 1 UI).
 
 ## 4. Exit criteria
 
