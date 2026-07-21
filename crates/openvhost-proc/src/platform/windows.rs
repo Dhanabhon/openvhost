@@ -8,7 +8,6 @@
 //! per-process termination. FFI via windows-sys (already in-tree via tokio).
 
 use std::io;
-use std::os::windows::process::CommandExt;
 use std::process::Stdio;
 
 use windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent;

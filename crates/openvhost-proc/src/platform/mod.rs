@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn env_is_allowlist_not_inherit() {
-        // SAFETY: Test-only environment variable manipulation. Single-threaded test isolation.
+        // SAFETY: test-only env mutation; the two env tests touch disjoint keys.
         unsafe {
             std::env::set_var("OPENVHOST_TEST_SHOULD_NOT_LEAK", "1");
         }
@@ -179,7 +179,7 @@ mod tests {
             !env.iter()
                 .any(|(k, _)| k == "OPENVHOST_TEST_SHOULD_NOT_LEAK")
         );
-        // SAFETY: Same as above.
+        // SAFETY: test-only env mutation; the two env tests touch disjoint keys.
         unsafe {
             std::env::remove_var("OPENVHOST_TEST_SHOULD_NOT_LEAK");
         }
