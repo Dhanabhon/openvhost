@@ -32,6 +32,7 @@ pub(crate) struct RawEntry {
 }
 
 fn reject(reason: &str) -> PkgError {
+    tracing::warn!(reason = %reason, "archive rejected");
     PkgError::UnsafeArchive(reason.to_string())
 }
 

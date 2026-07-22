@@ -11,7 +11,9 @@ use crate::download::download_and_verify;
 use crate::error::PkgError;
 use crate::extract;
 use crate::layout::{self, Staging};
-use crate::request::{ArchiveFormat, InstallRequest, InstalledPackage, PackagesRoot, Progress};
+use crate::request::{
+    ArchiveFormat, InstallRequest, InstalledPackage, PackagesRoot, Progress, validate_component,
+};
 
 /// Process-wide install gate (S25): a single permit, so at most one
 /// [`install_package`] call is ever mid-flight in this process at a time —
@@ -61,6 +63,17 @@ pub async fn install_package(
     root: &PackagesRoot,
     mut progress: impl FnMut(Progress) + Send,
 ) -> Result<InstalledPackage, PkgError> {
+    // Re-validate the path components even though `InstallRequest::new`
+    // already checked them (security audit A2): this defends the trust
+    // boundary at the point it actually matters — right before
+    // `req.name`/`req.major`/`req.version` get used to build filesystem
+    // paths — so it holds even if a caller ever obtained an `InstallRequest`
+    // by some means other than `::new`. Cheap; fails closed on any bad
+    // component before any network or filesystem work happens.
+    validate_component(&req.name)?;
+    validate_component(&req.major)?;
+    validate_component(&req.version)?;
+
     let _permit = install_gate()
         .acquire()
         .await
@@ -104,6 +117,13 @@ pub async fn install_package(
     let link = root.current_link(&req.name, &req.major);
     layout::update_current(&link, &req.version)?;
     progress(Progress::Linked);
+
+    tracing::info!(
+        name = %req.name,
+        version = %req.version,
+        dest = %final_dir.display(),
+        "install complete"
+    );
 
     Ok(InstalledPackage {
         dir: final_dir,

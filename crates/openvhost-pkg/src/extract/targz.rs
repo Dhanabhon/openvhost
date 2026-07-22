@@ -27,7 +27,9 @@ use super::{PlannedEntry, PlannedKind};
 use crate::error::PkgError;
 
 fn reject(msg: impl Into<String>) -> PkgError {
-    PkgError::UnsafeArchive(msg.into())
+    let msg = msg.into();
+    tracing::warn!(reason = %msg, "archive rejected");
+    PkgError::UnsafeArchive(msg)
 }
 
 /// Extract `archive` (a verified, open handle positioned anywhere) into the

@@ -13,14 +13,19 @@ pub enum ArchiveFormat {
     Zip,
 }
 
+/// A validated request to install one package version. Constructed ONLY via
+/// [`InstallRequest::new`], which enforces every boundary check (safe path
+/// components, https-only/no-userinfo/no-IP-literal URL, well-formed
+/// SHA-256) — fields are `pub(crate)` specifically so nothing outside this
+/// crate can construct one by struct literal and bypass `::new` (S1/F20).
 #[derive(Debug, Clone)]
 pub struct InstallRequest {
-    pub name: String,
-    pub major: String,
-    pub version: String,
-    pub url: url::Url,
-    pub sha256: String,
-    pub format: ArchiveFormat,
+    pub(crate) name: String,
+    pub(crate) major: String,
+    pub(crate) version: String,
+    pub(crate) url: url::Url,
+    pub(crate) sha256: String,
+    pub(crate) format: ArchiveFormat,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,9 +115,25 @@ pub(crate) fn validate_component(s: &str) -> Result<(), PkgError> {
 }
 
 /// Validate a URL as an acceptable download target (S1): https only, host
-/// present, no userinfo, no IP-literal host. Called at request build AND on
-/// every redirect hop (download.rs reuses this).
+/// present, no userinfo, no IP-literal host. Called at request build time
+/// (`InstallRequest::new`) AND on every redirect hop (`download.rs` reuses
+/// this) — ONE validator, ONE set of rules, for both trust-boundary
+/// crossings.
+///
+/// Debug builds additionally accept plain `http` to a loopback host (S2),
+/// so hermetic tests need no TLS; `#[cfg(debug_assertions)]` compiles this
+/// carve-out out entirely in release, so production builds are https-only
+/// with no exception, regardless of caller.
 pub(crate) fn validate_https_url(u: &url::Url) -> Result<(), PkgError> {
+    #[cfg(debug_assertions)]
+    {
+        if u.scheme() == "http"
+            && let Some(host) = u.host_str()
+            && (host == "127.0.0.1" || host == "localhost" || host == "[::1]")
+        {
+            return Ok(());
+        }
+    }
     if u.scheme() != "https" {
         return Err(PkgError::InvalidUrl("scheme must be https"));
     }

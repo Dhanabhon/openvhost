@@ -78,6 +78,8 @@ pub(crate) async fn download_capped(
         .error_for_status()
         .map_err(|e| PkgError::Network(e.to_string()))?;
 
+    tracing::info!(url = %url, final_url = %resp.url(), "download start");
+
     let declared = resp.content_length();
     if let Some(len) = declared
         && len > cap
@@ -136,6 +138,7 @@ pub(crate) async fn download_capped(
 
     let actual = hex::encode(hasher.finalize());
     if actual != sha256 {
+        tracing::warn!(expected = %sha256, actual = %actual, "sha256 mismatch");
         drop(file);
         let _ = fs::remove_file(&archive_path);
         return Err(PkgError::HashMismatch {
@@ -143,6 +146,7 @@ pub(crate) async fn download_capped(
             actual,
         });
     }
+    tracing::info!(bytes = total, "download verified");
     progress(Progress::Verified);
     file.seek(SeekFrom::Start(0))
         .map_err(|e| io_err("seek", &archive_path, e))?;
@@ -154,17 +158,11 @@ fn check_scheme(url: &url::Url) -> Result<(), PkgError> {
 }
 
 fn check_scheme_result(url: &url::Url) -> Result<(), PkgError> {
-    // Production: https only via validate_https_url. Debug builds also accept
-    // http to a loopback host so hermetic tests need no TLS.
-    #[cfg(debug_assertions)]
-    {
-        if url.scheme() == "http"
-            && let Some(host) = url.host_str()
-            && (host == "127.0.0.1" || host == "localhost" || host == "[::1]")
-        {
-            return Ok(());
-        }
-    }
+    // Shared with `request.rs::validate_https_url` (S1/S2): the initial
+    // request URL (`InstallRequest::new`) and every redirect hop here go
+    // through the exact same check, including its debug-only loopback
+    // carve-out — one validator, not two copies that could silently drift
+    // apart.
     validate_https_url(url)
 }
 

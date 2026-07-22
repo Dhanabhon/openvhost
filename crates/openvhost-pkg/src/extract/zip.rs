@@ -30,7 +30,9 @@ use crate::error::PkgError;
 const S_IFLNK: u32 = 0o120000;
 
 fn reject(msg: impl Into<String>) -> PkgError {
-    PkgError::UnsafeArchive(msg.into())
+    let msg = msg.into();
+    tracing::warn!(reason = %msg, "archive rejected");
+    PkgError::UnsafeArchive(msg)
 }
 fn io_err(op: &'static str, path: &Path, source: io::Error) -> PkgError {
     PkgError::Io {

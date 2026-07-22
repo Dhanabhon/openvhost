@@ -51,39 +51,19 @@ fn serve_once(body: Vec<u8>) -> String {
     format!("http://127.0.0.1:{port}/pkg.tar.gz")
 }
 
-/// Build an `InstallRequest` for the loopback `http://` server above without
-/// going through `InstallRequest::new`. That constructor enforces
-/// https-only (S1) with no debug/loopback carve-out — only `download.rs`'s
-/// redirect-hop check has one (S2) — so a real hermetic loopback server can
-/// never satisfy it. `InstallRequest`'s fields are all `pub` specifically so
-/// callers who already hold a validated/trusted URL can construct one
-/// directly; the scheme/userinfo/IP-literal checks this bypasses are
-/// independently covered by `request.rs`'s own unit tests
-/// (`rejects_http_url`, `rejects_userinfo_url`, `rejects_ip_literal_host`).
-/// This test exercises the download→verify→extract→install→link pipeline
-/// that runs after that boundary, over a real, unmocked local HTTP server.
-fn local_request(
-    name: &str,
-    major: &str,
-    version: &str,
-    url: &str,
-    sha256: &str,
-) -> InstallRequest {
-    InstallRequest {
-        name: name.to_string(),
-        major: major.to_string(),
-        version: version.to_string(),
-        url: url::Url::parse(url).unwrap(),
-        sha256: sha256.to_string(),
-        format: ArchiveFormat::TarGz,
-    }
-}
-
-// dev-build note: `local_request` bypasses `InstallRequest::new`'s https-only
-// check for request construction; the download step inside `install_package`
-// still runs `download.rs`'s own scheme check, which accepts loopback
-// `http://` only under `debug_assertions` (S2). `cargo test` builds debug,
-// so this hermetic test exercises a real, unmocked HTTP connection end to end.
+// dev-build note: `InstallRequest::new`'s https-only check (S1) shares its
+// validator with `download.rs`'s redirect-hop check (S2,
+// `request.rs::validate_https_url`), which has a debug-only loopback
+// carve-out — a plain `http://127.0.0.1:<port>` URL is accepted here ONLY
+// because this test binary and its `openvhost-pkg` dependency are both
+// compiled in the dev profile (`cargo test` builds debug by default); the
+// carve-out is compiled out entirely in release (`#[cfg(debug_assertions)]`),
+// so production callers can never construct a request this way. This test
+// exercises the full download→verify→extract→install→link pipeline over a
+// real, unmocked local HTTP server, going through the SAME `::new`
+// constructor a real caller would use — `InstallRequest`'s fields are
+// `pub(crate)` precisely so nothing outside this crate (including this test)
+// can bypass it via struct literal.
 #[tokio::test]
 async fn installs_targz_end_to_end() {
     let archive = targz(&[("main.c", b"int main;"), ("bin/php", b"#!/bin/sh")]);
@@ -97,7 +77,8 @@ async fn installs_targz_end_to_end() {
     let root = PackagesRoot::from_home(home.path());
     std::fs::create_dir_all(root.as_path()).unwrap();
 
-    let req = local_request("php", "8.4", "8.4.99", &url, &sha);
+    let req =
+        InstallRequest::new("php", "8.4", "8.4.99", &url, &sha, ArchiveFormat::TarGz).unwrap();
     let mut events = Vec::new();
     let installed = install_package(&req, &root, |p| events.push(p))
         .await
@@ -134,10 +115,12 @@ async fn second_install_is_already_installed() {
         .unwrap();
     let root = PackagesRoot::from_home(home.path());
     std::fs::create_dir_all(root.as_path()).unwrap();
-    let req = local_request("php", "8.4", "8.4.98", &url, &sha);
+    let req =
+        InstallRequest::new("php", "8.4", "8.4.98", &url, &sha, ArchiveFormat::TarGz).unwrap();
     install_package(&req, &root, |_| {}).await.unwrap();
     // second attempt (dest exists) — no server needed, pre-check fires
-    let req2 = local_request("php", "8.4", "8.4.98", req.url.as_str(), &sha);
+    let req2 =
+        InstallRequest::new("php", "8.4", "8.4.98", &url, &sha, ArchiveFormat::TarGz).unwrap();
     let err = install_package(&req2, &root, |_| {}).await.unwrap_err();
     assert!(matches!(
         err,
