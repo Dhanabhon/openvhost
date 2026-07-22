@@ -8,6 +8,7 @@
 //! produces `InstallRequest`s for this API. Security invariants: see
 //! docs/superpowers/specs/2026-07-22-p06-pkg-pipeline-design.md §5.
 
+mod download;
 mod error;
 mod extract;
 mod request;
