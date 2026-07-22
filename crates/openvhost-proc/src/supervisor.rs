@@ -116,6 +116,8 @@ impl Supervisor {
         Ok(e.logs.tail(n))
     }
 
+    /// Must be called from within a tokio runtime context: spawns the
+    /// service task with `tokio::spawn`.
     pub fn start(&self, id: &str) -> Result<(), ProcError> {
         let (spawn, stop_flag, control_rx) = {
             let mut entries = self.inner.entries.lock().unwrap_or_else(|e| e.into_inner());

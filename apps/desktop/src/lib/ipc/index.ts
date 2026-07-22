@@ -17,6 +17,19 @@ function isIpcError(e: unknown): e is IpcError {
 }
 
 /**
+ * Normalize any thrown/rejected value into an `IpcError`. Real `IpcError`s
+ * pass through unchanged; anything else escaping the invoke layer (raw
+ * `Error` instances, plain-string rejections, other transport errors) is
+ * wrapped as the `core` variant so callers can always rely on `.kind` and a
+ * string `.message` — the UI never renders "undefined" or crashes on a
+ * bare-primitive throw.
+ */
+function normalizeError(e: unknown): IpcError {
+	if (isIpcError(e)) return e;
+	return { kind: 'core', message: String(e) } satisfies IpcError;
+}
+
+/**
  * Fetch CoreInfo from the Rust core. Failures always throw an `IpcError`:
  * anything else escaping the invoke layer (transport errors, plain strings)
  * is normalized to the `core` variant so the UI never renders "undefined".
@@ -27,27 +40,40 @@ export async function coreInfo(simulateError = false): Promise<CoreInfo> {
 		if (result.status === 'error') throw result.error;
 		return result.data;
 	} catch (e) {
-		if (isIpcError(e)) throw e;
-		throw { kind: 'core', message: String(e) } satisfies IpcError;
+		throw normalizeError(e);
 	}
 }
 
-function unwrap<T>(r: { status: 'ok'; data: T } | { status: 'error'; error: unknown }): T {
-	if (r.status === 'error') throw r.error;
-	return r.data;
+/**
+ * Await a tauri-specta result, unwrapping to `.data` on success. Every error
+ * path — a resolved `{ status: 'error' }` envelope AND a rejection that never
+ * made it into that envelope (transport errors thrown before/instead of the
+ * envelope) — is routed through {@link normalizeError}, the same
+ * normalization `coreInfo` uses, so callers always see a proper `IpcError`.
+ */
+async function unwrap<T>(
+	resultPromise: Promise<{ status: 'ok'; data: T } | { status: 'error'; error: unknown }>
+): Promise<T> {
+	try {
+		const r = await resultPromise;
+		if (r.status === 'error') throw r.error;
+		return r.data;
+	} catch (e) {
+		throw normalizeError(e);
+	}
 }
 
 export async function listServices(): Promise<ServiceStatus[]> {
-	return unwrap(await commands.listServices());
+	return unwrap(commands.listServices());
 }
 export async function startService(id: string): Promise<void> {
-	unwrap(await commands.startService(id));
+	await unwrap(commands.startService(id));
 }
 export async function stopService(id: string): Promise<void> {
-	unwrap(await commands.stopService(id));
+	await unwrap(commands.stopService(id));
 }
 export async function serviceLogTail(id: string, n: number): Promise<LogLine[]> {
-	return unwrap(await commands.serviceLogTail(id, n));
+	return unwrap(commands.serviceLogTail(id, n));
 }
 export function onServiceState(cb: (ev: ServiceStateEvent) => void): Promise<() => void> {
 	return events.serviceStateEvent.listen((e) => cb(e.payload));

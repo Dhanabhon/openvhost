@@ -6,7 +6,7 @@ vi.mock('@tauri-apps/api/core', () => ({
 	invoke: (...args: unknown[]) => invokeMock(...args)
 }));
 
-import { coreInfo } from './index';
+import { coreInfo, listServices } from './index';
 import type { ServiceStatus } from './index';
 import { ServicesStore } from '../services.svelte';
 
@@ -48,6 +48,21 @@ describe('coreInfo', () => {
 	it('normalizes a plain-string rejection into a core-variant IpcError', async () => {
 		invokeMock.mockRejectedValueOnce('transport down');
 		await expect(coreInfo()).rejects.toEqual({ kind: 'core', message: 'transport down' });
+	});
+});
+
+describe('listServices (non-coreInfo wrapper)', () => {
+	beforeEach(() => invokeMock.mockReset());
+
+	it('normalizes a plain-string rejection into a banner-safe IpcError', async () => {
+		invokeMock.mockRejectedValueOnce('list transport down');
+		const caught: unknown = await listServices().catch((e: unknown) => e);
+		// Banner-safe: the error banner does `'message' in error`, which throws
+		// if `error` is a primitive (the `in` operator requires an object on
+		// the right-hand side) — so this only passes once the raw string has
+		// actually been normalized into an object.
+		expect(() => 'message' in (caught as object)).not.toThrow();
+		expect(caught).toEqual({ kind: 'core', message: 'list transport down' });
 	});
 });
 

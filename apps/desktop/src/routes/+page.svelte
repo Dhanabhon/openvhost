@@ -17,6 +17,15 @@
 	const store = new ServicesStore({ listServices, serviceLogTail });
 	let info = $state<CoreInfo | null>(null);
 	let error = $state<IpcError | null>(null);
+	let logEl: HTMLDivElement | undefined;
+
+	// Blunt auto-follow (v0): whenever the log feed is replaced (every new
+	// line replaces `store.logs` with a new array), jump the pane to the
+	// bottom. Reading `store.logs` in the condition is what registers the
+	// reactive dependency so this effect reruns on each push.
+	$effect(() => {
+		if (store.logs && logEl) logEl.scrollTop = logEl.scrollHeight;
+	});
 
 	onMount(() => {
 		let unsubs: Array<() => void> = [];
@@ -117,6 +126,7 @@
 	<div
 		class="mt-2 flex-1 overflow-auto rounded border bg-neutral-50 p-2 font-mono text-xs leading-6"
 		data-testid="log"
+		bind:this={logEl}
 	>
 		{#each store.logs as l, i (i)}
 			<div class="grid grid-cols-[70px_44px_1fr] gap-2">
