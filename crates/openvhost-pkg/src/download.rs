@@ -58,7 +58,7 @@ pub(crate) async fn download_capped(
         .timeout(TOTAL_TIMEOUT)
         .min_tls_version(reqwest::tls::Version::TLS_1_2)
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= 5 {
+            if attempt.previous().len() > 5 {
                 return attempt.error(io_msg("too many redirects"));
             }
             match check_scheme_result(attempt.url()) {
@@ -225,6 +225,74 @@ mod tests {
         (url, handle)
     }
 
+    /// Like `serve`, but with no `Content-Length` header at all: the
+    /// response is close-delimited (`Connection: close`; the body ends when
+    /// the connection closes), which is the only way to make
+    /// `download_capped`'s `declared` come back `None` so its running
+    /// per-chunk counter — not the early declared-length check — is what
+    /// has to catch an over-cap body.
+    fn serve_no_content_length(body: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://127.0.0.1:{}/archive", addr.port());
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let _ = sock.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf);
+                let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n");
+                let _ = sock.write_all(&body);
+            }
+        });
+        (url, handle)
+    }
+
+    /// One-shot server that replies with a 302 redirect to `location`. Used
+    /// to prove the custom redirect policy rejects a hostile hop (S1)
+    /// BEFORE ever connecting to it: the redirect target is evaluated as a
+    /// plain `Url` value inside the policy closure, with no network access
+    /// to it, so `location` never needs to be an actually-reachable host.
+    fn serve_redirect(location: &'static str) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://127.0.0.1:{}/start", addr.port());
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let _ = sock.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
+                );
+                let _ = sock.write_all(resp.as_bytes());
+            }
+        });
+        (url, handle)
+    }
+
+    /// Join a server thread from async test code WITHOUT blocking the
+    /// current-thread test runtime's only OS thread. Needed specifically
+    /// for the "abandoned body" tests (`enforces_size_cap` and its
+    /// no-Content-Length sibling): `download_capped` returns as soon as it
+    /// detects the over-cap condition, without ever reading the rest of the
+    /// (multi-MiB) body, and a plain synchronous `h.join()` right after
+    /// that — with no intervening `.await` — parks the runtime's only
+    /// thread, so it can never poll reqwest's connection-driver task again
+    /// to notice the abandoned response and close the connection. The raw
+    /// test-server thread is then left writing into a socket nobody is
+    /// draining, and can block on `write_all` until its own write timeout
+    /// fires. `spawn_blocking` + `.await` moves the actual blocking join
+    /// onto a separate tokio blocking-pool thread, which lets the runtime
+    /// keep servicing other tasks (including that connection cleanup)
+    /// while we wait — confirmed empirically: this resolves promptly
+    /// rather than waiting out the full write timeout every time.
+    async fn join_server(h: std::thread::JoinHandle<()>) {
+        tokio::task::spawn_blocking(move || h.join())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     fn sha_hex(bytes: &[u8]) -> String {
         use sha2::{Digest, Sha256};
         hex::encode(Sha256::digest(bytes))
@@ -264,7 +332,10 @@ mod tests {
 
     #[tokio::test]
     async fn enforces_size_cap() {
-        // 2 MiB body against a tiny cap via the test-only constructor.
+        // 2 MiB body against a tiny cap via the test-only constructor. The
+        // client aborts as soon as it sees the over-cap Content-Length,
+        // before reading any body bytes — see `join_server` for why the
+        // thread join is offloaded rather than a direct blocking `h.join()`.
         let body = vec![0u8; 2 * 1024 * 1024];
         let (url, h) = serve(body, "");
         let u = url::Url::parse(&url).unwrap();
@@ -273,6 +344,64 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, PkgError::TooLarge { .. }));
+        join_server(h).await;
+    }
+
+    #[tokio::test]
+    async fn enforces_size_cap_via_running_counter_without_content_length() {
+        // S4's PRIMARY branch: the running byte counter must abort the
+        // stream mid-flight, independent of Content-Length. No
+        // Content-Length header is sent at all here (close-delimited
+        // HTTP/1.1 framing — `Connection: close`, body ends when the
+        // connection closes), so `declared` is `None` and the early
+        // declared-length check in `download_capped` never runs; only the
+        // `total > cap` check inside the streaming loop can catch this.
+        let body = vec![0u8; 2 * 1024 * 1024];
+        let (url, h) = serve_no_content_length(body);
+        let u = url::Url::parse(&url).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let err = download_capped(&u, &"0".repeat(64), dir.path(), 1024, |_| {})
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PkgError::TooLarge { .. }));
+        // staging archive must be gone on failure, same as the other abort paths
+        assert!(!dir.path().join("archive").exists());
+        join_server(h).await;
+    }
+
+    #[tokio::test]
+    async fn rejects_redirect_to_downgraded_scheme() {
+        // example.com is NOT loopback, so the S2 debug-loopback carve-out
+        // in `check_scheme_result` does not apply to it — this actually
+        // exercises the https-only check on the REDIRECT TARGET. A
+        // `http://127.0.0.1/...` target would prove nothing here, since
+        // that is exactly what S2 permits for the hermetic-test bypass.
+        // No connection to example.com is ever made: the custom redirect
+        // policy evaluates `Attempt::url()` (a plain `Url` value) and
+        // rejects before reqwest attempts to connect to it.
+        let (url, h) = serve_redirect("http://example.com/evil");
+        let u = url::Url::parse(&url).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let result = download_capped(&u, &"0".repeat(64), dir.path(), 1024, |_| {}).await;
+        assert!(
+            result.is_err(),
+            "redirect to a non-loopback http:// target must be rejected before following"
+        );
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_redirect_with_userinfo() {
+        // Bogus port (never actually connected to — the policy rejects on
+        // the URL's userinfo alone, before any connection attempt).
+        let (url, h) = serve_redirect("https://user:pw@127.0.0.1:9/evil");
+        let u = url::Url::parse(&url).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let result = download_capped(&u, &"0".repeat(64), dir.path(), 1024, |_| {}).await;
+        assert!(
+            result.is_err(),
+            "redirect target containing userinfo must be rejected before following"
+        );
         h.join().unwrap();
     }
 }
