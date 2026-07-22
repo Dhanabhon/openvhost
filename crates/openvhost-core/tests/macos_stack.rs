@@ -77,6 +77,36 @@ fn spec(id: &str, program: std::path::PathBuf, args: Vec<OsString>) -> ServiceSp
     }
 }
 
+/// Force-stops both services even when an assertion panics mid-test:
+/// `Supervisor` has no Drop kill path, so a failing run would otherwise
+/// leak live nginx/php-fpm processes. Best-effort: `stop` is fired for
+/// both ids and each is polled briefly toward a terminal state; the
+/// Step-4 pgrep audit remains the backstop.
+struct StopGuard<'a> {
+    sup: &'a Supervisor,
+    ids: [&'static str; 2],
+}
+
+impl Drop for StopGuard<'_> {
+    fn drop(&mut self) {
+        for id in self.ids {
+            let _ = self.sup.stop(id);
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            let all_terminal = self
+                .sup
+                .snapshot()
+                .iter()
+                .all(|s| !matches!(s.state, ServiceState::Starting | ServiceState::Running));
+            if all_terminal {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn stack_serves_phpinfo_and_tears_down_clean() {
     let Some(BrewStack { nginx, php_fpm }) = find_brew_binaries() else {
@@ -94,6 +124,10 @@ async fn stack_serves_phpinfo_and_tears_down_clean() {
     let paths = provision_macos_demo_stack(home.path(), port).unwrap();
 
     let sup = Supervisor::new(default_driver());
+    let _guard = StopGuard {
+        sup: &sup,
+        ids: ["php-fpm", "nginx"],
+    };
     sup.register(spec(
         "php-fpm",
         php_fpm,
