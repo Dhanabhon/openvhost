@@ -90,8 +90,11 @@ fn install_ignore_stop() {
 
 #[cfg(windows)]
 fn install_ignore_stop() {
-    use windows_sys::Win32::Foundation::BOOL;
+    // windows-sys 0.61 moved BOOL to `core` (it's no longer re-exported from
+    // `Win32::Foundation`); `Win32_Foundation` stays a required feature
+    // regardless, since Console's own bindings reference `Foundation::HANDLE`.
     use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+    use windows_sys::core::BOOL;
     unsafe extern "system" fn handler(_ctrl_type: u32) -> BOOL {
         1 // handled: ignore CTRL_C / CTRL_BREAK
     }

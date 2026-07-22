@@ -12,6 +12,20 @@ use openvhost_proc::{
 };
 use tokio::sync::broadcast;
 
+/// Wait budget for a graceful-stop-then-`Stopped` assertion.
+///
+/// Windows can never actually deliver graceful stop in v0: children spawn
+/// under `CREATE_NO_WINDOW`, which gives each its own hidden console, so
+/// `GenerateConsoleCtrlEvent` from us never reaches it — every Windows stop
+/// rides the supervisor's 5s grace deadline through to `kill()`. Give it
+/// enough headroom above that deadline; Unix's real SIGTERM path resolves
+/// fast, so keep that assertion tight.
+const STOP_TIMEOUT: Duration = if cfg!(windows) {
+    Duration::from_secs(8)
+} else {
+    Duration::from_secs(3)
+};
+
 fn testchild_spec(args: &[&str]) -> SpawnSpec {
     SpawnSpec {
         program: PathBuf::from(env!("CARGO_BIN_EXE_proc_testchild")),
@@ -80,7 +94,7 @@ async fn lifecycle_running_then_graceful_stop() {
         .pid;
     assert!(pid.is_some(), "running service must report a pid");
     sup.stop("t1").unwrap();
-    wait_state(&mut rx, "t1", Duration::from_secs(3), |s| {
+    wait_state(&mut rx, "t1", STOP_TIMEOUT, |s| {
         matches!(s, ServiceState::Stopped)
     })
     .await;
@@ -233,7 +247,7 @@ async fn concurrent_start_spawns_exactly_once() {
     );
 
     sup.stop("t6").unwrap();
-    wait_state(&mut rx, "t6", Duration::from_secs(3), |s| {
+    wait_state(&mut rx, "t6", STOP_TIMEOUT, |s| {
         matches!(s, ServiceState::Stopped)
     })
     .await;
@@ -276,7 +290,7 @@ async fn register_does_not_clobber_live_service() {
     assert!(matches!(after.state, ServiceState::Running));
 
     sup.stop("t7").unwrap();
-    wait_state(&mut rx, "t7", Duration::from_secs(3), |s| {
+    wait_state(&mut rx, "t7", STOP_TIMEOUT, |s| {
         matches!(s, ServiceState::Stopped)
     })
     .await;

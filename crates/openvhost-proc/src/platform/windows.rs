@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Windows driver v0. Containment flags set at spawn; graceful stop is an
-//! OPPORTUNISTIC CTRL_BREAK (works when a console exists — dev shells).
-//! The packaged GUI app (windows_subsystem = "windows") has no console, so
-//! v0/v1 graceful stop there is effectively hard-kill-only — documented
-//! honestly (spec §5). From P0-5, kill() means TerminateJobObject on the
-//! app-wide Job Object (ONE job per app); never simplify back to
+//! OPPORTUNISTIC CTRL_BREAK, but it never actually lands: CREATE_NO_WINDOW
+//! gives every spawned child its own hidden console, so CTRL_BREAK from us
+//! cannot reach it — that's true whether we're a dev console app or the
+//! packaged GUI (windows_subsystem = "windows") with no console at all. v0
+//! Windows stop is therefore always deadline+kill; real graceful shutdown
+//! arrives with P0-5 (Job Objects / per-service shutdown protocol) —
+//! documented honestly (spec §5). From P0-5, kill() means TerminateJobObject
+//! on the app-wide Job Object (ONE job per app); never simplify back to
 //! per-process termination. FFI via windows-sys (already in-tree via tokio).
 
 use std::io;
@@ -44,9 +47,13 @@ impl ProcessDriver for WindowsDriver {
     }
 
     fn request_graceful_stop(&self, child: &SpawnedChild) -> io::Result<()> {
-        // Opportunistic: reaches the child only when it shares a console
-        // with us (dev). Failure here is expected in the GUI app; the
-        // supervisor's 5s-deadline → kill() path is the real reclaimer.
+        // Opportunistic only, and it always fails in practice: CREATE_NO_WINDOW
+        // means this child owns its own hidden console, so CTRL_BREAK from us
+        // never reaches it. v0 Windows stop is always deadline+kill via the
+        // supervisor's 5s grace deadline → kill() path; that's the real
+        // reclaimer. Real graceful arrives with P0-5 (Job Objects /
+        // per-service shutdown protocol). The call is kept anyway because
+        // it's harmless: it returns Err and the caller ignores it.
         // SAFETY: plain Win32 call, no pointers.
         let ok = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, child.pid_snapshot()) };
         if ok != 0 {
