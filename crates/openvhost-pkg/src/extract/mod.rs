@@ -5,13 +5,11 @@
 //! written (spec §5 S10–S19). Format walks (`targz`, `zip`) build a plan
 //! with these primitives, then materialize it.
 
+pub(crate) mod targz;
 pub(crate) mod validate;
 
-// `PlannedKind`/`PlannedEntry` are the extraction-plan contract Tasks 3–4
-// build and materialize; nothing constructs them yet (not even a test), so
-// they're unconditionally dead code until those tasks land. Remove this
-// allow once `targz`/`zip` construct them.
-#[allow(dead_code)]
+/// The extraction-plan contract that `targz`/`zip`'s format walks build
+/// (pass 1) and materialize (pass 2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PlannedKind {
     Dir,
@@ -20,7 +18,6 @@ pub(crate) enum PlannedKind {
     Hardlink { target: String },
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PlannedEntry {
     pub rel: String,

@@ -11,6 +11,8 @@
 mod error;
 mod extract;
 mod request;
+#[cfg(test)]
+mod testkit;
 
 pub use error::PkgError;
 pub use request::{ArchiveFormat, InstallRequest, InstalledPackage, PackagesRoot, Progress};
