@@ -1957,39 +1957,24 @@ fn io_err(op: &'static str, p: &Path, e: std::io::Error) -> PkgError {
 }
 ```
 
-`crates/openvhost-pkg/src/platform/windows.rs`:
+`crates/openvhost-pkg/src/platform/windows.rs` — **macOS-first v1: explicit stub, NOT the junction implementation** (owner scope decision 2026-07-22). The junction design (verify-reparse-point → `fs::remove_dir` → `junction::create`, never `remove_dir_all` — S22) is preserved in spec §6.2 for the future Windows-enablement phase. For v1 the function returns an explicit error so the seam exists and a Windows build fails LOUDLY at the link step rather than silently no-op'ing:
 
 ```rust
 // SPDX-License-Identifier: GPL-3.0-or-later
-use std::fs;
 use std::path::Path;
 use crate::error::PkgError;
 
-/// Replace the per-major `current` junction. Verify any existing `current`
-/// is a reparse point, remove ONLY the reparse entry (`fs::remove_dir` maps
-/// to RemoveDirectoryW — never recurses into the target), then create a fresh
-/// junction to the absolute version dir. NEVER remove_dir_all here (S22).
-pub(crate) fn update_current(link: &Path, version: &str) -> Result<(), PkgError> {
-    let parent = link.parent().ok_or_else(|| bad("current has no parent"))?;
-    let target = parent.join(version); // absolute — junctions cannot be relative
-    if link.exists() {
-        let meta = fs::symlink_metadata(link).map_err(|e| io_err("stat", link, e))?;
-        let is_reparse = std::os::windows::fs::MetadataExt::file_attributes(&meta)
-            & 0x400 // FILE_ATTRIBUTE_REPARSE_POINT
-            != 0;
-        if !is_reparse {
-            return Err(bad("existing 'current' is not a junction; refusing to replace"));
-        }
-        fs::remove_dir(link).map_err(|e| io_err("remove_dir(junction)", link, e))?;
-    }
-    junction::create(&target, link).map_err(|e| io_err("junction create", link, e))
-}
-
-fn bad(m: &'static str) -> PkgError { PkgError::UnsafeArchive(m.to_string()) }
-fn io_err(op: &'static str, p: &Path, e: std::io::Error) -> PkgError {
-    PkgError::Io { op, path: p.to_path_buf(), source: e }
+/// macOS-first v1: Windows `current`-link support is deferred to the Windows
+/// enablement phase (NTFS junction — design in spec §6.2). Returns an explicit
+/// error rather than a silent no-op so nothing pretends a link was created.
+pub(crate) fn update_current(_link: &Path, _version: &str) -> Result<(), PkgError> {
+    Err(PkgError::UnsafeArchive(
+        "current-link on Windows is not implemented in v1 (macOS-first)".to_string(),
+    ))
 }
 ```
+
+Also in this task **remove the now-unused `junction` dependency** added in Task 1: delete the `[target.'cfg(windows)'.dependencies] junction = "1"` block from `crates/openvhost-pkg/Cargo.toml` (it is referenced nowhere now). Keep the macOS `xattr` dep.
 
 - [ ] **Step 2: Write failing tests for `layout.rs`**
 
@@ -2488,14 +2473,9 @@ cargo deny check licenses advisories 2>&1 | tail -20
 
 Expected: exit 0. If a new dep's license is not on the allowlist, STOP and report — do not edit `deny.toml` without confirming GPLv3 compatibility (repo rule); `junction` and `futures-util` are permissive and should pass. Record the outcome for the PR body.
 
-- [ ] **Step 2: Windows-build stand-in evidence (CI disabled — P0-3 §2.3 policy)**
+- [ ] **Step 2: (macOS-first — Windows cross-check DROPPED for v1)**
 
-```bash
-cargo check --target x86_64-pc-windows-msvc -p openvhost-pkg 2>&1 | tail -8
-cargo clippy --target x86_64-pc-windows-msvc -p openvhost-pkg -- -D warnings 2>&1 | tail -8
-```
-
-Expected: clean — proves the `#[cfg(windows)]` junction path and the whole crate compile for Windows. If the `junction` crate or a cfg block fails to compile, fix until clean (this is the only Windows signal available while CI is off). If the msvc target is missing: `rustup target add x86_64-pc-windows-msvc`.
+Per the owner's macOS-first scope decision (2026-07-22), this slice does NOT run the `x86_64-pc-windows-msvc` cross-check. The Windows `current`-link is an explicit-error stub (Task 6), the `junction` dep is removed, and Windows build/runtime verification moves to the future Windows-enablement phase. Nothing to do in this step — proceed to Step 3.
 
 - [ ] **Step 3: Full local gate suite (the merge gate while CI is off)**
 
@@ -2509,11 +2489,13 @@ Expected: all green. The hermetic pkg tests run; `live_net` skips (no env var) �
 
 ```bash
 git push -u origin feat/p06-pkg-pipeline
-gh pr create --title "feat: P0-6 — download/verify/extract pipeline (openvhost-pkg)" --body "Implements docs/superpowers/specs/2026-07-22-p06-pkg-pipeline-design.md: streaming HTTPS download, SHA-256 verify-before-parse on the same handle, hardened two-pass tar.gz + zip extraction (traversal/type/collision/symlink/mode/cap guards, all reject-the-archive fail-closed), atomic install, and a per-major current link (unix symlink swap; windows junction, compile-checked). No supervisor/app changes.
+gh pr create --title "feat: P0-6 — download/verify/extract pipeline (openvhost-pkg)" --body "Implements docs/superpowers/specs/2026-07-22-p06-pkg-pipeline-design.md: streaming HTTPS download, SHA-256 verify-before-parse on the same handle, hardened two-pass tar.gz + zip extraction (traversal/type/collision/symlink/mode/cap guards, all reject-the-archive fail-closed), atomic install, and a per-major current link (unix symlink swap). No supervisor/app changes.
 
-Verification: full hermetic adversarial unit + integration suite green; env-gated php.net live proof installs php-8.4.23 (configure + main/php_version.h present, current -> 8.4.23). Windows runtime deferred (CI billing, P0-3 §2.3): stand-in = clean x86_64-pc-windows-msvc check/clippy; junction runtime + the §6.3 backfill checklist on the first matrix run.
+macOS-first (v1, owner decision 2026-07-22): the per-major current link ships for unix/macOS; Windows update_current is an explicit-error stub and the junction dep + Windows cross-check are deferred to a later Windows-enablement phase (junction design preserved in spec §6.2). Cross-platform extraction hardening (reserved names, ADS, traversal, collisions) stays in full — it is security-required and platform-agnostic.
 
-SECURITY: download-verify code — MERGE-BLOCKED pending security-auditor APPROVE of this diff (CLAUDE.md golden rule 2). Spec §5 S1–S27 are the audit checklist."
+Verification: full hermetic adversarial unit + integration suite green; env-gated php.net live proof installs php-8.4.23 (configure + main/php_version.h present, current -> 8.4.23).
+
+SECURITY: download-verify code — MERGE-BLOCKED pending security-auditor APPROVE of this diff (CLAUDE.md golden rule 2). Spec §5 S1–S27 are the audit checklist (S22 Windows half deferred with the scope change above)."
 ```
 
 - [ ] **Step 5: Hand back to controller** — the controller runs the final whole-branch review AND dispatches the **security-auditor to audit the real diff** (merge gate). Then the owner-visible smoke = the `OPENVHOST_NET_TESTS=1` live proof already captured. Do NOT merge from this task.
