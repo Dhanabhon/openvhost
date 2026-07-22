@@ -11,6 +11,8 @@
 mod download;
 mod error;
 mod extract;
+mod layout;
+mod platform;
 mod request;
 #[cfg(test)]
 mod testkit;

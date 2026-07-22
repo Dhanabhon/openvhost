@@ -15,7 +15,6 @@ tar = "0.4"
 flate2 = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 tempfile = "3"
-fd-lock = "4"
 unicode-normalization = "0.1"
 url = "2"
 hex = "0.4"
@@ -24,14 +23,11 @@ tracing = "0.1"
 [target.'cfg(target_os = "macos")'.dependencies]
 xattr = "1"
 
-[target.'cfg(windows)'.dependencies]
-junction = "1"
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true }
-
-[target.'cfg(unix)'.dev-dependencies]
-libc = "0.2"
 
 [lints]
 workspace = true
