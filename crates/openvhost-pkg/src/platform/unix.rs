@@ -4,8 +4,16 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::PkgError;
+
+/// Monotonic per-process counter making each swap's temp symlink name unique,
+/// so two concurrent `update_current` calls for the same major can never share
+/// a temp path (and thus can't move each other's link into place). This is
+/// defense-in-depth beneath the install-level serialization (S25); it holds
+/// even if that serialization is ever bypassed.
+static SWAP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Atomic swap: create a temp symlink with a BARE RELATIVE sibling target
 /// (e.g. `"8.4.8"`, never `"../8.4.8"` or an absolute path — this survives
@@ -16,17 +24,30 @@ use crate::error::PkgError;
 /// (S22; the caller must NEVER reach for `remove_dir_all` here).
 pub(crate) fn update_current(link: &Path, version: &str) -> Result<(), PkgError> {
     let parent = link.parent().ok_or_else(|| bad("current has no parent"))?;
-    if let Ok(meta) = fs::symlink_metadata(link)
-        && !meta.file_type().is_symlink()
-    {
-        return Err(bad(
-            "existing 'current' is not a symlink; refusing to replace",
-        ));
+    // Proceed only if `current` is absent or is itself a symlink. A stat error
+    // other than NotFound is not a safe "assume absent" — surface it.
+    match fs::symlink_metadata(link) {
+        Ok(meta) if !meta.file_type().is_symlink() => {
+            return Err(bad(
+                "existing 'current' is not a symlink; refusing to replace",
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io_err("stat", link, e)),
     }
-    let tmp = parent.join(".current.tmp");
-    let _ = fs::remove_file(&tmp);
+    let tmp = parent.join(format!(
+        ".current.{}.{}.tmp",
+        std::process::id(),
+        SWAP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     std::os::unix::fs::symlink(version, &tmp).map_err(|e| io_err("symlink", &tmp, e))?;
-    fs::rename(&tmp, link).map_err(|e| io_err("rename", link, e))
+    if let Err(e) = fs::rename(&tmp, link) {
+        // Never leave the unique temp symlink behind on the failure path.
+        let _ = fs::remove_file(&tmp);
+        return Err(io_err("rename", link, e));
+    }
+    Ok(())
 }
 
 fn bad(m: &'static str) -> PkgError {
