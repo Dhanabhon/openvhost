@@ -5,45 +5,22 @@
 //! honored, never materialized as a plain file. Encrypted entries are
 //! rejected. Never uses zip-rs's own `extract`/`extract_unwrapped_root_dir`
 //! helpers (historic `../`/dup handling) — this is a manual walk.
-//!
-//! Every function here is exercised by this file's own test suite; the
-//! first NON-test caller (wiring this into the install pipeline) lands in
-//! a later task, so the plain (non-test) library build has no live entry
-//! point yet. `cfg_attr(not(test), ...)` defers *that* warning without
-//! silencing dead-code checks in the test build — where this module's
-//! correctness actually gets proven.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{Seek, SeekFrom};
 use std::path::Path;
 
+use super::common::{clamp_mode, copy_capped, reject, set_dir_mode, set_file_mode};
 use super::validate::{
-    MAX_ENTRIES, MAX_TOTAL_BYTES, RawEntry, StripInfo, collision_key, strip_single_root,
-    stripped_rel, validate_entry_name,
+    MAX_ENTRIES, MAX_TOTAL_BYTES, RawEntry, collision_key, strip_single_root, stripped_rel,
+    validate_entry_name,
 };
 use crate::error::PkgError;
 
 /// `S_IFLNK` (unix "is a symlink" file-type bits), as stored in a zip
 /// entry's external file attributes (upper 16 bits = unix mode).
 const S_IFLNK: u32 = 0o120000;
-
-fn reject(msg: impl Into<String>) -> PkgError {
-    let msg = msg.into();
-    tracing::warn!(reason = %msg, "archive rejected");
-    PkgError::UnsafeArchive(msg)
-}
-fn io_err(op: &'static str, path: &Path, source: io::Error) -> PkgError {
-    PkgError::Io {
-        op,
-        path: path.to_path_buf(),
-        source,
-    }
-}
-fn clamp_mode(mode: u32) -> u32 {
-    if mode & 0o111 != 0 { 0o755 } else { 0o644 }
-}
 
 /// A validated, post-strip regular-file entry ready for pass-2 writing.
 /// `rel` is already the FINAL destination-relative path — resolved exactly
@@ -69,7 +46,7 @@ struct PlannedFile {
 pub(crate) fn extract_zip(archive: &mut fs::File, dest: &Path) -> Result<(), PkgError> {
     archive
         .seek(SeekFrom::Start(0))
-        .map_err(|e| io_err("seek", Path::new("<archive>"), e))?;
+        .map_err(|e| PkgError::io("seek", Path::new("<archive>"), e))?;
     let mut zip =
         zip::ZipArchive::new(&mut *archive).map_err(|e| reject(format!("zip open: {e}")))?;
 
@@ -154,14 +131,11 @@ pub(crate) fn extract_zip(archive: &mut fs::File, dest: &Path) -> Result<(), Pkg
         return Err(reject("declared size exceeds cap"));
     }
 
-    // Single-root strip (S18), captured as data so every staged entry's
-    // final rel is derived through the ONE shared deterministic transform
+    // Single-root strip (S18): `strip_single_root` computes both the
+    // decision and `root` itself, so every staged entry's final rel is
+    // derived through the ONE shared deterministic transform
     // (`stripped_rel`) — never a blind `split_once('/')` chop, which can
     // silently mis-map or drop a validated entry.
-    let root = staged
-        .first()
-        .map(|s| s.rel.split('/').next().unwrap_or(&s.rel).to_string())
-        .unwrap_or_default();
     let mut raws: Vec<RawEntry> = staged
         .iter()
         .map(|s| RawEntry {
@@ -169,8 +143,7 @@ pub(crate) fn extract_zip(archive: &mut fs::File, dest: &Path) -> Result<(), Pkg
             is_dir: s.is_dir,
         })
         .collect();
-    let stripped = strip_single_root(&mut raws);
-    let strip = StripInfo { stripped, root };
+    let strip = strip_single_root(&mut raws);
 
     // Resolve every staged entry's FINAL rel exactly once, via the shared
     // transform, and collision-check directories and files together (same
@@ -201,7 +174,7 @@ pub(crate) fn extract_zip(archive: &mut fs::File, dest: &Path) -> Result<(), Pkg
     dirs.sort_by_key(|r| r.split('/').count());
     for rel in &dirs {
         let p = dest.join(rel);
-        fs::create_dir_all(&p).map_err(|e| io_err("create_dir", &p, e))?;
+        fs::create_dir_all(&p).map_err(|e| PkgError::io("create_dir", &p, e))?;
         set_dir_mode(&p)?;
     }
 
@@ -211,7 +184,7 @@ pub(crate) fn extract_zip(archive: &mut fs::File, dest: &Path) -> Result<(), Pkg
     for f in &files {
         let out_path = dest.join(&f.rel);
         if let Some(parent) = out_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| io_err("create_dir", parent, e))?;
+            fs::create_dir_all(parent).map_err(|e| PkgError::io("create_dir", parent, e))?;
         }
         let mut entry = zip
             .by_index(f.index)
@@ -220,57 +193,10 @@ pub(crate) fn extract_zip(archive: &mut fs::File, dest: &Path) -> Result<(), Pkg
             .write(true)
             .create_new(true)
             .open(&out_path)
-            .map_err(|e| io_err("create_new", &out_path, e))?;
+            .map_err(|e| PkgError::io("create_new", &out_path, e))?;
         written = copy_capped(&mut entry, &mut out, written)?;
         set_file_mode(&out_path, clamp_mode(f.mode))?;
     }
-    Ok(())
-}
-
-/// Copy with a running total cap over REAL decompressed bytes (S17); never
-/// `read_to_end` (which would let a hostile entry allocate unbounded memory
-/// before the cap could ever reject it).
-fn copy_capped(
-    reader: &mut impl Read,
-    writer: &mut impl io::Write,
-    mut total: u64,
-) -> Result<u64, PkgError> {
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = reader
-            .read(&mut buf)
-            .map_err(|e| reject(format!("read: {e}")))?;
-        if n == 0 {
-            break;
-        }
-        total = total.saturating_add(n as u64);
-        if total > MAX_TOTAL_BYTES {
-            return Err(reject("decompressed size exceeds cap"));
-        }
-        writer
-            .write_all(&buf[..n])
-            .map_err(|e| reject(format!("write: {e}")))?;
-    }
-    Ok(total)
-}
-
-#[cfg(unix)]
-fn set_file_mode(p: &Path, mode: u32) -> Result<(), PkgError> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(p, fs::Permissions::from_mode(mode)).map_err(|e| io_err("chmod", p, e))
-}
-#[cfg(not(unix))]
-fn set_file_mode(_p: &Path, _mode: u32) -> Result<(), PkgError> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_dir_mode(p: &Path) -> Result<(), PkgError> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(p, fs::Permissions::from_mode(0o755)).map_err(|e| io_err("chmod", p, e))
-}
-#[cfg(not(unix))]
-fn set_dir_mode(_p: &Path) -> Result<(), PkgError> {
     Ok(())
 }
 

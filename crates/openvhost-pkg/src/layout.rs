@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Staging, atomic install, stale-staging sweep, and `current`-link update
 //! (spec §5 S20–S22).
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::fs;
 use std::io;
@@ -37,13 +36,13 @@ impl Staging {
     /// `root.staging_root()` (creating that root if needed).
     pub(crate) fn create(root: &PackagesRoot) -> Result<Staging, PkgError> {
         let sroot = root.staging_root();
-        fs::create_dir_all(&sroot).map_err(|e| io_err("create_dir", &sroot, e))?;
+        fs::create_dir_all(&sroot).map_err(|e| PkgError::io("create_dir", &sroot, e))?;
         set_private(&sroot)?;
 
         let dir = tempfile::Builder::new()
             .prefix("ovh")
             .tempdir_in(&sroot)
-            .map_err(|e| io_err("tempdir", &sroot, e))?;
+            .map_err(|e| PkgError::io("tempdir", &sroot, e))?;
         set_private(dir.path())?;
 
         let lock_path = dir.path().join(".lock");
@@ -52,12 +51,12 @@ impl Staging {
             .truncate(true)
             .write(true)
             .open(&lock_path)
-            .map_err(|e| io_err("lockfile", &lock_path, e))?;
+            .map_err(|e| PkgError::io("lockfile", &lock_path, e))?;
         // Exclusive, non-blocking: staging dirs are freshly minted with a
         // random name, so contention here would mean something else already
         // opened this exact path — treat that as a hard error rather than
         // waiting.
-        try_lock_exclusive(&lock_file).map_err(|e| io_err("flock", &lock_path, e))?;
+        try_lock_exclusive(&lock_file).map_err(|e| PkgError::io("flock", &lock_path, e))?;
 
         Ok(Staging {
             dir,
@@ -97,14 +96,14 @@ pub(crate) fn install_dir(
         return Err(already_installed(name, version));
     }
     if let Some(parent) = final_dir.parent() {
-        fs::create_dir_all(parent).map_err(|e| io_err("create_dir", parent, e))?;
+        fs::create_dir_all(parent).map_err(|e| PkgError::io("create_dir", parent, e))?;
     }
     match fs::rename(staged_root, final_dir) {
         Ok(()) => Ok(()),
         Err(e) if matches!(e.raw_os_error(), Some(code) if is_exists(code)) => {
             Err(already_installed(name, version))
         }
-        Err(e) => Err(io_err("rename", final_dir, e)),
+        Err(e) => Err(PkgError::io("rename", final_dir, e)),
     }
 }
 
@@ -219,19 +218,12 @@ fn try_lock_exclusive(_file: &fs::File) -> io::Result<()> {
 #[cfg(unix)]
 fn set_private(p: &Path) -> Result<(), PkgError> {
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(p, fs::Permissions::from_mode(0o700)).map_err(|e| io_err("chmod", p, e))
+    fs::set_permissions(p, fs::Permissions::from_mode(0o700))
+        .map_err(|e| PkgError::io("chmod", p, e))
 }
 #[cfg(not(unix))]
 fn set_private(_p: &Path) -> Result<(), PkgError> {
     Ok(())
-}
-
-fn io_err(op: &'static str, p: &Path, e: io::Error) -> PkgError {
-    PkgError::Io {
-        op,
-        path: p.to_path_buf(),
-        source: e,
-    }
 }
 
 #[cfg(test)]
@@ -307,7 +299,13 @@ mod tests {
         let link = r.current_link("php", "8.4");
         std::fs::create_dir_all(&link).unwrap(); // a real dir named "current"
         std::fs::create_dir_all(major.join("8.4.1")).unwrap();
-        assert!(update_current(&link, "8.4.1").is_err());
+        // Asserts the SPECIFIC variant (security audit D3): `UnsafeArchive`'s
+        // Display ("archive rejected: ...") is nonsense for a current-link
+        // precondition failure that has nothing to do with archive content.
+        assert!(matches!(
+            update_current(&link, "8.4.1"),
+            Err(PkgError::Unsupported(_))
+        ));
     }
 
     #[test]

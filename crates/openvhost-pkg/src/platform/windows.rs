@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Windows `current`-link maintenance — **macOS-first v1 stub**.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::path::Path;
 
@@ -13,7 +12,7 @@ use crate::error::PkgError;
 /// than a silent no-op, so a Windows build fails loudly at the link step
 /// instead of pretending a link was created.
 pub(crate) fn update_current(_link: &Path, _version: &str) -> Result<(), PkgError> {
-    Err(PkgError::UnsafeArchive(
+    Err(PkgError::Unsupported(
         "current-link on Windows is not implemented in v1 (macOS-first)".to_string(),
     ))
 }

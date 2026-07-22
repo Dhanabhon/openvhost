@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Unix `current`-link maintenance: an atomic symlink swap.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::fs;
 use std::path::Path;
@@ -28,36 +27,28 @@ pub(crate) fn update_current(link: &Path, version: &str) -> Result<(), PkgError>
     // other than NotFound is not a safe "assume absent" — surface it.
     match fs::symlink_metadata(link) {
         Ok(meta) if !meta.file_type().is_symlink() => {
-            return Err(bad(
-                "existing 'current' is not a symlink; refusing to replace",
+            return Err(PkgError::Unsupported(
+                "existing 'current' is not a symlink; refusing to replace".to_string(),
             ));
         }
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(io_err("stat", link, e)),
+        Err(e) => return Err(PkgError::io("stat", link, e)),
     }
     let tmp = parent.join(format!(
         ".current.{}.{}.tmp",
         std::process::id(),
         SWAP_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    std::os::unix::fs::symlink(version, &tmp).map_err(|e| io_err("symlink", &tmp, e))?;
+    std::os::unix::fs::symlink(version, &tmp).map_err(|e| PkgError::io("symlink", &tmp, e))?;
     if let Err(e) = fs::rename(&tmp, link) {
         // Never leave the unique temp symlink behind on the failure path.
         let _ = fs::remove_file(&tmp);
-        return Err(io_err("rename", link, e));
+        return Err(PkgError::io("rename", link, e));
     }
     Ok(())
 }
 
 fn bad(m: &'static str) -> PkgError {
     PkgError::UnsafeArchive(m.to_string())
-}
-
-fn io_err(op: &'static str, p: &Path, e: std::io::Error) -> PkgError {
-    PkgError::Io {
-        op,
-        path: p.to_path_buf(),
-        source: e,
-    }
 }

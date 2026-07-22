@@ -103,8 +103,10 @@ pub(crate) fn validate_component(s: &str) -> Result<(), PkgError> {
     if s.starts_with('.') || s.starts_with('-') {
         return Err(bad("must not start with . or -"));
     }
-    if s.ends_with('.') || s.ends_with(' ') {
-        return Err(bad("must not end with . or space"));
+    // A trailing space is already impossible here: the charset check above
+    // only allows `[a-z0-9._-]`, which excludes ' ' outright.
+    if s.ends_with('.') {
+        return Err(bad("must not end with a dot"));
     }
     // Reserved Windows device basename (before the first dot), case-insensitive.
     let stem = s.split('.').next().unwrap_or(s);

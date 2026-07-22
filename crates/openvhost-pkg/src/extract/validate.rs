@@ -1,13 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Pure path/entry validation — the extractor's trusted core. No I/O.
-//!
-//! Every function here is exercised by this file's own test suite, which
-//! proves correctness now; the first NON-test callers land in Tasks 3–4
-//! (tar/zip extraction), so the plain (non-test) library build has no live
-//! entry point into this module yet. `cfg_attr(not(test), ...)` defers
-//! *that* warning to those tasks without silencing dead-code checks in the
-//! test build — where this module's correctness actually gets proven.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use unicode_normalization::UnicodeNormalization;
 
@@ -16,13 +8,10 @@ use crate::request::RESERVED;
 
 pub(crate) const MAX_DEPTH: usize = 32;
 pub(crate) const MAX_REL_BYTES: usize = 240;
-/// Per-archive entry-count cap (S17): read by Tasks 3–4's format walks, not
-/// by anything in this task; not yet live even in the test build.
-#[allow(dead_code)]
+/// Per-archive entry-count cap (S17), enforced by both format walks
+/// (`extract::targz`, `extract::zip`).
 pub(crate) const MAX_ENTRIES: usize = 100_000;
-/// Decompressed-bytes cap (S17): read by Tasks 3–4's format walks, not by
-/// anything in this task; not yet live even in the test build.
-#[allow(dead_code)]
+/// Decompressed-bytes cap (S17), enforced by both format walks.
 pub(crate) const MAX_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
@@ -79,7 +68,6 @@ pub(crate) fn validate_entry_name(raw: &str) -> Result<String, PkgError> {
         return Err(reject("entry nesting too deep"));
     }
     for c in raw.split('/') {
-        let c = c.strip_suffix('/').unwrap_or(c);
         if c.is_empty() {
             continue;
         }
@@ -108,22 +96,26 @@ pub(crate) fn collision_key(rel: &str) -> String {
 
 /// Apply the single-top-dir strip rule (S18): if EVERY entry shares one
 /// top-level component AND that component appears as an explicit directory
-/// entry, remove that leading component from all entries. Returns whether a
-/// strip occurred. Entries are already name-validated.
-pub(crate) fn strip_single_root(entries: &mut [RawEntry]) -> bool {
-    strip_single_root_vec(entries)
+/// entry, remove that leading component from all entries. Returns the
+/// decision as [`StripInfo`] — computing `root` here, ONCE, rather than
+/// leaving each format walk (`targz`, `zip`) recompute it independently
+/// from `entries[0]` (two copies of the same logic that could silently
+/// drift apart). Entries are already name-validated.
+pub(crate) fn strip_single_root(entries: &mut [RawEntry]) -> StripInfo {
+    let root = entries
+        .first()
+        .map(|e| top(&e.rel).to_string())
+        .unwrap_or_default();
+    let stripped = strip_single_root_vec(entries, &root);
+    StripInfo { stripped, root }
 }
 
 fn top(rel: &str) -> &str {
     rel.split('/').next().unwrap_or(rel)
 }
 
-fn strip_single_root_vec(entries: &mut [RawEntry]) -> bool {
-    if entries.is_empty() {
-        return false;
-    }
-    let root = top(&entries[0].rel);
-    if root.is_empty() {
+fn strip_single_root_vec(entries: &mut [RawEntry], root: &str) -> bool {
+    if entries.is_empty() || root.is_empty() {
         return false;
     }
     let all_share = entries.iter().all(|e| top(&e.rel) == root);
@@ -183,9 +175,8 @@ pub(crate) fn stripped_rel(validated_raw: &str, strip: &StripInfo) -> Option<Str
 }
 
 /// Validate a symlink target (S14): relative, valid UTF-8, no `.`/`..`
-/// components (sibling/descendant only), and lexically resolves inside the
-/// root. `link_rel` is the already-validated link path.
-pub(crate) fn validate_symlink_target(link_rel: &str, target: &str) -> Result<(), PkgError> {
+/// components (sibling/descendant only).
+pub(crate) fn validate_symlink_target(target: &str) -> Result<(), PkgError> {
     if target.is_empty() {
         return Err(reject("empty symlink target"));
     }
@@ -197,11 +188,9 @@ pub(crate) fn validate_symlink_target(link_rel: &str, target: &str) -> Result<()
             return Err(reject("symlink target has '.'/'..'/empty component"));
         }
     }
-    // Lexical resolution: link lives in its parent dir; join target; must stay
-    // at depth >= 0 relative to root (no component takes it above root). With
-    // no '..' allowed this is guaranteed, but keep the depth check for defense.
-    let parent_depth = link_rel.split('/').count().saturating_sub(1);
-    let _ = parent_depth; // no '..' means it can never escape; explicit for clarity
+    // No component above can ever be '.'/'..'  (checked in the loop just
+    // above), so the target can never lexically ascend out of wherever the
+    // link lives, regardless of nesting depth — nothing further to check.
     Ok(())
 }
 
@@ -279,7 +268,9 @@ mod tests {
                 is_dir: false,
             },
         ];
-        assert!(strip_single_root(&mut one));
+        let strip = strip_single_root(&mut one);
+        assert!(strip.stripped);
+        assert_eq!(strip.root, "php-8.4");
         assert_eq!(one[0].rel, "");
         assert_eq!(one[1].rel, "main.c");
 
@@ -293,7 +284,7 @@ mod tests {
                 is_dir: true,
             },
         ];
-        assert!(!strip_single_root(&mut flat));
+        assert!(!strip_single_root(&mut flat).stripped);
         assert_eq!(flat[0].rel, "php.exe");
 
         // single top-level entry that is a FILE, not a dir -> no strip
@@ -301,7 +292,7 @@ mod tests {
             rel: "only.txt".into(),
             is_dir: false,
         }];
-        assert!(!strip_single_root(&mut single_file));
+        assert!(!strip_single_root(&mut single_file).stripped);
     }
 
     #[test]
@@ -349,19 +340,11 @@ mod tests {
     #[test]
     fn symlink_targets() {
         // sibling / descendant relative targets ok
-        assert!(validate_symlink_target("lib/libfoo.so", "libfoo.so.1").is_ok());
-        assert!(validate_symlink_target("a/b/link", "c/d").is_ok());
+        assert!(validate_symlink_target("libfoo.so.1").is_ok());
+        assert!(validate_symlink_target("c/d").is_ok());
         // absolute, parent-escaping, or dot components rejected
-        for (link, tgt) in [
-            ("a/link", "/abs"),
-            ("a/link", "../../etc/passwd"),
-            ("a/link", "./x"),
-            ("a/link", "b/../x"),
-        ] {
-            assert!(
-                validate_symlink_target(link, tgt).is_err(),
-                "reject {link} -> {tgt}"
-            );
+        for tgt in ["/abs", "../../etc/passwd", "./x", "b/../x"] {
+            assert!(validate_symlink_target(tgt).is_err(), "reject {tgt}");
         }
     }
 }

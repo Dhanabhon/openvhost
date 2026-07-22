@@ -2,7 +2,6 @@
 //! Pipeline orchestration: sweep → stage → download+verify → extract →
 //! atomic install → current link. Single in-process install at a time (S25).
 
-use std::path::Path;
 use std::sync::OnceLock;
 
 use tokio::sync::Semaphore;
@@ -27,14 +26,6 @@ use crate::request::{
 fn install_gate() -> &'static Semaphore {
     static GATE: OnceLock<Semaphore> = OnceLock::new();
     GATE.get_or_init(|| Semaphore::new(1))
-}
-
-fn io_err(op: &'static str, path: &Path, source: std::io::Error) -> PkgError {
-    PkgError::Io {
-        op,
-        path: path.to_path_buf(),
-        source,
-    }
 }
 
 /// Install `req` under `root`.
@@ -91,7 +82,8 @@ pub async fn install_package(
     let staging = Staging::create(root)?;
     let staging_path = staging.path().to_path_buf();
     let extract_root = staging_path.join("root");
-    std::fs::create_dir_all(&extract_root).map_err(|e| io_err("create_dir", &extract_root, e))?;
+    std::fs::create_dir_all(&extract_root)
+        .map_err(|e| PkgError::io("create_dir", &extract_root, e))?;
 
     // Download + verify onto the same handle we extract from (S8).
     let mut file = download_and_verify(&req.url, &req.sha256, &staging_path, &mut progress).await?;

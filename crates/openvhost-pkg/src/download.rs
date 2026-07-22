@@ -4,14 +4,6 @@
 //! feature level and we send Accept-Encoding: identity — S3). Verification
 //! happens BEFORE the handle is returned to the extractor, on the SAME open
 //! file (S8); nothing is ever re-opened by path.
-//!
-//! Every function here is exercised by this file's own test suite; the first
-//! NON-test caller (wiring this into the install pipeline) lands in a later
-//! task, so the plain (non-test) library build has no live entry point yet.
-//! `cfg_attr(not(test), ...)` defers *that* warning without silencing
-//! dead-code checks in the test build — where this module's correctness
-//! actually gets proven (matches `extract/targz.rs` and `extract/zip.rs`).
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
@@ -50,7 +42,7 @@ pub(crate) async fn download_capped(
     cap: u64,
     mut progress: impl FnMut(Progress),
 ) -> Result<fs::File, PkgError> {
-    check_scheme(url)?;
+    check_scheme_result(url)?;
 
     let client = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
@@ -94,7 +86,7 @@ pub(crate) async fn download_capped(
         .write(true)
         .create_new(true)
         .open(&archive_path)
-        .map_err(|e| io_err("create_new", &archive_path, e))?;
+        .map_err(|e| PkgError::io("create_new", &archive_path, e))?;
 
     let mut hasher = Sha256::new();
     let mut total: u64 = 0;
@@ -110,7 +102,7 @@ pub(crate) async fn download_capped(
         }
         hasher.update(&chunk);
         file.write_all(&chunk)
-            .map_err(|e| io_err("write", &archive_path, e))?;
+            .map_err(|e| PkgError::io("write", &archive_path, e))?;
         progress(Progress::Downloaded { bytes: total });
     }
 
@@ -134,7 +126,7 @@ pub(crate) async fn download_capped(
     }
 
     file.sync_all()
-        .map_err(|e| io_err("sync", &archive_path, e))?;
+        .map_err(|e| PkgError::io("sync", &archive_path, e))?;
 
     let actual = hex::encode(hasher.finalize());
     if actual != sha256 {
@@ -149,12 +141,8 @@ pub(crate) async fn download_capped(
     tracing::info!(bytes = total, "download verified");
     progress(Progress::Verified);
     file.seek(SeekFrom::Start(0))
-        .map_err(|e| io_err("seek", &archive_path, e))?;
+        .map_err(|e| PkgError::io("seek", &archive_path, e))?;
     Ok(file)
-}
-
-fn check_scheme(url: &url::Url) -> Result<(), PkgError> {
-    check_scheme_result(url)
 }
 
 fn check_scheme_result(url: &url::Url) -> Result<(), PkgError> {
@@ -164,14 +152,6 @@ fn check_scheme_result(url: &url::Url) -> Result<(), PkgError> {
     // carve-out — one validator, not two copies that could silently drift
     // apart.
     validate_https_url(url)
-}
-
-fn io_err(op: &'static str, path: &Path, source: std::io::Error) -> PkgError {
-    PkgError::Io {
-        op,
-        path: path.to_path_buf(),
-        source,
-    }
 }
 
 fn io_msg(msg: &str) -> Box<dyn std::error::Error + Send + Sync> {

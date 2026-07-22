@@ -3,14 +3,6 @@
 //! validates EVERY entry and rejects the whole archive on any violation;
 //! only then does pass 2 write. Never uses tar-rs `unpack` (RUSTSEC-2021-0080
 //! link traversal) — a manual walk applying the `validate` primitives.
-//!
-//! Every function here is exercised by this file's own test suite; the
-//! first NON-test caller (wiring this into the install pipeline) lands in a
-//! later task, so the plain (non-test) library build has no live entry
-//! point yet. `cfg_attr(not(test), ...)` defers *that* warning without
-//! silencing dead-code checks in the test build — where this module's
-//! correctness actually gets proven.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::HashSet;
 use std::fs;
@@ -19,17 +11,29 @@ use std::path::Path;
 
 use flate2::read::GzDecoder;
 
+use super::common::{clamp_mode, copy_capped, reject, set_dir_mode, set_file_mode};
 use super::validate::{
     MAX_ENTRIES, MAX_TOTAL_BYTES, RawEntry, StripInfo, collision_key, strip_single_root,
     stripped_rel, validate_entry_name, validate_symlink_target,
 };
-use super::{PlannedEntry, PlannedKind};
 use crate::error::PkgError;
 
-fn reject(msg: impl Into<String>) -> PkgError {
-    let msg = msg.into();
-    tracing::warn!(reason = %msg, "archive rejected");
-    PkgError::UnsafeArchive(msg)
+/// The extraction-plan contract this format walk's pass 1 builds and pass 2
+/// materializes. tar.gz-specific: `zip.rs` builds its own lighter-weight
+/// `Staged`/`PlannedFile` locals instead, since zip's random-access central
+/// directory needs no separate plan/materialize split.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PlannedKind {
+    Dir,
+    File { mode: u32 },
+    Symlink { target: String },
+    Hardlink { target: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlannedEntry {
+    rel: String,
+    kind: PlannedKind,
 }
 
 /// A `Read` adapter that errors once cumulative bytes read through it exceed
@@ -81,7 +85,7 @@ pub(crate) fn extract_targz(archive: &mut fs::File, dest: &Path) -> Result<(), P
 fn plan_targz(archive: &mut fs::File) -> Result<(Vec<PlannedEntry>, StripInfo), PkgError> {
     archive
         .seek(SeekFrom::Start(0))
-        .map_err(|e| io_err("seek", Path::new("<archive>"), e))?;
+        .map_err(|e| PkgError::io("seek", Path::new("<archive>"), e))?;
     let mut ar = tar::Archive::new(LimitedReader::new(
         GzDecoder::new(&mut *archive),
         MAX_TOTAL_BYTES,
@@ -144,7 +148,7 @@ fn plan_targz(archive: &mut fs::File) -> Result<(Vec<PlannedEntry>, StripInfo), 
             T::Directory => PlannedKind::Dir,
             T::Symlink => {
                 let tgt = link_target(&entry)?;
-                validate_symlink_target(&rel, &tgt)?;
+                validate_symlink_target(&tgt)?;
                 PlannedKind::Symlink { target: tgt }
             }
             T::Link => {
@@ -158,14 +162,10 @@ fn plan_targz(archive: &mut fs::File) -> Result<(Vec<PlannedEntry>, StripInfo), 
         staged.push(Staged { rel, kind, is_dir });
     }
 
-    // Capture the strip decision as data BEFORE `strip_single_root` mutates
-    // `raws` in place. `root` is only ever consulted through `stripped_rel`,
-    // which pass 2 applies identically to raw archive names — the mutated
-    // `raws` themselves are discarded once we have the boolean decision.
-    let root = staged
-        .first()
-        .map(|s| s.rel.split('/').next().unwrap_or(&s.rel).to_string())
-        .unwrap_or_default();
+    // The single-root-strip decision (S18) — including `root` itself — is
+    // computed by `strip_single_root`; this walk and `zip.rs`'s never
+    // recompute `root` independently from two copies of the same
+    // `entries.first()` logic.
     let mut raws: Vec<RawEntry> = staged
         .iter()
         .map(|s| RawEntry {
@@ -173,8 +173,7 @@ fn plan_targz(archive: &mut fs::File) -> Result<(Vec<PlannedEntry>, StripInfo), 
             is_dir: s.is_dir,
         })
         .collect();
-    let stripped = strip_single_root(&mut raws);
-    let strip = StripInfo { stripped, root };
+    let strip = strip_single_root(&mut raws);
 
     // Collision check on final paths, computed via the shared deterministic
     // transform — never a fuzzy re-match, so pass 2 can reproduce the exact
@@ -234,7 +233,7 @@ fn materialize(
     dirs.sort_by_key(|e| e.rel.split('/').count());
     for d in dirs {
         let p = dest.join(&d.rel);
-        fs::create_dir_all(&p).map_err(|e| io_err("create_dir", &p, e))?;
+        fs::create_dir_all(&p).map_err(|e| PkgError::io("create_dir", &p, e))?;
         set_dir_mode(&p)?;
     }
 
@@ -254,7 +253,7 @@ fn materialize(
     // drop, a validated file — see the pass2_rel_matches_pass1_* tests.)
     archive
         .seek(SeekFrom::Start(0))
-        .map_err(|e| io_err("seek", Path::new("<archive>"), e))?;
+        .map_err(|e| PkgError::io("seek", Path::new("<archive>"), e))?;
     let mut ar = tar::Archive::new(LimitedReader::new(
         GzDecoder::new(&mut *archive),
         MAX_TOTAL_BYTES,
@@ -289,7 +288,7 @@ fn materialize(
             .write(true)
             .create_new(true)
             .open(&out_path)
-            .map_err(|e| io_err("create_new", &out_path, e))?;
+            .map_err(|e| PkgError::io("create_new", &out_path, e))?;
         written = copy_capped(&mut entry, &mut out, written)?;
         set_file_mode(&out_path, mode)?;
     }
@@ -309,7 +308,8 @@ fn materialize(
             }
             let dst = dest.join(&e.rel);
             ensure_parent(&dst)?;
-            let copied = fs::copy(&src, &dst).map_err(|e2| io_err("hardlink copy", &dst, e2))?;
+            let copied =
+                fs::copy(&src, &dst).map_err(|e2| PkgError::io("hardlink copy", &dst, e2))?;
             written = written.saturating_add(copied);
             if written > MAX_TOTAL_BYTES {
                 return Err(reject("decompressed size exceeds cap"));
@@ -334,31 +334,6 @@ fn materialize(
 
     strip_quarantine(dest);
     Ok(())
-}
-
-/// Copy with a running total cap over REAL decompressed bytes (S17).
-fn copy_capped(
-    reader: &mut impl Read,
-    writer: &mut impl io::Write,
-    mut total: u64,
-) -> Result<u64, PkgError> {
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = reader
-            .read(&mut buf)
-            .map_err(|e| reject(format!("read: {e}")))?;
-        if n == 0 {
-            break;
-        }
-        total = total.saturating_add(n as u64);
-        if total > MAX_TOTAL_BYTES {
-            return Err(reject("decompressed size exceeds cap"));
-        }
-        writer
-            .write_all(&buf[..n])
-            .map_err(|e| reject(format!("write: {e}")))?;
-    }
-    Ok(total)
 }
 
 /// Strip `com.apple.quarantine` (and other non-essential `com.apple.*`) xattrs
@@ -392,27 +367,9 @@ fn strip_quarantine(dest: &Path) {
 #[cfg(not(target_os = "macos"))]
 fn strip_quarantine(_dest: &Path) {}
 
-fn set_file_mode(p: &Path, mode: u32) -> Result<(), PkgError> {
-    set_file_mode_impl(p, mode)
-}
-
-#[cfg(unix)]
-fn set_file_mode_impl(p: &Path, mode: u32) -> Result<(), PkgError> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(p, fs::Permissions::from_mode(mode)).map_err(|e| io_err("chmod", p, e))
-}
-#[cfg(not(unix))]
-fn set_file_mode_impl(_p: &Path, _mode: u32) -> Result<(), PkgError> {
-    Ok(())
-}
-
-fn clamp_mode(mode: u32) -> u32 {
-    if mode & 0o111 != 0 { 0o755 } else { 0o644 }
-}
-
 fn ensure_parent(p: &Path) -> Result<(), PkgError> {
     if let Some(parent) = p.parent() {
-        fs::create_dir_all(parent).map_err(|e| io_err("create_dir", parent, e))?;
+        fs::create_dir_all(parent).map_err(|e| PkgError::io("create_dir", parent, e))?;
     }
     Ok(())
 }
@@ -445,33 +402,15 @@ fn verify_real_ancestors(dest: &Path, path: &Path) -> Result<(), PkgError> {
             }
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(io_err("stat", ancestor, e)),
+            Err(e) => return Err(PkgError::io("stat", ancestor, e)),
         }
     }
     Ok(())
 }
 
-fn io_err(op: &'static str, path: &Path, source: io::Error) -> PkgError {
-    PkgError::Io {
-        op,
-        path: path.to_path_buf(),
-        source,
-    }
-}
-
-#[cfg(unix)]
-fn set_dir_mode(p: &Path) -> Result<(), PkgError> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(p, fs::Permissions::from_mode(0o755)).map_err(|e| io_err("chmod", p, e))
-}
-#[cfg(not(unix))]
-fn set_dir_mode(_p: &Path) -> Result<(), PkgError> {
-    Ok(())
-}
-
 #[cfg(unix)]
 fn create_symlink(target: &str, link: &Path) -> Result<(), PkgError> {
-    std::os::unix::fs::symlink(target, link).map_err(|e| io_err("symlink", link, e))
+    std::os::unix::fs::symlink(target, link).map_err(|e| PkgError::io("symlink", link, e))
 }
 #[cfg(windows)]
 fn create_symlink(_target: &str, _link: &Path) -> Result<(), PkgError> {

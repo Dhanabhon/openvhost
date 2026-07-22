@@ -8,7 +8,6 @@
 //! an explicit-error stub (see [`windows::update_current`]); the junction
 //! implementation is preserved in spec §6.2 for a future Windows-enablement
 //! phase and is deliberately NOT written here.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::path::Path;
 

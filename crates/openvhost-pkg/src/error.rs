@@ -30,4 +30,22 @@ pub enum PkgError {
     },
     #[error("internal error: {0}")]
     Internal(String),
+    #[error("unsupported: {0}")]
+    Unsupported(String),
+}
+
+impl PkgError {
+    /// Build an [`PkgError::Io`] variant. The ONE shared constructor for
+    /// this variant, used by every call site across the crate (download,
+    /// layout, install, extract/targz, extract/zip, platform/unix) instead
+    /// of each module keeping its own byte-identical private `io_err`
+    /// helper — a future change to how I/O errors are reported only has to
+    /// land here.
+    pub(crate) fn io(op: &'static str, path: &std::path::Path, source: std::io::Error) -> PkgError {
+        PkgError::Io {
+            op,
+            path: path.to_path_buf(),
+            source,
+        }
+    }
 }
