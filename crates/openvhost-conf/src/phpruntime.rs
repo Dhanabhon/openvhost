@@ -60,10 +60,39 @@ impl PhpRuntimeAdapter for PhpFpmRuntime {
 
     async fn validate(
         &self,
-        _php_bin: &Path,
-        _ctx: &RenderCtx,
+        php_bin: &Path,
+        ctx: &RenderCtx,
     ) -> Result<ValidationReport, ConfError> {
-        unimplemented!("php-fpm validate lands in Task 3")
+        let Some(pool) = self.generate_pool_config(ctx)? else {
+            // No pool file on the TCP/Windows path — nothing to validate here.
+            return Ok(ValidationReport {
+                ok: true,
+                stderr: String::new(),
+            });
+        };
+        crate::validate::materialize(std::slice::from_ref(&pool))?;
+        // php-fpm -t only needs logs/ to pre-exist (for error_log).
+        let logs = ctx.home.join("logs");
+        std::fs::create_dir_all(&logs).map_err(|e| ConfError::Io {
+            op: "create_dir",
+            path: logs,
+            source: e,
+        })?;
+        let out = tokio::process::Command::new(php_bin)
+            .arg("-t")
+            .arg("-n") // hermetic: skip brew php.ini
+            .arg("-y")
+            .arg(&pool.path)
+            .output()
+            .await
+            .map_err(|e| ConfError::ValidatorSpawn {
+                bin: php_bin.display().to_string(),
+                source: e,
+            })?;
+        Ok(ValidationReport {
+            ok: out.status.success(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
     }
 }
 

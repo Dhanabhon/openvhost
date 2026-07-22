@@ -111,11 +111,39 @@ impl WebServerAdapter for NginxAdapter {
 
     async fn validate(
         &self,
-        _nginx_bin: &Path,
-        _ctx: &RenderCtx,
+        nginx_bin: &Path,
+        ctx: &RenderCtx,
     ) -> Result<ValidationReport, ConfError> {
-        // Implemented in Task 3.
-        unimplemented!("nginx validate lands in Task 3")
+        // Materialize main + site into ctx.home, pre-create the dirs `nginx -t`
+        // needs (run/, run/nginx/, logs/ — NOT www/), then run the validator.
+        let main = self.generate_main_config(ctx)?;
+        let site = self.generate_site_config(ctx)?;
+        crate::validate::materialize(&[main.clone(), site])?;
+        for d in ["run", "run/nginx", "logs"] {
+            let p = ctx.home.join(d);
+            std::fs::create_dir_all(&p).map_err(|e| ConfError::Io {
+                op: "create_dir",
+                path: p,
+                source: e,
+            })?;
+        }
+        let err_log = ctx.home.join("logs/nginx.error.log");
+        let out = tokio::process::Command::new(nginx_bin)
+            .arg("-e")
+            .arg(&err_log) // MANDATORY: without -e, nginx leaks to /opt/homebrew/var
+            .arg("-t")
+            .arg("-c")
+            .arg(&main.path)
+            .output()
+            .await
+            .map_err(|e| ConfError::ValidatorSpawn {
+                bin: nginx_bin.display().to_string(),
+                source: e,
+            })?;
+        Ok(ValidationReport {
+            ok: out.status.success(), // exit code ONLY
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
     }
 
     fn supports_hot_reload(&self) -> bool {
