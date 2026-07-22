@@ -9,6 +9,7 @@
 //! docs/superpowers/specs/2026-07-22-p06-pkg-pipeline-design.md §5.
 
 mod error;
+mod extract;
 mod request;
 
 pub use error::PkgError;

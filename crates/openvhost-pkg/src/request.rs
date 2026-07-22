@@ -68,7 +68,11 @@ impl PackagesRoot {
     }
 }
 
-const RESERVED: [&str; 24] = [
+/// Reserved Windows device basenames (case-insensitive), checked without a
+/// trailing extension. Shared crate-wide: `validate_component` (below) uses
+/// it for name/major/version components, and `extract::validate` imports it
+/// for archive entry-name validation (S11) — ONE list, no duplication.
+pub(crate) const RESERVED: [&str; 24] = [
     "con", "prn", "aux", "nul", "com0", "com1", "com2", "com3", "com4", "com5", "com6", "com7",
     "com8", "com9", "lpt0", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
 ];
