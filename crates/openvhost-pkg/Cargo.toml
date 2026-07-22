@@ -29,5 +29,8 @@ junction = "1"
 [dev-dependencies]
 tokio = { workspace = true }
 
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
 [lints]
 workspace = true

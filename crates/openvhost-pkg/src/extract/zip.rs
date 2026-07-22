@@ -79,10 +79,21 @@ pub(crate) fn extract_zip(archive: &mut fs::File, dest: &Path) -> Result<(), Pkg
     }
 
     // Pass 1 (metadata-only): validate every entry, skip symlinks entirely,
-    // and stage the rest for the strip decision. Reading `name_raw`,
-    // `encrypted`, `unix_mode` and `size` off a `by_index` handle costs no
-    // decompression — that metadata lives in the already-parsed central
-    // directory record; only actually reading bytes (pass 2, below) does.
+    // and stage the rest for the strip decision. `by_index_raw` (NOT
+    // `by_index`) is used deliberately: `by_index`'s password gate fails
+    // closed on an encrypted entry BEFORE handing back a `ZipFile` at all,
+    // which would make an `entry.encrypted()` check reached through
+    // `by_index` unreachable dead code — the archive would still get
+    // rejected (via `by_index`'s own generic error), but nothing in this
+    // file's own logic would ever exercise that rejection, and a future
+    // crate change that defers the password check to decompression time
+    // would silently stop rejecting at all. `by_index_raw` reads the SAME
+    // cached central-directory metadata (`name_raw`, `encrypted`,
+    // `unix_mode`, `size`) WITHOUT that password gate and WITHOUT
+    // decompressing or decrypting anything (confirmed empirically: it
+    // reports `encrypted() == true` for an encrypted entry instead of
+    // erroring), so the `encrypted()` check below is a real, reachable,
+    // directly-tested rejection.
     struct Staged {
         rel: String,
         is_dir: bool,
@@ -93,13 +104,14 @@ pub(crate) fn extract_zip(archive: &mut fs::File, dest: &Path) -> Result<(), Pkg
 
     for i in 0..zip.len() {
         let entry = zip
-            .by_index(i)
+            .by_index_raw(i)
             .map_err(|e| reject(format!("zip entry {i}: {e}")))?;
-        // Belt-and-suspenders: for the pinned zip crate version, `by_index`
-        // itself already fails closed with "password required" whenever an
-        // entry is encrypted and no password was supplied (which we never
-        // do), so this `encrypted()` branch is unreachable today — kept
-        // explicit so the intent survives a future crate-behavior change.
+        // Encrypted entries are rejected explicitly, before any name/mode
+        // inspection: see the pass-1 comment above for why `by_index_raw`
+        // makes this a real, reachable check. Covered by
+        // `rejects_encrypted_entries`, which asserts this exact
+        // `UnsafeArchive("encrypted zip entry")` rejection, not just
+        // "some error occurred".
         if entry.encrypted() {
             return Err(reject("encrypted zip entry"));
         }
@@ -177,11 +189,18 @@ pub(crate) fn extract_zip(archive: &mut fs::File, dest: &Path) -> Result<(), Pkg
         }
     }
 
-    // Pass 2a: directories, shallow -> deep.
+    // Pass 2a: directories, shallow -> deep, mode-clamped (S16) exactly
+    // like targz.rs's `set_dir_mode`. `create_dir_all` alone leaves a
+    // directory's mode dependent on the process umask (e.g. 0o777 under a
+    // permissive one); these directories go on to hold binaries and config
+    // later executed/read (php-fpm/nginx), so a world-writable directory
+    // would let a co-resident local user swap a verified binary/config
+    // before first use.
     dirs.sort_by_key(|r| r.split('/').count());
     for rel in &dirs {
         let p = dest.join(rel);
         fs::create_dir_all(&p).map_err(|e| io_err("create_dir", &p, e))?;
+        set_dir_mode(&p)?;
     }
 
     // Pass 2b: files, streamed from the SAME archive handle by index (never
@@ -240,6 +259,16 @@ fn set_file_mode(p: &Path, mode: u32) -> Result<(), PkgError> {
 }
 #[cfg(not(unix))]
 fn set_file_mode(_p: &Path, _mode: u32) -> Result<(), PkgError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_dir_mode(p: &Path) -> Result<(), PkgError> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(p, fs::Permissions::from_mode(0o755)).map_err(|e| io_err("chmod", p, e))
+}
+#[cfg(not(unix))]
+fn set_dir_mode(_p: &Path) -> Result<(), PkgError> {
     Ok(())
 }
 
@@ -393,7 +422,80 @@ mod tests {
             mode: 0o644,
         }]);
         mark_first_entry_encrypted(&mut bytes);
-        assert!(extract(&bytes).is_err());
+        // Assert the SPECIFIC rejection our own `entry.encrypted()` check
+        // (via `by_index_raw`) produces, not just "some error happened" —
+        // this is the regression test for that check actually firing.
+        match extract(&bytes) {
+            Err(PkgError::UnsafeArchive(msg)) => assert_eq!(msg, "encrypted zip entry"),
+            other => panic!("expected UnsafeArchive(\"encrypted zip entry\"), got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    /// `umask(2)` is process-wide, not per-thread. Scoping this test to set
+    /// it (via a Drop-restoring guard) is safe in THIS suite specifically
+    /// because every other test here checks either mere existence
+    /// (`is_file`/`is_dir`/`exists`) or a mode this crate's own code
+    /// explicitly `chmod`s after creation (files: `set_file_mode`; dirs, as
+    /// of this test: `set_dir_mode`) — never an AMBIENT, umask-derived
+    /// mode. A future test that asserts an un-clamped, umask-derived mode
+    /// would need its own isolation.
+    struct UmaskGuard(libc::mode_t);
+
+    #[cfg(unix)]
+    impl UmaskGuard {
+        fn set(new_mask: libc::mode_t) -> Self {
+            // SAFETY: `umask` has no preconditions beyond a valid process
+            // (always true) and atomically returns the previous mask, which
+            // we capture here and restore on drop.
+            let previous = unsafe { libc::umask(new_mask) };
+            Self(previous)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for UmaskGuard {
+        fn drop(&mut self) {
+            // SAFETY: restores the mask `set` captured, same call shape.
+            unsafe {
+                libc::umask(self.0);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clamps_dir_modes_regardless_of_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        // A permissive (zero) umask would let a bare `create_dir_all` land
+        // at 0o777. Under a common 0o022 default umask, an unconditional
+        // `assert_eq!(mode, 0o755)` would pass EVEN WITHOUT an explicit
+        // chmod (0o777 & !0o022 == 0o755), which would make the assertion
+        // vacuous as a regression guard for `set_dir_mode`. Forcing umask
+        // to 0 here means this test can only pass if the directory's mode
+        // is explicitly clamped, regardless of the environment's ambient
+        // umask.
+        let _umask_guard = UmaskGuard::set(0);
+        // A lone top-level `Dir` entry would itself be treated as the
+        // single-root-strip (S18) target and dropped entirely (see
+        // `rejects_duplicate_names`'s comment for the same gotcha) — add a
+        // sibling file so there's no single shared top-level component and
+        // `sub/` survives as a real, created directory to assert on.
+        let bytes = zip_bytes(&[
+            ZipSpec::Dir { path: "sub/" },
+            ZipSpec::File {
+                path: "other.txt",
+                data: b"x",
+                mode: 0o644,
+            },
+        ]);
+        let dest = extract(&bytes).unwrap();
+        let m = std::fs::metadata(dest.path().join("sub"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(m, 0o755);
     }
 
     #[test]

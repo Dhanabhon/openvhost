@@ -2224,6 +2224,7 @@ dependencies = [
  "flate2",
  "hex",
  "junction",
+ "libc",
  "reqwest 0.12.28",
  "sha2",
  "tar",
