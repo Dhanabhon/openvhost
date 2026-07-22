@@ -2,7 +2,7 @@
 //! Test-only archive builders. Lets unit tests construct adversarial tar.gz
 //! and zip archives in memory so the extractor is exercised against real
 //! hostile inputs, not mocks.
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::io::Write;
 
@@ -116,4 +116,90 @@ pub(crate) fn temp_file_with(bytes: &[u8]) -> tempfile::NamedTempFile {
     f.write_all(bytes).unwrap();
     f.flush().unwrap();
     f
+}
+
+/// One zip entry to build via [`zip_bytes`]. Mirrors the archive entry kinds
+/// the zip extractor's central-directory walk must classify and validate.
+pub(crate) enum ZipSpec {
+    File {
+        path: &'static str,
+        data: &'static [u8],
+        mode: u32,
+    },
+    Dir {
+        path: &'static str,
+    },
+    Symlink {
+        path: &'static str,
+        target: &'static str,
+    },
+}
+
+/// Build a zip archive in memory from `entries`.
+///
+/// `ZipSpec::Symlink` uses [`zip::write::ZipWriter::add_symlink`], NOT
+/// `SimpleFileOptions::unix_permissions` (an earlier draft of this fixture
+/// tried that): `zip` 2.4.2's `unix_permissions` masks its input with
+/// `& 0o777` (its own doc comment: "cannot be used to denote an entry as a
+/// directory, symlink, or other special file type"), so
+/// `unix_permissions(0o120777)` silently drops the `S_IFLNK` type bits and
+/// would build a PLAIN executable file named "link" — not a symlink entry
+/// at all — defeating the fixture's purpose and the extractor test that
+/// depends on it. `add_symlink` sets the link-type bit directly on the
+/// internal permissions field, bypassing that mask (confirmed against the
+/// vendored `zip-2.4.2` source: `write.rs`'s `add_symlink` ORs in
+/// `ffi::S_IFLNK` after defaulting `permissions`, never routing through the
+/// masked `unix_permissions` setter).
+pub(crate) fn zip_bytes(entries: &[ZipSpec]) -> Vec<u8> {
+    use zip::write::SimpleFileOptions;
+    let mut buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut zw = zip::ZipWriter::new(&mut buf);
+        for e in entries {
+            match e {
+                ZipSpec::File { path, data, mode } => {
+                    let opt = SimpleFileOptions::default().unix_permissions(*mode);
+                    zw.start_file(*path, opt).unwrap();
+                    zw.write_all(data).unwrap();
+                }
+                ZipSpec::Dir { path } => {
+                    zw.add_directory(*path, SimpleFileOptions::default())
+                        .unwrap();
+                }
+                ZipSpec::Symlink { path, target } => {
+                    zw.add_symlink(*path, *target, SimpleFileOptions::default())
+                        .unwrap();
+                }
+            }
+        }
+        zw.finish().unwrap();
+    }
+    buf.into_inner()
+}
+
+/// Flip the "encrypted" bit (general-purpose bit flag, bit 0) directly in
+/// the raw bytes of the FIRST central-directory record of a zip built by
+/// [`zip_bytes`].
+///
+/// This crate doesn't otherwise depend on `zip`'s `aes-crypto` feature (it's
+/// off in `Cargo.toml`, and legacy `ZipCrypto` encryption is only reachable
+/// through a `pub(crate)`-to-the-`zip`-crate method we cannot call), so a
+/// genuinely-encrypted fixture can't be built through the public writer API.
+/// `ZipArchive::new` builds its entry metadata — including `encrypted` —
+/// from the CENTRAL DIRECTORY only (its own doc comment: "ignores local
+/// file headers"), so patching just this one copy of the flag is sufficient
+/// to produce a fixture the extractor sees as encrypted; the local header
+/// copy is never consulted for that check, because `by_index` fails closed
+/// on `(no password supplied, entry encrypted)` before it would ever read
+/// entry content.
+pub(crate) fn mark_first_entry_encrypted(bytes: &mut [u8]) {
+    const CENTRAL_DIR_SIG: [u8; 4] = [0x50, 0x4B, 0x01, 0x02];
+    let pos = bytes
+        .windows(4)
+        .position(|w| w == CENTRAL_DIR_SIG)
+        .expect("fixture must contain a central directory record");
+    // Central directory file header layout (all little-endian): signature
+    // (4 bytes), version made by (2), version needed to extract (2), THEN
+    // the general purpose bit flag (2, bit 0 = encrypted) at offset 8.
+    bytes[pos + 8] |= 0x01;
 }

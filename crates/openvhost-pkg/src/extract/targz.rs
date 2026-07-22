@@ -20,8 +20,8 @@ use std::path::Path;
 use flate2::read::GzDecoder;
 
 use super::validate::{
-    MAX_ENTRIES, MAX_TOTAL_BYTES, RawEntry, collision_key, strip_single_root, validate_entry_name,
-    validate_symlink_target,
+    MAX_ENTRIES, MAX_TOTAL_BYTES, RawEntry, StripInfo, collision_key, strip_single_root,
+    stripped_rel, validate_entry_name, validate_symlink_target,
 };
 use super::{PlannedEntry, PlannedKind};
 use crate::error::PkgError;
@@ -37,43 +37,6 @@ pub(crate) fn extract_targz(archive: &mut fs::File, dest: &Path) -> Result<(), P
     let (plan, strip) = plan_targz(archive)?;
     materialize(archive, &plan, &strip, dest)?;
     Ok(())
-}
-
-/// The pass-1 single-root-strip (S18) decision, captured as data so pass 2
-/// can recompute each entry's final rel via the SAME deterministic
-/// transform ([`stripped_rel`]) instead of re-deriving it by matching raw
-/// names against the plan. The extractor's core guarantee is that pass 2
-/// materializes EXACTLY what pass 1 validated, never an approximation of
-/// it reconstructed by fuzzy string matching.
-struct StripInfo {
-    stripped: bool,
-    root: String,
-}
-
-/// Apply the pass-1 single-root-strip decision to an already-validated raw
-/// rel, deterministically. This is the ONE place either pass computes an
-/// entry's final rel, so they can never disagree:
-/// - not stripped: the rel is unchanged.
-/// - stripped, and `validated_raw` IS the root itself: `None` — this is the
-///   root directory entry the strip drops.
-/// - stripped, and `validated_raw` starts with `root/`: the rel with that
-///   prefix removed.
-/// - stripped, but `validated_raw` shares no relationship with `root`
-///   (only reachable for a hardlink TARGET string, which is an independent
-///   field never covered by `strip_single_root`'s all-entries-share-root
-///   check): `None` — callers fail closed on this (hardlink materialization
-///   rejects a target that doesn't resolve to an extracted file; pass 2's
-///   file loop skips a name absent from the plan).
-fn stripped_rel(validated_raw: &str, strip: &StripInfo) -> Option<String> {
-    if !strip.stripped {
-        return Some(validated_raw.to_string());
-    }
-    if validated_raw == strip.root {
-        return None;
-    }
-    validated_raw
-        .strip_prefix(&format!("{}/", strip.root))
-        .map(|s| s.to_string())
 }
 
 /// Pass 1 — read all headers, validate, build a strip-adjusted plan.

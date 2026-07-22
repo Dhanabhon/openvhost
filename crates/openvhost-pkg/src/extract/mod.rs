@@ -7,6 +7,7 @@
 
 pub(crate) mod targz;
 pub(crate) mod validate;
+pub(crate) mod zip;
 
 /// The extraction-plan contract that `targz`/`zip`'s format walks build
 /// (pass 1) and materialize (pass 2).
