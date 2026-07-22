@@ -2048,11 +2048,13 @@ name = "openvhost-core"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "openvhost-proc",
  "serde",
  "serde_json",
  "specta",
  "tempfile",
  "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]
