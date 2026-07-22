@@ -1,18 +1,23 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! openvhost-pkg — package manager (stub).
+//! openvhost-pkg — download → SHA-256 verify → extract → install pipeline.
 //!
-//! Responsibility (master plan §3.1): download → SHA-256 verify → extract;
-//! packages/<name>/<major>/<full>/ layout with a current link per major;
-//! install/uninstall/upgrade/disable. Implementation lands in the P0-6 slice.
+//! Responsibility (master plan §3.1): fetch a pinned (url, sha256) archive,
+//! verify BEFORE parsing, extract through hardened manual walks, install
+//! atomically to packages/<name>/<major>/<version>/ with a per-major
+//! `current` link. The signed-manifest layer is a separate future slice that
+//! produces `InstallRequest`s for this API. Security invariants: see
+//! docs/superpowers/specs/2026-07-22-p06-pkg-pipeline-design.md §5.
 
-/// Crate marker used until the package manager slice lands.
-pub const CRATE_NAME: &str = "openvhost-pkg";
-
+mod download;
+mod error;
+mod extract;
+mod install;
+mod layout;
+mod platform;
+mod request;
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests {
-    #[test]
-    fn crate_name_is_stable() {
-        assert_eq!(super::CRATE_NAME, "openvhost-pkg");
-    }
-}
+mod testkit;
+
+pub use error::PkgError;
+pub use install::install_package;
+pub use request::{ArchiveFormat, InstallRequest, InstalledPackage, PackagesRoot, Progress};
