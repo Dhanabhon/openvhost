@@ -29,6 +29,11 @@ pub fn find_brew_binaries() -> Option<BrewStack> {
 }
 
 /// Write each generated file to disk under its `path`, creating parents.
+///
+/// `ctx.home` MUST be a throwaway validation home — this writes files into
+/// it NON-ATOMICALLY (plain writes, no tmp+rename). It must never be
+/// pointed at a live home; the apply/swap pipeline (deferred) owns atomic
+/// installation.
 pub(crate) fn materialize(files: &[GeneratedFile]) -> Result<(), ConfError> {
     for f in files {
         if let Some(parent) = f.path.parent() {

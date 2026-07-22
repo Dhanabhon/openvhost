@@ -58,6 +58,10 @@ impl PhpRuntimeAdapter for PhpFpmRuntime {
         }))
     }
 
+    /// `ctx.home` MUST be a throwaway validation home — `validate`
+    /// materializes generated files into it NON-ATOMICALLY (plain writes
+    /// into `config/generated/...`). It must never be pointed at a live
+    /// home; the apply/swap pipeline (deferred) owns atomic installation.
     async fn validate(
         &self,
         php_bin: &Path,

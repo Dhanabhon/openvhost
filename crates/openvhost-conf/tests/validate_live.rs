@@ -46,4 +46,29 @@ async fn generated_stack_passes_native_validators() {
 
     // The php-fpm empty-glob WARNING is expected and must NOT flip ok.
     // (No assertion on stderr emptiness — that is the whole point.)
+
+    // A zero-match `include` glob also passes plain `-t` silently, so `-t`
+    // alone can't prove the main->site include seam actually expanded. `-T`
+    // test-and-dumps the fully resolved config to stdout instead.
+    let main = NginxAdapter.generate_main_config(&ctx).unwrap();
+    let err_log = ctx.home.join("logs/nginx.error.log");
+    let dump = tokio::process::Command::new(&brew.nginx)
+        .arg("-e")
+        .arg(&err_log)
+        .arg("-T")
+        .arg("-c")
+        .arg(&main.path)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        dump.status.success(),
+        "nginx -T failed:\n{}",
+        String::from_utf8_lossy(&dump.stderr)
+    );
+    let dump_out = String::from_utf8_lossy(&dump.stdout);
+    assert!(
+        dump_out.contains("server_name myapp.localhost"),
+        "nginx -T did not show the expanded site include:\n{dump_out}"
+    );
 }

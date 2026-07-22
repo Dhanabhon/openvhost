@@ -17,11 +17,7 @@ pub trait WebServerAdapter: Send + Sync {
     fn id(&self) -> &'static str;
     fn generate_main_config(&self, ctx: &RenderCtx) -> Result<GeneratedFile, ConfError>;
     fn generate_site_config(&self, ctx: &RenderCtx) -> Result<GeneratedFile, ConfError>;
-    async fn validate(
-        &self,
-        nginx_bin: &Path,
-        ctx: &RenderCtx,
-    ) -> Result<ValidationReport, ConfError>;
+    async fn validate(&self, bin: &Path, ctx: &RenderCtx) -> Result<ValidationReport, ConfError>;
     fn supports_hot_reload(&self) -> bool;
 }
 
@@ -109,11 +105,14 @@ impl WebServerAdapter for NginxAdapter {
         })
     }
 
-    async fn validate(
-        &self,
-        nginx_bin: &Path,
-        ctx: &RenderCtx,
-    ) -> Result<ValidationReport, ConfError> {
+    /// `ctx.home` MUST be a throwaway validation home — `validate`
+    /// materializes generated files into it NON-ATOMICALLY (plain writes
+    /// into `config/generated/...`). It must never be pointed at a live
+    /// home; the apply/swap pipeline (deferred) owns atomic installation.
+    /// A clean run here also does NOT prove the REAL home's socket path
+    /// fits `sun_path`: the caller's `MAX_SOCKET_PATH_BYTES <= 103` guard
+    /// against the real home stays authoritative (spec §5).
+    async fn validate(&self, bin: &Path, ctx: &RenderCtx) -> Result<ValidationReport, ConfError> {
         // Materialize main + site into ctx.home, pre-create the dirs `nginx -t`
         // needs (run/, run/nginx/, logs/ — NOT www/), then run the validator.
         let main = self.generate_main_config(ctx)?;
@@ -128,7 +127,7 @@ impl WebServerAdapter for NginxAdapter {
             })?;
         }
         let err_log = ctx.home.join("logs/nginx.error.log");
-        let out = tokio::process::Command::new(nginx_bin)
+        let out = tokio::process::Command::new(bin)
             .arg("-e")
             .arg(&err_log) // MANDATORY: without -e, nginx leaks to /opt/homebrew/var
             .arg("-t")
@@ -137,7 +136,7 @@ impl WebServerAdapter for NginxAdapter {
             .output()
             .await
             .map_err(|e| ConfError::ValidatorSpawn {
-                bin: nginx_bin.display().to_string(),
+                bin: bin.display().to_string(),
                 source: e,
             })?;
         Ok(ValidationReport {

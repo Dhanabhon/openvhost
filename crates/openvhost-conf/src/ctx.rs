@@ -57,6 +57,13 @@ fn valid_component(s: &str) -> bool {
         })
 }
 
+/// nginx `upstream{}` block name token: `[a-z0-9_]`, non-empty.
+fn valid_upstream_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
 impl RenderCtx {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -86,6 +93,13 @@ impl RenderCtx {
                 reason: "must be a safe [a-z0-9._-] path component",
             });
         }
+        if !valid_upstream_name(&upstream_name) {
+            return Err(ConfError::InvalidField {
+                field: "upstream_name",
+                value: upstream_name,
+                reason: "must be a non-empty [a-z0-9_] token",
+            });
+        }
         #[allow(clippy::collapsible_if)]
         if let PhpUpstream::TcpPorts(ports) = &php_upstream {
             if ports.is_empty() {
@@ -105,10 +119,13 @@ impl RenderCtx {
 }
 
 /// The single chokepoint for embedding a path into a config template: reject
-/// non-UTF-8 (Tera cannot render it), normalize `\` to `/`, and strip a
-/// `\\?\` / `\\?\UNC\` verbatim prefix (nginx's parser understands neither).
-/// A no-op on ordinary unix paths.
-#[allow(dead_code)]
+/// non-UTF-8 (Tera cannot render it), normalize `\` to `/`, strip a `\\?\` /
+/// `\\?\UNC\` verbatim prefix (nginx's parser understands neither), and
+/// reject an embedded `"` or ASCII control character — the crate's central
+/// quoting invariant. Every generated directive double-quotes its path
+/// value, so a path containing `"` (e.g. a docroot of
+/// `/tmp/x" ; daemon on; #`) would splice an injected directive that still
+/// passes `nginx -t`. A no-op on ordinary, clean unix paths.
 pub(crate) fn to_config_path(p: &Path) -> Result<String, ConfError> {
     let s = p
         .to_str()
@@ -117,7 +134,15 @@ pub(crate) fn to_config_path(p: &Path) -> Result<String, ConfError> {
         .strip_prefix(r"\\?\UNC\")
         .map(|rest| format!(r"\\{rest}"))
         .unwrap_or_else(|| s.strip_prefix(r"\\?\").unwrap_or(s).to_string());
-    Ok(s.replace('\\', "/"))
+    let s = s.replace('\\', "/");
+    if s.contains('"') || s.bytes().any(|b| b.is_ascii_control()) {
+        return Err(ConfError::InvalidField {
+            field: "path",
+            value: s,
+            reason: "must not contain a double-quote or control character",
+        });
+    }
+    Ok(s)
 }
 
 #[cfg(test)]
@@ -178,6 +203,22 @@ mod tests {
     }
 
     #[test]
+    fn rejects_bad_upstream_name() {
+        for bad in ["php myapp", "php-x", ""] {
+            let r = RenderCtx::new(
+                PathBuf::from("/tmp/ovh"),
+                "a.localhost",
+                PathBuf::from("/tmp/ovh/www"),
+                "127.0.0.1:8080".parse().unwrap(),
+                "8.4",
+                PhpUpstream::UnixSocket(PathBuf::from("/tmp/ovh/run/php-fpm.sock")),
+                bad,
+            );
+            assert!(r.is_err(), "should reject upstream_name {bad:?}");
+        }
+    }
+
+    #[test]
     fn rejects_empty_tcp_upstream() {
         let r = RenderCtx::new(
             PathBuf::from("/tmp/ovh"),
@@ -202,5 +243,19 @@ mod tests {
         // A verbatim prefix is stripped.
         let s3 = to_config_path(std::path::Path::new(r"\\?\C:\x")).unwrap();
         assert_eq!(s3, "C:/x");
+    }
+
+    #[test]
+    fn to_config_path_rejects_quote_and_control_chars() {
+        let quoted = to_config_path(Path::new("/tmp/x\" ; daemon on; #"));
+        assert!(matches!(
+            quoted,
+            Err(ConfError::InvalidField { field: "path", .. })
+        ));
+        let newline = to_config_path(Path::new("/tmp/x\ny"));
+        assert!(matches!(
+            newline,
+            Err(ConfError::InvalidField { field: "path", .. })
+        ));
     }
 }
