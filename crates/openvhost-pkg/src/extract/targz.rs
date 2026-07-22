@@ -32,6 +32,42 @@ fn reject(msg: impl Into<String>) -> PkgError {
     PkgError::UnsafeArchive(msg)
 }
 
+/// A `Read` adapter that errors once cumulative bytes read through it exceed
+/// a fixed cap. Wraps the gzip decompression stream in BOTH extraction
+/// passes (DoS hardening B2) so tar-rs's OWN internal buffering — e.g.
+/// `read_all()`, used for GNU longname/longlink and PAX extended-header
+/// payloads — is bounded by the same decompressed-bytes cap `copy_capped`
+/// enforces for regular file content (S17). Without this, a crafted
+/// long-name/PAX header declaring a multi-GiB payload could be decompressed
+/// and buffered into memory by tar-rs internals before any of our own
+/// per-entry checks ever run.
+struct LimitedReader<R> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R> LimitedReader<R> {
+    fn new(inner: R, cap: u64) -> Self {
+        Self {
+            inner,
+            remaining: cap,
+        }
+    }
+}
+
+impl<R: Read> Read for LimitedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if (n as u64) > self.remaining {
+            return Err(io::Error::other(
+                "decompressed stream exceeds the total-bytes cap",
+            ));
+        }
+        self.remaining -= n as u64;
+        Ok(n)
+    }
+}
+
 /// Extract `archive` (a verified, open handle positioned anywhere) into the
 /// already-created empty directory `dest`. Pass 1 validates the whole archive
 /// and rejects it on any violation; only then does pass 2 write.
@@ -46,7 +82,10 @@ fn plan_targz(archive: &mut fs::File) -> Result<(Vec<PlannedEntry>, StripInfo), 
     archive
         .seek(SeekFrom::Start(0))
         .map_err(|e| io_err("seek", Path::new("<archive>"), e))?;
-    let mut ar = tar::Archive::new(GzDecoder::new(&mut *archive));
+    let mut ar = tar::Archive::new(LimitedReader::new(
+        GzDecoder::new(&mut *archive),
+        MAX_TOTAL_BYTES,
+    ));
 
     // First collect raw (rel, is_dir) for the strip decision + kind metadata.
     struct Staged {
@@ -60,6 +99,15 @@ fn plan_targz(archive: &mut fs::File) -> Result<(Vec<PlannedEntry>, StripInfo), 
 
     for entry in ar.entries().map_err(|e| reject(format!("tar read: {e}")))? {
         let entry = entry.map_err(|e| reject(format!("tar entry: {e}")))?;
+        // Count EVERY entry tar-rs yields us, BEFORE any metadata-type skip
+        // below (DoS hardening B1): `XGlobalHeader`/longname/longlink
+        // entries are otherwise iterated-and-discarded uncounted, so a
+        // crafted archive could stream millions of them past `MAX_ENTRIES`
+        // — a decompress-and-discard DoS that never trips the cap.
+        count += 1;
+        if count > MAX_ENTRIES {
+            return Err(reject("too many entries"));
+        }
         let et = entry.header().entry_type();
         // Skip metadata headers tar-rs may surface; reject dangerous types.
         use tar::EntryType as T;
@@ -68,10 +116,6 @@ fn plan_targz(archive: &mut fs::File) -> Result<(Vec<PlannedEntry>, StripInfo), 
             T::XHeader | T::XGlobalHeader | T::GNULongName | T::GNULongLink
         ) {
             continue;
-        }
-        count += 1;
-        if count > MAX_ENTRIES {
-            return Err(reject("too many entries"));
         }
         let path = entry.path().map_err(|e| reject(format!("bad path: {e}")))?;
         let rel = path
@@ -211,7 +255,10 @@ fn materialize(
     archive
         .seek(SeekFrom::Start(0))
         .map_err(|e| io_err("seek", Path::new("<archive>"), e))?;
-    let mut ar = tar::Archive::new(GzDecoder::new(&mut *archive));
+    let mut ar = tar::Archive::new(LimitedReader::new(
+        GzDecoder::new(&mut *archive),
+        MAX_TOTAL_BYTES,
+    ));
     let mut written: u64 = 0;
     for entry in ar
         .entries()
@@ -247,7 +294,13 @@ fn materialize(
         set_file_mode(&out_path, mode)?;
     }
 
-    // Hardlinks (materialized as copies) — target is an already-extracted file.
+    // Hardlinks (materialized as copies) — target is an already-extracted
+    // file. `fs::copy`'s own return (bytes copied) is folded into the SAME
+    // running `written` total `copy_capped` maintains above, and rejected
+    // past the cap (DoS hardening B3): otherwise, ~100k hardlinks each
+    // copying one already-in-cap file could amplify into a multi-TB disk
+    // write, entirely bypassing the real-bytes cap that governs regular
+    // file content.
     for e in plan {
         if let PlannedKind::Hardlink { target } = &e.kind {
             let src = dest.join(target);
@@ -256,7 +309,11 @@ fn materialize(
             }
             let dst = dest.join(&e.rel);
             ensure_parent(&dst)?;
-            fs::copy(&src, &dst).map_err(|e2| io_err("hardlink copy", &dst, e2))?;
+            let copied = fs::copy(&src, &dst).map_err(|e2| io_err("hardlink copy", &dst, e2))?;
+            written = written.saturating_add(copied);
+            if written > MAX_TOTAL_BYTES {
+                return Err(reject("decompressed size exceeds cap"));
+            }
         }
     }
 
@@ -437,6 +494,55 @@ mod tests {
         let dest = tempfile::tempdir().unwrap();
         extract_targz(tf.as_file_mut(), dest.path())?;
         Ok(dest)
+    }
+
+    #[test]
+    fn limited_reader_errors_once_cumulative_bytes_exceed_the_cap() {
+        // Direct, isolated proof of the new adapter (DoS hardening B2) — no
+        // archive needed to exercise the `Read` impl itself.
+        let data = b"hello world, this is more than ten bytes".to_vec();
+        let mut r = LimitedReader::new(&data[..], 10);
+        let mut buf = [0u8; 4];
+        // First two reads (4 + 4 = 8 bytes) stay under the 10-byte cap.
+        assert_eq!(r.read(&mut buf).unwrap(), 4);
+        assert_eq!(r.read(&mut buf).unwrap(), 4);
+        // Third read would bring the cumulative total to 12, over the cap.
+        assert!(r.read(&mut buf).is_err());
+    }
+
+    #[test]
+    fn limited_reader_allows_reads_up_to_exactly_the_cap() {
+        let data = b"0123456789".to_vec(); // exactly 10 bytes
+        let mut r = LimitedReader::new(&data[..], 10);
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, data);
+    }
+
+    #[test]
+    fn counts_metadata_entries_toward_the_max_entries_cap() {
+        // DoS hardening (B1): tar-rs yields `XGlobalHeader` entries to our
+        // pass-1 loop, and they must count against `MAX_ENTRIES` even
+        // though they're skipped as metadata — otherwise a crafted archive
+        // could stream millions of them past the cap uncounted (a
+        // decompress-and-discard DoS). Build `MAX_ENTRIES + 1` global-header
+        // entries (zero-byte, skipped) and confirm the whole archive is
+        // rejected as "too many entries" rather than silently accepted.
+        use flate2::{Compression, write::GzEncoder};
+        let gz = GzEncoder::new(Vec::new(), Compression::fast());
+        let mut ar = tar::Builder::new(gz);
+        let mut h = tar::Header::new_gnu();
+        h.set_size(0);
+        h.set_entry_type(tar::EntryType::XGlobalHeader);
+        h.set_cksum();
+        for _ in 0..=MAX_ENTRIES {
+            ar.append(&h, io::empty()).unwrap();
+        }
+        let bytes = ar.into_inner().unwrap().finish().unwrap();
+        match extract(&bytes) {
+            Err(PkgError::UnsafeArchive(msg)) => assert_eq!(msg, "too many entries"),
+            other => panic!("expected UnsafeArchive(\"too many entries\"), got {other:?}"),
+        }
     }
 
     #[test]
