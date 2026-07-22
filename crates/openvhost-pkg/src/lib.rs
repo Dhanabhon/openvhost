@@ -11,6 +11,7 @@
 mod download;
 mod error;
 mod extract;
+mod install;
 mod layout;
 mod platform;
 mod request;
@@ -18,4 +19,5 @@ mod request;
 mod testkit;
 
 pub use error::PkgError;
+pub use install::install_package;
 pub use request::{ArchiveFormat, InstallRequest, InstalledPackage, PackagesRoot, Progress};

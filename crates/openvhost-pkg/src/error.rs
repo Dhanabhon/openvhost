@@ -28,4 +28,6 @@ pub enum PkgError {
         #[source]
         source: std::io::Error,
     },
+    #[error("internal error: {0}")]
+    Internal(String),
 }
