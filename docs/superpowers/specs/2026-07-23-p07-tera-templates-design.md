@@ -7,7 +7,7 @@
 
 ## 1. Context
 
-`openvhost-conf` is a stub. This slice gives it the config-generation core: Tera templates → generated nginx + php-fpm configs, plus the native-validator pass that is P0-7's exit criterion. It supersedes the hand-written `NGINX_CONF`/`FPM_CONF` string constants in `crates/openvhost-core/src/platform/macos/demo_stack.rs` (P0-4) with real templates — the generated output is byte-equivalent to that already-shipped, phpinfo-serving stack (macOS consult proved this live). **macOS-first**: the unix/php-fpm path is implemented and validated; the Windows php-cgi upstream + `PhpRuntimeAdapter`-returns-None path is defined in the seam but deferred (Windows-enablement phase), consistent with [[project-scope-macos-first]].
+`openvhost-conf` is a stub. This slice gives it the config-generation core: Tera templates → generated nginx + php-fpm configs, plus the native-validator pass that is P0-7's exit criterion. It supersedes the hand-written `NGINX_CONF`/`FPM_CONF` string constants in `crates/openvhost-core/src/platform/macos/demo_stack.rs` (P0-4) with real templates — the generated output is directive-equivalent to that already-shipped, phpinfo-serving stack (macOS consult proved this live). **macOS-first**: the unix/php-fpm path is implemented and validated; the Windows php-cgi upstream + `PhpRuntimeAdapter`-returns-None path is defined in the seam but deferred (Windows-enablement phase), consistent with [[project-scope-macos-first]].
 
 ## 2. Goals
 
