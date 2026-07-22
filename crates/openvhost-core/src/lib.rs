@@ -12,3 +12,5 @@ mod info;
 pub use error::CoreError;
 pub use home::resolve_home;
 pub use info::{CoreInfo, core_info};
+
+pub mod platform;
