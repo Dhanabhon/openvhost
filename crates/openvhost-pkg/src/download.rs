@@ -382,11 +382,23 @@ mod tests {
         let (url, h) = serve_redirect("http://example.com/evil");
         let u = url::Url::parse(&url).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let result = download_capped(&u, &"0".repeat(64), dir.path(), 1024, |_| {}).await;
+        let err = download_capped(&u, &"0".repeat(64), dir.path(), 1024, |_| {})
+            .await
+            .unwrap_err();
+        // Prove the REDIRECT POLICY rejected the hop (reqwest surfaces a
+        // redirect-kind error whose Display contains "redirect") rather than a
+        // downstream connect/send failure to the target. This makes the test
+        // self-proving regardless of outbound network: a regressed scheme
+        // check that actually followed the redirect would fail with a
+        // connect/send error ("error sending request…"), never "redirect".
+        let PkgError::Network(msg) = &err else {
+            panic!("expected Network error, got {err:?}");
+        };
         assert!(
-            result.is_err(),
-            "redirect to a non-loopback http:// target must be rejected before following"
+            msg.to_lowercase().contains("redirect"),
+            "expected a redirect-policy rejection, got: {msg}"
         );
+        assert!(!dir.path().join("archive").exists());
         h.join().unwrap();
     }
 
@@ -397,11 +409,51 @@ mod tests {
         let (url, h) = serve_redirect("https://user:pw@127.0.0.1:9/evil");
         let u = url::Url::parse(&url).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let result = download_capped(&u, &"0".repeat(64), dir.path(), 1024, |_| {}).await;
+        let err = download_capped(&u, &"0".repeat(64), dir.path(), 1024, |_| {})
+            .await
+            .unwrap_err();
+        let PkgError::Network(msg) = &err else {
+            panic!("expected Network error, got {err:?}");
+        };
         assert!(
-            result.is_err(),
-            "redirect target containing userinfo must be rejected before following"
+            msg.to_lowercase().contains("redirect"),
+            "expected a redirect-policy rejection, got: {msg}"
         );
+        assert!(!dir.path().join("archive").exists());
         h.join().unwrap();
+    }
+
+    /// Hermetic, network-free proof of the per-hop validation LOGIC itself
+    /// (S1) — complements the live-socket redirect tests, which prove reqwest
+    /// wires this check into its redirect policy. A regression in
+    /// `check_scheme_result` is caught here instantly, with zero dependence on
+    /// outbound network reachability.
+    #[test]
+    fn check_scheme_result_rejects_hostile_targets() {
+        let ok = |s: &str| check_scheme_result(&url::Url::parse(s).unwrap()).is_ok();
+        // Rejected: scheme downgrade to a non-loopback host, userinfo, IP-literal.
+        assert!(
+            !ok("http://example.com/evil"),
+            "non-loopback http must be rejected"
+        );
+        assert!(
+            !ok("https://user:pw@example.com/evil"),
+            "userinfo must be rejected"
+        );
+        assert!(
+            !ok("https://1.2.3.4/evil"),
+            "IP-literal host must be rejected"
+        );
+        // Accepted: plain https to a domain.
+        assert!(
+            ok("https://www.php.net/x.tar.gz"),
+            "plain https domain must be accepted"
+        );
+        // Debug-only loopback-http carve-out (S2) — active under `cargo test`.
+        #[cfg(debug_assertions)]
+        assert!(
+            ok("http://127.0.0.1:8080/x"),
+            "debug loopback-http carve-out"
+        );
     }
 }
