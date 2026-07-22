@@ -5,6 +5,9 @@
 
 mod commands;
 
+#[cfg(target_os = "macos")]
+mod stack;
+
 use std::ffi::OsString;
 use std::sync::Arc;
 
@@ -101,6 +104,10 @@ pub fn run() {
             specta_builder.mount_events(app);
             let supervisor = Arc::new(Supervisor::new(default_driver()));
             supervisor.register(demo_ticker_spec());
+            #[cfg(target_os = "macos")]
+            for spec in stack::macos_stack_specs() {
+                supervisor.register(spec);
+            }
             let mut rx = supervisor.subscribe();
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
