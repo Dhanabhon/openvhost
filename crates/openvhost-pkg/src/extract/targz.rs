@@ -34,13 +34,50 @@ fn reject(msg: impl Into<String>) -> PkgError {
 /// already-created empty directory `dest`. Pass 1 validates the whole archive
 /// and rejects it on any violation; only then does pass 2 write.
 pub(crate) fn extract_targz(archive: &mut fs::File, dest: &Path) -> Result<(), PkgError> {
-    let plan = plan_targz(archive)?;
-    materialize(archive, &plan, dest)?;
+    let (plan, strip) = plan_targz(archive)?;
+    materialize(archive, &plan, &strip, dest)?;
     Ok(())
 }
 
+/// The pass-1 single-root-strip (S18) decision, captured as data so pass 2
+/// can recompute each entry's final rel via the SAME deterministic
+/// transform ([`stripped_rel`]) instead of re-deriving it by matching raw
+/// names against the plan. The extractor's core guarantee is that pass 2
+/// materializes EXACTLY what pass 1 validated, never an approximation of
+/// it reconstructed by fuzzy string matching.
+struct StripInfo {
+    stripped: bool,
+    root: String,
+}
+
+/// Apply the pass-1 single-root-strip decision to an already-validated raw
+/// rel, deterministically. This is the ONE place either pass computes an
+/// entry's final rel, so they can never disagree:
+/// - not stripped: the rel is unchanged.
+/// - stripped, and `validated_raw` IS the root itself: `None` — this is the
+///   root directory entry the strip drops.
+/// - stripped, and `validated_raw` starts with `root/`: the rel with that
+///   prefix removed.
+/// - stripped, but `validated_raw` shares no relationship with `root`
+///   (only reachable for a hardlink TARGET string, which is an independent
+///   field never covered by `strip_single_root`'s all-entries-share-root
+///   check): `None` — callers fail closed on this (hardlink materialization
+///   rejects a target that doesn't resolve to an extracted file; pass 2's
+///   file loop skips a name absent from the plan).
+fn stripped_rel(validated_raw: &str, strip: &StripInfo) -> Option<String> {
+    if !strip.stripped {
+        return Some(validated_raw.to_string());
+    }
+    if validated_raw == strip.root {
+        return None;
+    }
+    validated_raw
+        .strip_prefix(&format!("{}/", strip.root))
+        .map(|s| s.to_string())
+}
+
 /// Pass 1 — read all headers, validate, build a strip-adjusted plan.
-fn plan_targz(archive: &mut fs::File) -> Result<Vec<PlannedEntry>, PkgError> {
+fn plan_targz(archive: &mut fs::File) -> Result<(Vec<PlannedEntry>, StripInfo), PkgError> {
     archive
         .seek(SeekFrom::Start(0))
         .map_err(|e| io_err("seek", Path::new("<archive>"), e))?;
@@ -80,7 +117,17 @@ fn plan_targz(archive: &mut fs::File) -> Result<Vec<PlannedEntry>, PkgError> {
 
         let kind = match et {
             T::Regular | T::Continuous => {
+                // Fail fast on the RUNNING declared total (S17): tar-rs
+                // decompresses a skipped entry's data to advance to the next
+                // header, so checking only after the whole enumeration loop
+                // would force decompressing every prior entry's (honestly
+                // declared) huge payload before rejecting — a CPU/wall-clock
+                // DoS in the reject path. Same fail-fast shape as the
+                // MAX_ENTRIES check above.
                 declared_total = declared_total.saturating_add(entry.size());
+                if declared_total > MAX_TOTAL_BYTES {
+                    return Err(reject("declared size exceeds cap"));
+                }
                 PlannedKind::File {
                     mode: entry.header().mode().unwrap_or(0o644),
                 }
@@ -102,11 +149,14 @@ fn plan_targz(archive: &mut fs::File) -> Result<Vec<PlannedEntry>, PkgError> {
         staged.push(Staged { rel, kind, is_dir });
     }
 
-    if declared_total > MAX_TOTAL_BYTES {
-        return Err(reject("declared size exceeds cap"));
-    }
-
-    // Strip single root using the raw view, then carry the adjustment back.
+    // Capture the strip decision as data BEFORE `strip_single_root` mutates
+    // `raws` in place. `root` is only ever consulted through `stripped_rel`,
+    // which pass 2 applies identically to raw archive names — the mutated
+    // `raws` themselves are discarded once we have the boolean decision.
+    let root = staged
+        .first()
+        .map(|s| s.rel.split('/').next().unwrap_or(&s.rel).to_string())
+        .unwrap_or_default();
     let mut raws: Vec<RawEntry> = staged
         .iter()
         .map(|s| RawEntry {
@@ -115,38 +165,36 @@ fn plan_targz(archive: &mut fs::File) -> Result<Vec<PlannedEntry>, PkgError> {
         })
         .collect();
     let stripped = strip_single_root(&mut raws);
+    let strip = StripInfo { stripped, root };
 
-    // Collision check on final paths; also re-validate stripped paths.
+    // Collision check on final paths, computed via the shared deterministic
+    // transform — never a fuzzy re-match, so pass 2 can reproduce the exact
+    // same rel from the raw archive name alone.
     let mut seen: HashSet<String> = HashSet::new();
     let mut plan: Vec<PlannedEntry> = Vec::with_capacity(staged.len());
-    for (s, r) in staged.into_iter().zip(raws) {
-        if r.rel.is_empty() {
-            // the stripped root dir itself — drop it
-            continue;
-        }
-        let rel = if stripped {
-            validate_entry_name(&r.rel)?
-        } else {
-            r.rel
+    for s in staged {
+        let Some(rel) = stripped_rel(&s.rel, &strip) else {
+            continue; // the stripped root dir itself
         };
         if !seen.insert(collision_key(&rel)) {
             return Err(reject(format!("path collision: {rel}")));
         }
-        // Hardlink/symlink targets were validated pre-strip; recompute hardlink
-        // target against the stripped tree if a strip happened.
+        // Hardlink targets are an independent field (not covered by
+        // `strip_single_root`'s all-entries-share-root check), so recompute
+        // via the SAME deterministic transform rather than a blind
+        // split_once('/') chop; if it doesn't share the stripped root, leave
+        // it unchanged — pass 2's "hardlink target missing" check then fails
+        // closed on it rather than silently misresolving.
         let kind = match s.kind {
-            PlannedKind::Hardlink { target } if stripped => {
-                let t = target
-                    .split_once('/')
-                    .map(|(_, r)| r.to_string())
-                    .unwrap_or(target);
+            PlannedKind::Hardlink { target } if strip.stripped => {
+                let t = stripped_rel(&target, &strip).unwrap_or(target);
                 PlannedKind::Hardlink { target: t }
             }
             other => other,
         };
         plan.push(PlannedEntry { rel, kind });
     }
-    Ok(plan)
+    Ok((plan, strip))
 }
 
 fn link_target(entry: &tar::Entry<'_, impl Read>) -> Result<String, PkgError> {
@@ -163,7 +211,12 @@ fn link_target(entry: &tar::Entry<'_, impl Read>) -> Result<String, PkgError> {
 /// fresh decoder, real-bytes cap), then deferred hardlinks (copy) and finally
 /// symlinks (S14: last, after the tree exists, so no ancestor is a symlink at
 /// creation time), then strip macOS quarantine xattrs (S19).
-fn materialize(archive: &mut fs::File, plan: &[PlannedEntry], dest: &Path) -> Result<(), PkgError> {
+fn materialize(
+    archive: &mut fs::File,
+    plan: &[PlannedEntry],
+    strip: &StripInfo,
+    dest: &Path,
+) -> Result<(), PkgError> {
     // Directories first, shallow→deep.
     let mut dirs: Vec<&PlannedEntry> = plan
         .iter()
@@ -185,7 +238,11 @@ fn materialize(archive: &mut fs::File, plan: &[PlannedEntry], dest: &Path) -> Re
         })
         .collect();
 
-    // Re-seek to 0 and re-derive the same stripped rel for each Regular entry.
+    // Re-seek to 0 and re-derive each Regular entry's rel via the SAME
+    // deterministic transform pass 1 used — never a fuzzy match against the
+    // plan. (A fuzzy match is how a nested segment that happens to reuse
+    // the stripped root's own name could previously mismap, or silently
+    // drop, a validated file — see the pass2_rel_matches_pass1_* tests.)
     archive
         .seek(SeekFrom::Start(0))
         .map_err(|e| io_err("seek", Path::new("<archive>"), e))?;
@@ -206,9 +263,13 @@ fn materialize(archive: &mut fs::File, plan: &[PlannedEntry], dest: &Path) -> Re
             .to_str()
             .ok_or_else(|| reject("path not utf-8"))?
             .replace('\\', "/");
-        let rel = plan_rel_for(&raw, plan)?;
+        let cleaned = validate_entry_name(&raw)?;
+        let Some(rel) = stripped_rel(&cleaned, strip) else {
+            continue; // the stripped root dir itself
+        };
         let Some(&mode) = file_modes.get(rel.as_str()) else {
-            continue; // stripped root dir or non-file
+            continue; // not a plan File entry — shouldn't happen for a
+            // pass-1-accepted archive; fail closed by skipping
         };
         let out_path = dest.join(&rel);
         ensure_parent(&out_path)?;
@@ -234,10 +295,16 @@ fn materialize(archive: &mut fs::File, plan: &[PlannedEntry], dest: &Path) -> Re
         }
     }
 
-    // Symlinks last.
+    // Symlinks last (S14: after the tree exists, so no ancestor is a
+    // symlink at creation time). Verify every ancestor is a REAL directory
+    // before creating each link: `create_dir_all` treats a PRE-EXISTING
+    // symlink as an acceptable stand-in directory and silently walks
+    // through it, which would let a later symlink in this same archive
+    // land somewhere it was never validated to reach.
     for e in plan {
         if let PlannedKind::Symlink { target } = &e.kind {
             let link = dest.join(&e.rel);
+            verify_real_ancestors(dest, &link)?;
             ensure_parent(&link)?;
             create_symlink(target, &link)?;
         }
@@ -245,25 +312,6 @@ fn materialize(archive: &mut fs::File, plan: &[PlannedEntry], dest: &Path) -> Re
 
     strip_quarantine(dest);
     Ok(())
-}
-
-/// Map a raw pass-2 entry name to its planned (post-strip) rel by matching
-/// against the plan the way pass 1 built it. The plan already applied the
-/// single-root strip, so recompute: try the raw name and its once-stripped
-/// form, returning whichever the plan contains.
-fn plan_rel_for(raw: &str, plan: &[PlannedEntry]) -> Result<String, PkgError> {
-    let cleaned = validate_entry_name(raw)?;
-    if plan.iter().any(|e| e.rel == cleaned) {
-        return Ok(cleaned);
-    }
-    if let Some((_, after)) = cleaned.split_once('/')
-        && plan.iter().any(|e| e.rel == after)
-    {
-        return Ok(after.to_string());
-    }
-    // Not in plan (e.g. the stripped root dir entry) — return cleaned; caller
-    // skips names absent from file_modes.
-    Ok(cleaned)
 }
 
 /// Copy with a running total cap over REAL decompressed bytes (S17).
@@ -343,6 +391,40 @@ fn clamp_mode(mode: u32) -> u32 {
 fn ensure_parent(p: &Path) -> Result<(), PkgError> {
     if let Some(parent) = p.parent() {
         fs::create_dir_all(parent).map_err(|e| io_err("create_dir", parent, e))?;
+    }
+    Ok(())
+}
+
+/// Verify every ancestor directory between `dest` and `path`'s parent is
+/// EITHER not yet created (fine — the caller creates it for real via
+/// `ensure_parent`) or an actual directory, never a symlink.
+///
+/// Symlinks are materialized last (S14). If an ancestor here is already a
+/// symlink, some EARLIER symlink entry in this same archive put it there.
+/// `fs::create_dir_all` treats an existing symlink-to-a-directory as an
+/// acceptable stand-in and silently walks through it — which would let
+/// THIS symlink land somewhere the archive was never validated to reach
+/// (e.g. `a -> b` then `a/c -> ...` would actually create `b/c`, not
+/// `a/c`). Reject the whole archive instead of walking through it.
+fn verify_real_ancestors(dest: &Path, path: &Path) -> Result<(), PkgError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    for ancestor in parent.ancestors() {
+        if ancestor == dest {
+            break;
+        }
+        match fs::symlink_metadata(ancestor) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(reject(format!(
+                    "symlink ancestor in path: {}",
+                    ancestor.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_err("stat", ancestor, e)),
+        }
     }
     Ok(())
 }
@@ -561,5 +643,115 @@ mod tests {
             & 0o7777;
         assert_eq!(ex, 0o755, "exec bit kept, setuid stripped");
         assert_eq!(da, 0o644, "no exec bit");
+    }
+
+    #[test]
+    fn pass2_rel_matches_pass1_when_nested_dir_reuses_root_name() {
+        // Regression for a pass-2 mismap: a nested directory happens to be
+        // named the same as the archive's stripped root ("root/root/target/"
+        // strips to "root/target"), which collides TEXTUALLY with another
+        // entry's own (pre-strip) raw name ("root/target", the file). The
+        // old fuzzy raw-vs-plan string match resolved the file's raw name
+        // "root/target" against that directory's (coincidentally identical)
+        // plan rel instead of stripping it to "target", missed
+        // `file_modes`, and silently dropped the file: `extract()` returned
+        // `Ok` but `dest/target` was never written. The shared deterministic
+        // `stripped_rel` transform can't make this mistake — it recomputes
+        // from the raw name alone, never by matching against the plan.
+        let bytes = targz_bytes(&[
+            TarSpec::Dir { path: "root/" },
+            TarSpec::Dir {
+                path: "root/root/target/",
+            },
+            TarSpec::File {
+                path: "root/target",
+                data: b"AAA",
+                mode: 0o644,
+            },
+        ]);
+        let dest = extract(&bytes).unwrap();
+        assert!(dest.path().join("root/target").is_dir());
+        assert_eq!(std::fs::read(dest.path().join("target")).unwrap(), b"AAA");
+    }
+
+    #[test]
+    fn pass2_rel_matches_pass1_for_two_files_sharing_a_reused_segment_name() {
+        // Same ambiguity as above, but with two Regular entries: nested file
+        // "root/root/x" strips to "root/x", which is also the OTHER file's
+        // own pre-strip raw name. Pass 1 validates both as distinct,
+        // non-colliding plan entries ("root/x" and "x"). The old fuzzy match
+        // resolved entry2's raw "root/x" against entry1's (already-used)
+        // plan rel "root/x" instead of stripping it to "x", so the second
+        // `create_new` collided with the first write — a pass-1-accepted,
+        // non-colliding archive that pass 2 nonetheless failed to
+        // materialize. Confirms no partial/misdirected write: each file
+        // lands at its own distinct, correct path with its own content.
+        let bytes = targz_bytes(&[
+            TarSpec::Dir { path: "root/" },
+            TarSpec::File {
+                path: "root/root/x",
+                data: b"NESTED",
+                mode: 0o644,
+            },
+            TarSpec::File {
+                path: "root/x",
+                data: b"TOPLEVEL",
+                mode: 0o644,
+            },
+        ]);
+        let dest = extract(&bytes).unwrap();
+        assert_eq!(
+            std::fs::read(dest.path().join("root/x")).unwrap(),
+            b"NESTED"
+        );
+        assert_eq!(std::fs::read(dest.path().join("x")).unwrap(), b"TOPLEVEL");
+    }
+
+    #[test]
+    fn rejects_symlink_ancestor_traversal() {
+        // S14: `fs::create_dir_all` treats a PRE-EXISTING symlink as an
+        // acceptable stand-in directory and silently walks through it.
+        // Without an explicit real-ancestor check, "a/c" would actually be
+        // created at "b/c" (through the "a -> b" symlink created moments
+        // earlier in this same materialize pass) instead of failing closed.
+        // Both symlinks pass `validate_symlink_target` independently (each
+        // target, "b", is a plain sibling-relative name) — only the
+        // ancestor-is-a-real-directory check at creation time catches this.
+        let bytes = targz_bytes(&[
+            TarSpec::Dir { path: "b/" },
+            TarSpec::Symlink {
+                path: "a",
+                target: "b",
+            },
+            TarSpec::Symlink {
+                path: "a/c",
+                target: "b",
+            },
+        ]);
+        assert!(extract(&bytes).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn strip_quarantine_removes_apple_xattrs() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("quarantined");
+        std::fs::write(&file_path, b"x").unwrap();
+        xattr::set(&file_path, "com.apple.quarantine", b"0083;00000000;Test;").unwrap();
+        assert!(
+            xattr::list(&file_path)
+                .unwrap()
+                .any(|n| n.to_string_lossy() == "com.apple.quarantine"),
+            "test setup: xattr should be present before strip_quarantine runs"
+        );
+
+        strip_quarantine(dir.path());
+
+        assert!(
+            !xattr::list(&file_path)
+                .unwrap()
+                .any(|n| n.to_string_lossy() == "com.apple.quarantine"),
+            "com.apple.quarantine should be removed after strip_quarantine"
+        );
     }
 }
