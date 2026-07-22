@@ -4,7 +4,7 @@
 
 - **Date:** 2026-07-21
 - **Status:** Approved in brainstorming session; updated same day for master plan v1.1 (license decided: GPL-3.0-or-later); pending user review
-- **Source of truth:** `docs/OPENSERV_MASTER_PLAN.md` v1.1 (committed ahead of bootstrap when the v1.1 update arrived mid-review). This spec covers master-plan tasks **P0-1** and **P0-2** plus project bootstrap. It changes no master-plan decision.
+- **Source of truth:** `docs/OPENSERV_MASTER_PLAN.md` v1.1 (committed ahead of bootstrap when the v1.1 update arrived mid-review; superseded by `docs/OPENVHOST_MASTER_PLAN.md` v1.2 — see rename note above). This spec covers master-plan tasks **P0-1** and **P0-2** plus project bootstrap. It changes no master-plan decision.
 
 ## 1. Context
 
