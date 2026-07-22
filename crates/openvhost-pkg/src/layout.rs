@@ -141,9 +141,13 @@ fn is_stale(entry: &fs::DirEntry, now: SystemTime) -> bool {
 }
 
 /// Remove `path` ONLY if we can take its `.lock` file exclusively — i.e. no
-/// live [`Staging`] holds it. A missing `.lock` (older format, or a partial
-/// staging dir that never got as far as creating one) is treated as safe to
-/// remove, since staleness was already established by the caller.
+/// live [`Staging`] holds it — OR the `.lock` file is genuinely absent
+/// (`NotFound`: older format, or a partial staging dir that never got as far
+/// as creating one), which is safe to remove since staleness was already
+/// established by the caller. Any OTHER open error (`EMFILE`, `EACCES`, …)
+/// is NOT evidence of an orphan — it may just mean this process is
+/// transiently unable to check — so it is left alone; the next sweep
+/// reconsiders it.
 fn remove_if_unlocked(path: &Path) {
     let lock_path = path.join(".lock");
     match fs::OpenOptions::new().write(true).open(&lock_path) {
@@ -154,8 +158,12 @@ fn remove_if_unlocked(path: &Path) {
             // Else: a live Staging holds the lock (EWOULDBLOCK) -> skip.
             // `lock_file` drops here regardless, releasing any lock we took.
         }
-        Err(_) => {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
             let _ = fs::remove_dir_all(path);
+        }
+        Err(_) => {
+            // Transient/permission error opening the lock file: NOT proof
+            // of an orphan. Skip rather than risk deleting a live install.
         }
     }
 }
@@ -342,5 +350,49 @@ mod tests {
             "sweep must remove a stale dir once its lock is free"
         );
         std::mem::forget(leaked_dir); // already gone; nothing left to clean up
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_stale_removes_a_stale_dir_with_no_lock_file_at_all() {
+        // NotFound branch: a stale staging dir with NO `.lock` file at all
+        // (older format, or a partial staging dir that never got as far as
+        // creating one) is a true orphan and must still be removed.
+        let (_h, r) = root();
+        std::fs::create_dir_all(r.staging_root()).unwrap();
+        let staging = tempfile::tempdir_in(r.staging_root()).unwrap();
+        let dir_path = staging.path().to_path_buf();
+        set_mtime_past(&dir_path, STALE_AFTER + Duration::from_secs(60));
+
+        sweep_stale(&r);
+        assert!(
+            !dir_path.exists(),
+            "a stale dir with no .lock file at all must be removed as a true orphan"
+        );
+    }
+
+    // GROUP C (security audit): the fix this test locks in. Previously ANY
+    // `.lock` open error — including EMFILE/EACCES, not just a genuinely
+    // missing file — was treated as proof of an orphan and deleted. Forcing
+    // `.lock` itself to be a directory produces a deterministic, portable
+    // "can't open as a plain file" error with no dependency on permission
+    // bits (which a root-run process would simply bypass) — nothing else
+    // reliably fails an `OpenOptions::write(true).open` call the same way
+    // on every platform/user. This must now be SKIPPED, not deleted.
+    #[cfg(unix)]
+    #[test]
+    fn sweep_stale_skips_a_stale_dir_when_lock_path_is_not_a_plain_file() {
+        let (_h, r) = root();
+        std::fs::create_dir_all(r.staging_root()).unwrap();
+        let staging = tempfile::tempdir_in(r.staging_root()).unwrap();
+        let dir_path = staging.path().to_path_buf();
+        std::fs::create_dir(dir_path.join(".lock")).unwrap();
+        set_mtime_past(&dir_path, STALE_AFTER + Duration::from_secs(60));
+
+        sweep_stale(&r);
+        assert!(
+            dir_path.is_dir(),
+            "a non-NotFound .lock open error must not be treated as proof of an orphan"
+        );
     }
 }
