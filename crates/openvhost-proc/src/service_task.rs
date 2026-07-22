@@ -36,7 +36,9 @@ async fn finish(
     let state = classify_exit(stop_flag.load(Ordering::SeqCst), status.as_ref(), tail);
     let detail = match (&state, status) {
         (ServiceState::Failed { .. }, Some(s)) => Some(format!("exited with {s}")),
-        (ServiceState::Failed { .. }, None) => Some("exited before startup completed".to_string()),
+        (ServiceState::Failed { .. }, None) => {
+            Some("exit status unavailable (spawn failed or wait errored)".to_string())
+        }
         (_, Some(s)) => Some(format!("{s}")),
         _ => None,
     };

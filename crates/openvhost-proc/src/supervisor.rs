@@ -119,7 +119,7 @@ impl Supervisor {
     /// Must be called from within a tokio runtime context: spawns the
     /// service task with `tokio::spawn`.
     pub fn start(&self, id: &str) -> Result<(), ProcError> {
-        let (spawn, stop_flag, control_rx) = {
+        let (spawn, stop_flag, control_rx, prior) = {
             let mut entries = self.inner.entries.lock().unwrap_or_else(|e| e.into_inner());
             let e = entries
                 .get_mut(id)
@@ -127,6 +127,11 @@ impl Supervisor {
             if matches!(e.state, ServiceState::Starting | ServiceState::Running) {
                 return Ok(());
             }
+            let prior = match &e.state {
+                ServiceState::Stopped => "Stopped",
+                ServiceState::Failed { .. } => "Failed",
+                _ => "?",
+            };
             e.stop_requested.store(false, Ordering::SeqCst);
             let (ctl_tx, ctl_rx) = mpsc::channel(1);
             e.control = Some(ctl_tx);
@@ -138,7 +143,12 @@ impl Supervisor {
             // pre-Starting state, pass the guard too, and spawn a second
             // service_task for the same id (double-spawn).
             e.state = ServiceState::Starting;
-            (e.spec.spawn.clone(), Arc::clone(&e.stop_requested), ctl_rx)
+            (
+                e.spec.spawn.clone(),
+                Arc::clone(&e.stop_requested),
+                ctl_rx,
+                prior,
+            )
         };
         // The state was already written above under the lock; only emit the
         // notification here. Do NOT re-lock to "set" it again — that would
@@ -152,7 +162,7 @@ impl Supervisor {
         Inner::push_supervisor_log(
             &self.inner,
             id,
-            "state Stopped → Starting (requested by user)".to_string(),
+            format!("state {prior} → Starting (requested by user)"),
         );
         let inner = Arc::clone(&self.inner);
         let id_owned = id.to_string();

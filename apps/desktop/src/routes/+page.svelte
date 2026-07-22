@@ -31,12 +31,12 @@
 		let unsubs: Array<() => void> = [];
 		(async () => {
 			try {
-				await store.init();
-				info = await coreInfo();
 				unsubs = await Promise.all([
 					onServiceState((ev) => store.applyState(ev)),
 					onServiceLog((ev) => store.applyLog(ev))
 				]);
+				await store.init();
+				info = await coreInfo();
 			} catch (e) {
 				error = e as IpcError;
 			}
