@@ -1,18 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! openvhost-conf — config generator (stub).
-//!
-//! Responsibility (master plan §3.1): Tera templates → generated configs,
-//! atomic writes, native-validator + diff-preview pipeline, WebServerAdapter
-//! boundary. Implementation lands in the P0-7 slice.
+//! openvhost-conf — generated-config engine (Tera templates → nginx + php-fpm
+//! configs) with a native-validator pass. Pure generation: same input ⇒
+//! byte-identical output; never reads prior generated output. See
+//! docs/superpowers/specs/2026-07-23-p07-tera-templates-design.md.
 
-/// Crate marker used until the config generator slice lands.
-pub const CRATE_NAME: &str = "openvhost-conf";
+mod ctx;
+mod error;
 
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests {
-    #[test]
-    fn crate_name_is_stable() {
-        assert_eq!(super::CRATE_NAME, "openvhost-conf");
-    }
-}
+pub use ctx::{GeneratedFile, PhpUpstream, RenderCtx, ValidationReport};
+pub use error::ConfError;
