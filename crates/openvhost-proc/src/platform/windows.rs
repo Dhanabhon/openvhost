@@ -16,6 +16,7 @@ use std::process::Stdio;
 use windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent;
 
 use super::{PlatformHandle, ProcessDriver, SpawnSpec, SpawnedChild, assemble_env};
+use crate::orphan::{BootId, OrphanReaper, ProcStartTime, ReapKind};
 
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -67,5 +68,39 @@ impl ProcessDriver for WindowsDriver {
         // v0: direct TerminateProcess via tokio (single process, no tree).
         // P0-5 replaces this with TerminateJobObject on the app-wide job.
         child.child.start_kill()
+    }
+}
+
+/// Windows start-time via OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) +
+/// GetProcessTimes creation time. Deferred to the Windows-enablement phase.
+///
+/// Called unconditionally (P0-8 Task 4) via `platform::process_start_time`
+/// from `Inner::record_running` on every platform — on Windows this always
+/// returns `Err`, which `record_running` logs via `tracing::warn!` and
+/// otherwise ignores (best-effort recording, never fatal).
+#[cfg(windows)]
+pub(crate) fn process_start_time(_pid: u32) -> io::Result<Option<ProcStartTime>> {
+    Err(io::Error::other(
+        "process_start_time is not implemented on Windows in v1 (macOS-first)",
+    ))
+}
+
+/// `#[allow(dead_code)]` dropped (P0-8 Task 2): `registry::load()` calls this
+/// via `platform::current_boot_id()` from production code now, on this
+/// target too (the stub still returns an error — Windows-enablement phase).
+#[cfg(windows)]
+pub(crate) fn current_boot_id() -> io::Result<BootId> {
+    Err(io::Error::other(
+        "current_boot_id is not implemented on Windows in v1 (macOS-first)",
+    ))
+}
+
+pub(crate) struct WindowsReaper;
+
+impl OrphanReaper for WindowsReaper {
+    fn reap(&self, _pid: u32) -> io::Result<ReapKind> {
+        Err(io::Error::other(
+            "orphan reap is not implemented on Windows in v1 (macOS-first)",
+        ))
     }
 }

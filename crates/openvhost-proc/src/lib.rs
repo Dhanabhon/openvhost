@@ -9,6 +9,7 @@
 mod error;
 pub mod events;
 mod log;
+mod orphan;
 pub mod platform;
 mod service_task;
 mod state;
@@ -17,5 +18,11 @@ pub mod testchild;
 
 pub use error::ProcError;
 pub use events::{LogLevel, LogLine, ServiceState, ServiceStatus, StreamSource, SupervisorEvent};
-pub use platform::{OutputStream, ProcessDriver, SpawnSpec, SpawnedChild, default_driver};
+pub use orphan::{
+    BootId, FileRegistry, InstanceLock, OrphanReaper, ProcIdentity, ProcStartTime, ProcessRegistry,
+    RegistrySnapshot, SupervisedRecord,
+};
+pub use platform::{
+    OutputStream, ProcessDriver, SpawnSpec, SpawnedChild, default_driver, default_reaper,
+};
 pub use supervisor::{ServiceSpec, Supervisor};

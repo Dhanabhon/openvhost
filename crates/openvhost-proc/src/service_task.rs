@@ -48,6 +48,14 @@ async fn finish(
         _ => "?",
     };
     Inner::push_supervisor_log(inner, id, format!("state → {label}"));
+    // A process we ourselves observed exit (however it exited — clean stop,
+    // failure, or a spawn that never got a pid) is by definition not an
+    // orphan: remove its record so a future reap never considers it.
+    // Best-effort: a failed remove only risks a future leaked orphan (an
+    // already-dead pid reaps to a harmless no-op), never a wrong kill.
+    if let Err(e) = inner.registry.remove(id) {
+        tracing::warn!(service_id = id, error = %e, "failed to remove supervised-process record on terminal state");
+    }
     Inner::set_state(inner, id, state, detail);
 }
 
@@ -72,6 +80,9 @@ pub(crate) async fn run(
         }
     };
     Inner::set_pid(&inner, &id, child.id());
+    if let Some(pid) = child.id() {
+        Inner::record_running(&inner, &id, pid);
+    }
     Inner::push_supervisor_log(&inner, &id, format!("spawned pid {:?}", child.id()));
     if let Some(out) = child.take_stdout() {
         spawn_reader(Arc::clone(&inner), id.clone(), StreamSource::Stdout, out);

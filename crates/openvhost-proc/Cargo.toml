@@ -7,8 +7,10 @@ publish.workspace = true
 
 [dependencies]
 serde.workspace = true
+serde_json = "1"
 thiserror.workspace = true
 tokio.workspace = true
+tracing = "0.1"
 specta = { version = "2.0.0-rc.25", optional = true, features = ["derive"] }
 
 [target.'cfg(unix)'.dependencies]
@@ -21,8 +23,8 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 specta = ["dep:specta"]
 
 [dev-dependencies]
-serde_json = "1"
 libc = "0.2"
+tempfile = "3"
 
 [lints]
 workspace = true

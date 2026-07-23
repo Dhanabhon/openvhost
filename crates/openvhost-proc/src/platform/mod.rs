@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::sync::Arc;
 
+use crate::orphan::{BootId, OrphanReaper, ProcStartTime};
+
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
@@ -160,6 +162,51 @@ pub fn default_driver() -> Arc<dyn ProcessDriver> {
     {
         Arc::new(windows::WindowsDriver)
     }
+}
+
+pub fn default_reaper() -> Arc<dyn OrphanReaper> {
+    #[cfg(unix)]
+    {
+        Arc::new(unix::UnixReaper)
+    }
+    #[cfg(windows)]
+    {
+        Arc::new(windows::WindowsReaper)
+    }
+}
+
+// Widened `pub(crate)` -> `pub` (P0-8 Task 4): `Inner::record_running`
+// (in-crate) calls this unconditionally on both platforms, and the
+// macOS-gated exit-criterion integration test (`tests/orphan_reap.rs`) needs
+// to read a process's start-time from OUTSIDE the crate to construct a
+// `SupervisedRecord` for a process spawned directly by the test (never
+// through a `Supervisor`) — that test only has the crate's public API.
+#[cfg(unix)]
+pub fn process_start_time(pid: u32) -> std::io::Result<Option<ProcStartTime>> {
+    unix::process_start_time(pid)
+}
+#[cfg(windows)]
+pub fn process_start_time(pid: u32) -> std::io::Result<Option<ProcStartTime>> {
+    windows::process_start_time(pid)
+}
+
+// `current_boot_id`'s `#[allow(dead_code)]` was dropped here (P0-8 Task 2):
+// `registry::load()` is now a real, non-test caller on both dispatch arms.
+#[cfg(unix)]
+pub(crate) fn current_boot_id() -> std::io::Result<BootId> {
+    unix::current_boot_id()
+}
+#[cfg(windows)]
+pub(crate) fn current_boot_id() -> std::io::Result<BootId> {
+    windows::current_boot_id()
+}
+
+// `#[allow(dead_code)]` dropped (P0-8 Task 3): `reap::reject_reason` now
+// calls this via `platform::getpgid(std::process::id())` from production
+// code (the `#[cfg(unix)]` `reap_orphans` body).
+#[cfg(unix)]
+pub(crate) fn getpgid(pid: u32) -> std::io::Result<u32> {
+    unix::getpgid(pid)
 }
 
 #[cfg(test)]
