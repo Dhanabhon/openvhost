@@ -74,12 +74,11 @@ impl ProcessDriver for WindowsDriver {
 /// Windows start-time via OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) +
 /// GetProcessTimes creation time. Deferred to the Windows-enablement phase.
 ///
-/// `#[allow(dead_code)]`: only called via `platform::process_start_time`,
-/// which itself has no caller on Windows until Task 2/3 wires in the
-/// registry/reaper (the macOS-gated tests that exercise the dispatch layer
-/// today are `cfg(target_os = "macos")` and don't exist on this target).
+/// Called unconditionally (P0-8 Task 4) via `platform::process_start_time`
+/// from `Inner::record_running` on every platform — on Windows this always
+/// returns `Err`, which `record_running` logs via `tracing::warn!` and
+/// otherwise ignores (best-effort recording, never fatal).
 #[cfg(windows)]
-#[allow(dead_code)]
 pub(crate) fn process_start_time(_pid: u32) -> io::Result<Option<ProcStartTime>> {
     Err(io::Error::other(
         "process_start_time is not implemented on Windows in v1 (macOS-first)",

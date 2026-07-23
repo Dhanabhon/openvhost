@@ -175,24 +175,18 @@ pub fn default_reaper() -> Arc<dyn OrphanReaper> {
     }
 }
 
-// `#[allow(dead_code)]` dropped on the unix arm (P0-8 Task 3): the
-// `#[cfg(unix)]` `reap_orphans` body is now a real, non-test caller of this
-// wrapper on macOS. The `#[cfg(windows)]` arm below KEEPS its allow: on that
-// target `reap_orphans` compiles to the `#[cfg(not(unix))]` stub, which does
-// NOT call this — still no production caller until the Windows-enablement
-// phase actually wires up Windows reaping. (`current_boot_id` below already
-// got its real, non-test caller in Task 2 — see its own note.)
+// Widened `pub(crate)` -> `pub` (P0-8 Task 4): `Inner::record_running`
+// (in-crate) calls this unconditionally on both platforms, and the
+// macOS-gated exit-criterion integration test (`tests/orphan_reap.rs`) needs
+// to read a process's start-time from OUTSIDE the crate to construct a
+// `SupervisedRecord` for a process spawned directly by the test (never
+// through a `Supervisor`) — that test only has the crate's public API.
 #[cfg(unix)]
-pub(crate) fn process_start_time(pid: u32) -> std::io::Result<Option<ProcStartTime>> {
+pub fn process_start_time(pid: u32) -> std::io::Result<Option<ProcStartTime>> {
     unix::process_start_time(pid)
 }
-// `#[allow(dead_code)]` KEPT: no production caller on Windows yet (see the
-// unix-arm comment above) — only the `windows::process_start_time` impl
-// itself is called here, and that impl also keeps its own allow for the
-// same reason.
 #[cfg(windows)]
-#[allow(dead_code)]
-pub(crate) fn process_start_time(pid: u32) -> std::io::Result<Option<ProcStartTime>> {
+pub fn process_start_time(pid: u32) -> std::io::Result<Option<ProcStartTime>> {
     windows::process_start_time(pid)
 }
 

@@ -36,6 +36,7 @@ pub(crate) struct Inner {
     pub(crate) driver: Arc<dyn ProcessDriver>,
     pub(crate) entries: Mutex<HashMap<String, Entry>>,
     pub(crate) tx: broadcast::Sender<SupervisorEvent>,
+    pub(crate) registry: Arc<dyn crate::orphan::ProcessRegistry>,
 }
 
 #[derive(Clone)]
@@ -51,13 +52,47 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 impl Supervisor {
+    /// Construct a supervisor with NO crash-orphan cleanup: nothing is ever
+    /// recorded or reaped (backed by a [`crate::orphan::NoopRegistry`]).
+    /// Delegates to [`Supervisor::with_orphan_cleanup`] — reaping an always-
+    /// empty `NoopRegistry` touches no filesystem and kills nothing, so this
+    /// keeps every pre-P0-8-Task-4 caller's observable behavior byte-for-byte
+    /// unchanged while sharing one code path. Prefer
+    /// [`Supervisor::with_orphan_cleanup`] for any supervisor that should
+    /// participate in crash-orphan cleanup (spec §6/§7/§9) — that is what the
+    /// desktop app uses.
     pub fn new(driver: Arc<dyn ProcessDriver>) -> Self {
+        Self::with_orphan_cleanup(
+            driver,
+            Arc::new(crate::orphan::NoopRegistry),
+            crate::platform::default_reaper(),
+        )
+    }
+
+    /// Construct a supervisor that participates in crash-orphan cleanup:
+    /// reaps any orphans recorded by a PRIOR run against this same
+    /// `registry` before returning, then holds `registry` for record-at-spawn
+    /// (`Inner::record_running`) and remove-on-terminal-state
+    /// (`service_task::finish`).
+    ///
+    /// Safety invariant (spec §6): the reap runs BEFORE `Inner`/its entry map
+    /// exist, so no service can be registered or started until it completes
+    /// — a freshly spawned child can never be mistaken for a record this
+    /// same run just wrote.
+    pub fn with_orphan_cleanup(
+        driver: Arc<dyn ProcessDriver>,
+        registry: Arc<dyn crate::orphan::ProcessRegistry>,
+        reaper: Arc<dyn crate::orphan::OrphanReaper>,
+    ) -> Self {
+        let report = crate::orphan::reap_orphans(&*registry, &*reaper);
+        tracing::info!(?report, "supervisor: orphan reap complete");
         let (tx, _) = broadcast::channel(256);
         Self {
             inner: Arc::new(Inner {
                 driver,
                 entries: Mutex::new(HashMap::new()),
                 tx,
+                registry,
             }),
         }
     }
@@ -238,6 +273,31 @@ impl Inner {
         let mut entries = inner.entries.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(e) = entries.get_mut(id) {
             e.pid = pid;
+        }
+    }
+
+    /// Record identity at SPAWN, not at Running (spec §9, adopted): the
+    /// start-time is read immediately — same source as the reap-time compare
+    /// — shrinking the unrecorded-orphan window to ~0 (recording only once
+    /// `Running` is reached would leave the whole `Starting` window
+    /// unrecorded). Best-effort throughout: a registry write failure only
+    /// risks a future leaked orphan, never a wrong kill.
+    pub(crate) fn record_running(inner: &Arc<Inner>, id: &str, pid: u32) {
+        match crate::platform::process_start_time(pid) {
+            Ok(Some(start_time)) => {
+                let rec = crate::orphan::SupervisedRecord {
+                    service_id: id.to_string(),
+                    identity: crate::orphan::ProcIdentity { pid, start_time },
+                    recorded_at_ms: now_ms(),
+                };
+                if let Err(e) = inner.registry.record(&rec) {
+                    tracing::warn!(service_id = id, pid, error = %e, "failed to record supervised process");
+                }
+            }
+            Ok(None) => { /* already dead; nothing to record */ }
+            Err(e) => {
+                tracing::warn!(service_id = id, pid, error = %e, "could not read start-time to record")
+            }
         }
     }
 

@@ -63,38 +63,41 @@ pub struct RegistrySnapshot {
 
 /// Persistence only — no kill logic. state.db can implement this later.
 ///
-/// `#[allow(dead_code)]` dropped at the trait level (P0-8 Task 3):
-/// `reap_orphans` (the `#[cfg(unix)]` body) now calls
-/// `remove`/`list_current_boot` through a `&dyn ProcessRegistry` — real,
-/// dynamically-dispatched production call sites, on unix only. On
-/// `#[cfg(not(unix))]` (Windows), `reap_orphans` is the stub that ignores its
-/// `_registry` parameter entirely, so `remove`/`list_current_boot` have no
-/// real caller THERE either — hence the `cfg_attr` below, empirically
-/// verified against both the native macOS and the msvc `--lib` builds.
-/// `record` keeps an unconditional allow: nothing calls it through the trait
-/// object on EITHER platform yet (Task 4 adds spawn-time recording, spec §9).
-/// `FileRegistry` (the concrete impl) keeps its own separate allow — its
-/// only production caller (any method) arrives in Task 4.
+/// P0-8 Task 4 wires in the last real callers on every platform: `record` via
+/// `Inner::record_running` (spawn-time recording, spec §9) and
+/// `remove`/`list_current_boot` via `service_task::finish` and
+/// `reap_orphans` — all unconditional, non-cfg-gated call sites — so every
+/// method now has a genuine production caller and the earlier per-method
+/// `#[allow(dead_code)]`/`#[cfg_attr(...)]` markers are gone.
 pub trait ProcessRegistry: Send + Sync {
-    // `#[allow(dead_code)]`: no call site through `&dyn ProcessRegistry` on
-    // either platform yet — Task 4 wires in record-at-spawn (spec §9), the
-    // real caller.
-    #[allow(dead_code)]
     fn record(&self, rec: &SupervisedRecord) -> io::Result<()>; // upsert by service_id
-    // `#[cfg_attr(not(unix), allow(dead_code))]`: real caller on unix
-    // (`reap_orphans`'s `#[cfg(unix)]` body); the `#[cfg(not(unix))]` stub
-    // ignores its registry parameter, so this has no real caller on Windows.
-    #[cfg_attr(not(unix), allow(dead_code))]
     fn remove(&self, service_id: &str) -> io::Result<()>;
     /// Records for the CURRENT boot only; a stale boot_id purges the file and
     /// returns empty. Never errors on a corrupt/oversized file — rotates it
     /// aside and returns empty.
-    #[cfg_attr(not(unix), allow(dead_code))]
     fn list_current_boot(&self) -> io::Result<Vec<SupervisedRecord>>;
 }
 
+/// Trivial registry for [`Supervisor::new`](crate::supervisor::Supervisor::new)'s
+/// no-cleanup construction path: nothing is ever recorded, so nothing is ever
+/// reaped, and `list_current_boot` touches no filesystem — keeping that path's
+/// observable behavior byte-for-byte identical to every pre-P0-8-Task-4 caller
+/// (all existing `Supervisor::new(driver)` call sites).
+pub(crate) struct NoopRegistry;
+
+impl ProcessRegistry for NoopRegistry {
+    fn record(&self, _rec: &SupervisedRecord) -> io::Result<()> {
+        Ok(())
+    }
+    fn remove(&self, _service_id: &str) -> io::Result<()> {
+        Ok(())
+    }
+    fn list_current_boot(&self) -> io::Result<Vec<SupervisedRecord>> {
+        Ok(vec![])
+    }
+}
+
 pub(crate) mod registry;
-#[allow(unused_imports)] // see ProcessRegistry's dead_code note above
 pub use registry::FileRegistry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,14 +112,9 @@ pub trait OrphanReaper: Send + Sync {
     fn reap(&self, pid: u32) -> std::io::Result<ReapKind>;
 }
 
-/// `#[allow(dead_code)]`: never constructed outside `reap_orphans` (below),
-/// which itself has no production caller yet — `Supervisor::new` (Task 4 of
-/// P0-8) is the real caller. Until it lands, the only user is
-/// `reap::tests`, a `#[cfg(test)]` module invisible to the dead-code pass on
-/// the plain (non-`--test`) build of this crate, same mechanism as the
-/// `ProcessRegistry` trait above. Drop this allow once Task 4 wires in the
-/// real caller.
-#[allow(dead_code)]
+/// P0-8 Task 4 wires in the real caller: `Supervisor::with_orphan_cleanup`
+/// (and `Supervisor::new`, which delegates to it) calls `reap_orphans` below
+/// and logs the returned report via `tracing::info!`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ReapReport {
     pub killed_group: u32,
@@ -129,10 +127,10 @@ pub struct ReapReport {
 }
 
 pub(crate) mod reap;
-// `#[allow(unused_imports)]`: see `ReapReport`'s dead_code note above —
-// `reap_orphans` has no production caller until Task 4.
-#[allow(unused_imports)]
 pub use reap::reap_orphans;
+
+pub(crate) mod lock;
+pub use lock::InstanceLock;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

@@ -9,19 +9,9 @@ use std::sync::{Mutex, MutexGuard};
 use super::{BootId, ProcessRegistry, RegistrySnapshot, SupervisedRecord};
 use crate::platform;
 
-// `#[allow(dead_code)]` on the items below: no caller yet — Task 3's
-// `OrphanReaper` is the real caller of `FileRegistry`/`ProcessRegistry` in
-// production code. Until it lands, the only user is `registry::tests`
-// (a `#[cfg(test)]` module invisible to the dead-code pass on the plain,
-// non-`--test` build of this crate — the same mechanism documented on the
-// Task 1 platform readers in `platform/mod.rs`). Drop these once Task 3
-// wires in the real caller.
-#[allow(dead_code)]
 const MAX_BYTES: u64 = 64 * 1024;
-#[allow(dead_code)]
 const MAX_RECORDS: usize = 64;
 
-#[allow(dead_code)]
 pub struct FileRegistry {
     path: PathBuf,
     // Serializes every public entry point that can reach a write side
@@ -48,7 +38,6 @@ pub struct FileRegistry {
     io_lock: Mutex<()>,
 }
 
-#[allow(dead_code)]
 impl FileRegistry {
     pub fn new(run_dir: &Path) -> Self {
         Self {
@@ -219,15 +208,11 @@ impl ProcessRegistry for FileRegistry {
     }
 }
 
-// `#[allow(dead_code)]`: see the note above `MAX_BYTES` — no caller until
-// Task 3.
-#[allow(dead_code)]
 fn io_err(op: &'static str, path: &Path, source: io::Error) -> io::Error {
     io::Error::new(source.kind(), format!("{op} {}: {source}", path.display()))
 }
 
 #[cfg(unix)]
-#[allow(dead_code)]
 fn create_private(path: &Path) -> io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
@@ -238,19 +223,16 @@ fn create_private(path: &Path) -> io::Result<std::fs::File> {
         .open(path)
 }
 #[cfg(not(unix))]
-#[allow(dead_code)]
 fn create_private(path: &Path) -> io::Result<std::fs::File> {
     std::fs::File::create(path)
 }
 
 #[cfg(unix)]
-#[allow(dead_code)]
 fn set_private_dir(dir: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
 }
 #[cfg(not(unix))]
-#[allow(dead_code)]
 fn set_private_dir(_dir: &Path) {}
 
 #[cfg(test)]

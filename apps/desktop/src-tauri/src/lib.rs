@@ -11,7 +11,10 @@ mod stack;
 use std::ffi::OsString;
 use std::sync::Arc;
 
-use openvhost_proc::{ServiceSpec, SpawnSpec, Supervisor, SupervisorEvent, default_driver};
+use openvhost_proc::{
+    FileRegistry, InstanceLock, ServiceSpec, SpawnSpec, Supervisor, SupervisorEvent,
+    default_driver, default_reaper,
+};
 use tauri::Manager;
 use tauri_specta::{Builder, Event, collect_commands, collect_events};
 
@@ -102,40 +105,74 @@ pub fn run() {
         .invoke_handler(specta_builder.invoke_handler())
         .setup(move |app| {
             specta_builder.mount_events(app);
-            let supervisor = Arc::new(Supervisor::new(default_driver()));
-            supervisor.register(demo_ticker_spec());
-            #[cfg(target_os = "macos")]
-            for spec in stack::macos_stack_specs() {
-                supervisor.register(spec);
-            }
-            let mut rx = supervisor.subscribe();
-            let handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                loop {
-                    match rx.recv().await {
-                        Ok(SupervisorEvent::StateChanged { id, state, detail }) => {
-                            let _ = commands::ServiceStateEvent { id, state, detail }.emit(&handle);
-                        }
-                        Ok(SupervisorEvent::Log {
-                            id,
-                            ts_ms,
-                            level,
-                            line,
-                        }) => {
-                            let _ = commands::ServiceLogEvent {
-                                id,
-                                ts_ms,
-                                level,
-                                line,
-                            }
-                            .emit(&handle);
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    }
-                }
+
+            // Single-instance lock (design spec §7): reap MUST run only
+            // while this is held, otherwise a second live instance would
+            // reap the first's HEALTHY services (identity matches — it
+            // really is their process — but the "orphan" premise is false).
+            let home = openvhost_core::resolve_home().unwrap_or_else(|e| {
+                eprintln!(
+                    "openvhost: cannot resolve OPENVHOST_HOME ({e}); falling back to the current directory"
+                );
+                std::path::PathBuf::from(".")
             });
-            app.manage(supervisor);
+            let run_dir = home.join("run");
+            match InstanceLock::acquire(&run_dir) {
+                Ok(Some(lock)) => {
+                    // Keep the lock alive for the app's lifetime — dropping
+                    // it releases the flock and lets a later instance
+                    // acquire it.
+                    app.manage(lock);
+                    let registry = Arc::new(FileRegistry::new(&run_dir));
+                    let supervisor = Arc::new(Supervisor::with_orphan_cleanup(
+                        default_driver(),
+                        registry,
+                        default_reaper(),
+                    ));
+                    supervisor.register(demo_ticker_spec());
+                    #[cfg(target_os = "macos")]
+                    for spec in stack::macos_stack_specs() {
+                        supervisor.register(spec);
+                    }
+                    let mut rx = supervisor.subscribe();
+                    let handle = app.handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        loop {
+                            match rx.recv().await {
+                                Ok(SupervisorEvent::StateChanged { id, state, detail }) => {
+                                    let _ =
+                                        commands::ServiceStateEvent { id, state, detail }.emit(&handle);
+                                }
+                                Ok(SupervisorEvent::Log {
+                                    id,
+                                    ts_ms,
+                                    level,
+                                    line,
+                                }) => {
+                                    let _ = commands::ServiceLogEvent {
+                                        id,
+                                        ts_ms,
+                                        level,
+                                        line,
+                                    }
+                                    .emit(&handle);
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            }
+                        }
+                    });
+                    app.manage(supervisor);
+                }
+                Ok(None) => {
+                    eprintln!(
+                        "openvhost: another instance holds the run lock; not starting the supervisor"
+                    );
+                }
+                Err(e) => {
+                    eprintln!("openvhost: failed to acquire the run lock: {e}");
+                }
+            }
             Ok(())
         })
         .run(tauri::generate_context!());

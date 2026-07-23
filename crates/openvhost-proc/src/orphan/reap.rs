@@ -15,12 +15,7 @@ use super::{OrphanReaper, ProcessRegistry, ReapReport};
 use crate::platform;
 
 /// Reject a record before any action. Returns Some(reason) if unsafe.
-///
-/// `#[allow(dead_code)]`: only called from `reap_orphans` below, which itself
-/// has no production caller until Task 4 (`Supervisor::new`) — see
-/// `ReapReport`'s dead_code note in `orphan/mod.rs`.
 #[cfg(unix)]
-#[allow(dead_code)]
 fn reject_reason(rec: &SupervisedRecord) -> Option<&'static str> {
     let pid = rec.identity.pid;
     if pid <= 1 {
@@ -52,12 +47,9 @@ fn reject_reason(rec: &SupervisedRecord) -> Option<&'static str> {
     None
 }
 
-/// `#[allow(dead_code)]`: no production caller until Task 4 wires this into
-/// `Supervisor::new` (spec §6/§9) — see `ReapReport`'s dead_code note in
-/// `orphan/mod.rs`. The only caller today is the macOS-gated `tests` module
-/// at the bottom of this file.
+/// P0-8 Task 4's real caller: `Supervisor::with_orphan_cleanup` (and
+/// `Supervisor::new`, which delegates to it).
 #[cfg(unix)]
-#[allow(dead_code)]
 pub fn reap_orphans(registry: &dyn ProcessRegistry, reaper: &dyn OrphanReaper) -> ReapReport {
     let mut report = ReapReport::default();
     let records = match registry.list_current_boot() {
@@ -173,10 +165,7 @@ pub fn reap_orphans(registry: &dyn ProcessRegistry, reaper: &dyn OrphanReaper) -
     report
 }
 
-/// `#[allow(dead_code)]`: see the `#[cfg(unix)]` `reap_orphans` above — no
-/// production caller until Task 4.
 #[cfg(not(unix))]
-#[allow(dead_code)]
 pub fn reap_orphans(_registry: &dyn ProcessRegistry, _reaper: &dyn OrphanReaper) -> ReapReport {
     // Windows orphan reaping (Job Objects) is deferred to the Windows-enablement
     // phase (spec: macOS-first). An empty report keeps Supervisor::new compiling
