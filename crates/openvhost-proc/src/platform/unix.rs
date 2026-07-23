@@ -7,7 +7,7 @@ use std::io;
 use std::process::Stdio;
 
 use super::{PlatformHandle, ProcessDriver, SpawnSpec, SpawnedChild, assemble_env};
-use crate::orphan::{BootId, ProcStartTime};
+use crate::orphan::{BootId, OrphanReaper, ProcStartTime, ReapKind};
 
 pub(crate) struct UnixDriver;
 
@@ -166,14 +166,52 @@ pub(crate) fn getpgid(pid: u32) -> io::Result<u32> {
     }
 }
 
-use crate::orphan::{OrphanReaper, ReapKind};
+/// PURE validation floor for `UnixReaper::reap`, independent of and
+/// additional to `reap::reject_reason` in `orphan/reap.rs`. Defense-in-depth:
+/// `reap` is a `pub` trait method on a type returned by the `pub fn
+/// default_reaper()`, so it is publicly callable with an arbitrary `u32` by
+/// any caller — not just the validated `reap_orphans` orchestration, an
+/// assumption future callers (Task 4 wires in more of them) would otherwise
+/// silently rely on. No syscalls — a plain predicate, so it is safe to
+/// unit-test directly, unlike `reap()` itself, which must NEVER be called
+/// with these values (see this crate's test-safety note: `reap(1)` resolves
+/// to `kill(-1, SIGKILL)` on this platform).
+///
+/// Rejects `pid <= 1`: `pid == 0` means `kill(0, ...)` signals OUR OWN
+/// process group, and `pid == 1` means `getpgid(1) == 1` on macOS, so the
+/// group-kill arm below would resolve to `kill(-1, SIGKILL)` — every process
+/// the caller can signal. Also rejects `pid > i32::MAX as u32`: such a value
+/// goes negative when cast to `libc::pid_t` (`i32`), and `kill()` treats a
+/// negative pid as "signal the process GROUP with abs(pid)" — flipping an
+/// intended single-process kill into a group kill; `u32::MAX` in particular
+/// becomes `-1`, the same all-process catastrophe as `pid == 1` above.
+pub(crate) fn reap_pid_floor_violation(pid: u32) -> Option<&'static str> {
+    if pid <= 1 {
+        return Some("pid <= 1 (would self-signal our own group or flip into kill(-1, SIGKILL))");
+    }
+    if pid > i32::MAX as u32 {
+        return Some(
+            "pid > i32::MAX (u32->pid_t cast goes negative, flipping a single-pid kill into a group kill; u32::MAX becomes kill(-1, ...))",
+        );
+    }
+    None
+}
 
 pub(crate) struct UnixReaper;
 
 impl OrphanReaper for UnixReaper {
-    /// Re-verify group-leadership at reap time (never trust the spawn invariant
-    /// alone): `getpgid(pid) == pid` → group-kill; else single-pid fallback.
+    /// Defense-in-depth floor FIRST (`reap_pid_floor_violation` above — read
+    /// its doc comment): this method is reachable with an arbitrary `u32`
+    /// from any caller, not only the validated `reap_orphans` orchestration.
+    /// Then re-verify group-leadership at reap time (never trust the spawn
+    /// invariant alone): `getpgid(pid) == pid` → group-kill; else single-pid
+    /// fallback.
     fn reap(&self, pid: u32) -> io::Result<ReapKind> {
+        if let Some(reason) = reap_pid_floor_violation(pid) {
+            return Err(io::Error::other(format!(
+                "refusing to reap pid {pid}: {reason}"
+            )));
+        }
         match getpgid(pid) {
             Ok(pg) if pg == pid => {
                 signal_group(pid as i32, libc::SIGKILL)?;
@@ -188,5 +226,30 @@ impl OrphanReaper for UnixReaper {
                 Ok(ReapKind::SinglePidFallback)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod floor_tests {
+    use super::*;
+
+    // F2: test ONLY the pure predicate. NEVER call `UnixReaper::reap` (or
+    // `signal_group`/raw `libc::kill`) with 0, 1, or u32::MAX to "prove" this
+    // — `reap(1)` resolves to `kill(-1, SIGKILL)` on this platform
+    // (`getpgid(1) == 1`), which would signal EVERY process the developer
+    // running this suite owns.
+
+    #[test]
+    fn floor_violation_rejects_0_1_and_u32_max() {
+        assert!(reap_pid_floor_violation(0).is_some());
+        assert!(reap_pid_floor_violation(1).is_some());
+        assert!(reap_pid_floor_violation(u32::MAX).is_some());
+    }
+
+    #[test]
+    fn floor_violation_allows_pids_in_the_safe_range() {
+        assert!(reap_pid_floor_violation(2).is_none());
+        assert!(reap_pid_floor_violation(std::process::id()).is_none());
+        assert!(reap_pid_floor_violation(i32::MAX as u32).is_none());
     }
 }

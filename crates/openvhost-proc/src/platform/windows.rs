@@ -16,7 +16,7 @@ use std::process::Stdio;
 use windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent;
 
 use super::{PlatformHandle, ProcessDriver, SpawnSpec, SpawnedChild, assemble_env};
-use crate::orphan::{BootId, ProcStartTime};
+use crate::orphan::{BootId, OrphanReaper, ProcStartTime, ReapKind};
 
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -95,8 +95,6 @@ pub(crate) fn current_boot_id() -> io::Result<BootId> {
         "current_boot_id is not implemented on Windows in v1 (macOS-first)",
     ))
 }
-
-use crate::orphan::{OrphanReaper, ReapKind};
 
 pub(crate) struct WindowsReaper;
 
