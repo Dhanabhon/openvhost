@@ -617,7 +617,7 @@ git add crates/openvhost-proc Cargo.lock && git commit -s -m "feat(proc): atomic
   - `pub enum ReapKind { Group, SinglePidFallback }`
   - `pub trait OrphanReaper: Send + Sync { fn reap(&self, pid: u32) -> io::Result<ReapKind>; }`
   - `pub fn default_reaper() -> std::sync::Arc<dyn OrphanReaper>`
-  - `pub fn reap_orphans(registry: &dyn ProcessRegistry, reaper: &dyn OrphanReaper) -> ReapReport`
+  - `pub fn reap_orphans(registry: &dyn ProcessRegistry, reaper: &dyn OrphanReaper) -> ReapReport` (unix: full orchestration; Windows: compiling stub returning `ReapReport::default()` — the whole fn + `reject_reason` are `#[cfg(unix)]`, so keep the libc-using body out of the Windows build)
   - `pub struct ReapReport { pub killed_group, killed_single, killed_headless, skipped_dead, skipped_reused, rejected, errored: u32 }`
 
 - [ ] **Step 1: Add the trait/types to `orphan/mod.rs`**
@@ -822,10 +822,18 @@ pub fn default_reaper() -> Arc<dyn OrphanReaper> {
 //! resolves to NOT killing. `process_start_time` → `getpgid` (inside reaper) →
 //! `kill` is contiguous (no `.await`/I/O between check and kill).
 
-use super::{OrphanReaper, ProcessRegistry, ReapReport, SupervisedRecord};
+// reap_orphans is POSIX process-group semantics end to end; the Windows reaping
+// design (Job Objects) is a separate, deferred surface (spec: macOS-first). The
+// unix orchestration is cfg-gated with a compiling Windows stub so
+// `Supervisor::new` builds on both — the msvc cross-check (Task 5) proves it.
+use super::{OrphanReaper, ProcessRegistry, ReapReport};
+#[cfg(unix)]
+use super::SupervisedRecord;
+#[cfg(unix)]
 use crate::platform;
 
 /// Reject a record before any action. Returns Some(reason) if unsafe.
+#[cfg(unix)]
 fn reject_reason(rec: &SupervisedRecord) -> Option<&'static str> {
     let pid = rec.identity.pid;
     if pid <= 1 {
@@ -837,7 +845,6 @@ fn reject_reason(rec: &SupervisedRecord) -> Option<&'static str> {
     if pid == std::process::id() {
         return Some("pid is our own process");
     }
-    #[cfg(unix)]
     if let Ok(our_pgid) = platform::getpgid(std::process::id()) {
         if pid == our_pgid {
             return Some("pid is our own process group");
@@ -851,6 +858,7 @@ fn reject_reason(rec: &SupervisedRecord) -> Option<&'static str> {
     None
 }
 
+#[cfg(unix)]
 pub fn reap_orphans(registry: &dyn ProcessRegistry, reaper: &dyn OrphanReaper) -> ReapReport {
     let mut report = ReapReport::default();
     let records = match registry.list_current_boot() {
@@ -932,6 +940,14 @@ pub fn reap_orphans(registry: &dyn ProcessRegistry, reaper: &dyn OrphanReaper) -
         }
     }
     report
+}
+
+#[cfg(not(unix))]
+pub fn reap_orphans(_registry: &dyn ProcessRegistry, _reaper: &dyn OrphanReaper) -> ReapReport {
+    // Windows orphan reaping (Job Objects) is deferred to the Windows-enablement
+    // phase (spec: macOS-first). An empty report keeps Supervisor::new compiling
+    // on Windows and reaps nothing — the safe default.
+    ReapReport::default()
 }
 ```
 
