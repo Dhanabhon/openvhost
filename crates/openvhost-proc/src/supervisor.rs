@@ -53,7 +53,7 @@ pub(crate) fn now_ms() -> u64 {
 
 impl Supervisor {
     /// Construct a supervisor with NO crash-orphan cleanup: nothing is ever
-    /// recorded or reaped (backed by a [`crate::orphan::NoopRegistry`]).
+    /// recorded or reaped (backed by a crate-private `NoopRegistry`).
     /// Delegates to [`Supervisor::with_orphan_cleanup`] — reaping an always-
     /// empty `NoopRegistry` touches no filesystem and kills nothing, so this
     /// keeps every pre-P0-8-Task-4 caller's observable behavior byte-for-byte
