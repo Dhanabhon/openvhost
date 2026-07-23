@@ -54,6 +54,12 @@ async fn wait_state(
 }
 
 /// Force-stops the service on drop so a mid-test panic never leaks the child.
+/// Mirrors `orphan_reap.rs` / `macos_stack.rs`: after requesting stop, block
+/// (bounded) until the service is terminal, so the tokio-spawned service task
+/// has time to deliver SIGTERM and reap the child before the panicking thread
+/// unwinds out. This is why the test is `flavor = "multi_thread"` — on a
+/// single-threaded runtime this blocking poll would starve the very service
+/// task it is waiting on.
 struct StopGuard<'a> {
     sup: &'a Supervisor,
     id: &'static str,
@@ -61,6 +67,18 @@ struct StopGuard<'a> {
 impl Drop for StopGuard<'_> {
     fn drop(&mut self) {
         let _ = self.sup.stop(self.id);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            let all_terminal = self
+                .sup
+                .snapshot()
+                .iter()
+                .all(|s| !matches!(s.state, ServiceState::Starting | ServiceState::Running));
+            if all_terminal {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 }
 
