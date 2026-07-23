@@ -24,16 +24,28 @@ const MAX_RECORDS: usize = 64;
 #[allow(dead_code)]
 pub struct FileRegistry {
     path: PathBuf,
-    // Serializes each `record`/`remove` load-mutate-store critical section
-    // WITHIN THIS PROCESS: Task 4's supervisor calls `record()` from
-    // concurrent per-service tasks, and without this, two concurrent
-    // load-mutate-store sequences could each load the same snapshot, push
-    // their own record, and have the second `store()` silently clobber the
-    // first — a lost record means an orphan that never gets reaped. This
-    // does NOT provide cross-process safety; that comes from the
-    // single-instance advisory file lock (design spec §7, Task 4), which
-    // ensures only one supervisor process ever touches this file at all.
-    write_lock: Mutex<()>,
+    // Serializes every public entry point that can reach a write side
+    // effect WITHIN THIS PROCESS — NOT just `record`/`remove`'s obvious
+    // load-mutate-store. `load()` is NOT a pure read: its repair branches
+    // perform real disk writes (the boot-mismatch branch calls
+    // `self.store(&empty)`, and content-corruption branches call
+    // `rotate_corrupt()`, which renames the file aside). `list_current_boot`
+    // calls `load()` too, so it must hold this lock for the same duration
+    // `record`/`remove` do — otherwise an unlocked `list_current_boot()`
+    // that decided to purge/rotate from a stale read could execute that
+    // write AFTER a locked `record()`/`remove()` has already committed,
+    // reverting or clobbering the just-committed record. That is exactly
+    // the lost-update failure this lock exists to prevent, through a path
+    // it used to not cover. So every public entry point that can reach
+    // `load()` (and therefore its repair branches) — `record`, `remove`,
+    // AND `list_current_boot` — holds this lock for the duration of that
+    // call. `load()`/`store()` themselves do NOT acquire it (see their doc
+    // comments) — only the public entry points do, to avoid deadlocking on
+    // re-entry. This does NOT provide cross-process safety; that comes
+    // from the single-instance advisory file lock (design spec §7, Task 4),
+    // which ensures only one supervisor process ever touches this file at
+    // all.
+    io_lock: Mutex<()>,
 }
 
 #[allow(dead_code)]
@@ -41,16 +53,20 @@ impl FileRegistry {
     pub fn new(run_dir: &Path) -> Self {
         Self {
             path: run_dir.join("supervised.json"),
-            write_lock: Mutex::new(()),
+            io_lock: Mutex::new(()),
         }
     }
 
-    /// Acquire the intra-process write lock, recovering from poisoning. The
+    /// Acquire the intra-process I/O lock, recovering from poisoning. The
     /// guarded data is `()`, so a poisoned lock carries no invalid state —
     /// a prior panic mid-critical-section leaves nothing to roll back; the
-    /// next `load()` simply re-reads whatever is on disk.
-    fn lock_for_write(&self) -> MutexGuard<'_, ()> {
-        match self.write_lock.lock() {
+    /// next `load()` simply re-reads whatever is on disk. Named `lock_io`
+    /// rather than `lock_for_write` because it guards more than writes —
+    /// see the `io_lock` field doc: `load()`'s repair branches write too,
+    /// so every public entry point that can reach them must hold this,
+    /// including the read-shaped `list_current_boot()`.
+    fn lock_io(&self) -> MutexGuard<'_, ()> {
+        match self.io_lock.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
@@ -61,6 +77,14 @@ impl FileRegistry {
     /// aside and read back as an empty (current-boot) snapshot. A genuine
     /// I/O error (permission denied, `current_boot_id()` failing, etc.)
     /// still propagates via `?`.
+    ///
+    /// NOT a pure read: the repair branches below call `self.store(&empty)`
+    /// (boot mismatch) or `self.rotate_corrupt()` (corrupt/non-UTF8/
+    /// oversized/over-cap content), both of which write to disk. This
+    /// method deliberately does NOT acquire `io_lock` itself — every caller
+    /// (`record`, `remove`, `list_current_boot`) already holds it for the
+    /// duration of the call, and a self-locking `load()` would deadlock on
+    /// that re-entry.
     fn load(&self) -> io::Result<RegistrySnapshot> {
         let boot = platform::current_boot_id()?;
         let meta = match std::fs::metadata(&self.path) {
@@ -153,9 +177,9 @@ impl FileRegistry {
 impl ProcessRegistry for FileRegistry {
     fn record(&self, rec: &SupervisedRecord) -> io::Result<()> {
         // Held across the whole load-mutate-store section below: see the
-        // `write_lock` field doc for why (Task 4's concurrent per-service
+        // `io_lock` field doc for why (Task 4's concurrent per-service
         // spawns each call `record()`).
-        let _guard = self.lock_for_write();
+        let _guard = self.lock_io();
         let mut snap = self.load()?;
         let is_new = !snap.records.iter().any(|r| r.service_id == rec.service_id);
         if is_new && snap.records.len() >= MAX_RECORDS {
@@ -174,7 +198,7 @@ impl ProcessRegistry for FileRegistry {
     fn remove(&self, service_id: &str) -> io::Result<()> {
         // Held across the whole load-mutate-store section below (same
         // rationale as `record()` above).
-        let _guard = self.lock_for_write();
+        let _guard = self.lock_io();
         let mut snap = self.load()?;
         let before = snap.records.len();
         snap.records.retain(|r| r.service_id != service_id);
@@ -184,7 +208,13 @@ impl ProcessRegistry for FileRegistry {
         Ok(())
     }
     fn list_current_boot(&self) -> io::Result<Vec<SupervisedRecord>> {
-        // Read-only: no lock needed (see the `write_lock` field doc).
+        // NOT read-only: `load()`'s repair branches can write (purge +
+        // `store()` on boot mismatch, rotate-aside on corrupt/over-cap
+        // content) — see the `io_lock` field doc. Must hold the same lock
+        // as `record()`/`remove()` for the duration of the call, or an
+        // unlocked repair write here could land AFTER a locked
+        // `record()`/`remove()` has already committed, clobbering it.
+        let _guard = self.lock_io();
         Ok(self.load()?.records)
     }
 }
@@ -418,5 +448,74 @@ mod tests {
 
         let dir_mode = std::fs::metadata(&run_dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700, "registry dir must be 0700");
+    }
+
+    /// Regression test for `io_lock`: proves the mutex actually prevents
+    /// lost updates, which is the entire reason it exists. N threads each
+    /// call `record()` with their OWN distinct `service_id` on a `FileRegistry`
+    /// shared via `Arc` (`FileRegistry` is `Send + Sync`, per
+    /// `ProcessRegistry: Send + Sync`). Without `io_lock` held across the
+    /// whole load-mutate-store critical section, two racing calls can each
+    /// load the same on-disk snapshot, push their own record into their own
+    /// in-memory copy, and have the second `store()` silently clobber the
+    /// first's write — losing a record means an orphan that never gets
+    /// reaped. N=8 is well under `MAX_RECORDS` (64), so the write-time
+    /// capacity rule is deliberately not exercised here.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn concurrent_record_calls_do_not_lose_updates() {
+        use std::sync::Arc;
+        use std::thread;
+
+        const N: usize = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(FileRegistry::new(dir.path()));
+
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let registry = Arc::clone(&registry);
+                thread::spawn(move || registry.record(&rec(&format!("svc-{i}"), 100 + i as u32)))
+            })
+            .collect();
+
+        // Join every thread first (propagating any thread PANIC via the
+        // outer `.unwrap()`), THEN assert on the `record()` outcomes — a
+        // panicking thread must not be mistaken for a passing one.
+        let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        for (i, outcome) in outcomes.iter().enumerate() {
+            assert!(
+                outcome.is_ok(),
+                "record() for svc-{i} must succeed under concurrent access, got {outcome:?}"
+            );
+        }
+
+        // No lost updates: exactly N records survive, and each of the N
+        // distinct service_ids appears EXACTLY once (a lost update would
+        // make some id's count 0; this registry's upsert-by-service_id
+        // logic means a duplicate is not the expected failure shape here,
+        // but checking the exact count rather than just presence keeps the
+        // assertion honest either way).
+        let ids: Vec<String> = registry
+            .list_current_boot()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.service_id)
+            .collect();
+        assert_eq!(
+            ids.len(),
+            N,
+            "expected exactly {N} records after {N} concurrent record() calls (no lost \
+             updates), got {}: {ids:?}",
+            ids.len()
+        );
+        for i in 0..N {
+            let expected_id = format!("svc-{i}");
+            let occurrences = ids.iter().filter(|id| **id == expected_id).count();
+            assert_eq!(
+                occurrences, 1,
+                "service_id {expected_id:?} must appear exactly once after {N} concurrent \
+                 record() calls (found {occurrences}); 0 means a lost update"
+            );
+        }
     }
 }
