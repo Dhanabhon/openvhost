@@ -86,9 +86,10 @@ pub(crate) fn process_start_time(_pid: u32) -> io::Result<Option<ProcStartTime>>
     ))
 }
 
-/// `#[allow(dead_code)]`: see `process_start_time` above.
+/// `#[allow(dead_code)]` dropped (P0-8 Task 2): `registry::load()` calls this
+/// via `platform::current_boot_id()` from production code now, on this
+/// target too (the stub still returns an error — Windows-enablement phase).
 #[cfg(windows)]
-#[allow(dead_code)]
 pub(crate) fn current_boot_id() -> io::Result<BootId> {
     Err(io::Error::other(
         "current_boot_id is not implemented on Windows in v1 (macOS-first)",

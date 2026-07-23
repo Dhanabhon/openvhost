@@ -119,9 +119,9 @@ pub(crate) fn process_start_time(pid: u32) -> io::Result<Option<ProcStartTime>> 
 
 /// Current boot time via `sysctl(kern.boottime)` — the boot identity.
 ///
-/// `#[allow(dead_code)]`: see `process_start_time` above.
+/// `#[allow(dead_code)]` dropped (P0-8 Task 2): `registry::load()` calls this
+/// via `platform::current_boot_id()` from production code now.
 #[cfg(target_os = "macos")]
-#[allow(dead_code)]
 pub(crate) fn current_boot_id() -> io::Result<BootId> {
     let mut mib = [libc::CTL_KERN, libc::KERN_BOOTTIME];
     let mut tv = libc::timeval {

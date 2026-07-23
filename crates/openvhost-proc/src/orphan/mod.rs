@@ -4,6 +4,8 @@
 //! match and the safety gate in `reap` (spec §6). This is a SIGKILL-from-a-file
 //! path; every check here closes a specific false-kill scenario.
 
+use std::io;
+
 use serde::{Deserialize, Serialize};
 
 /// Start-time identity token that defeats PID reuse. Tagged so a registry
@@ -58,6 +60,27 @@ pub struct RegistrySnapshot {
     pub boot_id: BootId,
     pub records: Vec<SupervisedRecord>,
 }
+
+/// Persistence only — no kill logic. state.db can implement this later.
+///
+/// `#[allow(dead_code)]`: no caller yet — `OrphanReaper` (Task 3 of P0-8) is
+/// the real caller of this trait/`FileRegistry`. Until it lands, the only
+/// user is `registry::tests`, invisible to the dead-code pass on the plain
+/// (non-`--test`) build of this crate, same mechanism as the platform
+/// readers in Task 1. Drop this allow once Task 3 wires in the real caller.
+#[allow(dead_code)]
+pub trait ProcessRegistry: Send + Sync {
+    fn record(&self, rec: &SupervisedRecord) -> io::Result<()>; // upsert by service_id
+    fn remove(&self, service_id: &str) -> io::Result<()>;
+    /// Records for the CURRENT boot only; a stale boot_id purges the file and
+    /// returns empty. Never errors on a corrupt/oversized file — rotates it
+    /// aside and returns empty.
+    fn list_current_boot(&self) -> io::Result<Vec<SupervisedRecord>>;
+}
+
+pub(crate) mod registry;
+#[allow(unused_imports)] // see ProcessRegistry's dead_code note above
+pub use registry::FileRegistry;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

@@ -164,13 +164,14 @@ pub fn default_driver() -> Arc<dyn ProcessDriver> {
     }
 }
 
-// `ProcessRegistry`/`OrphanReaper` (Task 2/3 of P0-8) are the real callers
-// of these readers. Until they land, the only callers are the macOS-gated
-// tests in `orphan::tests`, which is invisible to the dead-code pass on any
-// non-test compilation of this crate (integration-test binaries, other
-// workspace members that link this lib) and, on Windows, invisible outright
-// (those tests are `cfg(target_os = "macos")`). Drop these allows once
-// Task 2/3 wires in real callers.
+// `OrphanReaper` (Task 3 of P0-8) is the real caller of `process_start_time`.
+// Until it lands, the only callers are the macOS-gated tests in
+// `orphan::tests`, which is invisible to the dead-code pass on any non-test
+// compilation of this crate (integration-test binaries, other workspace
+// members that link this lib) and, on Windows, invisible outright (those
+// tests are `cfg(target_os = "macos")`). Drop these allows once Task 3 wires
+// in the real caller. (`current_boot_id` below already got its real,
+// non-test caller in Task 2 — see its own note.)
 #[cfg(unix)]
 #[allow(dead_code)]
 pub(crate) fn process_start_time(pid: u32) -> std::io::Result<Option<ProcStartTime>> {
@@ -182,13 +183,13 @@ pub(crate) fn process_start_time(pid: u32) -> std::io::Result<Option<ProcStartTi
     windows::process_start_time(pid)
 }
 
+// `current_boot_id`'s `#[allow(dead_code)]` was dropped here (P0-8 Task 2):
+// `registry::load()` is now a real, non-test caller on both dispatch arms.
 #[cfg(unix)]
-#[allow(dead_code)]
 pub(crate) fn current_boot_id() -> std::io::Result<BootId> {
     unix::current_boot_id()
 }
 #[cfg(windows)]
-#[allow(dead_code)]
 pub(crate) fn current_boot_id() -> std::io::Result<BootId> {
     windows::current_boot_id()
 }
