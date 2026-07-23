@@ -62,7 +62,11 @@ pub fn reap_orphans(registry: &dyn ProcessRegistry, reaper: &dyn OrphanReaper) -
     for rec in records {
         let pid = rec.identity.pid;
         if let Some(reason) = reject_reason(&rec) {
-            tracing::warn!(service_id = %rec.service_id, pid, reason, "orphan reap: rejected record");
+            // `?` (Debug, escaping) — NOT `%` — because this is BEFORE the
+            // charset check (`reject_reason`) has cleared `service_id`: a
+            // hostile record can carry control chars/newlines here, and `?`
+            // escapes them instead of letting them pass raw into logs.
+            tracing::warn!(service_id = ?rec.service_id, pid, reason, "orphan reap: rejected record");
             report.rejected += 1;
             if let Err(e) = registry.remove(&rec.service_id) {
                 tracing::warn!(service_id = %rec.service_id, error = %e,
@@ -80,38 +84,26 @@ pub fn reap_orphans(registry: &dyn ProcessRegistry, reaper: &dyn OrphanReaper) -
                 // Leave the record: an error is not proof it's safe to drop.
             }
             Ok(None) => {
-                // Leader gone. Probe the group: while it is non-empty, POSIX
-                // keeps the pgid reserved — no OTHER group can be freshly
-                // assigned this exact number while current members hold it.
-                // That is narrower than "these members are ours"; see the
-                // honest residual-risk note on the kill below.
-                // SAFETY: signal 0 to the group probes existence only.
+                // Leader gone. Unlike every other kill in this file, we have
+                // NO start-time identity evidence for a dead leader: the
+                // recorded pid could have been reused by an unrelated
+                // process that itself became a group leader, spawned
+                // children, and then also died, leaving a headless group
+                // indistinguishable from ours by pid alone. Per the owner's
+                // fail-safe decision, this branch NEVER sends a fatal
+                // signal — on doubt, LEAK, don't kill (same posture as the
+                // `Err` arm above). The `kill(-pid, 0)` probe below sends NO
+                // signal (signal 0 delivers nothing) and exists ONLY to make
+                // the two outcomes distinguishable in logs.
+                // SAFETY: signal 0 to the group probes existence only; no
+                // signal is delivered, so this cannot affect any process.
                 let group_alive = unsafe { libc::kill(-(pid as libc::pid_t), 0) == 0 };
                 if group_alive {
-                    // SAFETY: plain kill syscall targeting a pgid just
-                    // confirmed to exist by the probe above; no memory
-                    // handed over.
-                    //
-                    // RESIDUAL RISK (stated honestly, not a guarantee): POSIX
-                    // guarantees only that a LIVE group's id is not
-                    // concurrently reassigned to a NEW, unrelated group — it
-                    // does NOT establish that the surviving members belong to
-                    // OUR service. We reach this branch because the recorded
-                    // leader pid no longer exists, so — unlike every other
-                    // kill in this file — we have NO start-time identity
-                    // evidence here: the leader pid could have been reused by
-                    // an unrelated process that itself became a group
-                    // leader, spawned children, and then also died, leaving a
-                    // headless group indistinguishable from ours by pid
-                    // alone. This branch accepts that residual risk in order
-                    // to reclaim genuinely leaked workers; tightening it
-                    // (e.g. requiring corroborating evidence on survivors) is
-                    // a pending policy decision — not something this comment
-                    // fix changes.
-                    let _ = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
-                    tracing::info!(service_id = %rec.service_id, pid, decision = "killed-group-headless",
-                        "orphan reap: dead leader, killed surviving group members");
-                    report.killed_headless += 1;
+                    tracing::warn!(service_id = %rec.service_id, pid, decision = "left-headless",
+                        "orphan reap: recorded leader is gone but workers linger; LEFT \
+                         running (no identity evidence to act on) — they will surface as \
+                         port-in-use on the next start");
+                    report.left_headless += 1;
                 } else {
                     tracing::info!(service_id = %rec.service_id, pid, decision = "dead-removed",
                         "orphan reap: process already gone");
@@ -454,14 +446,21 @@ mod tests {
         assert!(reg.list_current_boot().unwrap().is_empty());
     }
 
-    /// F6: the headless-group branch (`Ok(None)` + surviving members) had NO
-    /// test before this. Construct it directly: a leader plus a SEPARATE
-    /// process that joins the leader's group (`spawn_group_member`); kill
-    /// ONLY the leader and reap it for real (so `process_start_time` on the
-    /// leader genuinely observes `None`, and the member is untouched);
-    /// confirm the surviving member gets swept up by the headless-group kill.
+    /// C1 (merge-gate fix wave): the headless-group branch (`Ok(None)` +
+    /// surviving members) used to SIGKILL the group on zero start-time
+    /// identity evidence for the dead leader — the one kill in this file
+    /// that could hit an innocent reused-pid group. Per the owner's
+    /// fail-safe decision this branch now NEVER kills (leak, don't kill —
+    /// same posture as the `Err` arm). This is also the false-kill
+    /// regression guard the auditor asked for: construct the EXACT same
+    /// fixture as before (a leader plus a SEPARATE process that joins the
+    /// leader's group via `spawn_group_member`; kill+waitpid ONLY the
+    /// leader so `process_start_time(leader)` genuinely observes `None`),
+    /// then assert the surviving member is STILL ALIVE after
+    /// `reap_orphans` — inverted from this test's pre-fix assertion that it
+    /// was dead.
     #[test]
-    fn killed_headless_group_member_is_reaped() {
+    fn headless_group_is_left_not_killed() {
         let leader_pid = spawn_group_leader();
         let member_pid = spawn_group_member(leader_pid);
         // Cleans up unconditionally, even if an assertion below panics.
@@ -497,18 +496,28 @@ mod tests {
         let rep = reap_orphans(&reg, &*default_reaper());
 
         assert_eq!(
-            rep.killed_headless, 1,
-            "dead leader + surviving member must route to killed_headless"
+            rep.left_headless, 1,
+            "dead leader + surviving member must route to left_headless"
         );
-        // Bounded poll-reap (F4) — see reap_test_child_bounded's doc comment.
-        reap_test_child_bounded(member_pid, std::time::Duration::from_secs(2));
+        assert_eq!(rep.killed_group, 0, "this branch must never kill");
+        assert_eq!(rep.killed_single, 0, "this branch must never kill");
+        assert_eq!(rep.skipped_dead, 0);
+        // F1: `alive()` (`kill(pid, 0) == 0`) also returns true for a
+        // ZOMBIE, so — exactly like `reused_pid_wrong_start_time_is_never_killed`
+        // above — it cannot tell "never killed" apart from "wrongly killed
+        // and now a zombie of this test process". `still_running`
+        // (`waitpid(..., WNOHANG)`) is the predicate that can actually catch
+        // that: see its doc comment. This is the false-kill regression guard
+        // C1 exists for, so it gets the predicate that can actually fail.
         assert!(
-            !alive(member_pid),
-            "surviving group member must be dead after the headless-group kill"
+            still_running(member_pid),
+            "surviving group member must be LEFT RUNNING: a dead leader carries \
+             NO identity evidence, so this branch must never kill on doubt"
         );
         assert!(
             reg.list_current_boot().unwrap().is_empty(),
-            "record removed"
+            "record removed even though nothing was killed \
+             (the record is no longer actionable either way)"
         );
     }
 

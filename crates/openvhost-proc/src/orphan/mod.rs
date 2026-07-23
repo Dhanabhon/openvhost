@@ -30,7 +30,7 @@ impl BootId {
     /// Same boot within a small tolerance (kern.boottime shifts on clock steps).
     pub fn matches(&self, other: &BootId) -> bool {
         match (self, other) {
-            (BootId::Unix { sec: a, .. }, BootId::Unix { sec: b, .. }) => (a - b).abs() <= 5,
+            (BootId::Unix { sec: a, .. }, BootId::Unix { sec: b, .. }) => a.abs_diff(*b) <= 5,
             (BootId::Windows { boot_ms: a }, BootId::Windows { boot_ms: b }) => {
                 a.abs_diff(*b) <= 5000
             }
@@ -119,7 +119,7 @@ pub trait OrphanReaper: Send + Sync {
 pub struct ReapReport {
     pub killed_group: u32,
     pub killed_single: u32,
-    pub killed_headless: u32, // dead leader, surviving group members killed
+    pub left_headless: u32, // dead leader, surviving group members LEFT (not killed — no identity evidence)
     pub skipped_dead: u32,
     pub skipped_reused: u32,
     pub rejected: u32,
@@ -165,6 +165,29 @@ mod tests {
         })); // within 5s
         assert!(!a.matches(&BootId::Unix { sec: 1010, usec: 0 })); // beyond 5s
         assert!(!a.matches(&BootId::Windows { boot_ms: 1_000_000 })); // cross-os never
+    }
+
+    /// C2: a hostile/corrupt file-parsed `boot_id.sec` near `i64::MIN` must
+    /// never panic `matches` — `(a - b).abs()` overflows in debug/test builds
+    /// (overflow-checks on) for exactly this input, defeating the registry's
+    /// "never abort startup on bad content" contract (`load()` calls
+    /// `snap.boot_id.matches(&boot)` on deserialized, attacker-reachable
+    /// content). `a.abs_diff(*b)` is overflow-safe for every `i64` pair.
+    #[test]
+    fn boot_id_unix_overflow_does_not_panic() {
+        let hostile = BootId::Unix {
+            sec: i64::MIN,
+            usec: 0,
+        };
+        let normal = BootId::Unix { sec: 1000, usec: 0 };
+        assert!(
+            !hostile.matches(&normal),
+            "wildly different boots must not match"
+        );
+        assert!(
+            !normal.matches(&hostile),
+            "symmetric: must not panic either direction"
+        );
     }
 
     #[cfg(target_os = "macos")]

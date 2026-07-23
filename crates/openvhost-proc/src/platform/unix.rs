@@ -116,6 +116,20 @@ pub(crate) fn process_start_time(pid: u32) -> io::Result<Option<ProcStartTime>> 
     }))
 }
 
+/// Non-macOS unix (Linux, BSD, ...) start-time read is deferred to the
+/// Windows/Linux-enablement phase (spec: macOS-first). Mirrors the Windows
+/// stub in `windows.rs` exactly, restoring compilation for `openvhost-proc`
+/// on any `#[cfg(unix)]` target other than macOS — `platform::mod`'s
+/// `#[cfg(unix)] pub fn process_start_time` dispatches here unconditionally
+/// on every unix target, so without this arm the crate failed to compile at
+/// all on e.g. Linux (P0-8 merge-gate fix wave C6).
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn process_start_time(_pid: u32) -> io::Result<Option<ProcStartTime>> {
+    Err(io::Error::other(
+        "process_start_time is not implemented on this platform in v1 (macOS-first)",
+    ))
+}
+
 /// Current boot time via `sysctl(kern.boottime)` — the boot identity.
 ///
 /// `#[allow(dead_code)]` dropped (P0-8 Task 2): `registry::load()` calls this
@@ -148,6 +162,17 @@ pub(crate) fn current_boot_id() -> io::Result<BootId> {
         sec: tv.tv_sec,
         usec: tv.tv_usec as i64,
     })
+}
+
+/// Non-macOS unix (Linux, BSD, ...) boot-id read is deferred to the
+/// Windows/Linux-enablement phase (spec: macOS-first). Mirrors the Windows
+/// stub in `windows.rs` exactly — see `process_start_time`'s non-macOS-unix
+/// stub above for why this arm must exist (P0-8 merge-gate fix wave C6).
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn current_boot_id() -> io::Result<BootId> {
+    Err(io::Error::other(
+        "current_boot_id is not implemented on this platform in v1 (macOS-first)",
+    ))
 }
 
 /// Process-group id of `pid` (reap re-verifies `getpgid(pid) == pid`).

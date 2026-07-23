@@ -19,13 +19,22 @@ impl InstanceLock {
     /// `Ok(Some)` = acquired; `Ok(None)` = another instance holds it.
     #[cfg(unix)]
     pub fn acquire(run_dir: &Path) -> io::Result<Option<InstanceLock>> {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         use std::os::unix::io::AsRawFd;
         std::fs::create_dir_all(run_dir)?;
+        // Spec §4: the run dir holds the lock file and the process registry
+        // (pid/start-time identities) — tighten to 0700 at create time rather
+        // than trusting the ambient umask. `set_permissions` sets the exact
+        // bits regardless of umask (same approach as
+        // `registry::set_private_dir`), instead of `DirBuilder::mode`, which
+        // would still be masked by umask on creation.
+        std::fs::set_permissions(run_dir, std::fs::Permissions::from_mode(0o700))?;
         let path = run_dir.join("lock");
         let file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(false)
+            .mode(0o600)
             .open(&path)?;
         // SAFETY: `file` is a valid, open file descriptor for the duration of
         // this call; `flock(2)` has no other preconditions. `LOCK_NB` makes it

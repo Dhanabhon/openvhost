@@ -245,9 +245,18 @@ mod tests {
     // Used by every `target_os = "macos"` test below AND by the
     // `cfg(unix)` `store_sets_private_file_and_dir_permissions` test — gate
     // on `unix` (the union of both), not `target_os = "macos"` alone, so
-    // this stays live on any non-macOS unix (e.g. CI's ubuntu-latest `quick`
-    // job) while still being correctly dead on the Windows cross-check
-    // (Task 5).
+    // this helper stays DEFINED (compiles, name resolves) on any non-macOS
+    // unix (e.g. CI's ubuntu-latest `quick` job), while still being
+    // correctly dead on the Windows cross-check (Task 5). That is a
+    // compilation guarantee only, not a "the test passes there" guarantee:
+    // `platform::current_boot_id`/`process_start_time` have explicit
+    // "not implemented on this platform" stubs on non-macOS unix (P0-8
+    // merge-gate fix wave C6, which restored compilation on Linux/BSD after
+    // it had silently broken), so any test that actually calls into
+    // `record`/`list_current_boot` on such a target — including
+    // `store_sets_private_file_and_dir_permissions` — still errors out at
+    // RUNTIME there. Full non-macOS unix support is a later phase
+    // (macOS-first).
     #[cfg(unix)]
     fn rec(id: &str, pid: u32) -> SupervisedRecord {
         SupervisedRecord {
