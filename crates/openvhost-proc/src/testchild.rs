@@ -7,6 +7,9 @@
 
 use std::io::Write;
 
+/// Fixed response body the `--http` server returns and the E2E asserts on.
+pub const E2E_BODY: &str = "openvhost-e2e-ok";
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct TestchildArgs {
     pub lines: u64,
@@ -14,6 +17,7 @@ pub struct TestchildArgs {
     pub exit_code: i32,
     pub ignore_stop: bool,
     pub fail_after: Option<u64>,
+    pub http_port: Option<u16>,
 }
 
 impl Default for TestchildArgs {
@@ -24,6 +28,7 @@ impl Default for TestchildArgs {
             exit_code: 0,
             ignore_stop: false,
             fail_after: None,
+            http_port: None,
         }
     }
 }
@@ -50,6 +55,14 @@ pub fn parse(args: &[String]) -> Result<TestchildArgs, String> {
             }
             "--fail-after" => out.fail_after = Some(next_u64("--fail-after")?),
             "--ignore-stop" => out.ignore_stop = true,
+            "--http" => {
+                out.http_port = Some(
+                    it.next()
+                        .ok_or("--http needs a value")?
+                        .parse::<u16>()
+                        .map_err(|_| "--http needs a port number".to_string())?,
+                );
+            }
             other => return Err(format!("unknown flag {other}")),
         }
     }
@@ -58,6 +71,9 @@ pub fn parse(args: &[String]) -> Result<TestchildArgs, String> {
 
 #[allow(clippy::collapsible_if)]
 pub fn run(args: TestchildArgs) -> i32 {
+    if let Some(port) = args.http_port {
+        return serve_http(port);
+    }
     if args.ignore_stop {
         install_ignore_stop();
     }
@@ -77,6 +93,34 @@ pub fn run(args: TestchildArgs) -> i32 {
         std::thread::sleep(std::time::Duration::from_millis(args.interval_ms));
     }
     args.exit_code
+}
+
+/// Minimal HTTP/1.1 server: serve a fixed `200` + `E2E_BODY` on every
+/// connection until the supervisor kills the process. No signal handling —
+/// SIGTERM / console-ctrl terminates us (the child is not `--ignore-stop`).
+fn serve_http(port: u16) -> i32 {
+    let listener = match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("proc_testchild: cannot bind 127.0.0.1:{port}: {e}");
+            return 1;
+        }
+    };
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        E2E_BODY.len(),
+        E2E_BODY
+    );
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else { continue };
+        // Best-effort: consume up to 1 KiB of the request so the client's
+        // write side isn't reset before it reads the response. Discarded.
+        let mut buf = [0u8; 1024];
+        let _ = std::io::Read::read(&mut stream, &mut buf);
+        let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+        let _ = std::io::Write::flush(&mut stream);
+    }
+    0 // unreachable: incoming() blocks forever until the process is killed
 }
 
 #[cfg(unix)]
@@ -139,7 +183,8 @@ mod tests {
                 interval_ms: 50,
                 exit_code: 2,
                 ignore_stop: true,
-                fail_after: Some(1)
+                fail_after: Some(1),
+                http_port: None,
             }
         );
     }
@@ -147,6 +192,17 @@ mod tests {
     #[test]
     fn parse_rejects_unknown() {
         assert!(parse(&s(&["--nope"])).is_err());
+    }
+
+    #[test]
+    fn parse_http_flag() {
+        let a = parse(&s(&["--http", "8081"])).unwrap();
+        assert_eq!(a.http_port, Some(8081));
+    }
+
+    #[test]
+    fn parse_http_rejects_non_numeric() {
+        assert!(parse(&s(&["--http", "notaport"])).is_err());
     }
 
     // Binary-level behavior tests live in tests/testchild_bin.rs:
