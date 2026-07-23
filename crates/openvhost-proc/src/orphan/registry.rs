@@ -239,8 +239,16 @@ fn set_private_dir(_dir: &Path) {}
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::orphan::{ProcIdentity, ProcStartTime};
 
+    // Used by every `target_os = "macos"` test below AND by the
+    // `cfg(unix)` `store_sets_private_file_and_dir_permissions` test — gate
+    // on `unix` (the union of both), not `target_os = "macos"` alone, so
+    // this stays live on any non-macOS unix (e.g. CI's ubuntu-latest `quick`
+    // job) while still being correctly dead on the Windows cross-check
+    // (Task 5).
+    #[cfg(unix)]
     fn rec(id: &str, pid: u32) -> SupervisedRecord {
         SupervisedRecord {
             service_id: id.to_string(),
