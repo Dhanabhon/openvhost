@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::sync::Arc;
 
+use crate::orphan::{BootId, ProcStartTime};
+
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
@@ -160,6 +162,41 @@ pub fn default_driver() -> Arc<dyn ProcessDriver> {
     {
         Arc::new(windows::WindowsDriver)
     }
+}
+
+// `ProcessRegistry`/`OrphanReaper` (Task 2/3 of P0-8) are the real callers
+// of these readers. Until they land, the only callers are the macOS-gated
+// tests in `orphan::tests`, which is invisible to the dead-code pass on any
+// non-test compilation of this crate (integration-test binaries, other
+// workspace members that link this lib) and, on Windows, invisible outright
+// (those tests are `cfg(target_os = "macos")`). Drop these allows once
+// Task 2/3 wires in real callers.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub(crate) fn process_start_time(pid: u32) -> std::io::Result<Option<ProcStartTime>> {
+    unix::process_start_time(pid)
+}
+#[cfg(windows)]
+#[allow(dead_code)]
+pub(crate) fn process_start_time(pid: u32) -> std::io::Result<Option<ProcStartTime>> {
+    windows::process_start_time(pid)
+}
+
+#[cfg(unix)]
+#[allow(dead_code)]
+pub(crate) fn current_boot_id() -> std::io::Result<BootId> {
+    unix::current_boot_id()
+}
+#[cfg(windows)]
+#[allow(dead_code)]
+pub(crate) fn current_boot_id() -> std::io::Result<BootId> {
+    windows::current_boot_id()
+}
+
+#[cfg(unix)]
+#[allow(dead_code)]
+pub(crate) fn getpgid(pid: u32) -> std::io::Result<u32> {
+    unix::getpgid(pid)
 }
 
 #[cfg(test)]
