@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::sync::Arc;
 
-use crate::orphan::{BootId, ProcStartTime};
+use crate::orphan::{BootId, OrphanReaper, ProcStartTime};
 
 #[cfg(unix)]
 mod unix;
@@ -164,19 +164,32 @@ pub fn default_driver() -> Arc<dyn ProcessDriver> {
     }
 }
 
-// `OrphanReaper` (Task 3 of P0-8) is the real caller of `process_start_time`.
-// Until it lands, the only callers are the macOS-gated tests in
-// `orphan::tests`, which is invisible to the dead-code pass on any non-test
-// compilation of this crate (integration-test binaries, other workspace
-// members that link this lib) and, on Windows, invisible outright (those
-// tests are `cfg(target_os = "macos")`). Drop these allows once Task 3 wires
-// in the real caller. (`current_boot_id` below already got its real,
-// non-test caller in Task 2 — see its own note.)
+pub fn default_reaper() -> Arc<dyn OrphanReaper> {
+    #[cfg(unix)]
+    {
+        Arc::new(unix::UnixReaper)
+    }
+    #[cfg(windows)]
+    {
+        Arc::new(windows::WindowsReaper)
+    }
+}
+
+// `#[allow(dead_code)]` dropped on the unix arm (P0-8 Task 3): the
+// `#[cfg(unix)]` `reap_orphans` body is now a real, non-test caller of this
+// wrapper on macOS. The `#[cfg(windows)]` arm below KEEPS its allow: on that
+// target `reap_orphans` compiles to the `#[cfg(not(unix))]` stub, which does
+// NOT call this — still no production caller until the Windows-enablement
+// phase actually wires up Windows reaping. (`current_boot_id` below already
+// got its real, non-test caller in Task 2 — see its own note.)
 #[cfg(unix)]
-#[allow(dead_code)]
 pub(crate) fn process_start_time(pid: u32) -> std::io::Result<Option<ProcStartTime>> {
     unix::process_start_time(pid)
 }
+// `#[allow(dead_code)]` KEPT: no production caller on Windows yet (see the
+// unix-arm comment above) — only the `windows::process_start_time` impl
+// itself is called here, and that impl also keeps its own allow for the
+// same reason.
 #[cfg(windows)]
 #[allow(dead_code)]
 pub(crate) fn process_start_time(pid: u32) -> std::io::Result<Option<ProcStartTime>> {
@@ -194,8 +207,10 @@ pub(crate) fn current_boot_id() -> std::io::Result<BootId> {
     windows::current_boot_id()
 }
 
+// `#[allow(dead_code)]` dropped (P0-8 Task 3): `reap::reject_reason` now
+// calls this via `platform::getpgid(std::process::id())` from production
+// code (the `#[cfg(unix)]` `reap_orphans` body).
 #[cfg(unix)]
-#[allow(dead_code)]
 pub(crate) fn getpgid(pid: u32) -> std::io::Result<u32> {
     unix::getpgid(pid)
 }

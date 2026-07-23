@@ -95,3 +95,15 @@ pub(crate) fn current_boot_id() -> io::Result<BootId> {
         "current_boot_id is not implemented on Windows in v1 (macOS-first)",
     ))
 }
+
+use crate::orphan::{OrphanReaper, ReapKind};
+
+pub(crate) struct WindowsReaper;
+
+impl OrphanReaper for WindowsReaper {
+    fn reap(&self, _pid: u32) -> io::Result<ReapKind> {
+        Err(io::Error::other(
+            "orphan reap is not implemented on Windows in v1 (macOS-first)",
+        ))
+    }
+}

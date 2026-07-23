@@ -62,11 +62,10 @@ impl ProcessDriver for UnixDriver {
 /// for a dead/nonexistent pid (sysctl succeeds with len==0), `Err` on a real
 /// error. (macOS consult; empirically verified.)
 ///
-/// `#[allow(dead_code)]`: only called via `platform::process_start_time` from
-/// the macOS-gated tests in `orphan::tests` until Task 2/3 wires in the
-/// registry/reaper callers.
+/// `#[allow(dead_code)]` dropped (P0-8 Task 3): called via
+/// `platform::process_start_time` from the real `reap_orphans` production
+/// path now, not just the macOS-gated tests in `orphan::tests`.
 #[cfg(target_os = "macos")]
-#[allow(dead_code)]
 pub(crate) fn process_start_time(pid: u32) -> io::Result<Option<ProcStartTime>> {
     if pid == 0 || pid > i32::MAX as u32 {
         return Ok(None); // pid 0 is kernel_task; out-of-range can't be ours
@@ -153,9 +152,10 @@ pub(crate) fn current_boot_id() -> io::Result<BootId> {
 
 /// Process-group id of `pid` (reap re-verifies `getpgid(pid) == pid`).
 ///
-/// `#[allow(dead_code)]`: see `process_start_time` above.
+/// `#[allow(dead_code)]` dropped (P0-8 Task 3): called from production code
+/// now, both via the `platform::getpgid` wrapper (`reap::reject_reason`) and
+/// directly from `UnixReaper::reap` below.
 #[cfg(unix)]
-#[allow(dead_code)]
 pub(crate) fn getpgid(pid: u32) -> io::Result<u32> {
     // SAFETY: plain syscall, no memory handed over.
     let pg = unsafe { libc::getpgid(pid as libc::pid_t) };
@@ -163,5 +163,30 @@ pub(crate) fn getpgid(pid: u32) -> io::Result<u32> {
         Err(io::Error::last_os_error())
     } else {
         Ok(pg as u32)
+    }
+}
+
+use crate::orphan::{OrphanReaper, ReapKind};
+
+pub(crate) struct UnixReaper;
+
+impl OrphanReaper for UnixReaper {
+    /// Re-verify group-leadership at reap time (never trust the spawn invariant
+    /// alone): `getpgid(pid) == pid` → group-kill; else single-pid fallback.
+    fn reap(&self, pid: u32) -> io::Result<ReapKind> {
+        match getpgid(pid) {
+            Ok(pg) if pg == pid => {
+                signal_group(pid as i32, libc::SIGKILL)?;
+                Ok(ReapKind::Group)
+            }
+            _ => {
+                // SAFETY: plain kill syscall; identity already verified upstream.
+                let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                if rc != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(ReapKind::SinglePidFallback)
+            }
+        }
     }
 }

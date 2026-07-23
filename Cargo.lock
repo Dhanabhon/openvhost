@@ -2320,6 +2320,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+ "tracing",
  "windows-sys 0.61.2",
 ]
 
