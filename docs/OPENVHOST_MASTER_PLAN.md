@@ -181,7 +181,7 @@ Phase 1 implements `NginxAdapter` + `ApacheAdapter`. `CaddyAdapter` lands in Pha
 | Pooling | FPM manages workers | **We build a pool manager in Rust** ✅ |
 | Reload | `SIGUSR2` | Rolling restart of pool members |
 
-The Windows pool manager (`openvhost-proc::phpcgi_pool`) must: spawn N `php-cgi.exe -b 127.0.0.1:PORT` workers per (site × PHP version) group, allocate ports deterministically from `state.db`, set `PHP_FCGI_MAX_REQUESTS` and recycle workers, health-check via FastCGI ping, register every worker in the Job Object, and expose one upstream address list for the web server template. **This is the single highest-risk item and gates Phase 0 exit.**
+The Windows pool manager (`openvhost-proc::phpcgi_pool`) must: spawn N `php-cgi.exe -b 127.0.0.1:PORT` workers per (site × PHP version) group, allocate ports deterministically from `state.db`, set `PHP_FCGI_MAX_REQUESTS` and recycle workers, health-check via FastCGI ping, register every worker in the Job Object, and expose one upstream address list for the web server template. **This is the single highest-risk item and gates Phase 0 exit** — under the **macOS-first v1** scope (owner 2026-07-22) P0-5 is deferred to the **Windows-enablement phase**, so it gates *that* phase's exit, not the macOS Phase 0 exit or the Phase 1 UI. ✅
 
 ---
 ## 4. Development Roadmap
@@ -202,7 +202,11 @@ Goal: prove the four riskiest assumptions. **If any fails, revisit the stack bef
 | P0-8 | Orphan cleanup: PID persistence + stale-process kill on restart | rust-core-engineer | Kill app hard → relaunch → old services detected & reaped |
 | P0-9 | Integration test harness: start→HTTP assert→stop | qa-test-engineer | One E2E test runs in CI on both OS |
 
-**Phase 0 exit gate:** all nine green in CI, and a human has manually run the app on one real Mac and one real Windows machine.
+**Status (2026-07-24):** P0-1 · P0-2 ✅ (kickoff, PR #1/#2) · P0-3 ✅ (PR #3) · P0-4 ✅ (PR #4) · P0-6 ✅ (PR #5) · P0-7 ✅ (PR #6) · P0-8 ✅ (PR #7) · **P0-9 ⬜ (last macOS-first slice)** · P0-5 ⏸ deferred → Windows-enablement.
+
+**Phase 0 exit gate (original / full v1):** all nine green in CI, and a human has manually run the app on one real Mac and one real Windows machine.
+
+**Phase 0 exit gate (macOS-first v1 — ACTIVE, owner 2026-07-22):** the macOS subset (P0-1…P0-4, P0-6…P0-9) green under the **local gate suite** (CI is disabled for billing; local gates are the merge gate) plus a human manual smoke on one real Mac. P0-5, the manual Windows run, and the CI matrix on both OS are carried into the **Windows-enablement phase** and do **not** gate the macOS Phase 1 UI. ✅
 
 Binary sourcing for P0/P1 (🟡 hybrid strategy): use existing static builds first — `static-php-cli` for macOS PHP, official windows.php.net builds for Windows PHP, official Nginx/Apache/MySQL/MariaDB distributions — and move to our own reproducible CI builds in Phase 2+.
 
