@@ -81,6 +81,12 @@
 	--vh-accent-hover: var(--vh-brand-700);
 	--vh-accent-contrast: #ffffff;
 	--vh-link: var(--vh-brand-700);
+	/* brand-400 (§7.1's documented ring color) is the dark-mode accent — against this
+	   theme's light surfaces it measures ~2.3-2.5:1, short of WCAG 1.4.11's 3:1 non-text
+	   contrast floor for focus indicators. brand-600 (this theme's own accent) clears
+	   ~5.7-6.2:1 against --vh-surface/--vh-bg. Indirect via a semantic token so the dark
+	   theme can restore brand-400 here once it ships (it will pass against dark surfaces). */
+	--vh-focus-ring: var(--vh-brand-600);
 	--vh-selected: var(--vh-brand-100);
 	--vh-run: var(--vh-state-running-text);
 	--vh-start: var(--vh-state-starting-text);
@@ -133,7 +139,7 @@ pre,
 	font-variant-numeric: tabular-nums;
 }
 :focus-visible {
-	outline: 2px solid var(--vh-brand-400);
+	outline: 2px solid var(--vh-focus-ring);
 	outline-offset: 1px;
 	border-radius: var(--vh-radius-control);
 }
@@ -154,7 +160,9 @@ pre,
 /* ---- theme-ready hooks (dark palette is a follow-up; values still light) ---- */
 :root[data-theme='dark'] {
 	/* Dark overrides land here in the dark-mode slice. Intentionally empty so
-     the mechanism exists without shipping an unreviewed dark palette. */
+     the mechanism exists without shipping an unreviewed dark palette.
+     Remember --vh-focus-ring: var(--vh-brand-400) here — brand-400 is §7.1's documented
+     ring color and is the dark-mode accent, so it should pass 3:1 against dark surfaces. */
 }
 @media (prefers-color-scheme: dark) {
 	:root:not([data-theme='light']) {

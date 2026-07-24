@@ -17,15 +17,30 @@
 
 <div class="row svc-row">
 	<div class="primary">{service.displayName}</div>
-	<div class="mono meta">{service.endpoint ?? '—'}</div>
+	<div class="mono num meta">{service.endpoint ?? '—'}</div>
 	<StatusPill kind={service.state.kind} testId="pill-{service.id}" />
 	<div class="row-actions">
 		{#if service.state.kind === 'stopped'}
-			<Button variant="quiet" size="sm" onclick={() => onStart(service.id)}>Start</Button>
+			<Button
+				variant="quiet"
+				size="sm"
+				ariaLabel="Start {service.displayName}"
+				onclick={() => onStart(service.id)}>Start</Button
+			>
 		{:else if service.state.kind === 'failed'}
-			<Button variant="quiet" size="sm" onclick={() => onStart(service.id)}>Retry</Button>
+			<Button
+				variant="quiet"
+				size="sm"
+				ariaLabel="Retry {service.displayName}"
+				onclick={() => onStart(service.id)}>Retry</Button
+			>
 		{:else}
-			<Button variant="quiet" size="sm" onclick={() => onStop(service.id)}>Stop</Button>
+			<Button
+				variant="quiet"
+				size="sm"
+				ariaLabel="Stop {service.displayName}"
+				onclick={() => onStop(service.id)}>Stop</Button
+			>
 		{/if}
 	</div>
 </div>
@@ -62,7 +77,13 @@
 		border-bottom: 1px solid var(--vh-border);
 		transition: background var(--vh-dur-fast) var(--vh-ease-out);
 	}
-	.row:last-child {
+	/* A failed row's `.fail-detail` is a flat sibling rendered right after it (see markup
+	   above), so when the failed service is last in the list, `.fail-detail` — not the
+	   `.row` — is `.rowlist`'s actual last child, and `:last-child` alone misses the row.
+	   Cover that case explicitly: a row immediately followed by the trailing `.fail-detail`
+	   reads as the panel's last visible row and gets the same border suppression. */
+	.row:last-child,
+	.row:has(+ .fail-detail:last-child) {
 		border-bottom: 0;
 	}
 	.row:hover {

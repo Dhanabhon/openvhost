@@ -7,12 +7,17 @@
 		variant,
 		size,
 		disabled = false,
+		ariaLabel,
 		onclick,
 		children
 	}: {
 		variant?: 'primary' | 'quiet';
 		size?: 'sm';
 		disabled?: boolean;
+		/** Overrides the accessible name when the visible label alone is ambiguous out of
+		 * context — e.g. a row of repeated "Start"/"Stop" buttons, one per service, needs
+		 * each one to announce which service it acts on. Leaves the visible text untouched. */
+		ariaLabel?: string;
 		onclick: () => void;
 		children: Snippet;
 	} = $props();
@@ -26,6 +31,7 @@
 		variant === 'quiet' && 'btn-quiet',
 		size === 'sm' && 'btn-sm'
 	)}
+	aria-label={ariaLabel}
 	{disabled}
 	{onclick}
 >
