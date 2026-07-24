@@ -51,6 +51,7 @@
 </script>
 
 <AppShell runningCount={running}>
+	<h1 class="sr-only">OpenVHost — Services</h1>
 	{#if error}
 		<div class="banner-error" role="alert" data-testid="error-banner">
 			<strong>Command failed ({error.kind})</strong>
