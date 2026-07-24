@@ -115,10 +115,12 @@ These map 1:1 to the supervisor state machine in the master plan (§3.1) and mus
 
 | State | Token | Hex (dark bg) | Text-safe on light |
 |---|---|---|---|
-| Running | `state-running` | `#3FB950` | `#2E8B3D` |
+| Running | `state-running` | `#3FB950` | `#2B8139` |
 | Starting / pending | `state-starting` | `#D99A2B` | `#9A6B14` |
 | Failed | `state-failed` | `#E5534B` | `#C13832` |
 | Stopped / disabled | `state-stopped` | `#8A9099` | `#5C636E` |
+
+The running text-safe value was deepened from `#2E8B3D` to `#2B8139` (same hue and saturation, lightness 36.3% → 33.7%): the original measured 4.31:1 on white and 3.98:1 on Plaintext, short of the ≥ 4.5:1 floor §4.3 requires below. The replacement clears AA on every light text surface (white 4.88:1, Plaintext 4.51:1).
 
 Signal Green (`#3FB950`) is deliberately brighter and yellower than Evergreen so brand accent and "running" never read as the same thing. If a composition makes them ambiguous, add the state label text — color alone must never be the only carrier of state (accessibility).
 

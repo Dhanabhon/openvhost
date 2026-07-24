@@ -159,6 +159,15 @@
 		color: var(--vh-fail);
 		margin-bottom: 6px;
 	}
+	/* The mock's `<pre>` keeps `white-space: pre` + `overflow-x: auto`, which technically scrolls
+	   but hides most of a real stderr tail: an nginx `[emerg]` line citing an absolute
+	   Application Support path measured 2069px of content in an 846px box — 59% of the error
+	   text parked off-screen behind a macOS overlay scrollbar that gives no visible hint it is
+	   scrollable. An error message is the last thing that should need discovery to read, so
+	   wrap instead (matching LogPane's `.log .line`, which already wraps for the same reason).
+	   `overflow-wrap: anywhere` covers stderr tokens with no space to break at (long paths,
+	   base64, stack frames); `overflow-x: auto` stays as the backstop for anything still
+	   unwrappable. */
 	.fail-detail pre {
 		margin: 0;
 		padding: var(--vh-space-2) var(--vh-space-3);
@@ -167,6 +176,8 @@
 		border-radius: var(--vh-radius-control);
 		font-size: var(--vh-text-caption);
 		line-height: 1.6;
+		white-space: pre-wrap;
+		overflow-wrap: anywhere;
 		overflow-x: auto;
 		color: var(--vh-text);
 	}

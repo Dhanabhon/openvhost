@@ -28,7 +28,7 @@ Semantic state colors (map 1:1 to the supervisor state machine; never used for a
 
 | State | On dark / as fill | Text-safe on light |
 |---|---|---|
-| running | `#3FB950` | `#2E8B3D` |
+| running | `#3FB950` | `#2B8139` |
 | starting | `#D99A2B` | `#9A6B14` |
 | failed | `#E5534B` | `#C13832` |
 | stopped | `#8A9099` | `#5C636E` |

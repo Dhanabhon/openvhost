@@ -22,7 +22,8 @@
   --vh-state-failed: #e5534b;
   --vh-state-stopped: #8a9099;
   /* text-safe on light */
-  --vh-state-running-text: #2e8b3d;
+  /* Deepened from #2e8b3d (4.31:1 on #fff — under WCAG AA); see brand guidelines §4.2. */
+  --vh-state-running-text: #2b8139;
   --vh-state-starting-text: #9a6b14;
   --vh-state-failed-text: #c13832;
   --vh-state-stopped-text: #5c636e;
