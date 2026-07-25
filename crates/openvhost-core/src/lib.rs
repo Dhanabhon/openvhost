@@ -15,6 +15,6 @@ pub use db::Db;
 pub use error::CoreError;
 pub use home::resolve_home;
 pub use info::{CoreInfo, core_info};
-pub use site::{Domain, NewSite, PhpVersion, Site, SiteId, SiteName, WebServer};
+pub use site::{Docroot, Domain, NewSite, PhpVersion, Site, SiteId, SiteName, WebServer};
 
 pub mod platform;

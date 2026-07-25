@@ -3,7 +3,7 @@
 //! reaches generated config or a filesystem path is charset-checked here, at
 //! the boundary (the P0-7 config-injection lesson pushed to ingress).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::error::CoreError;
 
@@ -36,6 +36,7 @@ impl SiteId {
     pub fn new() -> Self {
         SiteId(uuid::Uuid::new_v4().to_string())
     }
+    /// Parse a UUID string into a validated `SiteId`.
     pub fn parse(s: &str) -> Result<Self, CoreError> {
         uuid::Uuid::parse_str(s).map_err(|_| invalid("id", "not a UUID"))?;
         Ok(SiteId(s.to_string()))
@@ -69,15 +70,16 @@ impl Domain {
     /// each label 1..=63, total ≤253, lowercase only.
     pub fn parse(s: &str) -> Result<Self, CoreError> {
         let total_ok = (1..=253).contains(&s.len());
-        let labels_ok = !s.is_empty()
-            && s.split('.').all(|label| {
-                (1..=63).contains(&label.len())
-                    && !label.starts_with('-')
-                    && !label.ends_with('-')
-                    && label
-                        .bytes()
-                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-            });
+        // An empty `s` already fails here: `"".split('.')` yields one
+        // zero-length label, which fails the per-label `1..=63` bound below.
+        let labels_ok = s.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        });
         if !(total_ok && labels_ok) {
             return Err(invalid(
                 "domain",
@@ -110,12 +112,43 @@ impl PhpVersion {
     }
 }
 
+/// A validated site document root: an absolute path with no NUL, `"`, or
+/// control byte (the exact class `openvhost-conf`'s `to_config_path`
+/// rejects — config-injection stopped at ingress). Constructed only via
+/// `parse`; the inner value is guaranteed valid UTF-8.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Docroot(String);
+
+impl Docroot {
+    /// Validate a docroot string: absolute, valid UTF-8 (it's `&str`), no
+    /// quote or control character (the exact class P0-7's `to_config_path`
+    /// rejects). NUL is already covered by `is_ascii_control`.
+    pub fn parse(s: &str) -> Result<Self, CoreError> {
+        if !Path::new(s).is_absolute() {
+            return Err(invalid("docroot", "must be an absolute path"));
+        }
+        if s.bytes().any(|b| b == b'"' || b.is_ascii_control()) {
+            return Err(invalid("docroot", "contains a quote or control character"));
+        }
+        Ok(Docroot(s.to_string()))
+    }
+    /// The validated docroot as a `&str`.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    /// The validated docroot as a `&Path`.
+    pub fn as_path(&self) -> &Path {
+        Path::new(&self.0)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WebServer {
     Nginx,
     Apache,
 }
 impl WebServer {
+    /// Parse `"nginx"` or `"apache"` into a `WebServer`.
     pub fn parse(s: &str) -> Result<Self, CoreError> {
         match s {
             "nginx" => Ok(WebServer::Nginx),
@@ -126,6 +159,7 @@ impl WebServer {
             )),
         }
     }
+    /// The canonical lowercase name (`"nginx"` or `"apache"`).
     pub fn as_str(&self) -> &'static str {
         match self {
             WebServer::Nginx => "nginx",
@@ -140,7 +174,7 @@ pub struct Site {
     pub id: SiteId,
     pub name: SiteName,
     pub domain: Domain,
-    pub docroot: PathBuf,
+    pub docroot: Docroot,
     pub web_server: WebServer,
     pub php_version: PhpVersion,
     pub enabled: bool,
@@ -153,29 +187,10 @@ pub struct Site {
 pub struct NewSite {
     pub name: SiteName,
     pub domain: Domain,
-    pub docroot: PathBuf,
+    pub docroot: Docroot,
     pub web_server: WebServer,
     pub php_version: PhpVersion,
     pub enabled: bool,
-}
-
-impl NewSite {
-    /// Validate a docroot string: absolute, valid UTF-8 (it's `&str`), no NUL /
-    /// control chars / `"` (the exact class P0-7's `to_config_path` rejects).
-    pub fn docroot_from(s: &str) -> Result<PathBuf, CoreError> {
-        if !Path::new(s).is_absolute() {
-            return Err(invalid("docroot", "must be an absolute path"));
-        }
-        if s.bytes()
-            .any(|b| b == 0 || b == b'"' || b.is_ascii_control())
-        {
-            return Err(invalid(
-                "docroot",
-                "contains a NUL, quote, or control character",
-            ));
-        }
-        Ok(PathBuf::from(s))
-    }
 }
 
 #[cfg(test)]
@@ -227,10 +242,17 @@ mod tests {
 
     #[test]
     fn docroot_absolute_utf8_no_control_or_quote() {
-        assert!(NewSite::docroot_from("/srv/www/shop").is_ok());
+        assert!(Docroot::parse("/srv/www/shop").is_ok());
         for bad in ["relative/path", "/has\"quote", "/has\0nul", "/has\ncontrol"] {
-            assert!(NewSite::docroot_from(bad).is_err(), "should reject {bad:?}");
+            assert!(Docroot::parse(bad).is_err(), "should reject {bad:?}");
         }
+    }
+
+    #[test]
+    fn docroot_roundtrips_as_path_and_as_str() {
+        let docroot = Docroot::parse("/srv/www").unwrap();
+        assert_eq!(docroot.as_path(), Path::new("/srv/www"));
+        assert_eq!(docroot.as_str(), "/srv/www");
     }
 
     #[test]
