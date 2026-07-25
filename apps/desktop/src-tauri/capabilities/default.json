@@ -1,12 +1,13 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "enables the default permissions",
+  "description": "Default permissions, plus two deliberately narrow grants. DO NOT PRUNE EITHER: core:window:allow-start-dragging is load-bearing — titleBarStyle Overlay + hiddenTitle means macOS draws no native draggable strip, so the custom titlebar's data-tauri-drag-region is the only way to move the window, and core:window:default carries only read-only getters (no allow-start-dragging), so without this grant the ACL silently rejects the drag and the window is immovable. dialog:allow-open is the folder picker for a site's project directory, deliberately chosen over dialog:default, which would also grant native save and native message dialogs (a UI-spoofing primitive) for no benefit.",
   "windows": [
     "main"
   ],
   "permissions": [
     "core:default",
+    "core:window:allow-start-dragging",
     "dialog:allow-open"
   ]
 }
