@@ -95,9 +95,19 @@ async fn generated_stack_passes_native_validators() {
 /// Both probes are exercised, because both go through `run_bounded`.
 #[tokio::test]
 async fn both_probes_pass_real_nginx_in_the_assembled_environment() {
+    // Deliberately FAILS rather than skipping when the binaries are absent, unlike its
+    // sibling above. This is the only check that proves a real nginx still works in the
+    // cleared environment `probe_env()` assembles — so if it silently no-ops, the gate
+    // reports green for the one thing it was added to verify. GitHub CI is disabled on
+    // this repo and local gates ARE the merge gate, so a skip here is indistinguishable
+    // from a pass by anyone reading the suite output. Flagged by the security-auditor at
+    // the gate that required the environment change.
     let Some(brew) = find_brew_binaries() else {
-        eprintln!("SKIP validate_live: Homebrew nginx/php-fpm not found (brew install nginx php)");
-        return;
+        panic!(
+            "Homebrew nginx/php-fpm not found, so the cleared-environment check could not run. \
+             This test must not skip: it is the only proof that env_clear() + probe_env() does \
+             not break a real nginx. Install them (brew install nginx php) and re-run."
+        );
     };
 
     let (_home, ctx) = temp_home_ctx();

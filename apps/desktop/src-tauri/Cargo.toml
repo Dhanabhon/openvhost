@@ -39,10 +39,18 @@ tauri-specta = { version = "2.0.0-rc.25", features = ["derive", "typescript"] }
 # than through a testable helper carved out of it. Verified against tauri 2.11.3
 # that the feature gates NOTHING but the `tauri::test` module (`src/lib.rs:1098`):
 # it does not touch `invoke_key`, the ACL, or the CSP. Adds no new crate to
-# Cargo.lock. CI note: dev-dependency features are not unified into `cargo build`
-# under the edition-2024 resolver, so `cargo build --workspace` and
-# `cargo test --workspace` compile `tauri` with different feature sets and each
-# keeps its own cached artifact.
+# Cargo.lock. Verified against the version the lockfile actually resolves, tauri
+# 2.11.5 — name it or drop it, but do not leave a stale number here, because the
+# claim above is only as good as the version it was checked against.
+# CI note: dev-dependency features are not unified into `cargo build`, so
+# `cargo build --workspace` and `cargo test --workspace` compile `tauri` with
+# different feature sets and each keeps its own cached artifact. That property
+# comes from `resolver = "2"`, pinned explicitly in the workspace Cargo.toml —
+# NOT from the edition, as an earlier version of this comment said. Under
+# resolver v1 the feature WOULD leak into the shipped build, so if that pin ever
+# changes, re-verify with:
+#   cargo tree -p openvhost-desktop -e features --edges normal,build -i tauri
+# The `test` feature must be absent from that graph.
 tauri = { version = "2", features = ["test"] }
 tempfile = "3"
 
