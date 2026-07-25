@@ -2530,6 +2530,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-specta",
+ "tempfile",
  "thiserror 2.0.19",
  "tokio",
 ]
