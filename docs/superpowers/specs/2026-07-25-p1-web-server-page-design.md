@@ -84,10 +84,15 @@ native-validator plumbing) and is tauri-free, which `openvhost-core`/`-conf` mus
 (golden rule 4).
 
 ```rust
-/// Version string as the binary reports it, or None when the probe fails for any
-/// reason (missing binary, non-zero exit, unparseable output). A missing version is
-/// not an error worth failing a whole page over.
-pub async fn probe_version(bin: &Path) -> Option<String>;
+/// `<bin> -e <err_log> -v` — nginx's version as the banner reports it, or None when
+/// the probe fails for any reason (missing binary, non-zero exit, unparseable
+/// output). A missing version is not an error worth failing a whole page over.
+///
+/// NGINX-SPECIFIC by contract: it reads STDERR, where nginx writes its banner, and
+/// `php-fpm -v` writes to stdout in a different shape. It carries `err_log` for the
+/// same reason `validate_live` does — `-e` is mandatory on EVERY nginx invocation
+/// (see below), so the signature has to be able to supply it.
+pub async fn probe_nginx_version(bin: &Path, err_log: &Path) -> Option<String>;
 
 /// `<bin> -e <err_log> -t -c <conf>` — validate an EXISTING config file in place.
 /// Writes nothing to `conf` and never calls `materialize`.
@@ -97,6 +102,13 @@ pub async fn validate_live(
     err_log: &Path,
 ) -> Result<ValidationReport, ConfError>;
 ```
+
+*(This block was `probe_version(bin: &Path) -> Option<String>` when the spec was
+written. The rename and the added `err_log` happened during Task 1 and were recorded
+in the plan's "Task 1 — As built" section but not here, so this section said one
+thing and `inspect.rs` another — including omitting the very `-e` the paragraphs
+below call mandatory. Both review gates flagged it independently. When an as-built
+divergence is recorded in the plan, mirror it here too.)*
 
 Reuses the existing `ValidationReport { ok, stderr }`, whose `ok` is derived from the
 exit code alone — never from stderr emptiness, because nginx writes informational lines
@@ -116,13 +128,42 @@ can hang forever is not. On timeout the child is killed and the command returns 
 that renders. *(The P0-7 validator's own missing timeout is a real latent bug and is
 recorded as a follow-up rather than fixed here, to keep this diff reviewable.)*
 
-**Golden rule 4 and process spawning.** The rule says all child processes go through
-`openvhost-proc`. `openvhost-conf` already spawns the P0-7 validator directly with
+**Golden rule 4 and process spawning — CONFIRMED reading (security-auditor,
+2026-07-26).** The rule says all child processes go through `openvhost-proc`.
+`openvhost-conf` already spawns the P0-7 validator directly with
 `tokio::process::Command` and does not depend on `openvhost-proc` — established in a
-security-auditor-approved slice — so the rule is understood as governing *supervised,
-long-running services*, not one-shot tool invocations. This slice follows that
-precedent. **This reading is flagged explicitly for the auditor to confirm or reject
-rather than assumed.**
+security-auditor-approved slice. That precedent was flagged for the auditor rather
+than assumed; the gate **confirmed** the carve-out but **narrowed** it, because the
+unconditional form "is a loophole someone will drive a truck through — the day a
+slice wants `security add-trusted-cert` or a hosts-file edit, those are also one-shot
+tools". The confirmed reading, which `crates/openvhost-conf/src/inspect.rs`'s module
+doc carries verbatim:
+
+> Rule 4 governs any child process whose lifetime OpenVHost manages — anything with a
+> lifecycle, restart policy, health check, orphan record, or that outlives the call
+> that created it. Those go through `openvhost-proc`, no exceptions.
+>
+> A one-shot tool invocation MAY spawn directly from the crate that owns knowledge of
+> that tool if and only if **all** of: (1) it is bounded by a wall-clock deadline;
+> (2) it is contained in its own process group and the deadline group-kills that
+> group; (3) no component of its argv is client-supplied; (4) it runs with the app's
+> own unelevated privileges — anything elevated, anything through the privileged
+> helper, and anything that mutates system state (hosts file, trust store,
+> launchd/services, privileged sockets) is OUTSIDE this carve-out regardless of how
+> short-lived it is; (5) its stdout/stderr are captured, not inherited; (6) its
+> environment is explicitly assembled, not inherited.
+>
+> A spawn that fails any of these goes through `openvhost-proc`.
+
+This slice's probes meet **all six**. Condition 6 was the one gap the audit found —
+`run_bounded` inherited the app's full environment while `openvhost-proc`'s
+`assemble_env` is a deliberate allowlist — and it is closed by mirroring that
+allowlist in `inspect::probe_env`. Two consequences motivated closing it rather than
+recording it: the *same nginx binary* was being validated in one environment and
+supervised in another, and nginx reads `NGINX`/`NGINX_SHM` as inherited listening
+socket descriptors. Note that the P0-7 validator in `webserver.rs` is a *different*
+spawn on a different path and still fails conditions 1 and 6; its follow-ups already
+stand (§7.1).
 
 ### 3.2 IPC — `apps/desktop/src-tauri/src/commands.rs`
 
@@ -152,15 +193,38 @@ WebServerDto {
 - The client sends **only an opaque brand id**, parsed against a closed list. It never
   sends a path, a filename, or an argument. An unknown id is a validation error, not a
   fallback.
-- `binaryPath` and `configPath` are derived **server-side** from `resolve_home()` and the
-  supervisor's registered spec. **Nothing client-supplied reaches argv.**
-- All three commands are read-only: none writes a **config** file, and none calls
-  `materialize`. One footnote, so the claim is literally true rather than nearly true — the
-  mandatory `-e <home>/logs/nginx.error.log` means nginx may **create or append its own error
-  log** under our home, during `-v` as well as `-t`. That is the whole purpose of `-e`:
-  without it nginx writes into its compiled-in prefix (`/opt/homebrew/var`) instead. So the
-  precise claim is *no write we author, and no write outside our own home* — not that nothing
-  on disk changes.
+- `binaryPath` and `configPath` are derived **server-side**, in `stack.rs`, at the moment
+  the specs are built — and returned alongside them as `StackPaths`, which the app `manage`s
+  as Tauri state. The commands read that managed state. They are **not** read back off the
+  supervisor: §3.3 explains at length why that is not possible (`Supervisor` exposes no
+  accessor and `ServiceStatus` carries no program path). Same values either way, but the
+  mechanism is the managed state, not the registered spec. **Nothing client-supplied reaches
+  argv.**
+- All three commands are read-only **with respect to configuration**: none writes a config
+  file, and none calls `materialize`. They are not read-only with respect to the filesystem,
+  and the boundary is worth stating exactly, because `nginx -t` performs a full configuration
+  parse and creates the files and directories that configuration declares — its `error_log`
+  and `access_log` targets and its `*_temp_path` directories — using the app's own privileges.
+  `-e <home>/logs/nginx.error.log` redirects only nginx's *pre-parse* error log; it does
+  **not** override an `error_log` directive inside the config (verified empirically against
+  nginx 1.27.3: an `error_log /tmp/x;` in the config is created even with `-e` pointing into
+  our home). Under the config OpenVHost provisions, every such path is inside `<home>`. That
+  is a property of *that config text*, not a property enforced by this slice: the live config
+  is a user-editable file, so a hand-edited `error_log`/`access_log`/`*_temp_path` will have
+  `nginx -t` create files anywhere the user can write. This is not a privilege boundary — the
+  user could run `nginx -t` themselves with the same effect — but it must not be described as
+  a containment guarantee.
+- **Forward-looking constraint on returning stderr verbatim.** `nginx -t` follows `include`
+  directives and echoes offending tokens verbatim, so a config that `include`s a file of
+  `KEY=value` lines echoes those values into stderr, which this page renders. Measured by the
+  audit: an `include env2.txt` containing `AWS_SECRET_KEY=…` put the secret in stderr.
+  **Harmless as built** — the validator runs as the user with no more reach than the user
+  already has, an unreadable file yields permission-denied with no content, and there is no
+  `{@html}` anywhere so the `<pre>` is escaped. It stops being harmless the moment any
+  validator runs elevated or through the privileged helper: "return stderr verbatim to the
+  webview" then becomes an arbitrary-file-read primitive driven by a user-writable config.
+  So: **a validator whose stderr crosses IPC must not run elevated.** If one ever must,
+  the stderr needs filtering at that point, not here.
 - `read_web_server_config` is *not* a general file reader: the path is derived from the
   parsed id, so it cannot be aimed at an arbitrary file.
 
@@ -249,9 +313,45 @@ the PR's owed-click-through list.
 
 ## 7. Open follow-ups recorded, not done here
 
-1. The P0-7 validator's missing timeout.
+1. The P0-7 validator's missing timeout — and, now, its missing env allowlist: it fails
+   conditions 1 and 6 of the confirmed golden-rule-4 reading in §3.1.
 2. The duplicated `find_brew_binaries`.
 3. `ApacheAdapter` + `httpd.conf`/vhost template + `httpd -t`, which is what would make
    the site editor's Apache option honest.
 4. The generated-vs-live diff, and the apply/swap pipeline it belongs to.
 5. Editable per-brand settings, which need a persistence surface first.
+
+### Carried out of the review gates (deliberate deferrals, with reasons)
+
+6. **No bound on call rate, response size, or blocking-pool consumption** (audit A2,
+   Medium). No rate limit on the two spawning commands, no size cap on the config text or
+   the stderr crossing IPC, and `tokio::fs` on a hung mount occupies an uncancellable
+   blocking-pool thread. Wants an in-flight guard or semaphore plus a ~1 MiB cap with a
+   truncation marker. Deferred because exploiting it requires XSS in a first-party webview
+   that loads no remote content.
+7. **The two degraded startup paths surface Tauri's raw "state not managed" string** (audit
+   A4, Low; verified *not* a panic). One `app.manage` after the match, with every arm
+   yielding an `Option<StackPaths>`; `commands::stack_paths`'s doc already records both the
+   fix and the no-overwrite trap that rules out the obvious approximation.
+8. **Extract ONE shared bounded one-shot runner** (audit A7), so the process-group
+   containment *and* the env allowlist each have exactly one home instead of two. This is
+   the real fix for the duplication `inspect.rs`'s module doc currently manages with a
+   "change both or neither" note, and it inverts the layering objection: the dependency
+   becomes one on a mechanism rather than one on the supervisor.
+9. `PROBE_TIMEOUT` is re-exported from `openvhost-conf` with no consumer — drop it or use
+   it (review M4).
+10. Display goes through lossy `.display().to_string()` while the spawn uses the real
+    `OsStr`, so a non-UTF-8 `OPENVHOST_HOME` renders a mangled path beside a correct
+    invocation (review M6).
+11. `StackPaths::nginx_error_log()`: `<home>/logs/nginx.error.log` is written out in three
+    places. **Sealing `StackPaths`' fields was ruled AGAINST** by the audit — same crate,
+    so field privacy would guard only a module boundary we control, whereas `89471df`
+    sealed across crates; and after the `ValidationTarget` change the remaining field reads
+    are display-only. Bundle the accessor with this de-duplication instead.
+12. Smaller carried items: the tearable test pid-file read (the audit ranked this *less*
+    urgent than a follow-up — `echo $!` is a single sub-8-byte `write(2)` and the
+    empty-file window is already handled), `ProbeFailure::Io` conflating spawn failure with
+    pipe-drain failure, the duplicated error extraction in the store (the
+    `[object Object]` path is unreachable today — `IpcError::Simulated` is only produced by
+    `core_info`), no `reading[id]` flag, `.panel` CSS triplication, and `Button`'s
+    independent `expanded`/`controls` optionals.
