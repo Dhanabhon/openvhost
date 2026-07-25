@@ -49,6 +49,16 @@ export class WebServersStore {
 	async validate(id: string): Promise<void> {
 		this.validating = { ...this.validating, [id]: true };
 		this.configError = { ...this.configError, [id]: '' };
+		// The previous verdict is dropped as the run STARTS, not merely overwritten on
+		// success. A validator that cannot even be launched throws an `IpcError`
+		// instead of returning a report (see the catch), so without this the row would
+		// render a fresh red "validator could not be launched" directly beside a green
+		// "Config is valid" from an earlier click — two statements about the SAME
+		// operation, one of them stale, with nothing marking it so. Clearing here also
+		// means no verdict is on screen while "Validating…" is: whatever is shown is
+		// always the answer to the click the user just made. Same principle as the
+		// row's stale-config-text suppression, applied to the channel the store owns.
+		this.reports = Object.fromEntries(Object.entries(this.reports).filter(([key]) => key !== id));
 		try {
 			const report = await this.api.validateWebServerConfig(id);
 			this.reports = { ...this.reports, [id]: report };

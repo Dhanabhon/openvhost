@@ -148,8 +148,12 @@
 		<pre id={configId} class="config" data-testid="config-{server.id}">{configText}</pre>
 	{/if}
 
-	<!-- A completed validator run. Kept visible even beside a read error: the two
-	     are different operations and both statements can be true at once. -->
+	<!-- A completed validator run. Kept visible even beside a READ error: those are
+	     different operations and both statements can be true at once. It is not kept
+	     beside a VALIDATE error — that would be two statements about the same
+	     operation, one of them stale — but nothing is suppressed here for it: the
+	     store drops this row's verdict when a validate run starts, so a validate
+	     error and a report can never arrive together. -->
 	{#if report}
 		<div
 			class="report {report.ok ? 'report-ok' : 'report-fail'}"

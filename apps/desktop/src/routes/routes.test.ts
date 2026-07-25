@@ -23,6 +23,7 @@ import SitesPage from './+page.svelte';
 import ServicesPage from './services/+page.svelte';
 import WebServerPage from './web-server/+page.svelte';
 import { servicesStore } from '$lib/services.shared.svelte';
+import { webServersStore } from '$lib/webservers.svelte';
 import type { ServiceStatus } from '$lib/ipc';
 
 const svc = (id: string, kind: 'running' | 'stopped'): ServiceStatus => ({
@@ -59,11 +60,20 @@ function railLink(
 	};
 }
 
-// The shared store is a module singleton, so every test states the supervisor
-// state it expects instead of inheriting the previous one's.
+// Both stores are module singletons, so every test states the state it expects
+// instead of inheriting the previous one's. Nothing writes to `webServersStore`
+// today — `onMount` does not run under SSR, so the /web-server page renders without
+// its load — which makes this latent rather than load-bearing; it is here so the
+// first test that DOES seed it cannot leak into its neighbours.
 beforeEach(() => {
 	servicesStore.services = [];
 	servicesStore.error = null;
+	webServersStore.servers = [];
+	webServersStore.error = null;
+	webServersStore.configText = {};
+	webServersStore.configError = {};
+	webServersStore.reports = {};
+	webServersStore.validating = {};
 });
 
 describe('a supervisor failure', () => {

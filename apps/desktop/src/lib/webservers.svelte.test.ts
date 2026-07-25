@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, expect, it, vi } from 'vitest';
 import { WebServersStore, type WebServersApi } from './webservers.svelte';
-import type { WebServerDto } from '$lib/ipc';
+import type { ValidationReportDto, WebServerDto } from '$lib/ipc';
 
 const nginx: WebServerDto = {
 	id: 'nginx',
@@ -87,6 +87,44 @@ describe('WebServersStore', () => {
 		expect(store.configError.nginx).toContain('could not be launched');
 		expect(store.error).toBeNull();
 		expect(store.reports.nginx).toBeUndefined();
+	});
+
+	// The failure this pins: validate once successfully (green "Config is valid"),
+	// then have the binary move away so the next click cannot even LAUNCH the
+	// validator. That is an `IpcError`, not a report with `ok: false`, so the store
+	// writes the row error and — before this fix — never touched `reports[id]`. The
+	// row then showed a fresh red "could not be launched" beside the earlier green
+	// verdict: two statements about the SAME operation with nothing marking one
+	// stale. Splitting the error channel would NOT fix that; dropping the verdict
+	// when the run starts does. Both the mid-flight and the settled state are
+	// asserted, because clearing in the `catch` instead would leave the stale
+	// verdict on screen under "Validating…".
+	it('drops the previous verdict when the next validate cannot be launched', async () => {
+		let canLaunch = true;
+		// Sentinel, not `undefined`: this must fail if the run never happened at all,
+		// rather than pass because nothing was ever observed.
+		let verdictWhileRunning: ValidationReportDto | undefined | 'the run never happened' =
+			'the run never happened';
+		const store = new WebServersStore(
+			api({
+				validateWebServerConfig: vi.fn(async () => {
+					if (canLaunch) return { ok: true, stderr: 'syntax is ok' };
+					// Read from INSIDE the in-flight run.
+					verdictWhileRunning = store.reports.nginx;
+					throw { kind: 'core', message: 'nginx binary not found at /opt/x/bin/nginx' };
+				})
+			})
+		);
+
+		await store.validate('nginx');
+		expect(store.reports.nginx.ok).toBe(true);
+
+		canLaunch = false;
+		await store.validate('nginx');
+
+		expect(verdictWhileRunning).toBeUndefined();
+		expect(store.reports.nginx).toBeUndefined();
+		expect(store.configError.nginx).toContain('nginx binary not found at /opt/x/bin/nginx');
 	});
 
 	it('clears the validating flag even when validation throws', async () => {

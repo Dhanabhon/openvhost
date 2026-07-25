@@ -11,7 +11,7 @@
 import { describe, expect, it } from 'vitest';
 import { render } from 'svelte/server';
 import WebServerPanel from './WebServerPanel.svelte';
-import type { WebServerDto } from '$lib/ipc';
+import type { ServiceStatus, WebServerDto } from '$lib/ipc';
 
 const nginx: WebServerDto = {
 	id: 'nginx',
@@ -33,6 +33,16 @@ const apache: WebServerDto = {
 	supportsHotReload: false,
 	configPath: null
 };
+
+/** A supervisor snapshot entry. Takes the whole `ServiceState` rather than a bare
+ * kind so `failed` — which carries `exit`/`stderrTail` — is expressible here. */
+const svc = (id: string, state: ServiceStatus['state']): ServiceStatus => ({
+	id,
+	displayName: id,
+	endpoint: null,
+	pid: state.kind === 'running' ? 1 : null,
+	state
+});
 
 function html(props: Record<string, unknown>): string {
 	return render(WebServerPanel, {
@@ -88,24 +98,88 @@ describe('WebServerPanel', () => {
 		expect(body).toContain('data-testid="show-config-nginx"');
 	});
 
-	it('renders a per-row failure on that row', () => {
-		const t = text(html({ configError: { nginx: 'cannot read /x/nginx.conf' } }));
-		expect(t).toContain('cannot read /x/nginx.conf');
+	// "On that row" is the load-bearing half and needs the negative: the panel indexes
+	// the per-id maps so each row gets only its own slice, and mutating that to
+	// `Object.values(configError)[0]` shows nginx's failure on Apache too — which the
+	// message assertion alone cannot tell apart from correct behaviour.
+	it('renders a per-row failure on that row and on no other', () => {
+		const body = html({ configError: { nginx: 'cannot read /x/nginx.conf' } });
+		expect(text(body)).toContain('cannot read /x/nginx.conf');
+		expect(body).toContain('data-testid="config-error-nginx"');
+		expect(body).not.toContain('data-testid="config-error-apache"');
 	});
 
-	// nginx's own diagnostic is the useful part; it must not be summarized away.
-	it('shows the validator stderr verbatim', () => {
-		const t = text(
-			html({
-				reports: { nginx: { ok: false, stderr: 'nginx: [emerg] unknown directive "bogus"' } }
-			})
-		);
-		expect(t).toContain('unknown directive');
+	// nginx's own diagnostic is the useful part; it must be neither summarized nor
+	// truncated. A single short assertion cannot say that — `stderr.slice(0, 40)`
+	// would satisfy it — so the fixture is long and multi-line and BOTH ends are
+	// asserted. (Whitespace fidelity is not observable through `text()`; the
+	// unmodified `<pre>` is what carries it.)
+	it('shows the validator stderr verbatim, first line through last', () => {
+		const first = 'nginx: [emerg] unexpected end of file, expecting } in /x/nginx.conf:120';
+		const last = 'nginx: configuration file /x/.openvhost/conf/nginx.conf test failed';
+		const stderr = [
+			first,
+			'nginx: [warn] the "user" directive makes sense only if the master process runs',
+			'nginx: [warn] duplicate MIME type text/plain in /x/.openvhost/conf/mime.types:31',
+			'nginx: [emerg] the server directive is not allowed here in /x/nginx.conf:44',
+			last
+		].join('\n');
+		const t = text(html({ reports: { nginx: { ok: false, stderr } } }));
+		expect(t).toContain(first);
+		expect(t).toContain(last);
 	});
 
-	it('shows the config text once it has been read', () => {
-		const t = text(html({ configText: { nginx: 'daemon off; worker_processes 1;' } }));
-		expect(t).toContain('worker_processes 1;');
+	// Same per-row slicing hole as the failure above, on the other map.
+	it('shows the config text on the row it was read for and on no other', () => {
+		const body = html({ configText: { nginx: 'daemon off; worker_processes 1;' } });
+		expect(text(body)).toContain('worker_processes 1;');
+		expect(body).toContain('data-testid="config-nginx"');
+		expect(body).not.toContain('data-testid="config-apache"');
+	});
+});
+
+// The one thing this page exists to get right, and the one thing every case above
+// leaves unexercised: they all pass `services: []`, so no pill renders at all.
+// Mutating the panel to `statusFor(services, server.serviceId ?? 'nginx')` puts
+// nginx's live status on Apache's row — telling the user OpenVHost is serving
+// Apache when it cannot — and before this block every other test in the file, and
+// in routes.test.ts, still passed. `webservers.derive.test.ts` pins the HELPER;
+// these pin the WIRING, which is where that bug would actually live.
+describe('the status pill', () => {
+	const nginxRunning = [svc('nginx', { kind: 'running' })];
+
+	it('appears on the row that owns the service and on no other row', () => {
+		const body = html({ services: nginxRunning });
+		expect(body).toContain('data-testid="ws-pill-nginx"');
+		// Apache has no supervised service, so it gets no pill at all — least of all
+		// a neighbour's.
+		expect(body).not.toContain('data-testid="ws-pill-apache"');
+	});
+
+	// Two different states down the same path: a constant that matched one of them
+	// cannot pass both. `failed` is included because it is the state the user most
+	// needs to be told the truth about.
+	it('reads the state off the snapshot rather than any constant', () => {
+		expect(html({ services: nginxRunning })).toContain('pill-running');
+		const failed = [svc('nginx', { kind: 'failed', exit: 1, stderrTail: ['bind() failed'] })];
+		expect(html({ services: failed })).toContain('pill-failed');
+	});
+
+	// Before the layout's first `listServices` answers there is no state to report,
+	// and a pill that guessed one would be a fabricated claim about the machine.
+	it('renders no pill at all before the first supervisor snapshot arrives', () => {
+		expect(html({ services: [] })).not.toContain('data-testid="ws-pill-');
+	});
+});
+
+// `onMount` does not run under SSR and the route paints before `list_web_servers`
+// resolves, so this state is on screen for a frame on every single visit. The copy
+// therefore must not assert anything the app has not checked yet.
+describe('the empty state', () => {
+	it('does not claim there are no web servers, since the list may still be loading', () => {
+		const t = text(html({ servers: [] }));
+		expect(t).toContain('Nothing to show yet');
+		expect(t.toLowerCase()).not.toContain('no web servers');
 	});
 });
 

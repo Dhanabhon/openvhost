@@ -54,6 +54,20 @@ describe('Rail destinations', () => {
 		expect(current('web-server')).toEqual([false, false, true]);
 	});
 
+	// The brief puts Web server AFTER Services — it answers "what would run", which
+	// only matters once you know what IS running. Every other case here looks each
+	// anchor up by its label, so the entry could be moved above Sites and all of them
+	// would still pass. Order is part of the contract, so it is asserted directly.
+	it('lists the destinations in order: Sites, then Services, then Web server', () => {
+		const labels = [...railHtml().matchAll(/<a\b[^>]*>([\s\S]*?)<\/a>/g)].map(([, inner]) =>
+			inner
+				.replace(/<[^>]*>/g, '')
+				.replace(/\s+/g, ' ')
+				.trim()
+		);
+		expect(labels).toEqual(['Sites', 'Services', 'Web server']);
+	});
+
 	// Must match whatever `/` renders — Sites. AppShell.svelte defaults the same way.
 	it('defaults to the landing destination when no `active` is passed', () => {
 		const body = railHtml();

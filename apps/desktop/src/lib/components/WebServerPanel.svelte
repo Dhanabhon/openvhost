@@ -47,11 +47,17 @@
 
 <section class="panel ws-panel" aria-label="Web servers" data-testid="web-servers">
 	{#if servers.length === 0}
+		<!-- Deliberately does NOT say "no web servers": the route paints before
+		     `list_web_servers` resolves (it spawns `nginx -v` server-side), so this block
+		     is on screen for a frame on EVERY visit. "No web servers listed" was a claim
+		     about the user's system that the app had not checked yet. This copy is true
+		     while the list is still loading AND once it has come back empty, which is the
+		     only honest thing to say without a `loaded` flag. -->
 		<div class="empty">
-			<div class="title">No web servers listed</div>
+			<div class="title">Nothing to show yet</div>
 			<p>
-				OpenVHost lists one row per brand it knows about. If the list failed to load, the error is
-				shown above.
+				OpenVHost lists one row per web server brand it knows about. If the list failed to load, the
+				error is shown above.
 			</p>
 		</div>
 	{:else}
