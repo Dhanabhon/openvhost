@@ -1,17 +1,29 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Rendered server-side (`svelte/server`), which needs no DOM and so runs in the existing
+// `node` vitest project.
+//
+// The PHP-version field is no longer a native `<select>`: it is `Select.svelte`, the APG
+// select-only combobox. The first five cases below therefore assert the SAME INTENT the
+// `<select>`-era ones did — a stored version that the offered list does not contain stays
+// present and stays marked as the current selection — against `role="option"` +
+// `aria-selected="true"` and the collapsed trigger's own visible value, instead of against
+// `<option selected>`. The popup deliberately stays in the DOM while closed (`hidden`), so
+// the whole option set is in server-rendered markup and remains assertable here.
+//
+// WHAT THIS FILE CANNOT COVER: there is no DOM in this project, so every interactive
+// behaviour of the new controls — keyboard navigation and typeahead, caret position after a
+// real keystroke, focus staying on the trigger while the popup is open, click-outside,
+// Escape closing only the popup and not the whole drawer — is out of reach. Do not add a
+// browser/jsdom project for it. The caret ARITHMETIC is the exception: it is exported as a
+// pure function (`filterDomainInput`) precisely so the part most likely to be wrong is
+// testable here. The rest is listed as manual click-through in the task report.
+
 import { describe, expect, it } from 'vitest';
 import { render } from 'svelte/server';
 import SiteDrawer, { filterDomainInput } from './SiteDrawer.svelte';
-import { WEB_SERVERS } from '$lib/sites.derive';
+import { PHP_VERSIONS, WEB_SERVERS } from '$lib/sites.derive';
 import type { SiteDto } from '$lib/ipc';
-
-// Rendered server-side (`svelte/server`), which needs no DOM and so runs in the
-// existing `node` vitest project. Svelte's SSR output carries the same `selected`
-// attribute the browser would apply to a `<select>`'s current value, which is
-// exactly what this file is about — see `selectedValues` below.
-//
-// The Domain field's caret handling cannot be driven here (no DOM, no key events), so
-// its arithmetic is exported as a pure function and asserted directly instead.
 
 const site = (phpVersion: string): SiteDto => ({
 	id: 'a',
@@ -53,6 +65,34 @@ function tagWith(html: string, attribute: string): string {
 	return match[0];
 }
 
+/**
+ * Every `role="option"` row in document order. Parsed attribute-order-tolerantly rather
+ * than by matching one literal tag string, so these assertions survive a change in how
+ * Svelte orders the attributes it emits.
+ */
+function phpOptions(html: string): { label: string; selected: boolean }[] {
+	return [...html.matchAll(/<button\b([^>]*\brole="option"[^>]*)>([\s\S]*?)<\/button>/g)].map(
+		([, attrs, inner]) => ({
+			label: text(inner.match(/class="option-label[^"]*">([^<]*)</)?.[1] ?? ''),
+			selected: /\baria-selected="true"/.test(attrs)
+		})
+	);
+}
+
+/** Labels of the rows marked as the current selection (expected: exactly one). */
+function selectedLabels(html: string): string[] {
+	return phpOptions(html)
+		.filter((o) => o.selected)
+		.map((o) => o.label);
+}
+
+/** What the COLLAPSED trigger shows — the selection a user actually sees before opening. */
+function triggerValue(html: string): string {
+	const match = html.match(/class="trigger-value[^"]*">([^<]*)</);
+	if (match === null) throw new Error('the drawer rendered no PHP-version combobox trigger');
+	return text(match[1]);
+}
+
 /** The web-server segmented control, and its two toggle buttons. */
 function serverGroup(html: string): string {
 	const match = html.match(/<div\b[^>]*role="group"[\s\S]*?<\/div>/);
@@ -65,51 +105,93 @@ function serverButtons(html: string): { label: string; attrs: string }[] {
 	);
 }
 
-/** The drawer's PHP-version `<select>`. */
-function phpSelect(dto: SiteDto | null): string {
-	const select = drawerHtml(dto).match(/<select\b[^>]*id="f-php"[\s\S]*?<\/select>/);
-	if (select === null) throw new Error('the drawer rendered no PHP-version <select>');
-	return select[0];
-}
-
-/**
- * `value` of every `<option>` marked selected. Parsed attribute-order-tolerantly
- * rather than by matching one literal tag string, so the assertions below survive
- * a change in how Svelte orders the attributes it emits.
- */
-function selectedValues(selectHtml: string): string[] {
-	return [...selectHtml.matchAll(/<option\b([^>]*)>/g)]
-		.filter(([, attrs]) => /\sselected(?=[\s=>]|$)/.test(attrs))
-		.map(([, attrs]) => attrs.match(/value="([^"]*)"/)?.[1] ?? '');
-}
-
 describe('SiteDrawer PHP version', () => {
-	// Regression (whole-branch review of #11): `PHP_VERSIONS` is a closed list, but
-	// state.db can hold any version an older build — or a later edit of that list —
-	// allowed. With no matching `<option>` the select rendered blank and the bound
-	// value silently became the browser's own pick, so Save rewrote the site's PHP
-	// version to something the user never chose.
+	// Regression (whole-branch review of #11): `PHP_VERSIONS` is a closed list, but state.db
+	// can hold any version an older build — or a later edit of that list — allowed. The
+	// native `<select>` rendered blank for an unmatched value and the binding silently took
+	// the browser's own pick, so Save rewrote the site's PHP version to something the user
+	// never chose. The listbox has the same failure mode by another name: a value with no
+	// row would leave nothing marked selected and nothing to navigate back to.
 	it('keeps a stored version that is not in the offered list selected', () => {
-		expect(selectedValues(phpSelect(site('8.0')))).toEqual(['8.0']);
+		expect(selectedLabels(drawerHtml(site('8.0')))).toEqual(['8.0 — not available']);
+	});
+
+	it('shows that stored version on the collapsed trigger, so it is visible unopened', () => {
+		expect(triggerValue(drawerHtml(site('8.0')))).toBe('8.0 — not available');
 	});
 
 	it('marks that version as not available rather than passing it off as offered', () => {
-		expect(phpSelect(site('8.0'))).toContain('>8.0 — not available</option>');
+		expect(phpOptions(drawerHtml(site('8.0'))).map((o) => o.label)).toContain(
+			'8.0 — not available'
+		);
 	});
 
-	// Control for the two above: proves `selectedValues` can see a selection at all,
-	// so the '8.0' assertion fails on a missing option rather than on SSR simply
-	// never emitting `selected`.
+	// Control for the three above: proves `selectedLabels` can see a selection at all, so
+	// the '8.0' assertions fail on a missing row rather than on SSR simply never emitting
+	// `aria-selected="true"`.
 	it('selects a stored version that is in the offered list', () => {
-		expect(selectedValues(phpSelect(site('8.3')))).toEqual(['8.3']);
+		expect(selectedLabels(drawerHtml(site('8.3')))).toEqual(['8.3']);
 	});
 
 	it('leaves the offered list alone for a stored version that is in it', () => {
-		expect(phpSelect(site('8.3'))).not.toContain('not available');
+		expect(drawerHtml(site('8.3'))).not.toContain('not available');
 	});
 
 	it('selects the newest offered version on the Add form', () => {
-		expect(selectedValues(phpSelect(null))).toEqual(['8.4']);
+		expect(selectedLabels(drawerHtml(null))).toEqual(['8.4']);
+	});
+
+	it('offers every version in PHP_VERSIONS', () => {
+		const labels = phpOptions(drawerHtml(site('8.0'))).map((o) => o.label);
+		expect(labels).toEqual(['8.0 — not available', ...PHP_VERSIONS]);
+	});
+
+	// The native `<select>` is gone; what replaces it has to be a real listbox, not a
+	// div that merely looks like one.
+	it('exposes the field as a collapsed listbox combobox instead of a native select', () => {
+		const html = drawerHtml(site('8.3'));
+		const trigger = tagWith(html, 'id="f-php"');
+		expect(trigger).toContain('role="combobox"');
+		expect(trigger).toContain('aria-haspopup="listbox"');
+		expect(trigger).toContain('aria-expanded="false"');
+		expect(trigger).toContain('aria-controls="f-php-listbox"');
+		expect(tagWith(html, 'id="f-php-listbox"')).toContain('role="listbox"');
+		expect(html).not.toContain('<select');
+	});
+
+	it('hides the popup until it is opened', () => {
+		expect(tagWith(drawerHtml(site('8.3')), 'id="f-php-listbox"')).toMatch(/\shidden(?=[\s=>])/);
+	});
+
+	// The popup must stay inside the drawer's own subtree: SiteDrawer traps focus with a
+	// window-scoped `focusin` handler that recaptures anything landing outside the dialog,
+	// so a portalled popup would be yanked back the instant it opened. SSR cannot see a
+	// runtime `document.body` portal, but it does pin the markup's shape.
+	it('renders the popup inside the dialog element, not as a sibling of it', () => {
+		const html = drawerHtml(site('8.3'));
+		const dialog = html.indexOf('role="dialog"');
+		const listbox = html.indexOf('id="f-php-listbox"');
+		expect(dialog).toBeGreaterThan(-1);
+		expect(listbox).toBeGreaterThan(dialog);
+		expect(html.slice(listbox)).toContain('</aside>');
+	});
+
+	it('keeps the error wiring the native select carried', () => {
+		const html = drawerHtml(site('8.3'), { php_version: 'must be major.minor digits, e.g. 8.3' });
+		const trigger = tagWith(html, 'id="f-php"');
+		expect(trigger).toContain('aria-invalid="true"');
+		expect(trigger).toContain('aria-describedby="f-php-error"');
+		expect(html).toContain('id="f-php-error"');
+	});
+
+	it('leaves aria-invalid off when the backend reported no problem', () => {
+		expect(tagWith(drawerHtml(site('8.3')), 'id="f-php"')).not.toContain('aria-invalid');
+	});
+
+	it('keeps the per-site hint', () => {
+		expect(text(drawerHtml(site('8.3')))).toContain(
+			'Applies to this site only. Other sites keep their own version.'
+		);
 	});
 });
 

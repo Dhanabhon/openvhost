@@ -54,6 +54,7 @@
 		type WebServerKind
 	} from '$lib/sites.derive';
 	import Button from './Button.svelte';
+	import Select from './Select.svelte';
 	import WebServerIcon from './WebServerIcon.svelte';
 
 	let {
@@ -483,18 +484,20 @@
 		</div>
 
 		<div class="field">
-			<label for="f-php">PHP version</label>
-			<select
-				class="input mono"
+			<!-- `for` AND `id` on the same label: `for` names the `<button role="combobox">`
+			     Select renders (a `<button>` is a labelable element, and `combobox` takes no
+			     name from its content), while the `id` lets Select name its popup listbox with
+			     the same words. -->
+			<label for="f-php" id="f-php-label">PHP version</label>
+			<Select
 				id="f-php"
+				labelId="f-php-label"
+				options={phpOptions}
 				bind:value={phpVersion}
-				aria-invalid={fieldErrors.php_version ? 'true' : undefined}
-				aria-describedby={fieldErrors.php_version ? 'f-php-error' : undefined}
-			>
-				{#each phpOptions as opt (opt.value)}
-					<option value={opt.value}>{opt.label}</option>
-				{/each}
-			</select>
+				invalid={Boolean(fieldErrors.php_version)}
+				describedBy={fieldErrors.php_version ? 'f-php-error' : undefined}
+				mono
+			/>
 			<p class="hint">Applies to this site only. Other sites keep their own version.</p>
 			<!-- Backend field name for the PHP version is `php_version` (snake_case) — see the
 			     note above the Name field. -->
@@ -668,8 +671,10 @@
 		align-items: center;
 		gap: 8px;
 	}
-	.input,
-	select.input {
+	/* No `select.input` companion rule any more: the PHP-version field is a `Select`
+	   component (its own scoped styles reproduce this same recipe), and Svelte flags a
+	   scoped selector that matches nothing in this file. */
+	.input {
 		font: inherit;
 		color: var(--vh-text);
 		background: var(--vh-surface);
