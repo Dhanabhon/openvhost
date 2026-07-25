@@ -7,6 +7,8 @@ use std::path::Path;
 
 use crate::error::CoreError;
 
+pub mod repo;
+
 fn invalid(field: &'static str, reason: impl Into<String>) -> CoreError {
     CoreError::Validation {
         field,

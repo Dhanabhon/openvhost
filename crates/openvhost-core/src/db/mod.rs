@@ -13,9 +13,8 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("src/db/migrations");
 
 /// Milliseconds since the Unix epoch (no date-lib dependency).
 ///
-/// Unconsumed by this slice — the Site domain model (state.db task 2) stamps
-/// `created_at`/`updated_at` with it. Kept here since it is `db`-scoped.
-#[allow(dead_code)]
+/// Used by `site::repo` to stamp `created_at`/`updated_at` on write. Kept
+/// here since it is `db`-scoped rather than `site`-scoped.
 pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
