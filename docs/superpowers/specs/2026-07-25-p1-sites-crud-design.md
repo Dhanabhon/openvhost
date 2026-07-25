@@ -57,6 +57,8 @@ and `From<CoreError>` maps `CoreError::Validation { field, reason }` → `IpcErr
 
 **Route + navigation.** Add a `/sites` route (`routes/sites/+page.svelte`); the rail's Sites item becomes a live link with `aria-current` when active, while Logs/Settings stay inert placeholders. `/` remains the Services page (no churn); making Sites the default landing view is a trivial follow-up once it has parity.
 
+> **Superseded 2026-07-25 (after this slice shipped as `e4cf35d`):** the owner asked for Sites to be the landing page, so `/` is now Sites and Services moved to `/services`. The follow-up was *not* quite trivial — `sites/+page.svelte` hardcoded `runningCount={0}` and only the Services page subscribed to the supervisor, so the swap would have had the titlebar announce "0 running" at launch. The supervisor subscription is now shared at the layout level. The paragraph above is kept as the dated record of what this slice decided, not as a description of the current routes.
+
 **Components** (`apps/desktop/src/lib/components/`):
 - `SitesPanel.svelte` — the page head ("Sites", a count sub-line, an "Add site" primary button) + the list, ported from `main-window.html`'s Sites section. Empty state: an intentional "No sites yet" panel with the Add-site affordance, never blank.
 - `SiteListRow.svelte` — name + domain (mono), PHP version, web server, an Enabled/Disabled pill, and an **Edit** action. (Named to avoid colliding with the existing services `ServiceRow.svelte`.)
