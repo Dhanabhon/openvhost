@@ -45,8 +45,16 @@
 	import { onMount, untrack } from 'svelte';
 	import { open } from '@tauri-apps/plugin-dialog';
 	import type { SiteDto, SiteInput } from '$lib/ipc';
-	import { composeDomain, splitDomain, phpVersionOptions, PHP_VERSIONS } from '$lib/sites.derive';
+	import {
+		composeDomain,
+		splitDomain,
+		phpVersionOptions,
+		PHP_VERSIONS,
+		WEB_SERVERS,
+		type WebServerKind
+	} from '$lib/sites.derive';
 	import Button from './Button.svelte';
+	import WebServerIcon from './WebServerIcon.svelte';
 
 	let {
 		site,
@@ -62,8 +70,12 @@
 		onClose: () => void;
 	} = $props();
 
-	function initialWebServer(dto: SiteDto | null): 'nginx' | 'apache' {
-		return dto?.webServer === 'apache' ? 'apache' : 'nginx';
+	// `SiteDto.webServer` crosses IPC as a bare string (specta exports the Rust enum's wire
+	// form, not a TS union), so narrow it here — anything unrecognised falls back to the one
+	// web server OpenVHost can actually configure.
+	function initialWebServer(dto: SiteDto | null): WebServerKind {
+		const found = WEB_SERVERS.find((server) => server === dto?.webServer);
+		return found ?? WEB_SERVERS[0];
 	}
 
 	// Form state is seeded ONCE from `site` (edit) or blank defaults (create), via `untrack`
@@ -74,7 +86,7 @@
 	let name = $state(untrack(() => site?.name ?? ''));
 	let subdomain = $state(untrack(() => (site ? splitDomain(site.domain) : '')));
 	let docroot = $state(untrack(() => site?.docroot ?? ''));
-	let webServer = $state<'nginx' | 'apache'>(untrack(() => initialWebServer(site)));
+	let webServer = $state<WebServerKind>(untrack(() => initialWebServer(site)));
 	let phpVersion = $state(untrack(() => site?.phpVersion ?? PHP_VERSIONS[0]));
 	let enabled = $state(untrack(() => site?.enabled ?? true));
 
@@ -265,6 +277,16 @@
 			.join(' ') || undefined
 	);
 
+	// Web-server group: the Apache-not-supported notice is a permanent description of the
+	// control, so unlike the fields above this is never `undefined`. A backend error, when
+	// there is one, is listed FIRST — it is the urgent half, and screen readers read
+	// `aria-describedby` in the order given.
+	const serverDescribedBy = $derived(
+		[fieldErrors.web_server ? 'f-server-error' : null, 'f-server-hint']
+			.filter((id): id is string => id !== null)
+			.join(' ')
+	);
+
 	async function submit(): Promise<void> {
 		if (submitting) return;
 		submitting = true;
@@ -426,19 +448,33 @@
 				class="seg"
 				role="group"
 				aria-labelledby="f-server-label"
-				aria-describedby={fieldErrors.web_server ? 'f-server-error' : undefined}
+				aria-describedby={serverDescribedBy}
 			>
-				<button
-					type="button"
-					aria-pressed={webServer === 'nginx'}
-					onclick={() => (webServer = 'nginx')}>nginx</button
-				>
-				<button
-					type="button"
-					aria-pressed={webServer === 'apache'}
-					onclick={() => (webServer = 'apache')}>apache</button
-				>
+				{#each WEB_SERVERS as server (server)}
+					<!-- Brand marks stay in their real colours in both states. Recolouring a
+					     trademark to suit our accent fill is exactly what WebServerIcon.svelte's
+					     header asks us not to do, and the mark is `aria-hidden` reinforcement
+					     anyway — the visible label carries the meaning. -->
+					<button
+						type="button"
+						aria-pressed={webServer === server}
+						onclick={() => (webServer = server)}
+					>
+						<WebServerIcon {server} />
+						{server}
+					</button>
+				{/each}
 			</div>
+			<!-- Apache stays selectable (owner's call) but OpenVHost genuinely cannot serve it:
+			     there is an NginxAdapter and nginx templates, no Apache counterpart. Saying so
+			     here — as a capability statement about this product, not a guess about the
+			     user's machine — is the honest alternative to a control that quietly produces
+			     an unservable site. Associated with the group via `aria-describedby` (below,
+			     after any error) so it is announced when the group is reached, not just seen. -->
+			<p class="hint" id="f-server-hint">
+				OpenVHost cannot serve Apache sites yet — it only generates nginx config. An Apache site
+				will save, but it won't be served.
+			</p>
 			<!-- Backend field name for the web server is `web_server` (snake_case) — see the
 			     note above the Name field. -->
 			{#if fieldErrors.web_server}
@@ -688,7 +724,14 @@
 		border-radius: var(--vh-radius-control);
 		overflow: hidden;
 	}
+	/* inline-flex + gap so each brand mark sits on the text baseline block beside its
+	   label; `justify-content: center` keeps the pair centred in the 88px cell rather than
+	   sliding left as the mark widens the content. */
 	.seg button {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		gap: var(--vh-space-2);
 		min-width: 88px;
 		font: inherit;
 		font-weight: 500;

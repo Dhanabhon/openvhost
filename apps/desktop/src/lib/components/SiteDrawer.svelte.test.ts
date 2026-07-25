@@ -2,6 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import { render } from 'svelte/server';
 import SiteDrawer, { filterDomainInput } from './SiteDrawer.svelte';
+import { WEB_SERVERS } from '$lib/sites.derive';
 import type { SiteDto } from '$lib/ipc';
 
 // Rendered server-side (`svelte/server`), which needs no DOM and so runs in the
@@ -52,6 +53,18 @@ function tagWith(html: string, attribute: string): string {
 	return match[0];
 }
 
+/** The web-server segmented control, and its two toggle buttons. */
+function serverGroup(html: string): string {
+	const match = html.match(/<div\b[^>]*role="group"[\s\S]*?<\/div>/);
+	if (match === null) throw new Error('the drawer rendered no web-server group');
+	return match[0];
+}
+function serverButtons(html: string): { label: string; attrs: string }[] {
+	return [...serverGroup(html).matchAll(/<button\b([^>]*)>([\s\S]*?)<\/button>/g)].map(
+		([, attrs, inner]) => ({ attrs, label: text(inner) })
+	);
+}
+
 /** The drawer's PHP-version `<select>`. */
 function phpSelect(dto: SiteDto | null): string {
 	const select = drawerHtml(dto).match(/<select\b[^>]*id="f-php"[\s\S]*?<\/select>/);
@@ -97,6 +110,42 @@ describe('SiteDrawer PHP version', () => {
 
 	it('selects the newest offered version on the Add form', () => {
 		expect(selectedValues(phpSelect(null))).toEqual(['8.4']);
+	});
+});
+
+describe('SiteDrawer web server', () => {
+	it('offers exactly the web servers the frontend knows about', () => {
+		expect(serverButtons(drawerHtml(null)).map((b) => b.label)).toEqual([...WEB_SERVERS]);
+	});
+
+	it('shows a brand mark beside each label', () => {
+		expect(serverGroup(drawerHtml(null)).match(/class="brand/g)).toHaveLength(WEB_SERVERS.length);
+	});
+
+	// The owner's explicit decision: Apache keeps its logo and stays selectable, and the UI
+	// says plainly that OpenVHost cannot serve it. A future "helpfully" disabled button
+	// should fail here and be re-decided, not slipped in.
+	it('leaves Apache selectable', () => {
+		const apache = serverButtons(drawerHtml(null)).find((b) => b.label === 'apache');
+		if (apache === undefined) throw new Error('the drawer rendered no Apache button');
+		expect(apache.attrs).not.toMatch(/\bdisabled\b/);
+	});
+
+	it('states that OpenVHost cannot serve Apache sites yet', () => {
+		expect(text(drawerHtml(null))).toContain(
+			'OpenVHost cannot serve Apache sites yet — it only generates nginx config. ' +
+				"An Apache site will save, but it won't be served."
+		);
+	});
+
+	// Visually adjacent is not enough — a screen-reader user reaching the group has to hear
+	// it. `aria-describedby` is read in the order given, so a backend error stays first.
+	it('associates that notice with the group, after any backend error', () => {
+		expect(serverGroup(drawerHtml(null))).toContain('aria-describedby="f-server-hint"');
+		expect(serverGroup(drawerHtml(null, { web_server: 'nope' }))).toContain(
+			'aria-describedby="f-server-error f-server-hint"'
+		);
+		expect(drawerHtml(null)).toContain('id="f-server-hint"');
 	});
 });
 
