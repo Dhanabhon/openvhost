@@ -4,7 +4,7 @@
 
 **Goal:** A rail entry and `/web-server` page that report the real facts about each web server OpenVHost knows — supervised status, the binary and config that were actually registered, version, hot-reload support, the live config's text — plus a Validate action that runs `nginx -t` against the live config.
 
-**Architecture:** Read-only throughout. New `openvhost-conf/src/inspect.rs` owns the two process probes (`probe_version`, `validate_live`), keeping them in the tauri-free crate that already owns web-server knowledge. `apps/desktop/src-tauri/src/stack.rs` starts returning the paths it already resolves so the app can `manage` them as state; three new read-only IPC commands read that state and call `inspect`. The page reuses the shared services store for status, so no second status source exists.
+**Architecture:** Read-only throughout. New `openvhost-conf/src/inspect.rs` owns the two process probes (`probe_nginx_version`, `validate_live`), keeping them in the tauri-free crate that already owns web-server knowledge. `apps/desktop/src-tauri/src/stack.rs` starts returning the paths it already resolves so the app can `manage` them as state; three new read-only IPC commands read that state and call `inspect`. The page reuses the shared services store for status, so no second status source exists.
 
 **Tech Stack:** Rust (tokio, thiserror, specta/tauri-specta), SvelteKit 5 runes, Tailwind 4, vitest with `svelte/server` SSR rendering.
 
@@ -368,6 +368,28 @@ code alone; nginx writes to stderr on success too."
 
 ---
 
+### Task 1 — As built (divergences from the code blocks above)
+
+Task 1 is complete. Its code blocks above are the plan as written; the implementation
+diverged in ways later tasks must use. They are recorded here rather than by editing the
+blocks, so the plan stays an honest record of what was predicted versus what was needed.
+
+1. **`probe_version` → `probe_nginx_version(bin: &Path, err_log: &Path)`.** Renamed because
+   it parses nginx's banner specifically — php-fpm writes `-v` to *stdout* and would yield
+   `None`, making the generic name a trap. The `err_log` argument was added so the version
+   probe also satisfies the global "`-e` on every nginx invocation" constraint literally,
+   rather than resting on an unverifiable claim about when nginx initialises its log.
+2. **The timeout kills the process *group*, not the child.** `kill_on_drop` alone leaked a
+   real grandchild — `Child::kill()` signals one pid. The implementation uses
+   `process_group(0)` plus `libc::kill(-pgid, SIGKILL)`, mirroring `openvhost-proc`'s
+   `UnixDriver`, which added `libc` to this crate under
+   `[target.'cfg(unix)'.dependencies]`. This duplicates a containment invariant that
+   already exists in `openvhost-proc`; the golden-rule-4 reading is documented in the
+   module and is **pending security-auditor confirmation in Task 6**.
+3. Test module is `#[cfg(all(test, unix))]` (it uses `PermissionsExt` and `#!/bin/sh`
+   fakes, which would fail a Windows workspace *compile*), and the timeout test uses
+   `#[tokio::test(start_paused = true)]`.
+
 ## Task 2: `stack.rs` returns the paths it already resolved
 
 **Files:**
@@ -564,7 +586,7 @@ A test asserts the reported paths equal the registered spec's program and its
 - Test: inline `#[cfg(test)] mod tests` in `apps/desktop/src-tauri/src/commands.rs`
 
 **Interfaces:**
-- Consumes: `openvhost_conf::{probe_version, validate_live}` (Task 1); `crate::stack::StackPaths` (Task 2); the existing `IpcError` with its `Validation { field, message }` and `Core { message }` variants.
+- Consumes: `openvhost_conf::{probe_nginx_version, validate_live}` (Task 1); `crate::stack::StackPaths` (Task 2); the existing `IpcError` with its `Validation { field, message }` and `Core { message }` variants.
 - Produces, for Task 4 — the exact TS shapes specta will emit:
   ```ts
   type WebServerDto = {
@@ -753,7 +775,11 @@ pub async fn list_web_servers(
     let p = stack_paths(&paths)?;
     // Probing the version SPAWNS `nginx -v`, so merely opening this page starts
     // a process. Bounded: one short-lived probe, fixed argv, PROBE_TIMEOUT.
-    let version = openvhost_conf::probe_version(&p.nginx_bin).await;
+    // Renamed from `probe_version` and given an `err_log` argument during Task 1 —
+    // see that task's As-built note. `-e` is mandatory on every nginx invocation,
+    // including `-v`.
+    let err_log = p.home.join("logs/nginx.error.log");
+    let version = openvhost_conf::probe_nginx_version(&p.nginx_bin, &err_log).await;
     Ok(vec![
         WebServerDto {
             id: "nginx".into(),
@@ -1397,6 +1423,6 @@ Merge-blocking per CLAUDE.md golden rule 2 (new IPC commands; UI-triggered proce
 
 **Placeholder scan.** One deliberate `todo!()` in Task 1 Step 1, explicitly scoped to that step and required gone by Step 3 — it is the RED state, not a placeholder. Task 6 Step 1 says "check; do not invent an edit" for the master plan rather than asserting an edit exists. No "add appropriate error handling"-style instructions: every error path names its variant and its destination.
 
-**Type consistency.** `ValidationReport { ok, stderr }` (Rust, existing) → `ValidationReportDto { ok, stderr }` (Task 3) → `ValidationReportDto` in TS (Task 4) → `reports[id]` (Task 5): consistent. `WebServerDto`'s snake_case Rust fields with `#[serde(rename_all = "camelCase")]` produce the camelCase TS names used in Tasks 4 and 5 — checked field by field: `display_name`/`displayName`, `service_id`/`serviceId`, `binary_path`/`binaryPath`, `supports_hot_reload`/`supportsHotReload`, `config_path`/`configPath`. `StackPaths { home, nginx_bin, nginx_conf }` defined in Task 2 and consumed with those exact names in Task 3. `statusFor`/`hotReloadLabel` defined in Task 4 and used with those names in Task 5. `PROBE_TIMEOUT`, `probe_version`, `validate_live`, `ConfError::ValidatorTimeout` defined in Task 1 and used in Task 3 and Task 6's verification step.
+**Type consistency.** `ValidationReport { ok, stderr }` (Rust, existing) → `ValidationReportDto { ok, stderr }` (Task 3) → `ValidationReportDto` in TS (Task 4) → `reports[id]` (Task 5): consistent. `WebServerDto`'s snake_case Rust fields with `#[serde(rename_all = "camelCase")]` produce the camelCase TS names used in Tasks 4 and 5 — checked field by field: `display_name`/`displayName`, `service_id`/`serviceId`, `binary_path`/`binaryPath`, `supports_hot_reload`/`supportsHotReload`, `config_path`/`configPath`. `StackPaths { home, nginx_bin, nginx_conf }` defined in Task 2 and consumed with those exact names in Task 3. `statusFor`/`hotReloadLabel` defined in Task 4 and used with those names in Task 5. `PROBE_TIMEOUT`, `probe_nginx_version`, `validate_live`, `ConfError::ValidatorTimeout` defined in Task 1 and used in Task 3 and Task 6's verification step.
 
 **One gap found and fixed during review:** Task 3's `list_web_servers` calls `NginxAdapter.supports_hot_reload()`, which requires the `WebServerAdapter` trait in scope — an easy compile error to hit and a confusing one. Task 3 Step 3 now says so explicitly.
