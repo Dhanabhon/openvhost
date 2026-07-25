@@ -73,6 +73,20 @@ describe('SitesStore', () => {
 		expect(store.error).toBeNull();
 	});
 
+	it("clearErrors() drops a previous attempt's field errors", async () => {
+		const a = api({
+			createSite: vi.fn(async () => {
+				throw { kind: 'validation', field: 'domain', message: 'already taken' };
+			})
+		});
+		const store = new SitesStore(a);
+		expect(await store.save(null, input)).toBe(false);
+		expect(store.fieldErrors.domain).toBe('already taken');
+		store.clearErrors();
+		expect(store.fieldErrors).toEqual({});
+		expect(store.error).toBeNull();
+	});
+
 	it('a non-validation error lands on error', async () => {
 		const a = api({
 			listSites: vi.fn(async () => {

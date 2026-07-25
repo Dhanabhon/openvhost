@@ -28,6 +28,12 @@ export class SitesStore {
 		this.fieldErrors = {};
 	}
 
+	/** Clear both error channels. Call when opening a fresh drawer session so a
+	 *  previous attempt's per-field error can't render on a new/blank form. */
+	clearErrors(): void {
+		this.reset();
+	}
+
 	async load(): Promise<void> {
 		this.reset();
 		try {

@@ -17,10 +17,12 @@
 	let drawerOpen = $state(false);
 
 	function onAdd(): void {
+		store.clearErrors();
 		editing = null;
 		drawerOpen = true;
 	}
 	function onEdit(site: SiteDto): void {
+		store.clearErrors();
 		editing = site;
 		drawerOpen = true;
 	}
