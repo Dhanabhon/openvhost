@@ -58,6 +58,33 @@ describe('WebServersStore', () => {
 		expect(store.error).toBeNull();
 	});
 
+	// `showConfig` clears this row's error as the read STARTS, and WebServerRow's
+	// `toggleConfig` documents that clear as "the retry path after a failed read".
+	// Losing it is permanent, not cosmetic: the row derives
+	// `showConfig = configText !== undefined && configError === '' && !collapsed`, so a
+	// row whose `configError[id]` is never cleared can NEVER display config text again,
+	// however many times the user clicks. Deleting the clear left 129/129 green.
+	it('clears the row error when the next read starts, so a failed read can be retried', async () => {
+		let failing = true;
+		const store = new WebServersStore(
+			api({
+				readWebServerConfig: vi.fn(async () => {
+					if (failing) throw { kind: 'core', message: 'no such file' };
+					return 'daemon off; worker_processes 1;';
+				})
+			})
+		);
+		await store.showConfig('nginx');
+		expect(store.configError.nginx).toContain('no such file');
+
+		failing = false;
+		await store.showConfig('nginx');
+		// BOTH halves are needed: text alone is not enough to reveal the block, because
+		// a lingering error suppresses it.
+		expect(store.configError.nginx).toBe('');
+		expect(store.configText.nginx).toBe('daemon off; worker_processes 1;');
+	});
+
 	it('exposes the validator stderr verbatim', async () => {
 		const store = new WebServersStore(
 			api({

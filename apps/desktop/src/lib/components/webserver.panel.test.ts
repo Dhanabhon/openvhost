@@ -67,6 +67,16 @@ function text(s: string): string {
 		.trim();
 }
 
+/** The opening `<button …>` tag carrying `testId`, so an attribute assertion is about
+ * THAT control rather than about the attribute appearing anywhere on the page. */
+function buttonTag(body: string, testId: string): string {
+	const found = body.match(new RegExp(`<button[^>]*data-testid="${testId}"[^>]*>`));
+	if (found === null) {
+		throw new Error(`no <button> with data-testid="${testId}" in:\n${body}`);
+	}
+	return found[0];
+}
+
 describe('WebServerPanel', () => {
 	it('shows the resolved binary, version and config path for nginx', () => {
 		const t = text(html({}));
@@ -135,6 +145,56 @@ describe('WebServerPanel', () => {
 		expect(text(body)).toContain('worker_processes 1;');
 		expect(body).toContain('data-testid="config-nginx"');
 		expect(body).not.toContain('data-testid="config-apache"');
+	});
+});
+
+// The shared `Button` was widened with `expanded`/`controls` FOR this disclosure, and
+// `disabled` is the only thing bounding a second `nginx -t` spawn — yet deleting
+// `expanded={showConfig}` and `disabled={validating}` from WebServerRow left
+// `pnpm test` at 129/129 and `pnpm check` at 0/0, with no dead code created. Task 5's
+// review proved the hard half (the 9 pre-existing Button consumers emit no
+// `aria-expanded` at all); nobody checked that the new consumer actually USES what the
+// component was widened for.
+describe('the disclosure and Validate controls', () => {
+	it('marks the disclosure expanded and points it at the region it reveals', () => {
+		const open = buttonTag(html({ configText: { nginx: 'daemon off;' } }), 'show-config-nginx');
+		expect(open).toContain('aria-expanded="true"');
+		// The IDREF must name the `<pre>` that is actually in the DOM in this state.
+		expect(open).toContain('aria-controls="ws-config-nginx"');
+	});
+
+	// The closed state is the one a screen-reader user meets first, and `false` must be
+	// PRESENT rather than the attribute being absent: absent means "not a disclosure",
+	// which is what a plain Button emits and what this row must not look like.
+	it('still announces aria-expanded="false" while the config is hidden', () => {
+		expect(buttonTag(html({}), 'show-config-nginx')).toContain('aria-expanded="false"');
+	});
+
+	// Without this, a double-click fires a SECOND `nginx -t` spawn while the first is in
+	// flight — `validate()` has no re-entrancy guard of its own (the security auditor
+	// found the same thing independently), so this attribute is the whole bound.
+	it('disables Validate while a validation is in flight, and only then', () => {
+		expect(buttonTag(html({ validating: { nginx: true } }), 'validate-nginx')).toMatch(
+			/\sdisabled/
+		);
+		expect(buttonTag(html({}), 'validate-nginx')).not.toMatch(/\sdisabled/);
+	});
+});
+
+// The copy added by this slice is the only place the product tells anyone to edit
+// `<home>/conf/nginx.conf` — and `provision_macos_demo_stack` rewrites that file
+// unconditionally on every startup, so the advice has to say so or it is a trap.
+describe('the failed-validation next step', () => {
+	it('warns that OpenVHost rewrites the file at startup', () => {
+		const t = text(html({ reports: { nginx: { ok: false, stderr: 'nginx: [emerg] boom' } } }));
+		expect(t).toContain('this page is read-only');
+		expect(t.toLowerCase()).toContain('rewrites this file when it starts');
+	});
+
+	// Nothing to warn about when the config IS valid: no next-step block renders.
+	it('says none of it when the config is valid', () => {
+		const t = text(html({ reports: { nginx: { ok: true, stderr: 'syntax is ok' } } }));
+		expect(t.toLowerCase()).not.toContain('rewrites this file');
 	});
 });
 

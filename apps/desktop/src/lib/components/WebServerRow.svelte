@@ -185,7 +185,18 @@
 				<pre>{report.stderr}</pre>
 			{/if}
 			{#if !report.ok}
-				<p class="next">Edit the file on disk, then validate again — this page is read-only.</p>
+				<!-- Says the rewrite out loud. `provision_macos_demo_stack` (openvhost-core's
+				     `platform/macos/demo_stack.rs`) `atomic_write`s `<home>/conf/nginx.conf`
+				     UNCONDITIONALLY, and `stack::macos_stack()` calls it on every startup — so a
+				     hand edit holds until the next launch and then vanishes with no notice. That
+				     is pre-existing P0-4 behaviour rather than this page's, but this sentence is
+				     the only place the product tells anyone to edit that file, so it is the place
+				     that has to be honest about it. If provisioning ever becomes conditional,
+				     this copy changes with it. -->
+				<p class="next">
+					Edit the file on disk, then validate again — this page is read-only. OpenVHost rewrites
+					this file when it starts, so hand edits are lost on the next launch.
+				</p>
 			{/if}
 		</div>
 	{/if}
@@ -193,7 +204,7 @@
 
 <style>
 	/* Ported from docs/design/mock.css: `.row` (padding/border/transition), `.row .primary`,
-	   `.row .meta`, `.row-actions`, `.grow`, `.validation` (the ok report), `.fail-detail` +
+	   `.row-actions`, `.grow`, `.validation` (the ok report), `.fail-detail` +
 	   `.fail-detail .headline`/`pre` (the failed report), `.field-error` as SiteDrawer.svelte
 	   already renders it, and `.diff`'s `max-height` for the scroll cap on config text.
 
