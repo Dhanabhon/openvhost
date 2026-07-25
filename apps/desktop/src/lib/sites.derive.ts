@@ -33,6 +33,18 @@ export function enabledPill(enabled: boolean): { label: string; cls: string } {
 export const PHP_VERSIONS = ['8.4', '8.3', '8.2', '8.1'] as const;
 
 /**
+ * Web servers a site can run under.
+ *
+ * The IPC boundary types `webServer` as a bare `string` (specta exports the Rust
+ * `WebServer` enum's wire form, not a TS union), so this is the frontend's own
+ * narrowing of that. Kept in lockstep with `WebServer::parse` in
+ * `crates/openvhost-core/src/site/model.rs`, which is the authority — the server
+ * rejects anything else regardless of what the UI offers.
+ */
+export const WEB_SERVERS = ['nginx', 'apache'] as const;
+export type WebServerKind = (typeof WEB_SERVERS)[number];
+
+/**
  * Options for the site editor's PHP-version `<select>`, always including the
  * site's stored version.
  *
