@@ -30,4 +30,6 @@ pub enum ConfError {
         #[source]
         source: std::io::Error,
     },
+    #[error("validator {bin} did not finish within {secs}s and was killed")]
+    ValidatorTimeout { bin: String, secs: u64 },
 }
