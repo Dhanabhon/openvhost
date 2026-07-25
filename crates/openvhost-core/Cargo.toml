@@ -9,6 +9,8 @@ publish.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 dirs.workspace = true
+sqlx.workspace = true
+uuid.workspace = true
 specta = { version = "2.0.0-rc.25", optional = true, features = ["derive"] }
 
 [features]

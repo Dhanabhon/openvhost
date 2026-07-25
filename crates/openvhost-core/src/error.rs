@@ -27,4 +27,10 @@ pub enum CoreError {
     /// (specialist-proven). Refuse early instead.
     #[error("socket path {} is {len} bytes (max 103); use a shorter OPENVHOST_HOME", path.display())]
     SocketPathTooLong { path: PathBuf, len: usize },
+    /// A database operation failed.
+    #[error("database: {0}")]
+    Db(#[from] sqlx::Error),
+    /// A domain value failed validation at the boundary (parse-don't-validate).
+    #[error("invalid {field}: {reason}")]
+    Validation { field: &'static str, reason: String },
 }
