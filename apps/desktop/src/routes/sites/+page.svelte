@@ -2,6 +2,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import AppShell from '$lib/components/AppShell.svelte';
+	import SiteDrawer from '$lib/components/SiteDrawer.svelte';
 	import SitesPanel from '$lib/components/SitesPanel.svelte';
 	import { createSite, deleteSite, listSites, updateSite, type SiteDto } from '$lib/ipc';
 	import { SitesStore } from '$lib/sites.svelte';
@@ -12,12 +13,17 @@
 		void store.load();
 	});
 
-	// The editor drawer lands in Task 4; until then Add/Edit are inert hooks. The `site` param
-	// stays unused until then, so it is disabled for this one line rather than loosening the
-	// project's `@typescript-eslint/no-unused-vars` (which has no `argsIgnorePattern`).
-	function onAdd(): void {}
-	// eslint-disable-next-line @typescript-eslint/no-unused-vars -- filled in by Task 4's drawer
-	function onEdit(site: SiteDto): void {}
+	let editing = $state<SiteDto | null>(null);
+	let drawerOpen = $state(false);
+
+	function onAdd(): void {
+		editing = null;
+		drawerOpen = true;
+	}
+	function onEdit(site: SiteDto): void {
+		editing = site;
+		drawerOpen = true;
+	}
 </script>
 
 <AppShell runningCount={0} active="sites">
@@ -28,6 +34,15 @@
 		</div>
 	{/if}
 	<SitesPanel sites={store.sites} {onAdd} {onEdit} />
+	{#if drawerOpen}
+		<SiteDrawer
+			site={editing}
+			fieldErrors={store.fieldErrors}
+			onSave={(id, input) => store.save(id, input)}
+			onDelete={(id) => store.remove(id)}
+			onClose={() => (drawerOpen = false)}
+		/>
+	{/if}
 </AppShell>
 
 <style>
