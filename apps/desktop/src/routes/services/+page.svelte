@@ -50,12 +50,9 @@
 
 <AppShell runningCount={running} active="services">
 	<h1 class="sr-only">OpenVHost — Services</h1>
-	{#if store.error}
-		<div class="banner-error" role="alert" data-testid="error-banner">
-			<strong>Command failed ({store.error.kind})</strong>
-			<span>{'message' in store.error ? store.error.message : ''}</span>
-		</div>
-	{/if}
+	<!-- The error banner used to live here. AppShell renders it now, from the same shared
+	     store, so start/stop and startup-load failures surface on every route instead of
+	     only on this one. -->
 	<ServicesPanel
 		services={store.services}
 		onStart={(id) => void store.start(id)}
@@ -70,23 +67,6 @@
 </AppShell>
 
 <style>
-	/* .banner-error has no direct mock.css analog (the mockup never shows a page-level IPC
-	   error banner) — it reuses the `.fail-detail` failure-surface recipe (fail-tinted
-	   background/border/text) from docs/design/mock.css so it reads as the same "failure"
-	   semantic used everywhere else in the product. */
-	.banner-error {
-		margin: var(--vh-space-3) var(--vh-space-6) 0;
-		padding: var(--vh-space-3) var(--vh-space-4);
-		border: 1px solid color-mix(in oklab, var(--vh-fail) 35%, transparent);
-		background: var(--vh-fail-tint);
-		border-radius: var(--vh-radius-control);
-		color: var(--vh-fail);
-		font-size: var(--vh-text-table);
-	}
-	.banner-error strong {
-		display: block;
-		margin-bottom: 2px;
-	}
 	/* .coreinfo adapts mock.css's `.statusline` (the caption-sized footer metadata strip used
 	   under the log toolbar in the mockup's log-focused screen). */
 	.coreinfo {

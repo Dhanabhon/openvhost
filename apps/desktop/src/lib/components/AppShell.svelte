@@ -2,6 +2,8 @@
 <script lang="ts">
 	import TitleBar from './TitleBar.svelte';
 	import Rail from './Rail.svelte';
+	import ErrorBanner from './ErrorBanner.svelte';
+	import { servicesStore } from '$lib/services.shared.svelte';
 
 	// Defaults to 'sites', which is what `/` renders (routes/+page.svelte) — so the landing
 	// page needs no `active` of its own, and a new route that forgets the prop highlights the
@@ -22,7 +24,16 @@
 	<TitleBar {runningCount} />
 	<div class="shell">
 		<Rail {active} />
-		<main class="content">{@render children()}</main>
+		<main class="content">
+			<!-- Rendered here rather than per-page so a supervisor failure is never silent on
+			     whichever route happens to be showing. The layout performs the startup load,
+			     and its failure would otherwise be visible only as an unexplained "0 running"
+			     in the titlebar. Reads the shared store directly — AppShell already displays
+			     supervisor-derived state (`runningCount`), so this is the same coupling, not a
+			     new one, and routing it through a prop would let a new page forget it. -->
+			<ErrorBanner error={servicesStore.error} />
+			{@render children()}
+		</main>
 	</div>
 </div>
 

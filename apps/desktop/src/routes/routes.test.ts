@@ -59,6 +59,44 @@ function railLink(body: string, label: 'Sites' | 'Services'): { href: string; cu
 // state it expects instead of inheriting the previous one's.
 beforeEach(() => {
 	servicesStore.services = [];
+	servicesStore.error = null;
+});
+
+describe('a supervisor failure', () => {
+	// The startup `listServices` runs in the LAYOUT, so its failure is not tied to any
+	// one page — but the banner used to live only on the Services page. With Sites as
+	// the landing route that meant a failed startup load showed as an unexplained
+	// "0 running" in the titlebar and nothing else: a false claim about the user's
+	// system, made silently, on the first screen. AppShell renders the banner now, so
+	// assert it on BOTH routes rather than only where it happens to have worked before.
+	const failure = { kind: 'core' as const, message: 'supervisor unreachable' };
+
+	it('renders on the landing route, not just on Services', () => {
+		servicesStore.error = failure;
+		const { body } = render(SitesPage);
+		expect(body).toContain('data-testid="error-banner"');
+		expect(body).toContain('supervisor unreachable');
+	});
+
+	it('still renders on Services', () => {
+		servicesStore.error = failure;
+		const { body } = render(ServicesPage);
+		expect(body).toContain('data-testid="error-banner"');
+		expect(body).toContain('supervisor unreachable');
+	});
+
+	it('renders exactly once per page, so moving it did not double it up', () => {
+		servicesStore.error = failure;
+		for (const page of [SitesPage, ServicesPage]) {
+			const { body } = render(page);
+			expect(body.match(/data-testid="error-banner"/g)).toHaveLength(1);
+		}
+	});
+
+	it('shows no banner when nothing has failed', () => {
+		const { body } = render(SitesPage);
+		expect(body).not.toContain('data-testid="error-banner"');
+	});
 });
 
 describe('the landing route (/)', () => {
