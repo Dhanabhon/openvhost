@@ -24,14 +24,8 @@ fn fallback_brew() -> BrewStack {
 }
 
 /// The paths the stack actually registered, so the Web Server page can report
-/// them instead of re-probing and possibly disagreeing.
-///
-/// `#[allow(dead_code)]`: only this module's own test reads these fields
-/// today (`reported_paths_match_the_registered_nginx_spec`). The Web Server
-/// page's IPC command reads them from the managed `Option<StackPaths>` state
-/// in a later task — drop the allow once that real caller exists (same
-/// pattern P0-8 used for staged multi-task landings).
-#[allow(dead_code)]
+/// them instead of re-probing and possibly disagreeing. Read out of the managed
+/// `Option<StackPaths>` state by `commands::list_web_servers` and friends.
 pub struct StackPaths {
     pub home: PathBuf,
     pub nginx_bin: PathBuf,

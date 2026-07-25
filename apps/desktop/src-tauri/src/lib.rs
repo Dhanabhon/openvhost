@@ -33,6 +33,9 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::create_site,
             commands::update_site,
             commands::delete_site,
+            commands::list_web_servers,
+            commands::read_web_server_config,
+            commands::validate_web_server_config,
         ])
         .events(collect_events![
             commands::ServiceStateEvent,

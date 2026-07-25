@@ -21,6 +21,9 @@ thiserror.workspace = true
 tokio.workspace = true
 openvhost-core = { path = "../../../crates/openvhost-core", features = ["specta"] }
 openvhost-proc = { path = "../../../crates/openvhost-proc", features = ["specta"] }
+# No `specta` feature: nothing from this crate crosses IPC directly — the
+# web-server commands map its `ValidationReport` onto a local DTO.
+openvhost-conf = { path = "../../../crates/openvhost-conf" }
 specta = { version = "2.0.0-rc.25", features = ["derive"] }
 specta-typescript = "0.0.12"
 tauri-specta = { version = "2.0.0-rc.25", features = ["derive", "typescript"] }

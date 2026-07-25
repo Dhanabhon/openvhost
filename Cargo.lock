@@ -2519,6 +2519,7 @@ dependencies = [
 name = "openvhost-desktop"
 version = "0.1.0"
 dependencies = [
+ "openvhost-conf",
  "openvhost-core",
  "openvhost-proc",
  "serde",

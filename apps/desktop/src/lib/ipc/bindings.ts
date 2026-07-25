@@ -14,6 +14,9 @@ export const commands = {
 	createSite: (input: SiteInput) => typedError<SiteDto, IpcError>(__TAURI_INVOKE("create_site", { input })),
 	updateSite: (id: string, input: SiteInput) => typedError<SiteDto, IpcError>(__TAURI_INVOKE("update_site", { id, input })),
 	deleteSite: (id: string) => typedError<boolean, IpcError>(__TAURI_INVOKE("delete_site", { id })),
+	listWebServers: () => typedError<WebServerDto[], IpcError>(__TAURI_INVOKE("list_web_servers")),
+	readWebServerConfig: (id: string) => typedError<string, IpcError>(__TAURI_INVOKE("read_web_server_config", { id })),
+	validateWebServerConfig: (id: string) => typedError<ValidationReportDto, IpcError>(__TAURI_INVOKE("validate_web_server_config", { id })),
 };
 
 /** Events */
@@ -113,6 +116,27 @@ export type SiteInput = {
 	webServer: string,
 	phpVersion: string,
 	enabled: boolean,
+};
+
+export type ValidationReportDto = {
+	ok: boolean,
+	stderr: string,
+};
+
+/**  One row on the Web Server page. */
+export type WebServerDto = {
+	id: string,
+	displayName: string,
+	supported: boolean,
+	/**
+	 *  Correlates with the shared services store for live status; `None` when
+	 *  the brand is not a supervised service.
+	 */
+	serviceId: string | null,
+	binaryPath: string | null,
+	version: string | null,
+	supportsHotReload: boolean,
+	configPath: string | null,
 };
 
 /* Tauri Specta runtime */
