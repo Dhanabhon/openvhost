@@ -10,6 +10,10 @@ export const commands = {
 	startService: (id: string) => typedError<null, IpcError>(__TAURI_INVOKE("start_service", { id })),
 	stopService: (id: string) => typedError<null, IpcError>(__TAURI_INVOKE("stop_service", { id })),
 	serviceLogTail: (id: string, n: number) => typedError<LogLine[], IpcError>(__TAURI_INVOKE("service_log_tail", { id, n })),
+	listSites: () => typedError<SiteDto[], IpcError>(__TAURI_INVOKE("list_sites")),
+	createSite: (input: SiteInput) => typedError<SiteDto, IpcError>(__TAURI_INVOKE("create_site", { input })),
+	updateSite: (id: string, input: SiteInput) => typedError<SiteDto, IpcError>(__TAURI_INVOKE("update_site", { id, input })),
+	deleteSite: (id: string) => typedError<boolean, IpcError>(__TAURI_INVOKE("delete_site", { id })),
 };
 
 /** Events */
@@ -44,7 +48,12 @@ export type IpcError =
 /**  An error bubbled up from openvhost-core. */
 { kind: "core"; message: string } | 
 /**  An error bubbled up from the process supervisor. */
-{ kind: "proc"; message: string };
+{ kind: "proc"; message: string } | 
+/**
+ *  A domain value failed validation; `field` names the offending input so
+ *  the UI can mark it instead of showing a generic banner.
+ */
+{ kind: "validation"; field: string; message: string };
 
 export type LogLevel = "info" | "warn" | "error";
 
@@ -75,6 +84,35 @@ export type ServiceStatus = {
 	endpoint: string | null,
 	pid: number | null,
 	state: ServiceState,
+};
+
+/**
+ *  A site as it crosses IPC. `Site`'s fields are opaque validated newtypes
+ *  (deliberately not serializable), so the wire form is plain strings.
+ */
+export type SiteDto = {
+	id: string,
+	name: string,
+	domain: string,
+	docroot: string,
+	webServer: string,
+	phpVersion: string,
+	enabled: boolean,
+	createdAt: number,
+	updatedAt: number,
+};
+
+/**
+ *  Client-supplied site fields. Note there is no `id`/`created_at`/
+ *  `updated_at`: those are server-owned and never taken from the client.
+ */
+export type SiteInput = {
+	name: string,
+	domain: string,
+	docroot: string,
+	webServer: string,
+	phpVersion: string,
+	enabled: boolean,
 };
 
 /* Tauri Specta runtime */

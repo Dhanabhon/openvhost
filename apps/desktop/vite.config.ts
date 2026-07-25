@@ -28,8 +28,13 @@ export default defineConfig({
 				test: {
 					name: 'server',
 					environment: 'node',
-					include: ['src/**/*.{test,spec}.{js,ts}'],
-					exclude: ['src/**/*.svelte.{test,spec}.{js,ts}']
+					// No separate browser/jsdom project exists yet, so `*.svelte.test.ts`
+					// is NOT excluded here (unlike the sveltekit default template) — a
+					// rune-based `.svelte.ts` store (e.g. `sites.svelte.ts`) has no DOM
+					// dependency and runs fine under `node`. A future test that renders an
+					// actual `.svelte` component would fail loudly here (no `document`),
+					// which is the right time to add a dedicated browser/jsdom project.
+					include: ['src/**/*.{test,spec}.{js,ts}']
 				}
 			}
 		]

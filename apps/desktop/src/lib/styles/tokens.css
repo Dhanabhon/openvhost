@@ -101,6 +101,10 @@
 	--vh-del-tint: color-mix(in oklab, var(--vh-state-failed) 10%, var(--vh-surface));
 	--vh-log-bg: #fdfdfb;
 	--vh-shadow-overlay: 0 12px 40px rgb(23 26 33 / 0.18), 0 2px 8px rgb(23 26 33 / 0.1);
+	/* Modal/drawer backdrop scrim. Same value as docs/design/mock.css's `.drawer-backdrop`
+	   (zero visual change) — tokenized so the queued dark-palette slice has one place to
+	   override instead of a hardcoded near-black baked into every overlay component. */
+	--vh-scrim: rgb(23 26 33 / 0.35);
 }
 
 /* ---------------------------------------------------------------------- */

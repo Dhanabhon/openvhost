@@ -29,6 +29,10 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::start_service,
             commands::stop_service,
             commands::service_log_tail,
+            commands::list_sites,
+            commands::create_site,
+            commands::update_site,
+            commands::delete_site,
         ])
         .events(collect_events![
             commands::ServiceStateEvent,
@@ -103,6 +107,7 @@ pub fn run() {
 
     let result = tauri::Builder::default()
         .invoke_handler(specta_builder.invoke_handler())
+        .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             specta_builder.mount_events(app);
 

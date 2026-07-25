@@ -7,10 +7,21 @@ import type {
 	LogLine,
 	ServiceLogEvent,
 	ServiceStateEvent,
-	ServiceStatus
+	ServiceStatus,
+	SiteDto,
+	SiteInput
 } from './bindings';
 
-export type { CoreInfo, IpcError, LogLine, ServiceLogEvent, ServiceStateEvent, ServiceStatus };
+export type {
+	CoreInfo,
+	IpcError,
+	LogLine,
+	ServiceLogEvent,
+	ServiceStateEvent,
+	ServiceStatus,
+	SiteDto,
+	SiteInput
+};
 
 function isIpcError(e: unknown): e is IpcError {
 	return typeof e === 'object' && e !== null && typeof (e as { kind?: unknown }).kind === 'string';
@@ -80,4 +91,17 @@ export function onServiceState(cb: (ev: ServiceStateEvent) => void): Promise<() 
 }
 export function onServiceLog(cb: (ev: ServiceLogEvent) => void): Promise<() => void> {
 	return events.serviceLogEvent.listen((e) => cb(e.payload));
+}
+
+export async function listSites(): Promise<SiteDto[]> {
+	return unwrap(commands.listSites());
+}
+export async function createSite(input: SiteInput): Promise<SiteDto> {
+	return unwrap(commands.createSite(input));
+}
+export async function updateSite(id: string, input: SiteInput): Promise<SiteDto> {
+	return unwrap(commands.updateSite(id, input));
+}
+export async function deleteSite(id: string): Promise<boolean> {
+	return unwrap(commands.deleteSite(id));
 }
