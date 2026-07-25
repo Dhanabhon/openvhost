@@ -12,6 +12,20 @@ use std::path::Path;
 
 use crate::error::CoreError;
 
+/// Longest `PhpVersion` we accept, in bytes. The selector is `MAJOR.MINOR`
+/// with digit-only components, and no PHP release has ever carried a
+/// three-digit major or minor — 8 bytes still admits `999.999` while keeping
+/// the value obviously bounded before it reaches a php-fpm pool name.
+const PHP_VERSION_MAX_LEN: usize = 8;
+
+/// Longest `Docroot` we accept, in bytes. macOS caps a pathname at `PATH_MAX`
+/// (1024) *including* the terminating NUL, so 1023 bytes is the longest path
+/// the OS can actually open — a longer string is unusable as a document root
+/// no matter what it contains, and must not reach state.db or a generated
+/// `root` directive. (Linux's 4096 is looser; Windows' classic 260 is tighter
+/// and gets its own bound when Windows support lands.)
+const DOCROOT_MAX_LEN: usize = 1023;
+
 fn invalid(field: &'static str, reason: impl Into<String>) -> CoreError {
     CoreError::Validation {
         field,
@@ -44,7 +58,7 @@ newtype_str!(
 );
 newtype_str!(
     PhpVersion,
-    "A `major.minor` PHP version selector (e.g. `8.3`)."
+    "A `major.minor` PHP version selector (e.g. `8.3`), at most 8 bytes."
 );
 
 impl SiteId {
@@ -107,8 +121,15 @@ impl Domain {
 }
 
 impl PhpVersion {
-    /// `major.minor`, digits only (e.g. `8.3`).
+    /// `major.minor`, digits only (e.g. `8.3`), at most
+    /// `PHP_VERSION_MAX_LEN` bytes.
     pub fn parse(s: &str) -> Result<Self, CoreError> {
+        if s.len() > PHP_VERSION_MAX_LEN {
+            return Err(invalid(
+                "php_version",
+                format!("must be at most {PHP_VERSION_MAX_LEN} bytes"),
+            ));
+        }
         let ok = match s.split_once('.') {
             Some((maj, min)) => {
                 !maj.is_empty()
@@ -128,18 +149,26 @@ impl PhpVersion {
     }
 }
 
-/// A validated site document root: an absolute path with no NUL, `"`, or
-/// control byte (the exact class `openvhost-conf`'s `to_config_path`
-/// rejects — config-injection stopped at ingress). Constructed only via
-/// `parse`; the inner value is guaranteed valid UTF-8.
+/// A validated site document root: an absolute path of at most
+/// `DOCROOT_MAX_LEN` bytes with no NUL, `"`, or control byte (the exact
+/// class `openvhost-conf`'s `to_config_path` rejects — config-injection
+/// stopped at ingress). Constructed only via `parse`; the inner value is
+/// guaranteed valid UTF-8.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Docroot(String);
 
 impl Docroot {
-    /// Validate a docroot string: absolute, valid UTF-8 (it's `&str`), no
-    /// quote or control character (the exact class P0-7's `to_config_path`
-    /// rejects). NUL is already covered by `is_ascii_control`.
+    /// Validate a docroot string: absolute, at most `DOCROOT_MAX_LEN` bytes,
+    /// valid UTF-8 (it's `&str`), no quote or control character (the exact
+    /// class P0-7's `to_config_path` rejects). NUL is already covered by
+    /// `is_ascii_control`.
     pub fn parse(s: &str) -> Result<Self, CoreError> {
+        if s.len() > DOCROOT_MAX_LEN {
+            return Err(invalid(
+                "docroot",
+                format!("must be at most {DOCROOT_MAX_LEN} bytes"),
+            ));
+        }
         if !Path::new(s).is_absolute() {
             return Err(invalid("docroot", "must be an absolute path"));
         }
@@ -255,6 +284,36 @@ mod tests {
         for bad in ["8", "8.3.1", "8.x", "v8.3", ""] {
             assert!(PhpVersion::parse(bad).is_err(), "should reject {bad:?}");
         }
+    }
+
+    #[test]
+    fn phpversion_rejects_overlong_input() {
+        // Otherwise well-formed `major.minor` — only the length is wrong.
+        let overlong = format!("1.{}", "2".repeat(PHP_VERSION_MAX_LEN - 1));
+        assert_eq!(overlong.len(), PHP_VERSION_MAX_LEN + 1);
+        assert!(PhpVersion::parse(&overlong).is_err());
+    }
+
+    #[test]
+    fn phpversion_accepts_exactly_max_len() {
+        let at_limit = format!("1.{}", "2".repeat(PHP_VERSION_MAX_LEN - 2));
+        assert_eq!(at_limit.len(), PHP_VERSION_MAX_LEN);
+        assert!(PhpVersion::parse(&at_limit).is_ok());
+    }
+
+    #[test]
+    fn docroot_rejects_overlong_path() {
+        // Absolute and charset-clean — only the length is wrong.
+        let overlong = format!("/{}", "a".repeat(DOCROOT_MAX_LEN));
+        assert_eq!(overlong.len(), DOCROOT_MAX_LEN + 1);
+        assert!(Docroot::parse(&overlong).is_err());
+    }
+
+    #[test]
+    fn docroot_accepts_exactly_max_len() {
+        let at_limit = format!("/{}", "a".repeat(DOCROOT_MAX_LEN - 1));
+        assert_eq!(at_limit.len(), DOCROOT_MAX_LEN);
+        assert!(Docroot::parse(&at_limit).is_ok());
     }
 
     #[test]
