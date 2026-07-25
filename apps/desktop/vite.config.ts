@@ -31,9 +31,12 @@ export default defineConfig({
 					// No separate browser/jsdom project exists yet, so `*.svelte.test.ts`
 					// is NOT excluded here (unlike the sveltekit default template) — a
 					// rune-based `.svelte.ts` store (e.g. `sites.svelte.ts`) has no DOM
-					// dependency and runs fine under `node`. A future test that renders an
-					// actual `.svelte` component would fail loudly here (no `document`),
-					// which is the right time to add a dedicated browser/jsdom project.
+					// dependency and runs fine under `node`, and so does rendering a
+					// `.svelte` component through `svelte/server` (see
+					// `SiteDrawer.svelte.test.ts`), whose markup carries the `selected`/
+					// `value` attributes a browser would apply. A test that needs a live
+					// DOM — user events, focus, measurement — would fail loudly here (no
+					// `document`); that is the right time to add a browser/jsdom project.
 					include: ['src/**/*.{test,spec}.{js,ts}']
 				}
 			}
