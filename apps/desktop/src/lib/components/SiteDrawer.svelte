@@ -39,6 +39,11 @@
 	let submitting = $state(false);
 	let confirmingDelete = $state(false);
 	let deleting = $state(false);
+	// Surfaces a rejected `open()` call (ACL denial, plugin/runtime error) next to the
+	// Project-folder field — a user *cancel* resolves `null` and is handled in `browse()`
+	// below without touching this; only a genuine failure sets it. Cleared at the start of
+	// every `browse()` attempt so a stale message can't outlive a later success.
+	let pickerError = $state<string | null>(null);
 
 	let drawerEl: HTMLElement | undefined = $state();
 	let nameInput: HTMLInputElement | undefined = $state();
@@ -154,9 +159,27 @@
 	}
 
 	async function browse(): Promise<void> {
-		const picked = await open({ directory: true, multiple: false, title: 'Choose project folder' });
-		if (typeof picked === 'string') docroot = picked;
+		pickerError = null;
+		try {
+			const picked = await open({
+				directory: true,
+				multiple: false,
+				title: 'Choose project folder'
+			});
+			if (typeof picked === 'string') docroot = picked;
+		} catch (e) {
+			pickerError = `Could not open the folder picker: ${String(e)}`;
+		}
 	}
+
+	// Project-folder field can carry two independent, non-exclusive errors — the backend's
+	// `fieldErrors.docroot` (from Save) and `pickerError` (from Browse) — so their `id`s are
+	// combined, space-separated, for `aria-describedby`; either alone still works standalone.
+	const rootDescribedBy = $derived(
+		[fieldErrors.docroot ? 'f-root-error' : null, pickerError ? 'f-root-picker-error' : null]
+			.filter((id): id is string => id !== null)
+			.join(' ') || undefined
+	);
 
 	async function submit(): Promise<void> {
 		if (submitting) return;
@@ -269,8 +292,8 @@
 					class="input mono"
 					id="f-root"
 					bind:value={docroot}
-					aria-invalid={fieldErrors.docroot ? 'true' : undefined}
-					aria-describedby={fieldErrors.docroot ? 'f-root-error' : undefined}
+					aria-invalid={fieldErrors.docroot || pickerError ? 'true' : undefined}
+					aria-describedby={rootDescribedBy}
 				/>
 				<button type="button" class="input-suffix input-suffix--btn" onclick={() => void browse()}>
 					Browse
@@ -278,6 +301,9 @@
 			</div>
 			{#if fieldErrors.docroot}
 				<p class="field-error" id="f-root-error">{fieldErrors.docroot}</p>
+			{/if}
+			{#if pickerError}
+				<p class="field-error" id="f-root-picker-error">{pickerError}</p>
 			{/if}
 		</div>
 
