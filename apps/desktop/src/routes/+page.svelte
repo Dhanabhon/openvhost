@@ -1,81 +1,64 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import {
-		coreInfo,
-		listServices,
-		onServiceLog,
-		onServiceState,
-		serviceLogTail,
-		startService,
-		stopService,
-		type CoreInfo,
-		type IpcError
-	} from '$lib/ipc';
 	import AppShell from '$lib/components/AppShell.svelte';
-	import LogPane from '$lib/components/LogPane.svelte';
-	import ServicesPanel from '$lib/components/ServicesPanel.svelte';
+	import SiteDrawer from '$lib/components/SiteDrawer.svelte';
+	import SitesPanel from '$lib/components/SitesPanel.svelte';
+	import { createSite, deleteSite, listSites, updateSite, type SiteDto } from '$lib/ipc';
 	import { runningCount } from '$lib/services.derive';
-	import { ServicesStore } from '$lib/services.svelte';
+	import { servicesStore } from '$lib/services.shared.svelte';
+	import { SitesStore } from '$lib/sites.svelte';
 
-	const store = new ServicesStore({ listServices, serviceLogTail });
-	let info = $state<CoreInfo | null>(null);
-	let error = $state<IpcError | null>(null);
-	const running = $derived(runningCount(store.services));
+	const store = new SitesStore({ listSites, createSite, updateSite, deleteSite });
+	// The titlebar's "N running" belongs to every route, so it reads the shared
+	// supervisor state that `routes/+layout.svelte` subscribes to — this page used to
+	// pass a hardcoded 0, which announced "0 running" even with services up.
+	const running = $derived(runningCount(servicesStore.services));
 
 	onMount(() => {
-		let unsubs: Array<() => void> = [];
-		(async () => {
-			try {
-				unsubs = await Promise.all([
-					onServiceState((ev) => store.applyState(ev)),
-					onServiceLog((ev) => store.applyLog(ev))
-				]);
-				await store.init();
-				info = await coreInfo();
-			} catch (e) {
-				error = e as IpcError;
-			}
-		})();
-		return () => unsubs.forEach((u) => u());
+		void store.load();
 	});
 
-	async function act(fn: (id: string) => Promise<void>, id: string) {
-		error = null;
-		try {
-			await fn(id);
-		} catch (e) {
-			error = e as IpcError;
-		}
+	let editing = $state<SiteDto | null>(null);
+	let drawerOpen = $state(false);
+
+	function onAdd(): void {
+		store.clearErrors();
+		editing = null;
+		drawerOpen = true;
+	}
+	function onEdit(site: SiteDto): void {
+		store.clearErrors();
+		editing = site;
+		drawerOpen = true;
 	}
 </script>
 
 <AppShell runningCount={running}>
-	<h1 class="sr-only">OpenVHost — Services</h1>
-	{#if error}
-		<div class="banner-error" role="alert" data-testid="error-banner">
-			<strong>Command failed ({error.kind})</strong>
-			<span>{'message' in error ? error.message : ''}</span>
+	{#if store.error}
+		<div class="banner-error" role="alert" data-testid="sites-error">
+			<strong>Command failed ({store.error.kind})</strong>
+			<span>{'message' in store.error ? store.error.message : ''}</span>
 		</div>
 	{/if}
-	<ServicesPanel
-		services={store.services}
-		onStart={(id) => act(startService, id)}
-		onStop={(id) => act(stopService, id)}
-	/>
-	<LogPane logs={store.logs} />
-	{#if info}
-		<p class="coreinfo mono">
-			OpenVHost {info.appVersion} · {info.os}/{info.arch} · {info.openvhostHome}
-		</p>
+	<SitesPanel sites={store.sites} {onAdd} {onEdit} />
+	{#if drawerOpen}
+		<SiteDrawer
+			site={editing}
+			fieldErrors={store.fieldErrors}
+			onSave={(id, input) => store.save(id, input)}
+			onDelete={(id) => store.remove(id)}
+			onClose={() => (drawerOpen = false)}
+		/>
 	{/if}
 </AppShell>
 
 <style>
-	/* .banner-error has no direct mock.css analog (the mockup never shows a page-level IPC
-	   error banner) — it reuses the `.fail-detail` failure-surface recipe (fail-tinted
-	   background/border/text) from docs/design/mock.css so it reads as the same "failure"
-	   semantic used everywhere else in the product. */
+	/* .banner-error: the same token-based failure-surface treatment as the Services page
+	   (routes/services/+page.svelte) — reuses mock.css's `.fail-detail` recipe so an IPC error reads as
+	   the same "failure" semantic everywhere in the product. No extra `<h1 class="sr-only">`
+	   here (unlike the Services page): SitesPanel already renders a real, visible `<h1>Sites</h1>`
+	   as part of its page head, so a second hidden h1 would just duplicate the landmark. */
 	.banner-error {
 		margin: var(--vh-space-3) var(--vh-space-6) 0;
 		padding: var(--vh-space-3) var(--vh-space-4);
@@ -88,12 +71,5 @@
 	.banner-error strong {
 		display: block;
 		margin-bottom: 2px;
-	}
-	/* .coreinfo adapts mock.css's `.statusline` (the caption-sized footer metadata strip used
-	   under the log toolbar in the mockup's log-focused screen). */
-	.coreinfo {
-		padding: 6px var(--vh-space-6) var(--vh-space-4);
-		color: var(--vh-text-2);
-		font-size: var(--vh-text-caption);
 	}
 </style>

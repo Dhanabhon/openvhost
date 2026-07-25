@@ -86,11 +86,28 @@ export async function stopService(id: string): Promise<void> {
 export async function serviceLogTail(id: string, n: number): Promise<LogLine[]> {
 	return unwrap(commands.serviceLogTail(id, n));
 }
-export function onServiceState(cb: (ev: ServiceStateEvent) => void): Promise<() => void> {
-	return events.serviceStateEvent.listen((e) => cb(e.payload));
+/**
+ * Subscribe to `service-state`. Rejects with an `IpcError`, like every command
+ * above: `events.*.listen` reaches the transport directly (it is not routed
+ * through {@link unwrap}), so a listener that cannot be registered would
+ * otherwise reject with a raw `Error` — and the caller is now
+ * `routes/+layout.svelte`, which renders the failure through the same
+ * `.kind`/`.message` banner shape as everything else.
+ */
+export async function onServiceState(cb: (ev: ServiceStateEvent) => void): Promise<() => void> {
+	try {
+		return await events.serviceStateEvent.listen((e) => cb(e.payload));
+	} catch (e) {
+		throw normalizeError(e);
+	}
 }
-export function onServiceLog(cb: (ev: ServiceLogEvent) => void): Promise<() => void> {
-	return events.serviceLogEvent.listen((e) => cb(e.payload));
+/** Subscribe to `service-log`. Same `IpcError` contract as {@link onServiceState}. */
+export async function onServiceLog(cb: (ev: ServiceLogEvent) => void): Promise<() => void> {
+	try {
+		return await events.serviceLogEvent.listen((e) => cb(e.payload));
+	} catch (e) {
+		throw normalizeError(e);
+	}
 }
 
 export async function listSites(): Promise<SiteDto[]> {
