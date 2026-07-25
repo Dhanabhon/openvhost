@@ -1,21 +1,28 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! macOS demo-stack registration (P0-4). Data-only: binaries from the
-//! Homebrew probe (resolved at registration time), configs provisioned
-//! under the OpenVHost home. P0-6 swaps the binary source to packages/.
+//! The stack paths the app reports, plus macOS demo-stack registration (P0-4).
+//! `StackPaths` is a portable data type defined for every target; only building
+//! it is platform-specific. Data-only: binaries from the Homebrew probe
+//! (resolved at registration time), configs provisioned under the OpenVHost
+//! home. P0-6 swaps the binary source to packages/.
 
+#[cfg(target_os = "macos")]
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+#[cfg(target_os = "macos")]
 use openvhost_core::platform::macos::demo_stack::{
     BrewStack, find_brew_binaries, provision_macos_demo_stack,
 };
+#[cfg(target_os = "macos")]
 use openvhost_proc::{ServiceSpec, SpawnSpec};
 
+#[cfg(target_os = "macos")]
 const DEMO_PORT: u16 = 8080;
 
 /// Apple Silicon default paths, used when probing finds nothing: the rows
 /// still register, and Start yields an honest Failed naming the missing
 /// path (the P0-3 spawn-fail contract) instead of the rows vanishing.
+#[cfg(target_os = "macos")]
 fn fallback_brew() -> BrewStack {
     BrewStack {
         nginx: PathBuf::from("/opt/homebrew/opt/nginx/bin/nginx"),
@@ -26,6 +33,25 @@ fn fallback_brew() -> BrewStack {
 /// The paths the stack actually registered, so the Web Server page can report
 /// them instead of re-probing and possibly disagreeing. Read out of the managed
 /// `Option<StackPaths>` state by `commands::list_web_servers` and friends.
+///
+/// Portable by construction — three `PathBuf`s, nothing platform-specific — so
+/// it is defined for EVERY target and `commands.rs` can name it ungated. Only
+/// building one is platform-specific (`macos_stack` below); targets with no
+/// stack builder manage `None`.
+// On a target with no stack builder this type is named and its fields are read
+// by ungated `commands.rs` code, but nothing CONSTRUCTS it, which is rustc's
+// separate "struct is never constructed" dead_code diagnostic. Reproduced in
+// isolation on rustc 1.96: that diagnostic does NOT fire for a struct whose
+// fields are read from a reachable signature, so this allow is belt-and-braces
+// rather than load-bearing. Kept because no non-macOS target can be compiled
+// from this repo yet (libsqlite3-sys's bundled C blocks cross-checks) and the
+// diagnostic's exact trigger has moved between releases, while the cost is nil:
+// it is cfg'd OFF on macOS, where all three fields are genuinely read, so no
+// dead-code signal is suppressed on the platform actually built here. Do NOT
+// switch this to `#[expect]` — that warns when the lint does not fire, turning
+// the unverifiable direction into a guaranteed break. A `#[cfg(not(macos))]`
+// duplicate stub type is also not the answer: unverifiable code that drifts.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub struct StackPaths {
     pub home: PathBuf,
     pub nginx_bin: PathBuf,
@@ -35,6 +61,7 @@ pub struct StackPaths {
 /// Specs to register plus the paths they were built from. `paths` is `None`
 /// exactly when the home could not be resolved — the same condition that
 /// already produces zero specs.
+#[cfg(target_os = "macos")]
 pub struct MacosStack {
     pub specs: Vec<ServiceSpec>,
     pub paths: Option<StackPaths>,
@@ -44,6 +71,7 @@ pub struct MacosStack {
 /// non-fatal (rows register; Start surfaces the problem honestly). Only a
 /// home-resolution failure skips the rows entirely — without a home there
 /// are no config paths to point at.
+#[cfg(target_os = "macos")]
 pub fn macos_stack() -> MacosStack {
     let home = match openvhost_core::resolve_home() {
         Ok(h) => h,
@@ -107,7 +135,7 @@ pub fn macos_stack() -> MacosStack {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;

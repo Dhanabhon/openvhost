@@ -2,10 +2,19 @@
 //! Tauri command surface — thin validation + delegation to openvhost-core
 //! (business logic never lives here; master plan §5).
 
+use std::path::Path;
+
+// `WebServerAdapter` is imported for its `supports_hot_reload` method: it is a
+// trait method, so the trait must be in scope even though the call site names
+// the concrete `NginxAdapter`.
+use openvhost_conf::WebServerAdapter;
+
 use openvhost_core::{
     CoreInfo, Db, Docroot, Domain, NewSite, PhpVersion, Site, SiteId, SiteName, SiteRepository,
     SqliteSiteRepository, WebServer,
 };
+
+use crate::stack::StackPaths;
 
 /// Serializable command error (spec §7.2). Establishes the pattern:
 /// every command returns `Result<_, IpcError>` and the UI renders failures.
@@ -242,18 +251,11 @@ pub async fn delete_site(db: tauri::State<'_, Db>, id: String) -> Result<bool, I
     Ok(repo.delete(&site_id).await?)
 }
 
-// `WebServerAdapter` is imported for its `supports_hot_reload` method: it is a
-// trait method, so the trait must be in scope even though the call below names
-// the concrete `NginxAdapter`.
-use openvhost_conf::WebServerAdapter;
-
-use crate::stack::StackPaths;
-
 /// The web servers OpenVHost knows about. A CLOSED list: the client sends only
 /// this id — never a path, filename or argument — and every path used by the
 /// commands below is derived server-side from managed state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WebServerBrand {
+enum WebServerBrand {
     Nginx,
     Apache,
 }
@@ -273,8 +275,21 @@ impl WebServerBrand {
         }
     }
 
+    /// Whether OpenVHost can actually operate this brand end to end: adapter,
+    /// template, real paths in `StackPaths` and a validator that speaks its
+    /// config. Exhaustive rather than `matches!`, so a third variant has to be
+    /// classified here instead of silently defaulting to unsupported.
     fn supported(self) -> bool {
-        matches!(self, Self::Nginx)
+        match self {
+            Self::Nginx => true,
+            // Flipping this to `true` is NOT on its own enough to support Apache.
+            // It also needs its own paths on `StackPaths`, its own arm in
+            // `live_config_path` below, and its own validator — the one
+            // `validate_web_server_config` uses runs `nginx -t`. Until all three
+            // exist, `live_config_path` is what stops a supported-but-pathless
+            // brand from being handed nginx's config under an Apache heading.
+            Self::Apache => false,
+        }
     }
 
     /// Reject an unsupported brand BEFORE deriving any path, so the failure is
@@ -289,6 +304,32 @@ impl WebServerBrand {
             message: "OpenVHost cannot serve Apache sites yet — it only generates nginx config"
                 .into(),
         })
+    }
+
+    /// The live config file for THIS brand — and the only way the commands below
+    /// can obtain a config path at all.
+    ///
+    /// The brand KEYS the path rather than merely gating it: the `match` is
+    /// exhaustive, so a future brand is a compile error here instead of silently
+    /// inheriting nginx's. `require_supported` runs first and inside, so a caller
+    /// cannot reach a path before the gate no matter how the statements are
+    /// ordered, and the user-facing message is unchanged.
+    ///
+    /// `self` is `Copy` and taken by value, so the elided output lifetime binds to
+    /// `paths` — the returned path always borrows from managed state.
+    fn live_config_path(self, paths: &StackPaths) -> Result<&Path, IpcError> {
+        self.require_supported()?;
+        match self {
+            Self::Nginx => Ok(&paths.nginx_conf),
+            // Unreachable while `Nginx` is the only `supported()` brand: the gate
+            // above already returned. Deliberately an error and not
+            // `unreachable!()` — marking Apache supported without giving it a
+            // path here must degrade to an honest failure, never a panic. Adding
+            // a path is also not sufficient by itself; see `supported()`.
+            Self::Apache => Err(IpcError::Core {
+                message: "no live configuration path is known for Apache".into(),
+            }),
+        }
     }
 }
 
@@ -332,17 +373,57 @@ pub struct ValidationReportDto {
     pub stderr: String,
 }
 
-/// The managed paths, or a rendered error when the home never resolved.
+/// The managed stack paths, or a rendered error when nothing was managed.
 ///
 /// The managed type is `Option<StackPaths>`, not `StackPaths`: tauri implements
 /// `CommandArg` only for `State<'r, T>`, so a command cannot take an
 /// optionally-managed state. Task 2 therefore manages the `Option` itself.
+///
+/// `None` means **no web server stack was managed for this platform**, which
+/// today is every target except macOS: the OpenVHost home resolved perfectly
+/// well and there is simply no stack builder yet. Hence the platform-agnostic
+/// message — it must not blame home resolution.
+///
+/// This is NOT how a failed startup surfaces. `lib.rs` manages the value inside
+/// the `resolve_home()` + `InstanceLock::acquire` success arm, so the two failure
+/// paths next to it manage **nothing at all**: `State` extraction itself fails
+/// and the user sees Tauri's raw error rather than this text. Of those two, an
+/// unresolvable home is the rare one — `InstanceLock::acquire` returning
+/// `Ok(None)`, i.e. the app was double-launched, is far more likely.
+///
+/// Making those two friendly would take one `app.manage` after the match, with
+/// every arm yielding an `Option<StackPaths>`. Do NOT approximate it by managing
+/// `None` early and the real value later: `Manager::manage` does not overwrite an
+/// existing value (its own doc example asserts `assert!(!app.manage(MyInt(1)))`),
+/// so the second call is a silent no-op that would pin every user to `None`.
 fn stack_paths<'a>(
     paths: &'a tauri::State<'_, Option<StackPaths>>,
 ) -> Result<&'a StackPaths, IpcError> {
     paths.inner().as_ref().ok_or_else(|| IpcError::Core {
-        message: "the OpenVHost home could not be resolved, so no web server is configured".into(),
+        message: "no web server stack is configured for this platform".into(),
     })
+}
+
+/// The page's rows, built from the paths the supervisor actually registered.
+///
+/// Split out of `list_web_servers` so the listing is testable without Tauri or a
+/// live version probe: everything process- or state-dependent arrives as an
+/// argument. A test can therefore pin that Apache is LISTED, not merely
+/// constructible.
+fn web_server_rows(p: &StackPaths, version: Option<String>) -> Vec<WebServerDto> {
+    vec![
+        WebServerDto {
+            id: "nginx".into(),
+            display_name: "nginx".into(),
+            supported: true,
+            service_id: Some("nginx".into()),
+            binary_path: Some(p.nginx_bin.display().to_string()),
+            version,
+            supports_hot_reload: openvhost_conf::NginxAdapter.supports_hot_reload(),
+            config_path: Some(p.nginx_conf.display().to_string()),
+        },
+        WebServerDto::apache(),
+    ]
 }
 
 #[tauri::command]
@@ -358,19 +439,7 @@ pub async fn list_web_servers(
     // — see `openvhost_conf::probe_nginx_version`'s own doc comment.
     let err_log = p.home.join("logs/nginx.error.log");
     let version = openvhost_conf::probe_nginx_version(&p.nginx_bin, &err_log).await;
-    Ok(vec![
-        WebServerDto {
-            id: "nginx".into(),
-            display_name: "nginx".into(),
-            supported: true,
-            service_id: Some("nginx".into()),
-            binary_path: Some(p.nginx_bin.display().to_string()),
-            version,
-            supports_hot_reload: openvhost_conf::NginxAdapter.supports_hot_reload(),
-            config_path: Some(p.nginx_conf.display().to_string()),
-        },
-        WebServerDto::apache(),
-    ])
+    Ok(web_server_rows(p, version))
 }
 
 #[tauri::command]
@@ -380,19 +449,20 @@ pub async fn read_web_server_config(
     id: String,
 ) -> Result<String, IpcError> {
     let brand = WebServerBrand::parse(&id)?;
-    brand.require_supported()?;
     let p = stack_paths(&paths)?;
-    // NOT a general file reader: the path comes from managed state keyed by the
-    // parsed brand, so it cannot be aimed at an arbitrary file.
-    //
-    // Precisely: `StackPaths` carries nginx's paths only, so the brand currently
-    // GATES this read (`require_supported` above) rather than indexing a
-    // per-brand path. `Nginx` is the only `supported()` variant, so that is the
-    // same thing today — but a second supported brand MUST add the per-brand
-    // lookup here, or it would silently be handed nginx's config.
-    std::fs::read_to_string(&p.nginx_conf).map_err(|e| IpcError::Core {
-        message: format!("cannot read {}: {e}", p.nginx_conf.display()),
-    })
+    // NOT a general file reader: the path is looked up in managed state BY the
+    // parsed brand, so it can neither be aimed at an arbitrary file nor return
+    // one brand's config under another's heading. An unsupported brand yields no
+    // path at all — `live_config_path` gates before it matches.
+    let conf = brand.live_config_path(p)?;
+    // Async read: the file is small, but an `OPENVHOST_HOME` on a stalled network
+    // mount would block a tokio worker thread, and on a desktop-sized worker pool
+    // that stalls the supervisor event pump and other in-flight commands too.
+    tokio::fs::read_to_string(conf)
+        .await
+        .map_err(|e| IpcError::Core {
+            message: format!("cannot read {}: {e}", conf.display()),
+        })
 }
 
 #[tauri::command]
@@ -402,14 +472,18 @@ pub async fn validate_web_server_config(
     id: String,
 ) -> Result<ValidationReportDto, IpcError> {
     let brand = WebServerBrand::parse(&id)?;
-    brand.require_supported()?;
     let p = stack_paths(&paths)?;
+    // Same brand-keyed lookup as `read_web_server_config`, and it is what makes
+    // the nginx binary below correct: `validate_live` runs `nginx -t`, so it may
+    // only ever be handed a path this accessor yielded for `Nginx`. A brand it
+    // rejects stops here rather than getting a green "valid" badge for a config
+    // nginx never examined.
+    let conf = brand.live_config_path(p)?;
     // Read-only: `validate_live` runs `-t` against the config in place and never
     // calls `materialize`. `-e` keeps nginx's OWN error log inside our home
-    // instead of its compiled-in prefix; no config file is written. Same
-    // gates-not-keys caveat as `read_web_server_config` applies to these paths.
+    // instead of its compiled-in prefix; no config file is written.
     let err_log = p.home.join("logs/nginx.error.log");
-    let report = openvhost_conf::validate_live(&p.nginx_bin, &p.nginx_conf, &err_log)
+    let report = openvhost_conf::validate_live(&p.nginx_bin, conf, &err_log)
         .await
         .map_err(|e| IpcError::Core {
             message: e.to_string(),
@@ -562,10 +636,26 @@ mod site_ipc_tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod web_server_ipc_tests {
+    use std::path::PathBuf;
+
     use super::*;
 
+    /// Not a real installation: `web_server_rows` and `live_config_path` only ever
+    /// move these paths around (nothing here is opened), so distinctive sentinels
+    /// prove a value was passed through rather than re-derived.
+    fn sample_paths() -> StackPaths {
+        StackPaths {
+            home: PathBuf::from("/nonexistent/openvhost-test-home"),
+            nginx_bin: PathBuf::from("/nonexistent/openvhost-test-home/bin/nginx"),
+            nginx_conf: PathBuf::from("/nonexistent/openvhost-test-home/conf/nginx.conf"),
+        }
+    }
+
+    /// Positive mappings only — the CLOSED-list property is pinned by
+    /// `unknown_brand_is_a_validation_error_naming_the_field` below, so this name
+    /// says just what it checks.
     #[test]
-    fn brand_parses_only_the_closed_list() {
+    fn brand_parses_the_known_ids() {
         assert_eq!(
             WebServerBrand::parse("nginx").unwrap(),
             WebServerBrand::Nginx
@@ -591,31 +681,72 @@ mod web_server_ipc_tests {
             "parsing must be exact-match"
         );
         assert!(WebServerBrand::parse("").is_err());
+        // Plausible ALIASES, not just hostile input: the closed list is the whole
+        // property, so a convenience arm like `"caddy" => Ok(Self::Nginx)` must
+        // fail here rather than silently operating on a server nobody named.
+        for alias in ["caddy", "apache2", "httpd", "nginx-full", "nginx "] {
+            assert!(
+                WebServerBrand::parse(alias).is_err(),
+                "{alias:?} is not on the closed list and must not parse"
+            );
+        }
     }
 
-    /// Apache has no adapter and no template, so it is listed but not operable.
-    /// Returning empty output instead of an error would let a UI bug render
-    /// "Apache's config is empty" for "Apache has no config".
+    /// Apache has no adapter and no template, so it must be LISTED but not
+    /// operable — dropping the row would leave the site editor's Apache option
+    /// unexplained, and returning empty output instead of an error would let a UI
+    /// bug render "Apache's config is empty" for "Apache has no config".
+    ///
+    /// Also pins the page's whole purpose: nginx's row reports the paths the
+    /// supervisor registered, verbatim, never anything re-probed.
     #[test]
-    fn apache_is_listed_as_unsupported_and_carries_no_paths() {
-        let row = WebServerDto::apache();
-        assert_eq!(row.id, "apache");
-        assert!(!row.supported);
-        assert!(row.binary_path.is_none());
-        assert!(row.config_path.is_none());
-        assert!(row.service_id.is_none());
+    fn rows_list_apache_and_report_nginx_from_the_given_paths() {
+        let p = sample_paths();
+        let listed = web_server_rows(&p, Some("1.27.3".into()));
+
+        let nginx = listed
+            .iter()
+            .find(|r| r.id == "nginx")
+            .unwrap_or_else(|| panic!("nginx must be listed, got {listed:?}"));
+        assert!(nginx.supported);
+        assert_eq!(nginx.service_id.as_deref(), Some("nginx"));
+        assert_eq!(nginx.version.as_deref(), Some("1.27.3"));
+        let bin = p.nginx_bin.display().to_string();
+        let conf = p.nginx_conf.display().to_string();
+        assert_eq!(nginx.binary_path.as_deref(), Some(bin.as_str()));
+        assert_eq!(nginx.config_path.as_deref(), Some(conf.as_str()));
+
+        let apache = listed
+            .iter()
+            .find(|r| r.id == "apache")
+            .unwrap_or_else(|| panic!("apache must be listed, got {listed:?}"));
+        assert!(!apache.supported);
+        assert!(apache.binary_path.is_none());
+        assert!(apache.config_path.is_none());
+        assert!(apache.service_id.is_none());
     }
 
+    /// True BY CONSTRUCTION now: the support gate lives inside the only function
+    /// that hands out a path, so no reordering of statements in
+    /// `read_web_server_config`/`validate_web_server_config` can read or validate a
+    /// file before the brand is checked.
     #[test]
     fn unsupported_brand_is_rejected_before_any_path_is_touched() {
-        let e = WebServerBrand::Apache.require_supported().unwrap_err();
-        match e {
-            IpcError::Validation { field, message } => {
+        let p = sample_paths();
+        match WebServerBrand::Apache.live_config_path(&p) {
+            Err(IpcError::Validation { field, message }) => {
                 assert_eq!(field, "id");
                 assert!(message.to_lowercase().contains("apache"));
             }
-            other => panic!("expected Validation, got {other:?}"),
+            Err(other) => panic!("expected Validation, got {other:?}"),
+            Ok(path) => panic!("apache must not yield a path, got {}", path.display()),
         }
+        // The supported brand gets ITS OWN config path out of managed state.
+        assert_eq!(
+            WebServerBrand::Nginx.live_config_path(&p).unwrap(),
+            p.nginx_conf.as_path()
+        );
         assert!(WebServerBrand::Nginx.require_supported().is_ok());
+        assert!(WebServerBrand::Apache.require_supported().is_err());
     }
 }
