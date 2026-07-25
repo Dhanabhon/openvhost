@@ -13,7 +13,10 @@ import type { ServiceStatus } from '$lib/ipc';
  * step with the binding without widening the barrel.
  */
 export function statusFor(
-	services: ServiceStatus[],
+	// `readonly` so a component can keep its own `services` prop readonly (the shape
+	// ServicesPanel.svelte already uses) and still call this — the lookup never
+	// mutates. Accepts a mutable array too, so no caller changes.
+	services: readonly ServiceStatus[],
 	serviceId: string | null
 ): ServiceStatus['state']['kind'] | null {
 	if (serviceId === null) return null;

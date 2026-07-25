@@ -21,6 +21,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { render } from 'svelte/server';
 import SitesPage from './+page.svelte';
 import ServicesPage from './services/+page.svelte';
+import WebServerPage from './web-server/+page.svelte';
 import { servicesStore } from '$lib/services.shared.svelte';
 import type { ServiceStatus } from '$lib/ipc';
 
@@ -44,7 +45,10 @@ function titlebarCount(body: string): string {
  * anchor's own attributes rather than matched against one literal tag string, so
  * these assertions survive a change in how Svelte orders emitted attributes.
  */
-function railLink(body: string, label: 'Sites' | 'Services'): { href: string; current: boolean } {
+function railLink(
+	body: string,
+	label: 'Sites' | 'Services' | 'Web server'
+): { href: string; current: boolean } {
 	const anchor = [...body.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/g)].find(([, , inner]) =>
 		inner.includes(label)
 	);
@@ -139,6 +143,30 @@ describe('the /services route', () => {
 		const { body } = render(ServicesPage);
 		expect(railLink(body, 'Services').current).toBe(true);
 		expect(railLink(body, 'Sites').current).toBe(false);
+	});
+});
+
+// `onMount` does not run under SSR, so this renders the page WITHOUT its
+// `list_web_servers` load — which is the point: the shell, the rail state and the
+// panel's empty state must all be right before any IPC has answered.
+describe('the /web-server route', () => {
+	it('renders the web-server panel', () => {
+		const { body } = render(WebServerPage);
+		expect(body).toContain('data-testid="web-servers"');
+	});
+
+	it('marks Web server as the current rail destination', () => {
+		const { body } = render(WebServerPage);
+		expect(railLink(body, 'Web server').current).toBe(true);
+		expect([railLink(body, 'Sites').current, railLink(body, 'Services').current]).toEqual([
+			false,
+			false
+		]);
+	});
+
+	it('reports the shared supervisor state in the titlebar, like every other route', () => {
+		servicesStore.services = [svc('nginx', 'running'), svc('php-fpm', 'stopped')];
+		expect(titlebarCount(render(WebServerPage).body)).toBe('1');
 	});
 });
 
