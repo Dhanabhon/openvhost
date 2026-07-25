@@ -1,4 +1,46 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<script module lang="ts">
+	/** The only characters a `.localhost` subdomain may contain, matching `Domain::parse`
+	 * in crates/openvhost-core/src/site/model.rs: dot-joined labels of `[a-z0-9-]`. */
+	const HOSTNAME_CHAR = /^[a-z0-9.-]$/;
+
+	/**
+	 * Keep only hostname characters, lowercasing as we go.
+	 *
+	 * Per code point, and independent of position, which is what makes the caret
+	 * arithmetic in `filterDomainInput` exact: filtering a prefix of `s` always yields a
+	 * prefix of filtering `s`, so the number of surviving characters before the caret is
+	 * simply the length of the filtered prefix. A regex `.replace()` over the whole string
+	 * could not promise that once `toLowerCase()` is allowed to change a string's length
+	 * (`İ` → `i` + combining dot).
+	 *
+	 * Downcasing rather than rejecting is deliberate: hostnames are case-insensitive and
+	 * `Domain::parse` demands lowercase, so an uppercase keystroke has exactly one sane
+	 * meaning. Dropping it instead would look like a broken keyboard.
+	 */
+	function filterHostname(s: string): string {
+		let out = '';
+		for (const ch of s) {
+			const lower = ch.toLowerCase();
+			if (HOSTNAME_CHAR.test(lower)) out += lower;
+		}
+		return out;
+	}
+
+	/**
+	 * Filter one input event's raw value and say where the caret belongs afterwards.
+	 *
+	 * Exported for `SiteDrawer.svelte.test.ts`: the caret arithmetic is the part of this
+	 * change that can actually be tested in the DOM-less `node` vitest project, and it is
+	 * also the part most likely to be wrong. This is a TYPING AFFORDANCE ONLY —
+	 * `Domain::parse` is still the authority, and nothing here decides whether a domain is
+	 * valid.
+	 */
+	export function filterDomainInput(raw: string, caret: number): { value: string; caret: number } {
+		return { value: filterHostname(raw), caret: filterHostname(raw.slice(0, caret)).length };
+	}
+</script>
+
 <script lang="ts">
 	import { onMount, untrack } from 'svelte';
 	import { open } from '@tauri-apps/plugin-dialog';
@@ -166,6 +208,40 @@
 		if (els.length > 0) els[0].focus();
 	}
 
+	/**
+	 * Restrict the Domain field to hostname characters as the user types.
+	 *
+	 * The whole point of doing this by hand — rather than reassigning a `bind:value` and
+	 * letting Svelte write the input back — is the caret. Assigning `input.value` moves the
+	 * text entry cursor to the end whenever the string actually changes (HTML standard,
+	 * `value` IDL setter), so mid-string editing becomes impossible unless the caret is
+	 * restored in the same synchronous turn. Hence: read the raw value AND the caret, filter
+	 * both together (`filterDomainInput`), write the element, then put the caret back.
+	 *
+	 * The field is therefore `value={subdomain}` + this handler, NOT `bind:value`: with the
+	 * element already holding the filtered string, Svelte's own `value` update is a no-op
+	 * (it compares `element.value` first), so nothing else ever touches the selection.
+	 *
+	 * Covers paste, drag-and-drop and autofill for free — they all raise `input`. `My_Site.COM`
+	 * pasted becomes `mysite.com` with the caret after it, rather than being rejected wholesale.
+	 */
+	function filterDomainField(el: HTMLInputElement): void {
+		const next = filterDomainInput(el.value, el.selectionStart ?? el.value.length);
+		if (el.value !== next.value) {
+			el.value = next.value;
+			el.setSelectionRange(next.caret, next.caret);
+		}
+		subdomain = next.value;
+	}
+
+	/** True while an IME is mid-composition. Rewriting `.value` under a live composition
+	 * fights the IME's own buffer, so those events are left alone and filtered once at
+	 * `compositionend` instead (which every composed character then goes through). Defensive:
+	 * this sandbox cannot drive a real IME. */
+	function isComposing(e: Event): boolean {
+		return 'isComposing' in e && e.isComposing === true;
+	}
+
 	async function browse(): Promise<void> {
 		pickerError = null;
 		try {
@@ -278,10 +354,17 @@
 		<div class="field">
 			<label for="f-domain">Domain</label>
 			<div class="input-group">
+				<!-- Holds the LABEL only — `.localhost` is the static suffix beside it, and
+				     `composeDomain`/`splitDomain` do the joining. See `filterDomainField` above
+				     for why this is `value=` + `oninput` instead of `bind:value`. -->
 				<input
 					class="input mono"
 					id="f-domain"
-					bind:value={subdomain}
+					value={subdomain}
+					oninput={(e) => {
+						if (!isComposing(e)) filterDomainField(e.currentTarget);
+					}}
+					oncompositionend={(e) => filterDomainField(e.currentTarget)}
 					aria-invalid={fieldErrors.domain ? 'true' : undefined}
 					aria-describedby={fieldErrors.domain ? 'f-domain-error' : undefined}
 				/>
