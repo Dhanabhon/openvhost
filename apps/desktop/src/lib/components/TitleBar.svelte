@@ -3,7 +3,13 @@
 	let { runningCount }: { runningCount: number } = $props();
 </script>
 
-<div class="titlebar" data-tauri-drag-region>
+<!-- `data-tauri-drag-region="deep"` (NOT the bare attribute): tauri's drag script only starts a
+     drag for a bare/`true` attribute when the click target IS this exact element, and
+     `.titlebar-name` (flex: 1) covers nearly the whole strip — so bare left the window
+     undraggable except the flex gap. "deep" makes the whole subtree a drag region; clickable
+     descendants still block dragging on their own, so a future titlebar button keeps working.
+     See titlebar.drag.test.ts for the full contract. -->
+<div class="titlebar" data-tauri-drag-region="deep">
 	<div class="titlebar-name"><b>OpenVHost</b></div>
 	<span class="pill pill-running"><span class="dot"></span>{runningCount} running</span>
 </div>
