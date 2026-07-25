@@ -31,3 +31,12 @@ source of truth for architecture, roadmap, and agent ownership.
 - Lint gate: `cargo fmt --check && cargo clippy --workspace -- -D warnings`
 - Run app (dev): `pnpm -C apps/desktop tauri dev`
 - Conventional Commits required.
+- state.db uses sqlx compile-time-checked queries with committed offline
+  metadata (`.sqlx/`). After changing any `query!`/`query_as!` or a migration:
+  `DATABASE_URL="sqlite://$PWD/target/_prepare.db" sqlx database create && \
+   sqlx migrate run --source crates/openvhost-core/src/db/migrations && \
+   cargo sqlx prepare --workspace` — then commit the updated `.sqlx/`. Builds
+  and CI run offline against the committed cache (no DB required). If
+  `sqlx-cli` can't be installed offline, build the query crate once with a
+  live `DATABASE_URL` against a migrated temp DB instead (unset
+  `SQLX_OFFLINE`) — sqlx writes `.sqlx/` as a side effect of that build.

@@ -5,12 +5,17 @@
 //! MUST NEVER depend on tauri: consumed by both the desktop app and the
 //! openvhost CLI. Current slice: home-directory resolution + CoreInfo.
 
+pub mod db;
 mod error;
 mod home;
 mod info;
+pub mod site;
 
+pub use db::Db;
 pub use error::CoreError;
 pub use home::resolve_home;
 pub use info::{CoreInfo, core_info};
+pub use site::repo::{SiteRepository, SqliteSiteRepository};
+pub use site::{Docroot, Domain, NewSite, PhpVersion, Site, SiteId, SiteName, WebServer};
 
 pub mod platform;
