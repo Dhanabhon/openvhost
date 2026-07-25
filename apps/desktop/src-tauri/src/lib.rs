@@ -147,8 +147,19 @@ pub fn run() {
                             ));
                             supervisor.register(demo_ticker_spec());
                             #[cfg(target_os = "macos")]
-                            for spec in stack::macos_stack_specs() {
-                                supervisor.register(spec);
+                            {
+                                let stack = stack::macos_stack();
+                                for spec in stack.specs {
+                                    supervisor.register(spec);
+                                }
+                                // Manage the Option ITSELF, unconditionally. Tauri implements
+                                // `CommandArg` only for `State<'r, T>` — there is no impl for
+                                // `Option<State<'r, T>>` — so a command cannot take an
+                                // optionally-managed state. Making `Option<StackPaths>` the
+                                // managed type is what lets a later command distinguish "no
+                                // home resolved" from "not wired up", while always having
+                                // something to extract.
+                                app.manage(stack.paths);
                             }
                             let mut rx = supervisor.subscribe();
                             let handle = app.handle().clone();

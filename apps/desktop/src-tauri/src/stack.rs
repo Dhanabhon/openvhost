@@ -23,16 +23,42 @@ fn fallback_brew() -> BrewStack {
     }
 }
 
+/// The paths the stack actually registered, so the Web Server page can report
+/// them instead of re-probing and possibly disagreeing.
+///
+/// `#[allow(dead_code)]`: only this module's own test reads these fields
+/// today (`reported_paths_match_the_registered_nginx_spec`). The Web Server
+/// page's IPC command reads them from the managed `Option<StackPaths>` state
+/// in a later task — drop the allow once that real caller exists (same
+/// pattern P0-8 used for staged multi-task landings).
+#[allow(dead_code)]
+pub struct StackPaths {
+    pub home: PathBuf,
+    pub nginx_bin: PathBuf,
+    pub nginx_conf: PathBuf,
+}
+
+/// Specs to register plus the paths they were built from. `paths` is `None`
+/// exactly when the home could not be resolved — the same condition that
+/// already produces zero specs.
+pub struct MacosStack {
+    pub specs: Vec<ServiceSpec>,
+    pub paths: Option<StackPaths>,
+}
+
 /// Build the two supervised stack rows. Provision errors are logged and
 /// non-fatal (rows register; Start surfaces the problem honestly). Only a
 /// home-resolution failure skips the rows entirely — without a home there
 /// are no config paths to point at.
-pub fn macos_stack_specs() -> Vec<ServiceSpec> {
+pub fn macos_stack() -> MacosStack {
     let home = match openvhost_core::resolve_home() {
         Ok(h) => h,
         Err(e) => {
             eprintln!("stack: cannot resolve OPENVHOST_HOME, skipping nginx/php-fpm rows: {e}");
-            return vec![];
+            return MacosStack {
+                specs: vec![],
+                paths: None,
+            };
         }
     };
     if let Err(e) = provision_macos_demo_stack(&home, DEMO_PORT) {
@@ -40,7 +66,13 @@ pub fn macos_stack_specs() -> Vec<ServiceSpec> {
     }
     let brew = find_brew_binaries().unwrap_or_else(fallback_brew);
     let conf = home.join("conf");
-    vec![
+    let nginx_conf = conf.join("nginx.conf");
+    let paths = StackPaths {
+        home: home.clone(),
+        nginx_bin: brew.nginx.clone(),
+        nginx_conf: nginx_conf.clone(),
+    };
+    let specs = vec![
         ServiceSpec {
             id: "php-fpm".into(),
             display_name: "PHP-FPM".into(),
@@ -68,11 +100,54 @@ pub fn macos_stack_specs() -> Vec<ServiceSpec> {
                     OsString::from("-e"),
                     home.join("logs/nginx.error.log").into_os_string(),
                     OsString::from("-c"),
-                    conf.join("nginx.conf").into_os_string(),
+                    nginx_conf.into_os_string(),
                 ],
                 cwd: None,
                 env: vec![],
             },
         },
-    ]
+    ];
+    MacosStack {
+        specs,
+        paths: Some(paths),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// The paths handed to the UI must be the SAME ones baked into the specs.
+    /// A second `find_brew_binaries()` call could disagree with the first (it
+    /// returns None unless BOTH nginx and php-fpm exist), so this pins that the
+    /// page and the supervisor cannot drift.
+    #[test]
+    fn reported_paths_match_the_registered_nginx_spec() {
+        let stack = macos_stack();
+        let Some(paths) = stack.paths else {
+            // No home resolvable in this environment: the specs must be empty
+            // too, which is the existing contract.
+            assert!(stack.specs.is_empty());
+            return;
+        };
+        let nginx = stack
+            .specs
+            .iter()
+            .find(|s| s.id == "nginx")
+            .expect("nginx spec should be registered when a home resolves");
+        assert_eq!(nginx.spawn.program, paths.nginx_bin);
+        // The spec spawns with `-c <conf>`; the reported conf must be that path.
+        let args: Vec<String> = nginx
+            .spawn
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let c = args
+            .iter()
+            .position(|a| a == "-c")
+            .expect("nginx spawns with -c");
+        assert_eq!(args[c + 1], paths.nginx_conf.to_string_lossy());
+    }
 }
