@@ -61,7 +61,7 @@ impl Db {
     }
 
     /// The underlying connection pool, for callers that run their own
-    /// queries (e.g. `sqlx::query!` sites in higher-level repositories).
+    /// queries (e.g. `sqlx::query!` call sites in higher-level repositories).
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
