@@ -26,7 +26,11 @@
 		</p>
 	</div>
 	<div class="grow"></div>
-	<Button variant="primary" onclick={onAdd}>Add site</Button>
+	<!-- `focusFallback`: this page's primary action, so `SiteDrawer.svelte` can hand focus here
+	     deterministically if the drawer's own "restore focus to whatever opened it" target no
+	     longer exists (e.g. deleting a site removes that row's Edit button from the DOM before
+	     the drawer unmounts). See that component's onMount cleanup. -->
+	<Button variant="primary" focusFallback onclick={onAdd}>Add site</Button>
 </div>
 
 <section class="panel" aria-label="Sites" data-testid="sites">

@@ -8,6 +8,7 @@
 		size,
 		disabled = false,
 		ariaLabel,
+		focusFallback = false,
 		onclick,
 		children
 	}: {
@@ -18,6 +19,12 @@
 		 * context — e.g. a row of repeated "Start"/"Stop" buttons, one per service, needs
 		 * each one to announce which service it acts on. Leaves the visible text untouched. */
 		ariaLabel?: string;
+		/** Marks this button's real DOM node as the app's deterministic focus-restoration
+		 * fallback (`data-vh-focus-fallback`) — consumed by `SiteDrawer.svelte`'s focus-trap
+		 * cleanup when the element that originally opened the drawer (e.g. a deleted row's
+		 * Edit button) no longer exists in the DOM. Opt-in and defaults to `false`; every
+		 * existing `<Button>` usage is unaffected. */
+		focusFallback?: boolean;
 		onclick: () => void;
 		children: Snippet;
 	} = $props();
@@ -32,6 +39,7 @@
 		size === 'sm' && 'btn-sm'
 	)}
 	aria-label={ariaLabel}
+	data-vh-focus-fallback={focusFallback ? '' : undefined}
 	{disabled}
 	{onclick}
 >

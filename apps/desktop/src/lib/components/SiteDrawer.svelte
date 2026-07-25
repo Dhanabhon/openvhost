@@ -43,6 +43,10 @@
 	let drawerEl: HTMLElement | undefined = $state();
 	let nameInput: HTMLInputElement | undefined = $state();
 	let previouslyFocused: HTMLElement | null = null;
+	// Plain (non-reactive — nothing renders off this) flag, flipped synchronously at the very
+	// start of the unmount cleanup below, before either of its `.focus()` calls. See that
+	// cleanup's comment for why `onFocusIn` needs to know a close is already in progress.
+	let closing = false;
 
 	const heading = $derived(site === null ? 'Add site' : `Edit site — ${site.name}`);
 
@@ -55,7 +59,32 @@
 		previouslyFocused = document.activeElement as HTMLElement | null;
 		nameInput?.focus();
 		return () => {
-			previouslyFocused?.focus();
+			// Flip `closing` first, synchronously, before any `.focus()` call below: those calls
+			// synchronously dispatch a `focusin` that `onFocusIn` — possibly still attached for
+			// this same teardown pass, since this cleanup's order relative to the
+			// `<svelte:window>` binding's own teardown isn't something to depend on — would
+			// otherwise see and "helpfully" recapture focus right back into the drawer that is
+			// in the middle of closing.
+			closing = true;
+			// On the delete path, `previouslyFocused` is the just-deleted row's own Edit
+			// button: `store.remove()` → `store.load()` removes that row (and its button) from
+			// the DOM *before* `onClose()` unmounts this drawer and runs this cleanup, so
+			// `.focus()` on it would silently no-op, dumping a keyboard user on `<body>`. Guard
+			// it, and fall back to a real, still-present focusable element: the Sites page's
+			// own primary action, `SitesPanel.svelte`'s "Add site" button, reached via the
+			// `data-vh-focus-fallback` hook it sets through `Button`'s `focusFallback` prop.
+			if (previouslyFocused && document.contains(previouslyFocused)) {
+				previouslyFocused.focus();
+				return;
+			}
+			const fallback = document.querySelector<HTMLElement>('[data-vh-focus-fallback]');
+			if (fallback) {
+				fallback.focus();
+				return;
+			}
+			// Neither the original trigger nor the page-level fallback exists (e.g. this
+			// drawer somehow rendered on a page with no such hook) — nothing focusable to hand
+			// off to. Explicit, acknowledged no-op, not a silently swallowed bug.
 		};
 	});
 
@@ -70,7 +99,20 @@
 		);
 	}
 
+	/** Window-scoped (see `<svelte:window>` below, not the `<aside>`) so Esc/Tab keep working
+	 * even if focus has drifted outside the drawer entirely — the realistic trigger is the
+	 * native folder picker (Browse) handing first-responder back to the webview body instead
+	 * of the Browse button, which could not be verified in this sandbox. This only runs while
+	 * `<svelte:window>` is part of the mounted tree, i.e. only while this component itself is
+	 * mounted: the parent renders `<SiteDrawer>` exclusively inside `{#if drawerOpen}`, so
+	 * there is no window where this listener is live but the drawer is "closed" — mount
+	 * implies open, and Svelte tears down `<svelte:window>` bindings on unmount like any other
+	 * effect, so nothing is left active afterward and nothing here interferes with any other
+	 * page (e.g. Services). `!drawerEl`/`closing` are cheap extra guards for the instant
+	 * before `bind:this` resolves and for the brief close transition (see the onMount cleanup
+	 * above). */
 	function onKeydown(e: KeyboardEvent): void {
+		if (!drawerEl || closing) return;
 		if (e.key === 'Escape') {
 			e.preventDefault();
 			onClose();
@@ -81,6 +123,15 @@
 		if (els.length === 0) return;
 		const first = els[0];
 		const last = els[els.length - 1];
+		if (!drawerEl.contains(document.activeElement)) {
+			// Focus is outside the drawer altogether — not merely at one of the two wrap
+			// boundaries checked below — so there is nothing sane to wrap from. Recapture it
+			// instead of letting Tab move focus wherever the untracked activeElement would
+			// send it next.
+			e.preventDefault();
+			first.focus();
+			return;
+		}
 		if (e.shiftKey && document.activeElement === first) {
 			e.preventDefault();
 			last.focus();
@@ -88,6 +139,18 @@
 			e.preventDefault();
 			first.focus();
 		}
+	}
+
+	/** Belt-and-braces recapture for the one path `onKeydown` above can't see at all: focus
+	 * landing outside the drawer with no Tab keypress involved (again, the native picker
+	 * returning focus to the webview body is the concrete, unverified-in-sandbox trigger).
+	 * Fires on every focus change anywhere in the document while mounted; a no-op the
+	 * overwhelming majority of the time, since focus moving between the drawer's own fields
+	 * already satisfies `contains`. Same mount-scoped lifetime and guards as `onKeydown`. */
+	function onFocusIn(): void {
+		if (!drawerEl || closing || drawerEl.contains(document.activeElement)) return;
+		const els = focusable();
+		if (els.length > 0) els[0].focus();
 	}
 
 	async function browse(): Promise<void> {
@@ -127,6 +190,9 @@
 	}
 </script>
 
+<!-- Window-scoped, not on the `<aside>` below, so Esc/Tab keep working even once focus has
+     drifted outside the drawer — see the `onKeydown`/`onFocusIn` doc comments above. -->
+<svelte:window onkeydown={onKeydown} onfocusin={onFocusIn} />
 <div class="drawer-backdrop" aria-hidden="true" onclick={onClose}></div>
 <!-- An explicit `role` always overrides an element's implicit ARIA semantics (the mechanism
      is designed for exactly this); `<aside>` — tangentially related content, arguably the
@@ -140,7 +206,6 @@
 	aria-modal="true"
 	aria-labelledby="drawer-title"
 	bind:this={drawerEl}
-	onkeydown={onKeydown}
 >
 	<div class="drawer-head">
 		<h2 id="drawer-title">{heading}</h2>
@@ -223,6 +288,23 @@
 			     pairing for the same segmented control. -->
 			<!-- svelte-ignore a11y_label_has_associated_control -->
 			<label id="f-server-label">Web server</label>
+			<!-- F4 (review fix-wave) note: `aria-invalid` was requested here "for parity" with
+			     the other four fields, but WAI-ARIA's Supported States and Properties table
+			     does not list `aria-invalid` for `role="group"` — nor for the two toggle
+			     `<button>`s' own implicit `button` role. Confirmed two ways, not assumed: (1)
+			     `aria-query`'s role data (the exact table `svelte-check`'s
+			     `a11y_role_supports_aria_props` rule consults) lists `aria-invalid` only for
+			     value-holding roles (checkbox, combobox, gridcell, listbox, radiogroup, slider,
+			     spinbutton, textbox, tree, application) — `group`/`button` are not among them,
+			     even after conglomerating their superclass (`roletype`/`structure`/`section`
+			     and `roletype`/`widget`/`command`) props; (2) empirically, adding it fired
+			     `a11y_role_supports_aria_props` at both `svelte-check` and `vite build`. Per
+			     spec, AT behaviour for an unsupported state/role pairing is undefined, and this
+			     project's gate requires 0 warnings — so it stays out rather than being forced
+			     through with a suppression comment. `aria-describedby` below already gives this
+			     group the same accessible error-association the other four fields get from
+			     their own `aria-describedby`; that IS the spec-compliant equivalent for a role
+			     that doesn't support `aria-invalid`. -->
 			<div
 				class="seg"
 				role="group"
@@ -325,12 +407,14 @@
 	      Close button and the two danger-zone buttons — fall outside `Button.svelte`'s
 	      existing `variant`/`size` surface (icon-sized quiet, and a danger variant it does
 	      not have). Save/Cancel still reuse the shared `Button` component, matching how
-	      SitesPanel/SiteListRow already use it. `Button.svelte` itself is not in this task's
-	      file list, so its surface is used as-is rather than extended. */
+	      SitesPanel/SiteListRow already use it. `Button.svelte`'s variant/size surface itself
+	      was not extended for these two controls. (Review fix-wave note: `Button.svelte` did
+	      later gain one small, unrelated, opt-in `focusFallback` prop — an F1 fix, see this
+	      file's onMount cleanup — which is a non-visual `data-*` hook, not a new variant.) */
 	.drawer-backdrop {
 		position: absolute;
 		inset: 0;
-		background: rgb(23 26 33 / 0.35);
+		background: var(--vh-scrim);
 		z-index: var(--vh-z-drawer-backdrop);
 	}
 	.drawer {
