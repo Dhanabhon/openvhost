@@ -2,9 +2,9 @@
 <script lang="ts">
 	import { resolve } from '$app/paths';
 
-	// Only 'services' exists as a real destination today (Phase 1 slice A). The union stays
-	// narrow on purpose — Sites/Logs/Settings join it once their own slices land.
-	let { active = 'services' }: { active?: 'services' } = $props();
+	// 'services' and 'sites' are real destinations now. The union stays narrow on purpose —
+	// Logs/Settings join it once their own slices land.
+	let { active = 'services' }: { active?: 'services' | 'sites' } = $props();
 </script>
 
 <nav class="rail" aria-label="Main">
@@ -21,9 +21,12 @@
 		<span class="name">OpenVHost</span>
 	</div>
 
-	<!-- Sites: inert placeholder — no site backend yet (own future slice). Not a link/button,
-	     so it is never in the tab order and never fakes a click action. -->
-	<span class="nav-item" aria-disabled="true">
+	<!-- Sites: live since the Sites CRUD slice. -->
+	<a
+		class="nav-item"
+		href={resolve('/sites')}
+		aria-current={active === 'sites' ? 'page' : undefined}
+	>
 		<svg
 			width="18"
 			height="18"
@@ -39,9 +42,9 @@
 			<circle cx="5" cy="5.2" r="0.2" />
 		</svg>
 		Sites
-	</span>
+	</a>
 
-	<!-- Services: the only live destination this slice ships. -->
+	<!-- Services: the other live destination. -->
 	<a class="nav-item" href={resolve('/')} aria-current={active === 'services' ? 'page' : undefined}>
 		<svg
 			width="18"

@@ -3,14 +3,23 @@
 	import TitleBar from './TitleBar.svelte';
 	import Rail from './Rail.svelte';
 
-	let { runningCount, children }: { runningCount: number; children: import('svelte').Snippet } =
-		$props();
+	// Defaults to 'services' so the existing Services page (routes/+page.svelte), which never
+	// passes `active`, needs no change.
+	let {
+		runningCount,
+		active = 'services',
+		children
+	}: {
+		runningCount: number;
+		active?: 'services' | 'sites';
+		children: import('svelte').Snippet;
+	} = $props();
 </script>
 
 <div class="window">
 	<TitleBar {runningCount} />
 	<div class="shell">
-		<Rail active="services" />
+		<Rail {active} />
 		<main class="content">{@render children()}</main>
 	</div>
 </div>
