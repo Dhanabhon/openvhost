@@ -171,12 +171,24 @@ config is empty".
 layout, so the page reads live status with zero new IPC and no second source of truth to
 drift.
 
-**The binary path comes from the supervisor, not a fresh probe.** The nginx `ServiceSpec`
-already holds `spawn.program`, resolved at registration — that is the binary that would
-actually be spawned, so it is the truthful answer. It also avoids a real quirk:
+**The binary path comes from what was registered, not a fresh probe.** The goal is the
+truthful answer — the binary that would actually be spawned — and to avoid a real quirk:
 `find_brew_binaries()` requires **both** nginx and php-fpm to exist and returns `None`
 otherwise, so a fresh probe would report "nginx not found" on a machine where nginx is
 installed but php-fpm is not.
+
+**Correction made while planning.** An earlier draft of this section said to read
+`ServiceSpec.spawn.program` back off the supervisor. That is not possible: `Supervisor`
+exposes only `register`, `snapshot`, `log_tail`, `start`, `stop` and `subscribe`, and
+`ServiceStatus` carries no program path — so there is no accessor, and adding one would
+mean changing `openvhost-proc` for a read-only UI page.
+
+Instead, `apps/desktop/src-tauri/src/stack.rs` — which already resolves the binaries and
+config paths when it builds the specs — returns those paths alongside the specs, and the
+app `manage`s them as Tauri state next to the `Supervisor`. The command then reads managed
+state. This guarantees the page reports exactly the paths that were registered (same
+values, same moment, no second probe that could disagree), needs no change to
+`openvhost-proc`, and keeps the resolution logic in the one place that already owns it.
 
 *(Noted, not fixed here: two separate `find_brew_binaries` implementations exist —
 `openvhost-conf::validate` and `openvhost_core::platform::macos::demo_stack` — and the
