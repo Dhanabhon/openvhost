@@ -185,6 +185,14 @@ fn kill_process_group(pgid: Option<u32>) {
 /// our home. `nginx -v` very likely exits before it would ever open an error
 /// log, but that rests on nginx internals we cannot verify here, and passing
 /// `-e` costs nothing.
+///
+/// The cost is not quite zero, so write the floor down: `-e` was introduced in
+/// **nginx 1.19.5**. An older binary rejects it while parsing options and never
+/// prints its banner, so this returns `None` where a bare `-v` would have found a
+/// version. That floor already exists app-wide — [`validate_live`] hard-requires
+/// `-e` — and openvhost-pkg ships its own nginx, so this only affects someone
+/// pointing OpenVHost at a system nginx older than 1.19.5, who sees the version as
+/// unknown rather than anything breaking.
 pub async fn probe_nginx_version(bin: &Path, err_log: &Path) -> Option<String> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.arg("-e").arg(err_log).arg("-v");
@@ -260,7 +268,10 @@ pub async fn validate_live(
 // `PermissionsExt`, and the containment assertions are raw `libc::kill`. Without
 // the `unix` gate this module does not COMPILE on Windows, which would break
 // `cargo test --workspace` and `cargo clippy --workspace --all-targets` there
-// (matching `crates/openvhost-proc/src/orphan/reap.rs`'s gate).
+// (`crates/openvhost-proc/src/orphan/reap.rs:168` gates its tests the same WAY but
+// more narrowly — `all(test, target_os = "macos")`, because those tests assert on
+// macOS-specific `sysctl` behaviour. This module needs only POSIX, so `unix` is the
+// correct width here. Do NOT widen reap.rs's gate to match this one.)
 #[cfg(all(test, unix))]
 #[allow(clippy::unwrap_used)]
 mod tests {
