@@ -15,13 +15,14 @@
 // behaviour of the new controls — keyboard navigation and typeahead, caret position after a
 // real keystroke, focus staying on the trigger while the popup is open, click-outside,
 // Escape closing only the popup and not the whole drawer — is out of reach. Do not add a
-// browser/jsdom project for it. The caret ARITHMETIC is the exception: it is exported as a
-// pure function (`filterDomainInput`) precisely so the part most likely to be wrong is
-// testable here. The rest is listed as manual click-through in the task report.
+// browser/jsdom project for it. The caret ARITHMETIC is the exception: it is exported as
+// pure functions (`filterDomainInput`, `filterNameInput`) precisely so the part most likely
+// to be wrong is testable here. The rest is listed as manual click-through in the task
+// report.
 
 import { describe, expect, it } from 'vitest';
 import { render } from 'svelte/server';
-import SiteDrawer, { filterDomainInput } from './SiteDrawer.svelte';
+import SiteDrawer, { filterDomainInput, filterNameInput } from './SiteDrawer.svelte';
 import { PHP_VERSIONS, WEB_SERVERS } from '$lib/sites.derive';
 import type { SiteDto } from '$lib/ipc';
 
@@ -284,5 +285,69 @@ describe('SiteDrawer domain field', () => {
 
 	it('survives a caret beyond the end of the string', () => {
 		expect(filterDomainInput('ab', 99)).toEqual({ value: 'ab', caret: 2 });
+	});
+});
+
+describe('SiteDrawer name field', () => {
+	// The owner typed Thai into this field and got the raw backend slug error back. Filtering
+	// alone would have been worse in one way — a Thai keystroke produces NOTHING, so with no
+	// stated rule the field looks broken — hence the permanent hint, asserted below.
+	it('states the rule permanently, not only after a rejected save', () => {
+		expect(drawerHtml(null)).toContain('id="f-name-hint"');
+		expect(text(drawerHtml(null))).toContain('Lowercase letters, numbers and dashes only');
+	});
+
+	it('keeps the hint described even while a backend error is showing, error first', () => {
+		expect(tagWith(drawerHtml(null, { name: 'taken' }), 'id="f-name"')).toContain(
+			'aria-describedby="f-name-error f-name-hint"'
+		);
+	});
+
+	// UNLIKE the domain field above, which deliberately has NO maxlength: there the input holds
+	// only the label and `.localhost` is appended, so no client-side length can correspond to
+	// `Domain::parse`'s 253-byte bound on the whole domain. Here the field holds exactly the
+	// string `SiteName::parse` bounds at 1..=63 BYTES, and the filter guarantees ASCII, so 63
+	// is the same number in both. Do not "harmonise" these two — they differ for a reason.
+	it('caps length at the 63 SiteName::parse allows', () => {
+		expect(tagWith(drawerHtml(site('8.3')), 'id="f-name"')).toContain('maxlength="63"');
+	});
+
+	it('keeps a slug untouched', () => {
+		expect(filterNameInput('my-site-2', 9)).toEqual({ value: 'my-site-2', caret: 9 });
+	});
+
+	// THE difference from the domain filter. A dot is legal in a hostname and illegal in a
+	// name; sharing one charset between the two fields would let `my.site` reach a backend
+	// that rejects it.
+	it('drops the dot a hostname would have kept', () => {
+		expect(filterNameInput('my.site', 7)).toEqual({ value: 'mysite', caret: 6 });
+	});
+
+	it('drops Thai text rather than sending it to a parser that rejects it', () => {
+		// The exact input from the owner's report.
+		expect(filterNameInput('ทดสอบ', 5)).toEqual({ value: '', caret: 0 });
+		// And mixed, so it is clear the Latin part survives rather than the whole entry dying.
+		expect(filterNameInput('ทดสอบshop', 9)).toEqual({ value: 'shop', caret: 4 });
+	});
+
+	it('lowercases instead of rejecting', () => {
+		expect(filterNameInput('MyShop', 6)).toEqual({ value: 'myshop', caret: 6 });
+	});
+
+	it('strips a leading dash, which SiteName::parse forbids', () => {
+		expect(filterNameInput('-shop', 5)).toEqual({ value: 'shop', caret: 4 });
+		expect(filterNameInput('---shop', 7)).toEqual({ value: 'shop', caret: 4 });
+		// Caret inside the stripped run collapses to the start rather than going negative.
+		expect(filterNameInput('---shop', 2)).toEqual({ value: 'shop', caret: 0 });
+	});
+
+	// A trailing dash is NOT stripped, deliberately: someone typing `my-` is mid-word, and
+	// eating the dash would make `my-site` impossible to type. The backend error covers it.
+	it('leaves a trailing dash alone so a dashed name stays typable', () => {
+		expect(filterNameInput('my-', 3)).toEqual({ value: 'my-', caret: 3 });
+	});
+
+	it('keeps the caret where the user is typing when a character is rejected', () => {
+		expect(filterNameInput('ab_cd', 3)).toEqual({ value: 'abcd', caret: 2 });
 	});
 });

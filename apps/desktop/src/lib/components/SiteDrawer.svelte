@@ -4,27 +4,49 @@
 	 * in crates/openvhost-core/src/site/model.rs: dot-joined labels of `[a-z0-9-]`. */
 	const HOSTNAME_CHAR = /^[a-z0-9.-]$/;
 
+	/** The only characters a site name may contain, matching `SiteName::parse`: a slug of
+	 * `[a-z0-9-]`. NO dot — that is the one difference from `HOSTNAME_CHAR`, and mixing the
+	 * two up would let `my.site` reach a field whose backend rejects it. */
+	const SLUG_CHAR = /^[a-z0-9-]$/;
+
 	/**
-	 * Keep only hostname characters, lowercasing as we go.
+	 * Keep only the characters `allowed` accepts, lowercasing as we go.
 	 *
-	 * Per code point, and independent of position, which is what makes the caret
-	 * arithmetic in `filterDomainInput` exact: filtering a prefix of `s` always yields a
-	 * prefix of filtering `s`, so the number of surviving characters before the caret is
-	 * simply the length of the filtered prefix. A regex `.replace()` over the whole string
-	 * could not promise that once `toLowerCase()` is allowed to change a string's length
-	 * (`İ` → `i` + combining dot).
+	 * Per code point, and independent of position, which is what makes the caret arithmetic
+	 * in `filterInput` exact: filtering a prefix of `s` always yields a prefix of filtering
+	 * `s`, so the number of surviving characters before the caret is simply the length of
+	 * the filtered prefix. A regex `.replace()` over the whole string could not promise
+	 * that once `toLowerCase()` is allowed to change a string's length (`İ` → `i` +
+	 * combining dot).
 	 *
-	 * Downcasing rather than rejecting is deliberate: hostnames are case-insensitive and
-	 * `Domain::parse` demands lowercase, so an uppercase keystroke has exactly one sane
-	 * meaning. Dropping it instead would look like a broken keyboard.
+	 * Downcasing rather than rejecting is deliberate: both fields are case-insensitive
+	 * identifiers whose parsers demand lowercase, so an uppercase keystroke has exactly one
+	 * sane meaning. Dropping it instead would look like a broken keyboard.
 	 */
-	function filterHostname(s: string): string {
+	function filterChars(s: string, allowed: RegExp): string {
 		let out = '';
 		for (const ch of s) {
 			const lower = ch.toLowerCase();
-			if (HOSTNAME_CHAR.test(lower)) out += lower;
+			if (allowed.test(lower)) out += lower;
 		}
 		return out;
+	}
+
+	/** Slug charset, then drop any leading `-`, because `SiteName::parse` requires the first
+	 * character to be alphanumeric.
+	 *
+	 * Stripping a LEADING run is the only positional rule that keeps the prefix property
+	 * `filter(prefix)` is a prefix of `filter(whole)` — which the caret formula depends on.
+	 * Proof: let A = filterChars(prefix), B = filterChars(whole), A a prefix of B. If A is
+	 * all dashes then stripping gives `''`, a prefix of anything. Otherwise A = `-`×k + rest
+	 * with rest[0] not a dash; because A is a prefix of B, B shares that same `-`×k run, so
+	 * both strip exactly k and A[k..] stays a prefix of B[k..].
+	 *
+	 * A TRAILING-dash rule could NOT be enforced this way — and must not be, since a user
+	 * typing `my-` is mid-word. That, and the 1..=63 length bound (see `maxlength` on the
+	 * input), are what the inline server error still covers. */
+	function filterSlug(s: string): string {
+		return filterChars(s, SLUG_CHAR).replace(/^-+/, '');
 	}
 
 	/**
@@ -32,12 +54,24 @@
 	 *
 	 * Exported for `SiteDrawer.svelte.test.ts`: the caret arithmetic is the part of this
 	 * change that can actually be tested in the DOM-less `node` vitest project, and it is
-	 * also the part most likely to be wrong. This is a TYPING AFFORDANCE ONLY —
-	 * `Domain::parse` is still the authority, and nothing here decides whether a domain is
-	 * valid.
+	 * also the part most likely to be wrong. These are TYPING AFFORDANCES ONLY —
+	 * `SiteName::parse`/`Domain::parse` remain the authority, and nothing here decides
+	 * whether a name or domain is valid.
 	 */
+	function filterInput(
+		raw: string,
+		caret: number,
+		filter: (s: string) => string
+	): { value: string; caret: number } {
+		return { value: filter(raw), caret: filter(raw.slice(0, caret)).length };
+	}
+
 	export function filterDomainInput(raw: string, caret: number): { value: string; caret: number } {
-		return { value: filterHostname(raw), caret: filterHostname(raw.slice(0, caret)).length };
+		return filterInput(raw, caret, (s) => filterChars(s, HOSTNAME_CHAR));
+	}
+
+	export function filterNameInput(raw: string, caret: number): { value: string; caret: number } {
+		return filterInput(raw, caret, filterSlug);
 	}
 </script>
 
@@ -238,13 +272,24 @@
 	 * Covers paste, drag-and-drop and autofill for free — they all raise `input`. `My_Site.COM`
 	 * pasted becomes `mysite.com` with the caret after it, rather than being rejected wholesale.
 	 */
-	function filterDomainField(el: HTMLInputElement): void {
-		const next = filterDomainInput(el.value, el.selectionStart ?? el.value.length);
+	function applyFilter(
+		el: HTMLInputElement,
+		filter: (raw: string, caret: number) => { value: string; caret: number }
+	): string {
+		const next = filter(el.value, el.selectionStart ?? el.value.length);
 		if (el.value !== next.value) {
 			el.value = next.value;
 			el.setSelectionRange(next.caret, next.caret);
 		}
-		subdomain = next.value;
+		return next.value;
+	}
+
+	function filterDomainField(el: HTMLInputElement): void {
+		subdomain = applyFilter(el, filterDomainInput);
+	}
+
+	function filterNameField(el: HTMLInputElement): void {
+		name = applyFilter(el, filterNameInput);
 	}
 
 	/** True while an IME is mid-composition. Rewriting `.value` under a live composition
@@ -272,6 +317,15 @@
 	// Project-folder field can carry two independent, non-exclusive errors — the backend's
 	// `fieldErrors.docroot` (from Save) and `pickerError` (from Browse) — so their `id`s are
 	// combined, space-separated, for `aria-describedby`; either alone still works standalone.
+	// Like the web-server group below and unlike the docroot field above, the hint is a
+	// permanent description of the control, so this is never `undefined`. Error first: readers
+	// announce the list in order and the error is the urgent half.
+	const nameDescribedBy = $derived(
+		[fieldErrors.name ? 'f-name-error' : null, 'f-name-hint']
+			.filter((id): id is string => id !== null)
+			.join(' ')
+	);
+
 	const rootDescribedBy = $derived(
 		[fieldErrors.docroot ? 'f-root-error' : null, pickerError ? 'f-root-picker-error' : null]
 			.filter((id): id is string => id !== null)
@@ -356,14 +410,31 @@
 	<div class="drawer-body">
 		<div class="field">
 			<label for="f-name">Name</label>
+			<!-- `value=` + `oninput` rather than `bind:value`, for the caret reason documented on
+			     `applyFilter`. `maxlength` is 63 because `SiteName::parse` bounds `s.len()` — BYTES,
+			     not characters — and the filter above guarantees ASCII-only, so here the two
+			     coincide exactly. -->
 			<input
-				class="input"
+				class="input mono"
 				id="f-name"
-				bind:value={name}
+				value={name}
+				maxlength="63"
+				oninput={(e) => {
+					if (!isComposing(e)) filterNameField(e.currentTarget);
+				}}
+				oncompositionend={(e) => filterNameField(e.currentTarget)}
 				bind:this={nameInput}
 				aria-invalid={fieldErrors.name ? 'true' : undefined}
-				aria-describedby={fieldErrors.name ? 'f-name-error' : undefined}
+				aria-describedby={nameDescribedBy}
 			/>
+			<!-- The rule has to be VISIBLE, not just enforced. Filtering means a Thai (or any
+			     non-slug) keystroke produces nothing at all — no character, no error — which
+			     without this line reads as a broken keyboard or a frozen app. The owner hit
+			     exactly this field with Thai text. -->
+			<p class="hint" id="f-name-hint">
+				Lowercase letters, numbers and dashes only — it names this site's generated config files.
+				Use Domain for the address you'll visit.
+			</p>
 			<!-- `fieldErrors` keys are the BACKEND's snake_case field names (commands.rs /
 			     openvhost-core's `invalid("php_version", ...)` etc.), not the camelCase
 			     `SiteInput` keys — `name`/`domain`/`docroot` happen to read the same either
