@@ -154,7 +154,13 @@ WebServerDto {
   fallback.
 - `binaryPath` and `configPath` are derived **server-side** from `resolve_home()` and the
   supervisor's registered spec. **Nothing client-supplied reaches argv.**
-- All three commands are read-only. None writes a file; none calls `materialize`.
+- All three commands are read-only: none writes a **config** file, and none calls
+  `materialize`. One footnote, so the claim is literally true rather than nearly true — the
+  mandatory `-e <home>/logs/nginx.error.log` means nginx may **create or append its own error
+  log** under our home, during `-v` as well as `-t`. That is the whole purpose of `-e`:
+  without it nginx writes into its compiled-in prefix (`/opt/homebrew/var`) instead. So the
+  precise claim is *no write we author, and no write outside our own home* — not that nothing
+  on disk changes.
 - `read_web_server_config` is *not* a general file reader: the path is derived from the
   parsed id, so it cannot be aimed at an arbitrary file.
 
