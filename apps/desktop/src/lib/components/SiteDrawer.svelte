@@ -1,10 +1,61 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<script module lang="ts">
+	/** The only characters a `.localhost` subdomain may contain, matching `Domain::parse`
+	 * in crates/openvhost-core/src/site/model.rs: dot-joined labels of `[a-z0-9-]`. */
+	const HOSTNAME_CHAR = /^[a-z0-9.-]$/;
+
+	/**
+	 * Keep only hostname characters, lowercasing as we go.
+	 *
+	 * Per code point, and independent of position, which is what makes the caret
+	 * arithmetic in `filterDomainInput` exact: filtering a prefix of `s` always yields a
+	 * prefix of filtering `s`, so the number of surviving characters before the caret is
+	 * simply the length of the filtered prefix. A regex `.replace()` over the whole string
+	 * could not promise that once `toLowerCase()` is allowed to change a string's length
+	 * (`İ` → `i` + combining dot).
+	 *
+	 * Downcasing rather than rejecting is deliberate: hostnames are case-insensitive and
+	 * `Domain::parse` demands lowercase, so an uppercase keystroke has exactly one sane
+	 * meaning. Dropping it instead would look like a broken keyboard.
+	 */
+	function filterHostname(s: string): string {
+		let out = '';
+		for (const ch of s) {
+			const lower = ch.toLowerCase();
+			if (HOSTNAME_CHAR.test(lower)) out += lower;
+		}
+		return out;
+	}
+
+	/**
+	 * Filter one input event's raw value and say where the caret belongs afterwards.
+	 *
+	 * Exported for `SiteDrawer.svelte.test.ts`: the caret arithmetic is the part of this
+	 * change that can actually be tested in the DOM-less `node` vitest project, and it is
+	 * also the part most likely to be wrong. This is a TYPING AFFORDANCE ONLY —
+	 * `Domain::parse` is still the authority, and nothing here decides whether a domain is
+	 * valid.
+	 */
+	export function filterDomainInput(raw: string, caret: number): { value: string; caret: number } {
+		return { value: filterHostname(raw), caret: filterHostname(raw.slice(0, caret)).length };
+	}
+</script>
+
 <script lang="ts">
 	import { onMount, untrack } from 'svelte';
 	import { open } from '@tauri-apps/plugin-dialog';
 	import type { SiteDto, SiteInput } from '$lib/ipc';
-	import { composeDomain, splitDomain, phpVersionOptions, PHP_VERSIONS } from '$lib/sites.derive';
+	import {
+		composeDomain,
+		splitDomain,
+		phpVersionOptions,
+		PHP_VERSIONS,
+		WEB_SERVERS,
+		type WebServerKind
+	} from '$lib/sites.derive';
 	import Button from './Button.svelte';
+	import Select from './Select.svelte';
+	import WebServerIcon from './WebServerIcon.svelte';
 
 	let {
 		site,
@@ -20,8 +71,12 @@
 		onClose: () => void;
 	} = $props();
 
-	function initialWebServer(dto: SiteDto | null): 'nginx' | 'apache' {
-		return dto?.webServer === 'apache' ? 'apache' : 'nginx';
+	// `SiteDto.webServer` crosses IPC as a bare string (specta exports the Rust enum's wire
+	// form, not a TS union), so narrow it here — anything unrecognised falls back to the one
+	// web server OpenVHost can actually configure.
+	function initialWebServer(dto: SiteDto | null): WebServerKind {
+		const found = WEB_SERVERS.find((server) => server === dto?.webServer);
+		return found ?? WEB_SERVERS[0];
 	}
 
 	// Form state is seeded ONCE from `site` (edit) or blank defaults (create), via `untrack`
@@ -32,7 +87,7 @@
 	let name = $state(untrack(() => site?.name ?? ''));
 	let subdomain = $state(untrack(() => (site ? splitDomain(site.domain) : '')));
 	let docroot = $state(untrack(() => site?.docroot ?? ''));
-	let webServer = $state<'nginx' | 'apache'>(untrack(() => initialWebServer(site)));
+	let webServer = $state<WebServerKind>(untrack(() => initialWebServer(site)));
 	let phpVersion = $state(untrack(() => site?.phpVersion ?? PHP_VERSIONS[0]));
 	let enabled = $state(untrack(() => site?.enabled ?? true));
 
@@ -166,6 +221,40 @@
 		if (els.length > 0) els[0].focus();
 	}
 
+	/**
+	 * Restrict the Domain field to hostname characters as the user types.
+	 *
+	 * The whole point of doing this by hand — rather than reassigning a `bind:value` and
+	 * letting Svelte write the input back — is the caret. Assigning `input.value` moves the
+	 * text entry cursor to the end whenever the string actually changes (HTML standard,
+	 * `value` IDL setter), so mid-string editing becomes impossible unless the caret is
+	 * restored in the same synchronous turn. Hence: read the raw value AND the caret, filter
+	 * both together (`filterDomainInput`), write the element, then put the caret back.
+	 *
+	 * The field is therefore `value={subdomain}` + this handler, NOT `bind:value`: with the
+	 * element already holding the filtered string, Svelte's own `value` update is a no-op
+	 * (it compares `element.value` first), so nothing else ever touches the selection.
+	 *
+	 * Covers paste, drag-and-drop and autofill for free — they all raise `input`. `My_Site.COM`
+	 * pasted becomes `mysite.com` with the caret after it, rather than being rejected wholesale.
+	 */
+	function filterDomainField(el: HTMLInputElement): void {
+		const next = filterDomainInput(el.value, el.selectionStart ?? el.value.length);
+		if (el.value !== next.value) {
+			el.value = next.value;
+			el.setSelectionRange(next.caret, next.caret);
+		}
+		subdomain = next.value;
+	}
+
+	/** True while an IME is mid-composition. Rewriting `.value` under a live composition
+	 * fights the IME's own buffer, so those events are left alone and filtered once at
+	 * `compositionend` instead (which every composed character then goes through). Defensive:
+	 * this sandbox cannot drive a real IME. */
+	function isComposing(e: Event): boolean {
+		return 'isComposing' in e && e.isComposing === true;
+	}
+
 	async function browse(): Promise<void> {
 		pickerError = null;
 		try {
@@ -187,6 +276,16 @@
 		[fieldErrors.docroot ? 'f-root-error' : null, pickerError ? 'f-root-picker-error' : null]
 			.filter((id): id is string => id !== null)
 			.join(' ') || undefined
+	);
+
+	// Web-server group: the Apache-not-supported notice is a permanent description of the
+	// control, so unlike the fields above this is never `undefined`. A backend error, when
+	// there is one, is listed FIRST — it is the urgent half, and screen readers read
+	// `aria-describedby` in the order given.
+	const serverDescribedBy = $derived(
+		[fieldErrors.web_server ? 'f-server-error' : null, 'f-server-hint']
+			.filter((id): id is string => id !== null)
+			.join(' ')
 	);
 
 	async function submit(): Promise<void> {
@@ -278,10 +377,17 @@
 		<div class="field">
 			<label for="f-domain">Domain</label>
 			<div class="input-group">
+				<!-- Holds the LABEL only — `.localhost` is the static suffix beside it, and
+				     `composeDomain`/`splitDomain` do the joining. See `filterDomainField` above
+				     for why this is `value=` + `oninput` instead of `bind:value`. -->
 				<input
 					class="input mono"
 					id="f-domain"
-					bind:value={subdomain}
+					value={subdomain}
+					oninput={(e) => {
+						if (!isComposing(e)) filterDomainField(e.currentTarget);
+					}}
+					oncompositionend={(e) => filterDomainField(e.currentTarget)}
 					aria-invalid={fieldErrors.domain ? 'true' : undefined}
 					aria-describedby={fieldErrors.domain ? 'f-domain-error' : undefined}
 				/>
@@ -343,19 +449,33 @@
 				class="seg"
 				role="group"
 				aria-labelledby="f-server-label"
-				aria-describedby={fieldErrors.web_server ? 'f-server-error' : undefined}
+				aria-describedby={serverDescribedBy}
 			>
-				<button
-					type="button"
-					aria-pressed={webServer === 'nginx'}
-					onclick={() => (webServer = 'nginx')}>nginx</button
-				>
-				<button
-					type="button"
-					aria-pressed={webServer === 'apache'}
-					onclick={() => (webServer = 'apache')}>apache</button
-				>
+				{#each WEB_SERVERS as server (server)}
+					<!-- Brand marks stay in their real colours in both states. Recolouring a
+					     trademark to suit our accent fill is exactly what WebServerIcon.svelte's
+					     header asks us not to do, and the mark is `aria-hidden` reinforcement
+					     anyway — the visible label carries the meaning. -->
+					<button
+						type="button"
+						aria-pressed={webServer === server}
+						onclick={() => (webServer = server)}
+					>
+						<WebServerIcon {server} />
+						{server}
+					</button>
+				{/each}
 			</div>
+			<!-- Apache stays selectable (owner's call) but OpenVHost genuinely cannot serve it:
+			     there is an NginxAdapter and nginx templates, no Apache counterpart. Saying so
+			     here — as a capability statement about this product, not a guess about the
+			     user's machine — is the honest alternative to a control that quietly produces
+			     an unservable site. Associated with the group via `aria-describedby` (below,
+			     after any error) so it is announced when the group is reached, not just seen. -->
+			<p class="hint" id="f-server-hint">
+				OpenVHost cannot serve Apache sites yet — it only generates nginx config. An Apache site
+				will save, but it won't be served.
+			</p>
 			<!-- Backend field name for the web server is `web_server` (snake_case) — see the
 			     note above the Name field. -->
 			{#if fieldErrors.web_server}
@@ -364,18 +484,20 @@
 		</div>
 
 		<div class="field">
-			<label for="f-php">PHP version</label>
-			<select
-				class="input mono"
+			<!-- `for` AND `id` on the same label: `for` names the `<button role="combobox">`
+			     Select renders (a `<button>` is a labelable element, and `combobox` takes no
+			     name from its content), while the `id` lets Select name its popup listbox with
+			     the same words. -->
+			<label for="f-php" id="f-php-label">PHP version</label>
+			<Select
 				id="f-php"
+				labelId="f-php-label"
+				options={phpOptions}
 				bind:value={phpVersion}
-				aria-invalid={fieldErrors.php_version ? 'true' : undefined}
-				aria-describedby={fieldErrors.php_version ? 'f-php-error' : undefined}
-			>
-				{#each phpOptions as opt (opt.value)}
-					<option value={opt.value}>{opt.label}</option>
-				{/each}
-			</select>
+				invalid={Boolean(fieldErrors.php_version)}
+				describedBy={fieldErrors.php_version ? 'f-php-error' : undefined}
+				mono
+			/>
 			<p class="hint">Applies to this site only. Other sites keep their own version.</p>
 			<!-- Backend field name for the PHP version is `php_version` (snake_case) — see the
 			     note above the Name field. -->
@@ -549,8 +671,10 @@
 		align-items: center;
 		gap: 8px;
 	}
-	.input,
-	select.input {
+	/* No `select.input` companion rule any more: the PHP-version field is a `Select`
+	   component (its own scoped styles reproduce this same recipe), and Svelte flags a
+	   scoped selector that matches nothing in this file. */
+	.input {
 		font: inherit;
 		color: var(--vh-text);
 		background: var(--vh-surface);
@@ -605,7 +729,14 @@
 		border-radius: var(--vh-radius-control);
 		overflow: hidden;
 	}
+	/* inline-flex + gap so each brand mark sits on the text baseline block beside its
+	   label; `justify-content: center` keeps the pair centred in the 88px cell rather than
+	   sliding left as the mark widens the content. */
 	.seg button {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		gap: var(--vh-space-2);
 		min-width: 88px;
 		font: inherit;
 		font-weight: 500;
