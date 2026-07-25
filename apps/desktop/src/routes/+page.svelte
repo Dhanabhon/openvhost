@@ -1,67 +1,65 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import {
-		coreInfo,
-		listServices,
-		onServiceLog,
-		onServiceState,
-		serviceLogTail,
-		startService,
-		stopService,
-		type CoreInfo,
-		type IpcError
-	} from '$lib/ipc';
+	import { coreInfo, onServiceLog, type CoreInfo, type IpcError } from '$lib/ipc';
 	import AppShell from '$lib/components/AppShell.svelte';
 	import LogPane from '$lib/components/LogPane.svelte';
 	import ServicesPanel from '$lib/components/ServicesPanel.svelte';
 	import { runningCount } from '$lib/services.derive';
-	import { ServicesStore } from '$lib/services.svelte';
+	import { servicesStore as store } from '$lib/services.shared.svelte';
 
-	const store = new ServicesStore({ listServices, serviceLogTail });
 	let info = $state<CoreInfo | null>(null);
-	let error = $state<IpcError | null>(null);
 	const running = $derived(runningCount(store.services));
 
+	// The service snapshot and the `service-state` subscription belong to
+	// `routes/+layout.svelte` now — they feed the titlebar count on EVERY route, so
+	// keeping them here would leave other pages announcing "0 running". What stays is
+	// page-specific: the live log feed and the tail that seeds it (both exist only
+	// because this page renders LogPane) plus the footer's one-shot CoreInfo.
 	onMount(() => {
-		let unsubs: Array<() => void> = [];
-		(async () => {
+		let unlisten: (() => void) | null = null;
+		let disposed = false;
+
+		void (async () => {
 			try {
-				unsubs = await Promise.all([
-					onServiceState((ev) => store.applyState(ev)),
-					onServiceLog((ev) => store.applyLog(ev))
-				]);
-				await store.init();
+				const stop = await onServiceLog((ev) => store.applyLog(ev));
+				// This page CAN unmount now that Services is a route the user navigates away
+				// from, and the `await` above may resolve after that: unsubscribe immediately
+				// instead of registering a listener nothing will ever clean up.
+				if (disposed) {
+					stop();
+					return;
+				}
+				unlisten = stop;
+				// Waits for the layout's snapshot internally, so a page that mounts before
+				// its layout still seeds from the right service.
+				await store.loadLogTail();
 				info = await coreInfo();
 			} catch (e) {
-				error = e as IpcError;
+				store.fail(e as IpcError);
 			}
 		})();
-		return () => unsubs.forEach((u) => u());
-	});
 
-	async function act(fn: (id: string) => Promise<void>, id: string) {
-		error = null;
-		try {
-			await fn(id);
-		} catch (e) {
-			error = e as IpcError;
-		}
-	}
+		return () => {
+			disposed = true;
+			unlisten?.();
+			unlisten = null;
+		};
+	});
 </script>
 
 <AppShell runningCount={running}>
 	<h1 class="sr-only">OpenVHost — Services</h1>
-	{#if error}
+	{#if store.error}
 		<div class="banner-error" role="alert" data-testid="error-banner">
-			<strong>Command failed ({error.kind})</strong>
-			<span>{'message' in error ? error.message : ''}</span>
+			<strong>Command failed ({store.error.kind})</strong>
+			<span>{'message' in store.error ? store.error.message : ''}</span>
 		</div>
 	{/if}
 	<ServicesPanel
 		services={store.services}
-		onStart={(id) => act(startService, id)}
-		onStop={(id) => act(stopService, id)}
+		onStart={(id) => void store.start(id)}
+		onStop={(id) => void store.stop(id)}
 	/>
 	<LogPane logs={store.logs} />
 	{#if info}

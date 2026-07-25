@@ -5,9 +5,15 @@
 	import SiteDrawer from '$lib/components/SiteDrawer.svelte';
 	import SitesPanel from '$lib/components/SitesPanel.svelte';
 	import { createSite, deleteSite, listSites, updateSite, type SiteDto } from '$lib/ipc';
+	import { runningCount } from '$lib/services.derive';
+	import { servicesStore } from '$lib/services.shared.svelte';
 	import { SitesStore } from '$lib/sites.svelte';
 
 	const store = new SitesStore({ listSites, createSite, updateSite, deleteSite });
+	// The titlebar's "N running" belongs to every route, so it reads the shared
+	// supervisor state that `routes/+layout.svelte` subscribes to — this page used to
+	// pass a hardcoded 0, which announced "0 running" even with services up.
+	const running = $derived(runningCount(servicesStore.services));
 
 	onMount(() => {
 		void store.load();
@@ -28,7 +34,7 @@
 	}
 </script>
 
-<AppShell runningCount={0} active="sites">
+<AppShell runningCount={running} active="sites">
 	{#if store.error}
 		<div class="banner-error" role="alert" data-testid="sites-error">
 			<strong>Command failed ({store.error.kind})</strong>

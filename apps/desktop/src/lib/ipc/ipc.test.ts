@@ -6,9 +6,14 @@ vi.mock('@tauri-apps/api/core', () => ({
 	invoke: (...args: unknown[]) => invokeMock(...args)
 }));
 
-import { coreInfo, listServices } from './index';
-import type { ServiceStatus } from './index';
-import { ServicesStore } from '../services.svelte';
+const listenMock = vi.fn();
+vi.mock('@tauri-apps/api/event', () => ({
+	listen: (...args: unknown[]) => listenMock(...args),
+	once: vi.fn(),
+	emit: vi.fn()
+}));
+
+import { coreInfo, listServices, onServiceState } from './index';
 
 const sample = {
 	appVersion: '0.1.0',
@@ -66,35 +71,46 @@ describe('listServices (non-coreInfo wrapper)', () => {
 	});
 });
 
-const svc = (id: string, kind: 'stopped' | 'running'): ServiceStatus =>
-	({ id, displayName: id, endpoint: null, pid: null, state: { kind } }) as ServiceStatus;
+// `ServicesStore`'s own tests live in `../services.svelte.test.ts` (alongside
+// `sites.svelte.test.ts`) — this file is about the IPC barrel.
 
-describe('ServicesStore', () => {
-	const api = {
-		listServices: async () => [svc('demo-ticker', 'stopped')],
-		serviceLogTail: async () => [{ tsMs: 1, level: 'info', line: 'seed' }] as never[]
-	};
+describe('onServiceState', () => {
+	beforeEach(() => listenMock.mockReset());
 
-	it('init seeds services and log tail', async () => {
-		const store = new ServicesStore(api as never);
-		await store.init();
-		expect(store.services).toHaveLength(1);
-		expect(store.logs[0]?.line).toBe('seed');
+	it('resolves to the unlisten function the transport returns', async () => {
+		const unlisten = vi.fn();
+		listenMock.mockResolvedValueOnce(unlisten);
+		await expect(onServiceState(() => {})).resolves.toBe(unlisten);
+		expect(listenMock).toHaveBeenCalledWith('service-state-event', expect.any(Function));
 	});
 
-	it('applyState replaces the matching service state', async () => {
-		const store = new ServicesStore(api as never);
-		await store.init();
-		store.applyState({ id: 'demo-ticker', state: { kind: 'running' }, detail: null } as never);
-		expect(store.services[0]?.state.kind).toBe('running');
+	it('delivers the event payload to the callback', async () => {
+		const seen: unknown[] = [];
+		listenMock.mockImplementationOnce(async (_name: string, cb: (e: unknown) => void) => {
+			cb({ event: 'service-state-event', id: 1, payload: { id: 'nginx' } });
+			return vi.fn();
+		});
+		await onServiceState((ev) => seen.push(ev));
+		expect(seen).toEqual([{ id: 'nginx' }]);
 	});
 
-	it('applyLog caps the feed at 50', async () => {
-		const store = new ServicesStore(api as never);
-		for (let i = 0; i < 60; i++) {
-			store.applyLog({ id: 'x', tsMs: i, level: 'info', line: `l${i}` } as never);
-		}
-		expect(store.logs).toHaveLength(50);
-		expect(store.logs[0]?.line).toBe('l10');
+	// `events.*.listen` reaches the transport directly rather than through the
+	// `unwrap` helper the commands use, so without explicit normalization a failed
+	// subscription rejects with a raw Error and the banner's `'message' in error`
+	// read (and the `IpcError` type) no longer hold.
+	it('normalizes a raw transport failure into a core-variant IpcError', async () => {
+		listenMock.mockRejectedValueOnce(new Error('event transport down'));
+		await expect(onServiceState(() => {})).rejects.toEqual({
+			kind: 'core',
+			message: 'Error: event transport down'
+		});
+	});
+
+	it('passes an IpcError-shaped rejection through unchanged', async () => {
+		listenMock.mockRejectedValueOnce({ kind: 'proc', message: 'supervisor gone' });
+		await expect(onServiceState(() => {})).rejects.toEqual({
+			kind: 'proc',
+			message: 'supervisor gone'
+		});
 	});
 });
