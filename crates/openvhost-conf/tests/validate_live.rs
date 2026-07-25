@@ -9,16 +9,13 @@
 
 use openvhost_conf::{
     NginxAdapter, PhpFpmRuntime, PhpRuntimeAdapter, PhpUpstream, RenderCtx, WebServerAdapter,
-    find_brew_binaries,
+    find_brew_binaries, probe_nginx_version, validate_live,
 };
 
-#[tokio::test]
-async fn generated_stack_passes_native_validators() {
-    let Some(brew) = find_brew_binaries() else {
-        eprintln!("SKIP validate_live: Homebrew nginx/php-fpm not found (brew install nginx php)");
-        return;
-    };
-
+/// The world both cases need: a temp home whose path CONTAINS A SPACE (see the
+/// module doc) plus the `RenderCtx` pointing at it. Returns the `TempDir` so the
+/// caller keeps it alive — dropping it deletes the home mid-test.
+fn temp_home_ctx() -> (tempfile::TempDir, RenderCtx) {
     // Short /tmp base (sun_path headroom) with a SPACE in the dir name.
     let base = tempfile::Builder::new()
         .prefix("ovh conf ") // <- space is intentional
@@ -26,7 +23,6 @@ async fn generated_stack_passes_native_validators() {
         .unwrap();
     let home = base.path().to_path_buf();
     let socket = home.join("run/php-fpm.sock");
-
     let ctx = RenderCtx::new(
         home.clone(),
         "myapp.localhost",
@@ -37,6 +33,17 @@ async fn generated_stack_passes_native_validators() {
         "php_myapp",
     )
     .unwrap();
+    (base, ctx)
+}
+
+#[tokio::test]
+async fn generated_stack_passes_native_validators() {
+    let Some(brew) = find_brew_binaries() else {
+        eprintln!("SKIP validate_live: Homebrew nginx/php-fpm not found (brew install nginx php)");
+        return;
+    };
+
+    let (_home, ctx) = temp_home_ctx();
 
     let nginx_report = NginxAdapter.validate(&brew.nginx, &ctx).await.unwrap();
     assert!(nginx_report.ok, "nginx -t failed:\n{}", nginx_report.stderr);
@@ -70,5 +77,60 @@ async fn generated_stack_passes_native_validators() {
     assert!(
         dump_out.contains("server_name myapp.localhost"),
         "nginx -T did not show the expanded site include:\n{dump_out}"
+    );
+}
+
+/// REAL-NGINX proof for condition (6) of `inspect`'s golden-rule-4 reading:
+/// `run_bounded` now does `env_clear()` + an allowlist, so both probes run in an
+/// assembled environment rather than the app's.
+///
+/// This needs its own case because the test above CANNOT cover it: that one goes
+/// through `webserver.rs`'s `NginxAdapter::validate`, which spawns with its own
+/// untimed `.output()` and never touches `run_bounded`. Clearing the environment
+/// is the kind of change that can only be disproved by a real binary — a fake
+/// `#!/bin/sh` script needs nothing but `PATH` — so if nginx ever does need a
+/// variable the allowlist does not carry, THIS is the test that says so instead
+/// of a user seeing "Config is not valid" for a config that is fine.
+///
+/// Both probes are exercised, because both go through `run_bounded`.
+#[tokio::test]
+async fn both_probes_pass_real_nginx_in_the_assembled_environment() {
+    let Some(brew) = find_brew_binaries() else {
+        eprintln!("SKIP validate_live: Homebrew nginx/php-fpm not found (brew install nginx php)");
+        return;
+    };
+
+    let (_home, ctx) = temp_home_ctx();
+    // `validate_live` validates a config that ALREADY EXISTS and writes nothing,
+    // so the generated files have to be on disk first. `NginxAdapter::validate`
+    // materializes them as a side effect, which is exactly the seam under test:
+    // the same bytes, the same binary, a different environment.
+    let generated = NginxAdapter.validate(&brew.nginx, &ctx).await.unwrap();
+    assert!(
+        generated.ok,
+        "precondition: the generated config must be valid before this proves \
+         anything about the environment:\n{}",
+        generated.stderr
+    );
+    let main = NginxAdapter.generate_main_config(&ctx).unwrap();
+    let err_log = ctx.home.join("logs/nginx.error.log");
+
+    let live = validate_live(&brew.nginx, &main.path, &err_log)
+        .await
+        .unwrap();
+    assert!(
+        live.ok,
+        "real `nginx -t` FAILED under the assembled probe environment while the \
+         same config passed under the inherited one — nginx needs an environment \
+         variable `inspect::probe_env`'s allowlist does not carry. Report this \
+         rather than widening the allowlist blind:\n{}",
+        live.stderr
+    );
+
+    let version = probe_nginx_version(&brew.nginx, &err_log).await;
+    assert!(
+        version.is_some(),
+        "real `nginx -v` produced no parseable banner under the assembled probe \
+         environment, so every row would read `Version: Unknown`"
     );
 }

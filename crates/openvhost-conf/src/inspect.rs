@@ -9,30 +9,62 @@
 //! pointing it at a live home. `validate_live` validates a config file that
 //! already exists, in place, writing nothing.
 //!
-//! # Golden-rule-4 reading (PENDING security-auditor confirmation)
+//! # Golden-rule-4 reading (CONFIRMED by security-auditor, 2026-07-26)
 //!
 //! `CLAUDE.md` golden rule 4 says every child process in the codebase goes
 //! through `openvhost-proc`. Spawning a one-shot tool directly from THIS crate
 //! has shipped precedent (`webserver.rs`'s `NginxAdapter::validate`, P0-7), but
 //! the raw `libc::kill(-pgid, SIGKILL)` in `kill_process_group` below does not:
 //! it makes this the SECOND independent implementation of the same POSIX
-//! containment invariant in the workspace. The other copy is
-//! `crates/openvhost-proc/src/platform/unix.rs` (`UnixDriver::spawn`'s
-//! `process_group(0)` plus `signal_group`) — read it when you change this, and
-//! change both or neither.
+//! containment invariant in the workspace — and, since [`probe_env`], of the
+//! same reproducible-ENVIRONMENT invariant too. Both halves have exactly one
+//! other copy: `crates/openvhost-proc/src/platform/unix.rs`
+//! (`UnixDriver::spawn`'s `process_group(0)` plus `signal_group`, and its
+//! `.env_clear().envs(assemble_env(..))`, whose list lives in
+//! `crates/openvhost-proc/src/platform/mod.rs`) — read it when you change
+//! EITHER half here, and change both or neither. Naming only the process-group
+//! half is how the env half stayed un-mirrored through a whole review round.
 //!
 //! Two alternatives were considered and rejected: an
 //! `openvhost-conf → openvhost-proc` dependency edge (couples config generation
 //! to the supervisor, for a mechanism config generation only needs for one-shot
 //! tools), and making `openvhost-proc`'s `signal_group` `pub` (the same coupling
 //! by another route, plus it widens that crate's API surface for an
-//! out-of-crate caller). The reading of rule 4 taken here is: SUPERVISED
-//! SERVICES — anything with a lifecycle, restart policy, health check or orphan
-//! record — go through `openvhost-proc`; one-shot tool invocations that live and
-//! die inside a single function call spawn directly. That reading is NOT settled
-//! — it is pending security-auditor confirmation later in this slice. If it is
-//! rejected, this module is what moves.
+//! out-of-crate caller).
+//!
+//! The CONFIRMED reading, in the NARROWED form the auditor required. The
+//! unconditional "one-shot tools may spawn directly" form was rejected as "a
+//! loophole someone will drive a truck through — the day a slice wants
+//! `security add-trusted-cert` or a hosts-file edit, those are also one-shot
+//! tools":
+//!
+//! Rule 4 governs any child process whose lifetime OpenVHost manages — anything
+//! with a lifecycle, restart policy, health check, orphan record, or that
+//! outlives the call that created it. Those go through `openvhost-proc`, no
+//! exceptions.
+//!
+//! A one-shot tool invocation MAY spawn directly from the crate that owns
+//! knowledge of that tool if and only if **all** of: (1) it is bounded by a
+//! wall-clock deadline; (2) it is contained in its own process group and the
+//! deadline group-kills that group; (3) no component of its argv is
+//! client-supplied; (4) it runs with the app's own unelevated privileges —
+//! anything elevated, anything through the privileged helper, and anything that
+//! mutates system state (hosts file, trust store, launchd/services, privileged
+//! sockets) is OUTSIDE this carve-out regardless of how short-lived it is;
+//! (5) its stdout/stderr are captured, not inherited; (6) its environment is
+//! explicitly assembled, not inherited.
+//!
+//! A spawn that fails any of these goes through `openvhost-proc`.
+//!
+//! This module meets ALL SIX: (1) [`PROBE_TIMEOUT`] bounds [`run_bounded`];
+//! (2) `process_group(0)` plus [`kill_process_group`] on expiry; (3) argv is
+//! `-e`/`-t`/`-c`/`-v` plus paths the caller derived from managed state — the
+//! webview sends only an opaque brand id, never a path; (4) both probes run as
+//! the app's own unelevated user, touch no privileged helper, and mutate no
+//! system state; (5) `Stdio::piped()` on both output streams and
+//! `Stdio::null()` on stdin; (6) [`probe_env`].
 
+use std::ffi::OsString;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -53,6 +85,56 @@ enum ProbeFailure {
     Io(std::io::Error),
     /// `PROBE_TIMEOUT` elapsed. The process group has been killed.
     TimedOut,
+}
+
+/// The environment a probe's child runs in: this list and nothing else. Condition
+/// (6) of the module doc's golden-rule-4 reading.
+///
+/// DUPLICATED ON PURPOSE, and the copy is the junior partner: the SOURCE OF TRUTH
+/// is `assemble_env` in `crates/openvhost-proc/src/platform/mod.rs`. Keep the two
+/// lists identical — see the module doc's "change both or neither" note, which
+/// covers this list as well as the process-group containment. It is copied rather
+/// than imported because an `openvhost-conf → openvhost-proc` dependency edge
+/// would couple config generation to the supervisor for a mechanism config
+/// generation only needs for one-shot tools (module doc, rejected alternatives).
+/// Extracting ONE shared bounded one-shot runner, so the containment and this
+/// list each have a single home, is recorded as a follow-up.
+///
+/// Why this is not mere tidiness. Without it the SAME nginx binary is validated
+/// in one environment and supervised in another, so `nginx -t` can pass here
+/// while the supervised nginx fails — the page would then be confidently wrong
+/// about the thing it exists to report. nginx also reads `NGINX`/`NGINX_SHM` as
+/// a list of INHERITED LISTENING SOCKET DESCRIPTORS (its binary-upgrade
+/// protocol); a validation probe must never be handed those.
+fn probe_env() -> Vec<(OsString, OsString)> {
+    let mut out: Vec<(OsString, OsString)> = Vec::new();
+    let mut push_from_parent = |key: &str| {
+        if let Some(v) = std::env::var_os(key) {
+            out.push((OsString::from(key), v));
+        }
+    };
+    for key in ["PATH", "HOME", "TMPDIR", "LANG"] {
+        push_from_parent(key);
+    }
+    #[cfg(windows)]
+    {
+        for key in ["SystemRoot", "windir", "TEMP", "TMP"] {
+            push_from_parent(key);
+        }
+        // CRT startup needs System32 resolvable even with a cleared env.
+        if let Some(root) = std::env::var_os("SystemRoot") {
+            let mut p = root.clone();
+            p.push("\\System32");
+            match out.iter_mut().find(|(k, _)| k == "PATH") {
+                Some((_, existing)) => {
+                    existing.push(";");
+                    existing.push(&p);
+                }
+                None => out.push((OsString::from("PATH"), p)),
+            }
+        }
+    }
+    out
 }
 
 /// Spawn `cmd` in its own process group, capture stdout+stderr, and wait for it
@@ -82,6 +164,15 @@ async fn run_bounded(
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // Condition (6) of the module doc's reading: explicitly assembled, never
+        // inherited. `env_clear` also drops anything the CALLER already set on
+        // `cmd` — deliberate, and the reason this pair lives here rather than in
+        // each probe: `run_bounded` owns the child's environment outright, so a
+        // future probe cannot forget to clear it. A probe that genuinely needs an
+        // extra variable adds it to `probe_env` (and to `assemble_env`, its
+        // source of truth) rather than setting it on the command.
+        .env_clear()
+        .envs(probe_env())
         // Secondary net, for "the caller drops this whole future" — the timeout
         // arm below does the real reclaiming. On its own this is NOT enough:
         // `kill_on_drop`, exactly like `Child::kill()`, only ever signals the
@@ -434,6 +525,77 @@ mod tests {
         assert!(recorded.contains("-v"), "argv was: {recorded}");
     }
 
+    /// Condition (6) of the module doc's reading, half one: the allowlist is
+    /// CLOSED. Pure — no spawn — so it fails for a `probe_env` widened to
+    /// `std::env::vars()` regardless of what the ambient environment happens to
+    /// hold on the machine running the suite.
+    #[test]
+    fn probe_env_yields_only_allowlisted_keys() {
+        // Mirrors `assemble_env`'s list in `openvhost-proc/src/platform/mod.rs`.
+        // A key added there and here belongs in this array too; a key added ONLY
+        // here fails this test, which is the point.
+        let mut allowed: Vec<&str> = vec!["PATH", "HOME", "TMPDIR", "LANG"];
+        if cfg!(windows) {
+            allowed.extend(["SystemRoot", "windir", "TEMP", "TMP"]);
+        }
+        let env = probe_env();
+        for (k, _) in &env {
+            assert!(
+                allowed.iter().any(|a| std::ffi::OsStr::new(a) == k),
+                "{k:?} is not on the probe env allowlist: {env:?}"
+            );
+        }
+        // `PATH` is always set for a process cargo launched, so this direction is
+        // reachable: it fails for an `env_clear()` with no `envs()` behind it.
+        assert!(
+            env.iter().any(|(k, _)| k == "PATH"),
+            "the allowlist must still PASS PATH through, or a probe cannot resolve \
+             the interpreter of anything it runs: {env:?}"
+        );
+    }
+
+    /// Condition (6), half two: what the child actually receives.
+    ///
+    /// The leak is set on the COMMAND rather than with `std::env::set_var` so this
+    /// test needs no process-global env mutation racing the other tests in this
+    /// binary — and it is strictly the stronger property: `run_bounded` owns the
+    /// child's environment outright, including against its own caller. If
+    /// `env_clear()` goes, an ambient variable reaches the child by exactly the
+    /// same route this one does.
+    #[tokio::test]
+    async fn run_bounded_gives_the_child_the_assembled_env_and_nothing_else() {
+        let d = tempfile::tempdir().unwrap();
+        let seen = d.path().join("env.txt");
+        let bin = fake_bin(d.path(), "nginx", &format!("env > \"{}\"", seen.display()));
+        let mut cmd = tokio::process::Command::new(&bin);
+        // `NGINX` is the concrete hazard, not a stand-in: nginx reads it as a list
+        // of inherited listening socket descriptors.
+        cmd.env("NGINX", "3;").env("OPENVHOST_MUST_NOT_LEAK", "1");
+        assert!(
+            run_bounded(&mut cmd).await.is_ok(),
+            "the fake should have run"
+        );
+
+        let env = std::fs::read_to_string(&seen).unwrap();
+        let keys: Vec<&str> = env
+            .lines()
+            .filter_map(|l| l.split_once('=').map(|(k, _)| k))
+            .collect();
+        assert!(
+            !keys.contains(&"NGINX"),
+            "NGINX reached the probe — nginx would treat it as inherited listening \
+             sockets:\n{env}"
+        );
+        assert!(
+            !keys.contains(&"OPENVHOST_MUST_NOT_LEAK"),
+            "the child's environment was inherited rather than assembled:\n{env}"
+        );
+        assert!(
+            keys.contains(&"PATH"),
+            "the allowlist did not reach the child:\n{env}"
+        );
+    }
+
     #[tokio::test]
     async fn validate_reports_ok_from_the_exit_code_alone() {
         // Success still writes to stderr (nginx says "syntax is ok" there), so
@@ -570,9 +732,45 @@ mod tests {
         // nginx DOES emit warnings to stderr. Splitting the whole blob on its
         // first `/` consumed the warning's path and reported the version as
         // unknown; parsing line by line is what fixes it.
+        //
+        // This fixture pins the LINE-BY-LINE scan ONLY, and does not cover
+        // `parse_version_line`'s digit guard: `trim_end_matches` reduces
+        // `opt/homebrew/var/log/x` to empty, so the `is_empty()` branch returns
+        // `None` for this warning with the guard AND without it. The guard has its
+        // own test below — do not treat this one as covering it.
         assert_eq!(
             parse_version("nginx: [warn] ... /opt/homebrew/var/log/x\nnginx version: nginx/1.27.3")
                 .as_deref(),
+            Some("1.27.3")
+        );
+    }
+
+    /// The digit guard, on the inputs that actually reach it: a path token whose
+    /// LAST character is a digit, so the trim leaves it non-empty. Without
+    /// `!token.starts_with(ascii_digit)` these render a FILE PATH in the row's
+    /// "Version" field — `Some("x/nginx.conf:120")` where the truth is "unknown".
+    ///
+    /// Both shapes are real nginx diagnostics, not invented ones: the same two
+    /// lines are already stderr fixtures in
+    /// `apps/desktop/src/lib/components/webserver.panel.test.ts`. The version probe
+    /// reads stderr, so a `-t`-style diagnostic on that stream is exactly what a
+    /// misconfigured install hands this parser.
+    #[test]
+    fn parse_version_rejects_a_path_token_the_trim_leaves_non_empty() {
+        assert_eq!(
+            parse_version(
+                "nginx: [emerg] unexpected end of file, expecting } in /x/nginx.conf:120"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_version("nginx: [warn] duplicate MIME type in /x/.openvhost/conf/mime.types:31"),
+            None
+        );
+        // …and the guard must not eat a real banner, which is the other half of
+        // why it is `starts_with(digit)` rather than "reject anything with a `/`".
+        assert_eq!(
+            parse_version("nginx version: nginx/1.27.3").as_deref(),
             Some("1.27.3")
         );
     }
