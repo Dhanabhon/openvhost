@@ -9,7 +9,9 @@ import type {
 	ServiceStateEvent,
 	ServiceStatus,
 	SiteDto,
-	SiteInput
+	SiteInput,
+	ValidationReportDto,
+	WebServerDto
 } from './bindings';
 
 export type {
@@ -20,7 +22,9 @@ export type {
 	ServiceStateEvent,
 	ServiceStatus,
 	SiteDto,
-	SiteInput
+	SiteInput,
+	ValidationReportDto,
+	WebServerDto
 };
 
 function isIpcError(e: unknown): e is IpcError {
@@ -121,4 +125,14 @@ export async function updateSite(id: string, input: SiteInput): Promise<SiteDto>
 }
 export async function deleteSite(id: string): Promise<boolean> {
 	return unwrap(commands.deleteSite(id));
+}
+
+export async function listWebServers(): Promise<WebServerDto[]> {
+	return unwrap(commands.listWebServers());
+}
+export async function readWebServerConfig(id: string): Promise<string> {
+	return unwrap(commands.readWebServerConfig(id));
+}
+export async function validateWebServerConfig(id: string): Promise<ValidationReportDto> {
+	return unwrap(commands.validateWebServerConfig(id));
 }
