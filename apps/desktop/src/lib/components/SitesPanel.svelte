@@ -32,7 +32,7 @@
 <section class="panel" aria-label="Sites" data-testid="sites">
 	{#if sites.length === 0}
 		<div class="empty">
-			<p class="primary">No sites yet</p>
+			<div class="title">No sites yet</div>
 			<p class="meta">
 				Add a site to serve a project folder at a <span class="mono">.localhost</span> domain.
 			</p>
@@ -48,13 +48,14 @@
 
 <style>
 	/* Ported from docs/design/main-window.html lines 60-70 (page head) + mock.css (.page-head,
-	   .page-head h1, .page-head .sub, .page-head .grow, .panel, .rowlist, .empty). `.empty`'s
-	   own contents (.primary/.meta/.mono) have no direct mock.css precedent — mock.css defines
-	   `.empty` itself but never demonstrates its inner markup on any screen — so this reuses the
-	   same "primary" (bold heading) / "meta" (muted detail) / "mono" (monospace fragment)
-	   vocabulary the row already uses, scoped under `.empty` the same way ServiceRow scopes
-	   `.row .primary`/`.row .meta`. `.mono` itself is the global utility class from
-	   lib/styles/tokens.css, not redefined here. */
+	   .page-head h1, .page-head .sub, .page-head .grow, .panel, .rowlist, .empty, .empty .title).
+	   `.empty .title` (heading) mirrors mock.css:445 and the same convention
+	   ServicesPanel.svelte already uses for its own empty state. The detail line has no direct
+	   mock.css precedent — mock.css defines `.empty` itself but never demonstrates its inner
+	   markup on any screen — so it reuses the row's "meta" (muted detail) / "mono" (monospace
+	   fragment) vocabulary, scoped under `.empty` the same way the row scopes `.row .meta`.
+	   `.mono` itself is the global utility class from lib/styles/tokens.css, not redefined
+	   here. */
 	.page-head {
 		display: flex;
 		align-items: center;
@@ -89,9 +90,10 @@
 		text-align: center;
 		color: var(--vh-text-2);
 	}
-	.empty .primary {
+	.empty .title {
 		font-weight: 600;
 		color: var(--vh-text);
+		margin-bottom: 4px;
 	}
 	.empty .meta {
 		font-size: var(--vh-text-table);

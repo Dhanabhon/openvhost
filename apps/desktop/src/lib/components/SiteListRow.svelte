@@ -26,11 +26,14 @@
 </div>
 
 <style>
-	/* Ported from docs/design/mock.css (.row, .site-row, .primary/.meta under .row, .pill/.dot/
-	   .pill-running/.pill-stopped, .row-actions). `.mono`/`.num` are NOT redefined here — both
-	   are global utility classes already applied app-wide from lib/styles/tokens.css
-	   (`code, pre, .mono { font-family: var(--vh-font-mono) }` / `.num { font-variant-numeric:
-	   tabular-nums }`), the same convention ServiceRow.svelte relies on.
+	/* Ported from docs/design/mock.css (.row, .site-row, .primary/.meta/.mono under .row,
+	   .pill/.dot/.pill-running/.pill-stopped, .row-actions). `.num` is NOT redefined here — it
+	   is a global utility class already applied app-wide from lib/styles/tokens.css
+	   (`.num { font-variant-numeric: tabular-nums }`), the same convention ServiceRow.svelte
+	   relies on. `.mono`'s font-family is likewise the global utility (`code, pre, .mono {
+	   font-family: var(--vh-font-mono) }`), but mock.css also sizes it per-row (`.row .mono {
+	   font-size: var(--vh-text-table) }`), so that rule IS ported below to match the
+	   domain/web-server cells' size.
 
 	   Deliberate deviation from the mock (see the design spec's deviation table): a site has no
 	   runtime state yet, so there is no status-running pill and no "Open" button — only the
@@ -56,6 +59,9 @@
 	}
 	.row .meta {
 		color: var(--vh-text-2);
+		font-size: var(--vh-text-table);
+	}
+	.row .mono {
 		font-size: var(--vh-text-table);
 	}
 	.site-row {
