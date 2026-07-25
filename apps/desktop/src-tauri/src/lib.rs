@@ -119,6 +119,21 @@ pub fn run() {
                             // it releases the flock and lets a later instance
                             // acquire it.
                             app.manage(lock);
+                            // Open the persistent state store best-effort: a
+                            // missing/unreadable state.db must never stop the
+                            // supervisor from starting. Sites features are
+                            // simply unavailable this run (no IPC command
+                            // reads `Db` yet — that lands with the Sites UI).
+                            match tauri::async_runtime::block_on(openvhost_core::Db::open(&home)) {
+                                Ok(db) => {
+                                    app.manage(db);
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "openvhost: state.db unavailable ({e}); Sites features disabled this run"
+                                    );
+                                }
+                            }
                             let registry = Arc::new(FileRegistry::new(&run_dir));
                             let supervisor = Arc::new(Supervisor::with_orphan_cleanup(
                                 default_driver(),
