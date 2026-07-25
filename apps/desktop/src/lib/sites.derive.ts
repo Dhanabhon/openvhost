@@ -31,3 +31,25 @@ export function enabledPill(enabled: boolean): { label: string; cls: string } {
  * installed needs the package IPC (its own slice).
  */
 export const PHP_VERSIONS = ['8.4', '8.3', '8.2', '8.1'] as const;
+
+/**
+ * Options for the site editor's PHP-version `<select>`, always including the
+ * site's stored version.
+ *
+ * `PHP_VERSIONS` above is a CLOSED list, but state.db can hold any version an
+ * older build — or a later edit of that list — allowed. A `<select>` with no
+ * `<option>` matching its bound value renders blank and the binding silently
+ * takes the browser's own pick instead, so saving would rewrite the site's PHP
+ * version to something the user never chose. Prepending the stored value keeps
+ * it visible, selected, and reversible until the user deliberately changes it.
+ *
+ * The annotation follows docs/design/site-editor.html's `8.1 — install first`
+ * convention, but says "not available" rather than "install first": all this
+ * knows is that OpenVHost does not offer the version, which is not the same
+ * claim as it being absent from disk.
+ */
+export function phpVersionOptions(current?: string | null): { value: string; label: string }[] {
+	const offered = PHP_VERSIONS.map((v) => ({ value: v, label: v }));
+	if (!current || (PHP_VERSIONS as readonly string[]).includes(current)) return offered;
+	return [{ value: current, label: `${current} — not available` }, ...offered];
+}

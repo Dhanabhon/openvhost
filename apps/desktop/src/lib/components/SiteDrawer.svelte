@@ -3,7 +3,7 @@
 	import { onMount, untrack } from 'svelte';
 	import { open } from '@tauri-apps/plugin-dialog';
 	import type { SiteDto, SiteInput } from '$lib/ipc';
-	import { composeDomain, splitDomain, PHP_VERSIONS } from '$lib/sites.derive';
+	import { composeDomain, splitDomain, phpVersionOptions, PHP_VERSIONS } from '$lib/sites.derive';
 	import Button from './Button.svelte';
 
 	let {
@@ -35,6 +35,14 @@
 	let webServer = $state<'nginx' | 'apache'>(untrack(() => initialWebServer(site)));
 	let phpVersion = $state(untrack(() => site?.phpVersion ?? PHP_VERSIONS[0]));
 	let enabled = $state(untrack(() => site?.enabled ?? true));
+
+	// Built once, from the site's STORED version rather than from the live `phpVersion`
+	// state above, for two reasons: the same read-once rationale as the fields (`site`
+	// cannot change under a mounted drawer), and because deriving it from the live value
+	// would delete an unlisted version's option the moment the user clicked away from it,
+	// stranding them with no way back. See `phpVersionOptions` for why the option has to
+	// exist at all.
+	const phpOptions = phpVersionOptions(untrack(() => site?.phpVersion));
 
 	let submitting = $state(false);
 	let confirmingDelete = $state(false);
@@ -364,8 +372,8 @@
 				aria-invalid={fieldErrors.php_version ? 'true' : undefined}
 				aria-describedby={fieldErrors.php_version ? 'f-php-error' : undefined}
 			>
-				{#each PHP_VERSIONS as v (v)}
-					<option value={v}>{v}</option>
+				{#each phpOptions as opt (opt.value)}
+					<option value={opt.value}>{opt.label}</option>
 				{/each}
 			</select>
 			<p class="hint">Applies to this site only. Other sites keep their own version.</p>
