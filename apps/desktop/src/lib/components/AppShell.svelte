@@ -3,11 +3,13 @@
 	import TitleBar from './TitleBar.svelte';
 	import Rail from './Rail.svelte';
 
-	// Defaults to 'services' so the existing Services page (routes/+page.svelte), which never
-	// passes `active`, needs no change.
+	// Defaults to 'sites', which is what `/` renders (routes/+page.svelte) — so the landing
+	// page needs no `active` of its own, and a new route that forgets the prop highlights the
+	// rail's default destination rather than an unrelated one. Services passes it explicitly
+	// (routes/services/+page.svelte). Keep this in step with Rail.svelte's own default.
 	let {
 		runningCount,
-		active = 'services',
+		active = 'sites',
 		children
 	}: {
 		runningCount: number;

@@ -2,9 +2,13 @@
 <script lang="ts">
 	import { resolve } from '$app/paths';
 
-	// 'services' and 'sites' are real destinations now. The union stays narrow on purpose —
+	// 'sites' and 'services' are real destinations. The union stays narrow on purpose —
 	// Logs/Settings join it once their own slices land.
-	let { active = 'services' }: { active?: 'services' | 'sites' } = $props();
+	//
+	// Defaults to 'sites' because Sites is what `/` renders: the app's landing page needs no
+	// `active` of its own, and an unset prop can only ever highlight the destination the user
+	// is most likely on. AppShell.svelte defaults the same way — change both together.
+	let { active = 'sites' }: { active?: 'services' | 'sites' } = $props();
 </script>
 
 <nav class="rail" aria-label="Main">
@@ -21,12 +25,8 @@
 		<span class="name">OpenVHost</span>
 	</div>
 
-	<!-- Sites: live since the Sites CRUD slice. -->
-	<a
-		class="nav-item"
-		href={resolve('/sites')}
-		aria-current={active === 'sites' ? 'page' : undefined}
-	>
+	<!-- Sites: the landing page — `/`, not `/sites` (owner decision: the app opens on Sites). -->
+	<a class="nav-item" href={resolve('/')} aria-current={active === 'sites' ? 'page' : undefined}>
 		<svg
 			width="18"
 			height="18"
@@ -44,8 +44,12 @@
 		Sites
 	</a>
 
-	<!-- Services: the other live destination. -->
-	<a class="nav-item" href={resolve('/')} aria-current={active === 'services' ? 'page' : undefined}>
+	<!-- Services: the other live destination, at its own `/services` route. -->
+	<a
+		class="nav-item"
+		href={resolve('/services')}
+		aria-current={active === 'services' ? 'page' : undefined}
+	>
 		<svg
 			width="18"
 			height="18"
