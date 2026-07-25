@@ -518,12 +518,15 @@ let stack = stack::macos_stack();
 for spec in stack.specs {
     supervisor.register(spec);
 }
-if let Some(paths) = stack.paths {
-    app.manage(paths);
-}
+// Manage the Option ITSELF, unconditionally. Tauri implements `CommandArg` only
+// for `State<'r, T>` — there is no impl for `Option<State<'r, T>>` — so a command
+// cannot take an optionally-managed state. Making `Option<StackPaths>` the managed
+// type is what lets Task 3's command distinguish "no home resolved" from "not
+// wired up", while always having something to extract.
+app.manage(stack.paths);
 ```
 
-Place `app.manage(paths)` in the same arm and before any command can run, alongside the existing `Db` management. If a `StackPaths` is absent, do **not** manage a placeholder — Task 3's command must be able to tell "no home" apart from "empty paths".
+Place `app.manage(stack.paths)` in the same arm and before any command can run, alongside the existing `Db` management. The managed type is `Option<StackPaths>`, never a bare `StackPaths`.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
@@ -729,9 +732,15 @@ pub struct ValidationReportDto {
     pub stderr: String,
 }
 
-/// Managed `StackPaths`, or a rendered error when the home never resolved.
-fn stack_paths<'a>(paths: Option<tauri::State<'a, StackPaths>>) -> Result<&'a StackPaths, IpcError> {
-    paths.map(tauri::State::inner).ok_or_else(|| IpcError::Core {
+/// The managed paths, or a rendered error when the home never resolved.
+///
+/// The managed type is `Option<StackPaths>`, not `StackPaths`: tauri implements
+/// `CommandArg` only for `State<'r, T>`, so a command cannot take an
+/// optionally-managed state. Task 2 therefore manages the `Option` itself.
+fn stack_paths<'a>(
+    paths: &'a tauri::State<'_, Option<StackPaths>>,
+) -> Result<&'a StackPaths, IpcError> {
+    paths.inner().as_ref().ok_or_else(|| IpcError::Core {
         message: "the OpenVHost home could not be resolved, so no web server is configured".into(),
     })
 }
@@ -739,9 +748,9 @@ fn stack_paths<'a>(paths: Option<tauri::State<'a, StackPaths>>) -> Result<&'a St
 #[tauri::command]
 #[specta::specta]
 pub async fn list_web_servers(
-    paths: Option<tauri::State<'_, StackPaths>>,
+    paths: tauri::State<'_, Option<StackPaths>>,
 ) -> Result<Vec<WebServerDto>, IpcError> {
-    let p = stack_paths(paths)?;
+    let p = stack_paths(&paths)?;
     // Probing the version SPAWNS `nginx -v`, so merely opening this page starts
     // a process. Bounded: one short-lived probe, fixed argv, PROBE_TIMEOUT.
     let version = openvhost_conf::probe_version(&p.nginx_bin).await;
@@ -763,12 +772,12 @@ pub async fn list_web_servers(
 #[tauri::command]
 #[specta::specta]
 pub async fn read_web_server_config(
-    paths: Option<tauri::State<'_, StackPaths>>,
+    paths: tauri::State<'_, Option<StackPaths>>,
     id: String,
 ) -> Result<String, IpcError> {
     let brand = WebServerBrand::parse(&id)?;
     brand.require_supported()?;
-    let p = stack_paths(paths)?;
+    let p = stack_paths(&paths)?;
     // NOT a general file reader: the path comes from managed state keyed by the
     // parsed brand, so it cannot be aimed at an arbitrary file.
     std::fs::read_to_string(&p.nginx_conf).map_err(|e| IpcError::Core {
@@ -779,12 +788,12 @@ pub async fn read_web_server_config(
 #[tauri::command]
 #[specta::specta]
 pub async fn validate_web_server_config(
-    paths: Option<tauri::State<'_, StackPaths>>,
+    paths: tauri::State<'_, Option<StackPaths>>,
     id: String,
 ) -> Result<ValidationReportDto, IpcError> {
     let brand = WebServerBrand::parse(&id)?;
     brand.require_supported()?;
-    let p = stack_paths(paths)?;
+    let p = stack_paths(&paths)?;
     let err_log = p.home.join("logs/nginx.error.log");
     let report = openvhost_conf::validate_live(&p.nginx_bin, &p.nginx_conf, &err_log)
         .await
@@ -857,7 +866,7 @@ the spawn surface is navigation, not only the Validate button."
 - Produces, for Task 5:
   ```ts
   // webservers.derive.ts
-  export function statusFor(services: ServiceStatus[], serviceId: string | null): ServiceState | null
+  export function statusFor(services: ServiceStatus[], serviceId: string | null): ServiceStatus['state']['kind'] | null
   export function hotReloadLabel(supportsHotReload: boolean): string
   // webservers.svelte.ts
   class WebServersStore {
@@ -880,6 +889,10 @@ Create `apps/desktop/src/lib/webservers.derive.test.ts`:
 import { describe, expect, it } from 'vitest';
 import { statusFor, hotReloadLabel } from './webservers.derive';
 import type { ServiceStatus } from '$lib/ipc';
+// NOTE: `ServiceState` is NOT exported from `$lib/ipc` (only `ServiceStateEvent`
+// and `ServiceStatus`), and `StatusPill` takes `kind: StateKind` rather than a
+// state object — so `statusFor` returns the kind STRING, indexed off the
+// exported `ServiceStatus` type. That satisfies both without touching the barrel.
 
 const svc = (id: string, kind: 'running' | 'stopped'): ServiceStatus => ({
 	id,
@@ -891,7 +904,7 @@ const svc = (id: string, kind: 'running' | 'stopped'): ServiceStatus => ({
 
 describe('statusFor', () => {
 	it('finds the supervised service a row correlates with', () => {
-		expect(statusFor([svc('nginx', 'running')], 'nginx')).toEqual({ kind: 'running' });
+		expect(statusFor([svc('nginx', 'running')], 'nginx')).toBe('running');
 	});
 
 	// Apache has no supervised service, so a row with no serviceId must render
@@ -918,7 +931,7 @@ Create `apps/desktop/src/lib/webservers.svelte.test.ts`:
 ```ts
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, expect, it, vi } from 'vitest';
-import { WebServersStore } from './webservers.svelte';
+import { WebServersStore, type WebServersApi } from './webservers.svelte';
 import type { WebServerDto } from '$lib/ipc';
 
 const nginx: WebServerDto = {
@@ -932,7 +945,7 @@ const nginx: WebServerDto = {
 	configPath: '/home/.openvhost/conf/nginx.conf'
 };
 
-function api(over: Partial<Parameters<typeof WebServersStore.prototype.constructor>[0]> = {}) {
+function api(over: Partial<WebServersApi> = {}): WebServersApi {
 	return {
 		listWebServers: vi.fn(async () => [nginx]),
 		readWebServerConfig: vi.fn(async () => 'daemon off;'),
@@ -982,13 +995,17 @@ describe('WebServersStore', () => {
 		expect(store.reports.nginx.stderr).toBe('nginx: [emerg] unknown directive "bogus"');
 	});
 
-	// A spawn failure is an IpcError, not a report. It must still surface.
-	it('surfaces a validator that could not be launched', async () => {
+	// A spawn failure is an IpcError, not a report. It must still surface — and it
+	// must land on the ROW, so assert that channel specifically rather than
+	// accepting either one (an assertion that can pass two ways pins neither).
+	it('surfaces a validator that could not be launched, on the row', async () => {
 		const store = new WebServersStore(
 			api({ validateWebServerConfig: vi.fn(async () => { throw { kind: 'core', message: 'could not be launched' }; }) })
 		);
 		await store.validate('nginx');
-		expect(store.configError.nginx ?? store.error?.message ?? '').toContain('could not be launched');
+		expect(store.configError.nginx).toContain('could not be launched');
+		expect(store.error).toBeNull();
+		expect(store.reports.nginx).toBeUndefined();
 	});
 
 	it('clears the validating flag even when validation throws', async () => {
@@ -1013,20 +1030,25 @@ Create `apps/desktop/src/lib/webservers.derive.ts`:
 
 ```ts
 // SPDX-License-Identifier: GPL-3.0-or-later
-import type { ServiceState, ServiceStatus } from '$lib/ipc';
+import type { ServiceStatus } from '$lib/ipc';
 
 /**
- * The supervised state a row shows, or `null` when the row has no supervised
- * service (Apache) or the snapshot has not arrived yet. Never falls back to
- * another row's state — a row showing a neighbour's status would be a lie about
- * what is running.
+ * The supervised state-kind a row shows, or `null` when the row has no
+ * supervised service (Apache) or the snapshot has not arrived yet. Never falls
+ * back to another row's state — a row showing a neighbour's status would be a
+ * lie about what is running.
+ *
+ * Returns the KIND rather than the whole state object for two reasons:
+ * `ServiceState` is not exported from `$lib/ipc`, and `StatusPill` takes
+ * `kind: StateKind`. Indexing off the exported `ServiceStatus` keeps this in
+ * step with the binding without widening the barrel.
  */
 export function statusFor(
 	services: ServiceStatus[],
 	serviceId: string | null
-): ServiceState | null {
+): ServiceStatus['state']['kind'] | null {
 	if (serviceId === null) return null;
-	return services.find((s) => s.id === serviceId)?.state ?? null;
+	return services.find((s) => s.id === serviceId)?.state.kind ?? null;
 }
 
 export function hotReloadLabel(supportsHotReload: boolean): string {
@@ -1269,7 +1291,7 @@ Expected: failure — `WebServerPanel.svelte` does not exist.
 Create `WebServerRow.svelte` and `WebServerPanel.svelte`. `WebServerPanel` is presentational: it takes `servers`, `services`, `configText`, `configError`, `reports`, `validating`, `onShowConfig`, `onValidate` as props (that is what makes the SSR test above possible) and renders a page head plus one `WebServerRow` per server.
 
 Each row must render:
-- the display name, and a `StatusPill` when `statusFor(services, serviceId)` is non-null;
+- the display name, and `<StatusPill kind={k} />` when `const k = statusFor(services, serviceId)` is non-null (it returns the kind string `StatusPill` expects, not a state object);
 - `Version`, showing the string or the literal word `Unknown` when `version === null`;
 - `Hot reload`, via `hotReloadLabel`;
 - binary path and config path in the `.mono` treatment;
