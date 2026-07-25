@@ -829,13 +829,15 @@ pnpm -C apps/desktop build 2>&1 | tail -2
 
 Expected: app builds and manages `Db` at startup; no IPC command added (bindings unchanged); everything offline-green; `cargo deny` exit 0.
 
-- [ ] **Step 4: Windows cross-check**
+- [ ] **Step 4: Windows portability note (msvc cross-check DEFERRED for this crate)**
 
+Unlike prior pure-Rust slices, `openvhost-core` now pulls `libsqlite3-sys` (bundled C SQLite). A `cargo check --target x86_64-pc-windows-msvc` from macOS runs that crate's build script, which compiles `sqlite3.c` for the msvc target — needing the msvc **C** toolchain (`cl.exe`), absent on macOS. So the from-macOS msvc cross-check that stood in for CI on pure-Rust crates cannot run for the DB layer.
+
+Do NOT gate on it. Run it once, INFORMATIONAL only, and record the outcome:
 ```bash
-cargo check --target x86_64-pc-windows-msvc -p openvhost-core 2>&1 | tail -5
+cargo check --target x86_64-pc-windows-msvc -p openvhost-core 2>&1 | tail -8 || true
 ```
-
-Expected: clean (sqlx sqlite bundles its own C SQLite; `Db`/newtypes are portable). If the msvc target is missing: `rustup target add x86_64-pc-windows-msvc`.
+A failure on the `libsqlite3-sys` C compilation is EXPECTED and is NOT a task failure — note it in the report. Windows build verification of the DB layer moves to the Windows-enablement CI matrix (macOS-first scope). The `Db`/newtypes/repo have no `#[cfg]` platform code, so nothing platform-specific needs verifying beyond that C build.
 
 - [ ] **Step 5: Push + PR**
 
