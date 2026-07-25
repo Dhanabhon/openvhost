@@ -26,6 +26,7 @@
 // These tests render the real component (SSR — no DOM needed) and assert the two properties that
 // keep line 58 and line 64 satisfied.
 
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { render } from 'svelte/server';
 import TitleBar from './TitleBar.svelte';
@@ -79,10 +80,36 @@ describe('TitleBar drag region', () => {
 					CLICKABLE_TAGS.includes(tag) ||
 					/\bcontenteditable(?!\s*=\s*["']false["'])/.test(attrs) ||
 					/\btabindex\s*=\s*["'](?!-1["'])/.test(attrs) ||
-					INTERACTIVE_ROLES.some((role) => new RegExp(`\\brole\\s*=\\s*["']${role}["']`).test(attrs))
+					INTERACTIVE_ROLES.some((role) =>
+						new RegExp(`\\brole\\s*=\\s*["']${role}["']`).test(attrs)
+					)
 			)
 			.map(({ tag, attrs }) => `<${tag}${attrs}>`);
 
 		expect(offenders).toEqual([]);
+	});
+
+	it('grants the start_dragging capability the drag region depends on', () => {
+		// The SECOND half of the contract, and the half that is invisible in the markup.
+		//
+		// Satisfying isDragRegion() only gets as far as drag.js:104:
+		//     window.__TAURI_INTERNALS__.invoke('plugin:window|' + cmd)
+		// which is fired WITHOUT await and WITHOUT .catch(). So if the capability does not permit
+		// `start_dragging`, the ACL rejects it and the rejection is swallowed: correct attribute,
+		// no drag, no error anywhere. Indistinguishable from the markup bug above.
+		//
+		// `core:default` is NOT enough. It pulls in `core:window:default`, which is a read-only
+		// GETTER set (allow-inner-size, allow-is-focused, allow-title, …). It does include
+		// `allow-internal-toggle-maximize` — which is why double-click-to-zoom works off
+		// `core:default` alone while dragging does not — but it does NOT include
+		// `allow-start-dragging`. That has to be granted explicitly.
+		//
+		// This asserts against the COMMITTED capability file. It cannot resolve the real ACL
+		// (src-tauri/gen/ is generated and gitignored, so it does not exist in a clean checkout),
+		// hence the hardcoded knowledge above about what core:window:default contains.
+		const cap = JSON.parse(
+			readFileSync(new URL('../../../src-tauri/capabilities/default.json', import.meta.url), 'utf8')
+		);
+		expect(cap.permissions).toContain('core:window:allow-start-dragging');
 	});
 });
