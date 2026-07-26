@@ -12,6 +12,10 @@ describe('formatBytes', () => {
 		expect(formatBytes(10 * 1024)).toBe('10 KB');
 		expect(formatBytes(1024 ** 3)).toBe('1.0 GB');
 		expect(formatBytes(1024 ** 3 * 12)).toBe('12 GB');
+		// M-a: the code already ships a TB tier the spec's §4.4/§7 omitted —
+		// amended there rather than removed here, since the code is the correct
+		// side of that disagreement. Pin it so it stays unpinned no longer.
+		expect(formatBytes(1024 ** 4)).toBe('1.0 TB');
 	});
 
 	// Zero is only ever "nothing is running". "0 B" reads like a measurement

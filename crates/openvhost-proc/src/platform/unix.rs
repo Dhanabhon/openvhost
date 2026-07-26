@@ -163,7 +163,7 @@ pub(crate) fn process_rss(pid: u32) -> io::Result<Option<u64>> {
     if pid == 0 || pid > i32::MAX as u32 {
         return Ok(None); // pid 0 is kernel_task; out-of-range can't be ours
     }
-    // SAFETY: `proc_taskinfo` is a POD of `u64`/`i32` fields (libc 0.2.189,
+    // SAFETY: `proc_taskinfo` is a POD of `u64`/`i32` fields (libc 0.2.187,
     // unix/bsd/apple/mod.rs:585), so an all-zero bit pattern is a valid value.
     let mut ti: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;

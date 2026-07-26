@@ -50,7 +50,7 @@ running system on 2026-07-26, not recalled.
 
 ### 3.1 Reading resident memory
 
-`libc 0.2.189` already exposes all three pieces needed — no new dependency:
+`libc 0.2.187` already exposes all three pieces needed — no new dependency:
 
 | Item | Location in libc |
 |---|---|
@@ -198,10 +198,10 @@ of a Rust timer that has to be told about window state.
   region) would make it read as part of the page and would scroll with it.
 - `formatBytes(n)` — pure, in a derive module, unit tested. **Specified exactly, so the
   implementation and its tests cannot disagree:** 1024-based steps labelled
-  `B / KB / MB / GB` (the convention `ps` and developer tooling use, not Finder's
+  `B / KB / MB / GB / TB` (the convention `ps` and developer tooling use, not Finder's
   decimal); one decimal place when the mantissa is below 10, none at or above it. So
-  `1.2 GB`, `85 MB`, `9.4 MB`, `512 KB`, `999 B`. Zero renders as `0 MB` in the strip so
-  the unit does not jump between states.
+  `1.0 TB`, `1.2 GB`, `85 MB`, `9.4 MB`, `512 KB`, `999 B`. Zero renders as `0 MB` in the
+  strip so the unit does not jump between states.
 
 ## 5. Cadence and cost
 
@@ -251,9 +251,9 @@ Frontend:
 
 - `formatBytes` at boundaries, asserting exact strings per §4.4: `0` → `0 MB`,
   `999` → `999 B`, `1024` → `1.0 KB`, `10 * 1024` → `10 KB` (the mantissa-10 switch from
-  one decimal to none), `1024^3` → `1.0 GB`, `1024^3 * 12` → `12 GB`. Vectors chosen to
-  be exact in binary floating point on purpose — `1024^3 * 1.25` would be a trap, since
-  `(1.25).toFixed(1)` is `"1.3"`, not `"1.2"`.
+  one decimal to none), `1024^3` → `1.0 GB`, `1024^3 * 12` → `12 GB`, `1024^4` →
+  `1.0 TB`. Vectors chosen to be exact in binary floating point on purpose —
+  `1024^3 * 1.25` would be a trap, since `(1.25).toFixed(1)` is `"1.3"`, not `"1.2"`.
 - Store: an api rejection leaves the figure unknown rather than zero (a zero would
   read as "nothing running", which is a different and wrong claim).
 - Store: the hidden-window pause actually stops issuing calls.
