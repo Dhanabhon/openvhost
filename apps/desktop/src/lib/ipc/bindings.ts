@@ -46,9 +46,9 @@ export const commands = {
 	 *  clean error the strip renders as "—" rather than Tauri's raw state panic
 	 *  message. Same precedent as the quit path.
 	 * 
-	 *  An `Err` from `process_rss` aborts the whole read — it means measurement is
-	 *  impossible on this platform, and reporting a partial sum as if it were
-	 *  complete would be a false figure (spec §4.1).
+	 *  The abort-on-`Err` rule (spec §4.1) lives in `collect_readings`, not here —
+	 *  see its doc comment for why the read loop was extracted instead of kept
+	 *  inline.
 	 */
 	servicesMemory: () => typedError<ServicesMemoryDto, IpcError>(__TAURI_INVOKE("services_memory")),
 	/**

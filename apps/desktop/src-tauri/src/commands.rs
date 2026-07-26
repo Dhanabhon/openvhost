@@ -210,6 +210,33 @@ fn sum_readings(readings: impl Iterator<Item = Option<u64>>) -> (u64, u32) {
     (bytes, count)
 }
 
+/// Read one resident-memory figure per pid, aborting the WHOLE collection on
+/// the first `Err`.
+///
+/// This is split out of `services_memory` because the abort-on-`Err` rule is a
+/// spec requirement (§4.1: an unreadable pid means measurement is impossible
+/// on this platform, so a partial sum must never be presented to the user as
+/// if it were complete) that used to live ENTIRELY inside that command's body,
+/// behind a `.map_err(...)?` that needs a live `AppHandle` and a real
+/// `Supervisor` to reach at all. Nothing could exercise it in a unit test, so
+/// a later "simplification" — swapping that `?` for `.ok()`, pushing a reading
+/// before mapping its error, or folding the loop into a `filter_map` over the
+/// `Result` — would silently start reporting a partial sum as if it were
+/// complete, and no test would fail.
+///
+/// Injecting `read` turns the rule into a pure function of its inputs, so it
+/// is reachable from a test the same way `sum_readings`'s rule already is. The
+/// short-circuit itself is `Result`'s `FromIterator` impl doing its job:
+/// `.collect::<io::Result<Vec<_>>>()` stops pulling from `pids.map(read)` at
+/// the first `Err`, so the abort is a property of `collect` rather than of
+/// hand-written control flow a future editor could quietly reorder.
+fn collect_readings(
+    pids: impl Iterator<Item = u32>,
+    read: impl Fn(u32) -> std::io::Result<Option<u64>>,
+) -> std::io::Result<Vec<Option<u64>>> {
+    pids.map(read).collect()
+}
+
 /// Resident memory of everything the supervisor is running.
 ///
 /// `try_state` rather than `State<'_, Arc<Supervisor>>`: the supervisor is only
@@ -217,9 +244,9 @@ fn sum_readings(readings: impl Iterator<Item = Option<u64>>) -> (u64, u32) {
 /// clean error the strip renders as "—" rather than Tauri's raw state panic
 /// message. Same precedent as the quit path.
 ///
-/// An `Err` from `process_rss` aborts the whole read — it means measurement is
-/// impossible on this platform, and reporting a partial sum as if it were
-/// complete would be a false figure (spec §4.1).
+/// The abort-on-`Err` rule (spec §4.1) lives in `collect_readings`, not here —
+/// see its doc comment for why the read loop was extracted instead of kept
+/// inline.
 #[tauri::command]
 #[specta::specta]
 pub async fn services_memory(app: tauri::AppHandle) -> Result<ServicesMemoryDto, IpcError> {
@@ -229,15 +256,12 @@ pub async fn services_memory(app: tauri::AppHandle) -> Result<ServicesMemoryDto,
             message: "the supervisor is not running".to_string(),
         });
     };
-    let mut readings: Vec<Option<u64>> = Vec::new();
-    for status in sup.snapshot() {
-        let Some(pid) = status.pid else { continue };
-        readings.push(
-            openvhost_proc::platform::process_rss(pid).map_err(|e| IpcError::Proc {
-                message: e.to_string(),
-            })?,
-        );
-    }
+    let pids = sup.snapshot().into_iter().filter_map(|status| status.pid);
+    let readings = collect_readings(pids, openvhost_proc::platform::process_rss).map_err(|e| {
+        IpcError::Proc {
+            message: e.to_string(),
+        }
+    })?;
     let (bytes, process_count) = sum_readings(readings.into_iter());
     Ok(ServicesMemoryDto {
         bytes,
@@ -881,6 +905,66 @@ mod site_ipc_tests {
         let readings = vec![Some(u64::MAX), Some(1000u64)];
         let (bytes, _) = sum_readings(readings.into_iter());
         assert_eq!(bytes, u64::MAX);
+    }
+
+    /// The abort rule (spec §4.1): once a reading comes back `Err`, the whole
+    /// collection must stop — not just return an error eventually, but stop
+    /// ASKING. A hand-written loop that reads every pid and only THEN returns
+    /// the first error would also satisfy a bare `is_err()` check here, and it
+    /// is the wrong, worse behaviour: it spends however many reads the
+    /// remaining pids would have cost on a result that is going to be thrown
+    /// away. The call counter is the load-bearing half of this test — without
+    /// it, this test cannot tell a real abort from "abort, eventually".
+    #[test]
+    fn collect_readings_aborts_without_reading_pids_after_the_failure() {
+        use std::cell::Cell;
+        let calls: Cell<u32> = Cell::new(0);
+        let pids = vec![1u32, 2, 3, 4];
+        let result = collect_readings(pids.into_iter(), |pid| {
+            calls.set(calls.get() + 1);
+            match pid {
+                1 => Ok(Some(1_000)),
+                2 => Err(std::io::Error::other("boom")),
+                // Would answer for pids 3 and 4 if `collect_readings` ever
+                // asked — asserted below that it never does.
+                _ => Ok(Some(9_999)),
+            }
+        });
+        assert!(
+            result.is_err(),
+            "an Err reading must fail the whole collection"
+        );
+        assert_eq!(
+            calls.get(),
+            2,
+            "the reader must be called for pid 1 and the failing pid 2, and NO \
+             FURTHER — a count of 4 here would mean every pid was read before the \
+             error was returned, which is exactly the regression this test exists \
+             to catch"
+        );
+    }
+
+    /// A mix of `Ok(Some(_))` and `Ok(None)` must come back in the same order
+    /// the pids went in, untouched: `sum_readings` is the only place allowed to
+    /// drop a `None` from the count, so nothing upstream of it may reorder or
+    /// filter readings first.
+    #[test]
+    fn collect_readings_passes_through_hits_and_misses_in_order() {
+        let pids = vec![10u32, 20, 30, 40];
+        let result = collect_readings(pids.into_iter(), |pid| {
+            Ok(match pid {
+                10 => Some(111),
+                20 => None,
+                30 => Some(333),
+                _ => None,
+            })
+        });
+        assert_eq!(
+            result.unwrap(),
+            vec![Some(111), None, Some(333), None],
+            "readings must arrive in pid order with Ok(None) preserved, not \
+             dropped or reordered before sum_readings sees them"
+        );
     }
 }
 
