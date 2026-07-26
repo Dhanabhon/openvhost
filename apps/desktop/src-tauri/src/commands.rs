@@ -168,6 +168,124 @@ pub async fn service_log_tail(
     sup.log_tail(&id, n as usize).map_err(IpcError::from)
 }
 
+/// Summed resident memory of the supervised services.
+///
+/// `bytes` and `process_count` are both u64/u32 crossing a
+/// `.dangerously_cast_bigints_to_number()` boundary — see `lib.rs`'s standing
+/// warning, which names "byte totals" as the case requiring a conscious check.
+/// `2^53` bytes is 9 petabytes; a resident set is many orders of magnitude
+/// below it. Checked, not assumed.
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ServicesMemoryDto {
+    pub bytes: u64,
+    /// How many pids actually produced a figure — NOT how many services are
+    /// running. See `sum_readings`.
+    pub process_count: u32,
+}
+
+/// Total bytes under the OpenVHost home. Same bigint check as
+/// [`ServicesMemoryDto`]: a home directory is nowhere near 9 PB.
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct HomeUsageDto {
+    pub bytes: u64,
+}
+
+/// Sum the readings that produced a figure, and count them.
+///
+/// Extracted from `services_memory` so the rule is testable without a live
+/// `AppHandle` and a real supervisor: `None` readings (a pid that exited between
+/// the snapshot and the read) drop out of the sum AND the count together, so the
+/// figure and its "N processes" label can never contradict each other.
+/// `saturating_add` so an absurd reading cannot wrap the total into a small,
+/// plausible-looking number.
+fn sum_readings(readings: impl Iterator<Item = Option<u64>>) -> (u64, u32) {
+    let mut bytes: u64 = 0;
+    let mut count: u32 = 0;
+    for r in readings.flatten() {
+        bytes = bytes.saturating_add(r);
+        count = count.saturating_add(1);
+    }
+    (bytes, count)
+}
+
+/// Read one resident-memory figure per pid, aborting the WHOLE collection on
+/// the first `Err`.
+///
+/// This is split out of `services_memory` because the abort-on-`Err` rule is a
+/// spec requirement (§4.1: an unreadable pid means measurement is impossible
+/// on this platform, so a partial sum must never be presented to the user as
+/// if it were complete) that used to live ENTIRELY inside that command's body,
+/// behind a `.map_err(...)?` that needs a live `AppHandle` and a real
+/// `Supervisor` to reach at all. Nothing could exercise it in a unit test, so
+/// a later "simplification" — swapping that `?` for `.ok()`, pushing a reading
+/// before mapping its error, or folding the loop into a `filter_map` over the
+/// `Result` — would silently start reporting a partial sum as if it were
+/// complete, and no test would fail.
+///
+/// Injecting `read` turns the rule into a pure function of its inputs, so it
+/// is reachable from a test the same way `sum_readings`'s rule already is. The
+/// short-circuit itself is `Result`'s `FromIterator` impl doing its job:
+/// `.collect::<io::Result<Vec<_>>>()` stops pulling from `pids.map(read)` at
+/// the first `Err`, so the abort is a property of `collect` rather than of
+/// hand-written control flow a future editor could quietly reorder.
+fn collect_readings(
+    pids: impl Iterator<Item = u32>,
+    read: impl Fn(u32) -> std::io::Result<Option<u64>>,
+) -> std::io::Result<Vec<Option<u64>>> {
+    pids.map(read).collect()
+}
+
+/// Resident memory of everything the supervisor is running.
+///
+/// `try_state` rather than `State<'_, Arc<Supervisor>>`: the supervisor is only
+/// managed when the setup bootstrap succeeded, and an unmanaged one must give a
+/// clean error the strip renders as "—" rather than Tauri's raw state panic
+/// message. Same precedent as the quit path.
+///
+/// The abort-on-`Err` rule (spec §4.1) lives in `collect_readings`, not here —
+/// see its doc comment for why the read loop was extracted instead of kept
+/// inline.
+#[tauri::command]
+#[specta::specta]
+pub async fn services_memory(app: tauri::AppHandle) -> Result<ServicesMemoryDto, IpcError> {
+    use tauri::Manager;
+    let Some(sup) = app.try_state::<Arc<Supervisor>>() else {
+        return Err(IpcError::Proc {
+            message: "the supervisor is not running".to_string(),
+        });
+    };
+    let pids = sup.snapshot().into_iter().filter_map(|status| status.pid);
+    let readings = collect_readings(pids, openvhost_proc::platform::process_rss).map_err(|e| {
+        IpcError::Proc {
+            message: e.to_string(),
+        }
+    })?;
+    let (bytes, process_count) = sum_readings(readings.into_iter());
+    Ok(ServicesMemoryDto {
+        bytes,
+        process_count,
+    })
+}
+
+/// Total size of the OpenVHost home.
+///
+/// The walk runs on `spawn_blocking`, not inline: it measured 40 ms over 6,470
+/// files (spec §3.2), which is long enough to matter on a runtime thread, and
+/// the figure is not urgent.
+#[tauri::command]
+#[specta::specta]
+pub async fn home_disk_usage() -> Result<HomeUsageDto, IpcError> {
+    let bytes = tauri::async_runtime::spawn_blocking(openvhost_core::home_disk_usage)
+        .await
+        .map_err(|e| IpcError::Core {
+            message: format!("the disk-usage task failed to run: {e}"),
+        })?
+        .map_err(IpcError::from)?;
+    Ok(HomeUsageDto { bytes })
+}
+
 /// A site as it crosses IPC. `Site`'s fields are opaque validated newtypes
 /// (deliberately not serializable), so the wire form is plain strings.
 #[derive(Debug, Clone, serde::Serialize, specta::Type)]
@@ -759,6 +877,94 @@ mod site_ipc_tests {
             }
             other => panic!("expected Validation, got {other:?}"),
         }
+    }
+
+    /// The count must report pids that actually produced a figure, not pids that
+    /// were listed. A service that exits between the snapshot and the read drops
+    /// out of BOTH the sum and the count, so the number and its label can never
+    /// disagree (spec §6).
+    #[test]
+    fn memory_sum_counts_only_the_pids_that_answered() {
+        let readings = vec![Some(1000u64), None, Some(2500u64), None];
+        let (bytes, count) = sum_readings(readings.into_iter());
+        assert_eq!(bytes, 3500);
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn memory_sum_of_nothing_is_zero_with_a_zero_count() {
+        let (bytes, count) = sum_readings(std::iter::empty());
+        assert_eq!(bytes, 0);
+        assert_eq!(count, 0);
+    }
+
+    /// Saturating, not wrapping: an absurd reading must not wrap the total to a
+    /// small number that looks plausible.
+    #[test]
+    fn memory_sum_saturates_instead_of_wrapping() {
+        let readings = vec![Some(u64::MAX), Some(1000u64)];
+        let (bytes, _) = sum_readings(readings.into_iter());
+        assert_eq!(bytes, u64::MAX);
+    }
+
+    /// The abort rule (spec §4.1): once a reading comes back `Err`, the whole
+    /// collection must stop — not just return an error eventually, but stop
+    /// ASKING. A hand-written loop that reads every pid and only THEN returns
+    /// the first error would also satisfy a bare `is_err()` check here, and it
+    /// is the wrong, worse behaviour: it spends however many reads the
+    /// remaining pids would have cost on a result that is going to be thrown
+    /// away. The call counter is the load-bearing half of this test — without
+    /// it, this test cannot tell a real abort from "abort, eventually".
+    #[test]
+    fn collect_readings_aborts_without_reading_pids_after_the_failure() {
+        use std::cell::Cell;
+        let calls: Cell<u32> = Cell::new(0);
+        let pids = vec![1u32, 2, 3, 4];
+        let result = collect_readings(pids.into_iter(), |pid| {
+            calls.set(calls.get() + 1);
+            match pid {
+                1 => Ok(Some(1_000)),
+                2 => Err(std::io::Error::other("boom")),
+                // Would answer for pids 3 and 4 if `collect_readings` ever
+                // asked — asserted below that it never does.
+                _ => Ok(Some(9_999)),
+            }
+        });
+        assert!(
+            result.is_err(),
+            "an Err reading must fail the whole collection"
+        );
+        assert_eq!(
+            calls.get(),
+            2,
+            "the reader must be called for pid 1 and the failing pid 2, and NO \
+             FURTHER — a count of 4 here would mean every pid was read before the \
+             error was returned, which is exactly the regression this test exists \
+             to catch"
+        );
+    }
+
+    /// A mix of `Ok(Some(_))` and `Ok(None)` must come back in the same order
+    /// the pids went in, untouched: `sum_readings` is the only place allowed to
+    /// drop a `None` from the count, so nothing upstream of it may reorder or
+    /// filter readings first.
+    #[test]
+    fn collect_readings_passes_through_hits_and_misses_in_order() {
+        let pids = vec![10u32, 20, 30, 40];
+        let result = collect_readings(pids.into_iter(), |pid| {
+            Ok(match pid {
+                10 => Some(111),
+                20 => None,
+                30 => Some(333),
+                _ => None,
+            })
+        });
+        assert_eq!(
+            result.unwrap(),
+            vec![Some(111), None, Some(333), None],
+            "readings must arrive in pid order with Ok(None) preserved, not \
+             dropped or reordered before sum_readings sees them"
+        );
     }
 }
 

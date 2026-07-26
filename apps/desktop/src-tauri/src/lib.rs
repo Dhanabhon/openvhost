@@ -40,6 +40,8 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::validate_web_server_config,
             commands::confirm_quit,
             commands::quit_dialog_ready,
+            commands::services_memory,
+            commands::home_disk_usage,
         ])
         .events(collect_events![
             commands::ServiceStateEvent,

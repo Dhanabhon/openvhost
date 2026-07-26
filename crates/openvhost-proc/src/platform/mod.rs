@@ -190,6 +190,17 @@ pub fn process_start_time(pid: u32) -> std::io::Result<Option<ProcStartTime>> {
     windows::process_start_time(pid)
 }
 
+/// Resident set size in bytes for a live pid. See the platform impls for the
+/// `Ok(None)` vs `Err` contract.
+#[cfg(unix)]
+pub fn process_rss(pid: u32) -> std::io::Result<Option<u64>> {
+    unix::process_rss(pid)
+}
+#[cfg(windows)]
+pub fn process_rss(pid: u32) -> std::io::Result<Option<u64>> {
+    windows::process_rss(pid)
+}
+
 // `current_boot_id`'s `#[allow(dead_code)]` was dropped here (P0-8 Task 2):
 // `registry::load()` is now a real, non-test caller on both dispatch arms.
 #[cfg(unix)]

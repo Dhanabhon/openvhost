@@ -38,6 +38,27 @@ export const commands = {
 	 *  confirmation dialog on their own window.
 	 */
 	quitDialogReady: () => typedError<null, IpcError>(__TAURI_INVOKE("quit_dialog_ready")),
+	/**
+	 *  Resident memory of everything the supervisor is running.
+	 * 
+	 *  `try_state` rather than `State<'_, Arc<Supervisor>>`: the supervisor is only
+	 *  managed when the setup bootstrap succeeded, and an unmanaged one must give a
+	 *  clean error the strip renders as "—" rather than Tauri's raw state panic
+	 *  message. Same precedent as the quit path.
+	 * 
+	 *  The abort-on-`Err` rule (spec §4.1) lives in `collect_readings`, not here —
+	 *  see its doc comment for why the read loop was extracted instead of kept
+	 *  inline.
+	 */
+	servicesMemory: () => typedError<ServicesMemoryDto, IpcError>(__TAURI_INVOKE("services_memory")),
+	/**
+	 *  Total size of the OpenVHost home.
+	 * 
+	 *  The walk runs on `spawn_blocking`, not inline: it measured 40 ms over 6,470
+	 *  files (spec §3.2), which is long enough to matter on a runtime thread, and
+	 *  the figure is not urgent.
+	 */
+	homeDiskUsage: () => typedError<HomeUsageDto, IpcError>(__TAURI_INVOKE("home_disk_usage")),
 };
 
 /** Events */
@@ -61,6 +82,14 @@ export type CoreInfo = {
 	arch: string,
 	/**  Resolved OpenVHost home directory, for display. */
 	openvhostHome: string,
+};
+
+/**
+ *  Total bytes under the OpenVHost home. Same bigint check as
+ *  [`ServicesMemoryDto`]: a home directory is nowhere near 9 PB.
+ */
+export type HomeUsageDto = {
+	bytes: number,
 };
 
 /**
@@ -115,6 +144,24 @@ export type ServiceStatus = {
 	endpoint: string | null,
 	pid: number | null,
 	state: ServiceState,
+};
+
+/**
+ *  Summed resident memory of the supervised services.
+ * 
+ *  `bytes` and `process_count` are both u64/u32 crossing a
+ *  `.dangerously_cast_bigints_to_number()` boundary — see `lib.rs`'s standing
+ *  warning, which names "byte totals" as the case requiring a conscious check.
+ *  `2^53` bytes is 9 petabytes; a resident set is many orders of magnitude
+ *  below it. Checked, not assumed.
+ */
+export type ServicesMemoryDto = {
+	bytes: number,
+	/**
+	 *  How many pids actually produced a figure — NOT how many services are
+	 *  running. See `sum_readings`.
+	 */
+	processCount: number,
 };
 
 /**

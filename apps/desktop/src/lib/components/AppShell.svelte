@@ -3,7 +3,9 @@
 	import TitleBar from './TitleBar.svelte';
 	import Rail from './Rail.svelte';
 	import ErrorBanner from './ErrorBanner.svelte';
+	import StatusBar from './StatusBar.svelte';
 	import { servicesStore } from '$lib/services.shared.svelte';
+	import { statsStore } from '$lib/stats.shared.svelte';
 
 	// Defaults to 'sites', which is what `/` renders (routes/+page.svelte) — so the landing
 	// page needs no `active` of its own, and a new route that forgets the prop highlights the
@@ -36,6 +38,12 @@
 			{@render children()}
 		</main>
 	</div>
+	<StatusBar
+		servicesBytes={statsStore.servicesBytes}
+		processCount={statsStore.processCount}
+		homeBytes={statsStore.homeBytes}
+		homePending={statsStore.homePending}
+	/>
 </div>
 
 <style>
@@ -44,10 +52,14 @@
 	   window floating on a page — border/border-radius/box-shadow all removed here because the
 	   real macOS window already draws its own chrome; this div IS the window's content, not a
 	   picture of one). Relies on `html, body { height: 100% }` in routes/layout.css so this
-	   height: 100% has a definite ancestor height to resolve against. */
+	   height: 100% has a definite ancestor height to resolve against.
+	   `auto 1fr auto`: titlebar, the shell, and the status strip. The strip is a
+	   THIRD ROW rather than a child of `.content` because it reports window-level
+	   state — putting it inside `.content` (the one scrolling region) would make it
+	   scroll away with the page and read as part of it. */
 	.window {
 		display: grid;
-		grid-template-rows: auto 1fr;
+		grid-template-rows: auto 1fr auto;
 		height: 100%;
 		width: 100%;
 		background: var(--vh-bg);
