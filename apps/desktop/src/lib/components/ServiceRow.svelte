@@ -17,7 +17,11 @@
 
 <div class="row svc-row">
 	<div class="primary">{service.displayName}</div>
-	<div class="mono num meta">{service.endpoint ?? '—'}</div>
+	<!-- `title` so the full value stays reachable when the cell ellipsizes: `endpoint` is
+	     free-form text from the ServiceSpec, and the demo ticker's is a whole sentence. -->
+	<div class="mono num meta endpoint" title={service.endpoint ?? undefined}>
+		{service.endpoint ?? '—'}
+	</div>
 	<StatusPill kind={service.state.kind} testId="pill-{service.id}" />
 	<div class="row-actions">
 		{#if service.state.kind === 'stopped'}
@@ -64,6 +68,9 @@
 	      (name / version / endpoint / state / action) — `ServiceStatus` carries no version
 	      field, so the version column is dropped and the remaining columns re-proportioned.
 
+	   1b. The re-proportioning that followed from (1) was wrong on both axes and is corrected
+	      at `.svc-row` below, where the reasoning lives.
+
 	   2. The mock's `.fail-detail .actions` (the "View log" / "Change port" links) is NOT
 	      ported: neither a per-service log route nor a port-editing UI exists anywhere in this
 	      app yet, and this codebase's established convention (see Rail.svelte's Sites/Logs/
@@ -102,8 +109,43 @@
 		justify-content: flex-end;
 		opacity: 0.85;
 	}
+	/* The ENDPOINT carries the flexible track, not the name.
+
+	   The mock is 5 columns — `minmax(180px, 1fr) 90px 150px 120px auto` (name / version /
+	   endpoint / state / action) — where 150px suited its short sample endpoints. Dropping the
+	   version column (see deviation 1 above) originally re-proportioned this to
+	   `minmax(200px, 1fr) 150px 120px auto`, which broke twice over:
+
+	   - the name was the only `fr` track, so it absorbed ALL the slack. On a 1180px window
+	     that left ~490px of dead space after "nginx" and squeezed the other three columns
+	     against the right edge.
+	   - 150px is narrower than `http://127.0.0.1:8080` renders in mono at
+	     `--vh-text-table`, and a grid item defaults to `min-width: auto` — it refuses to
+	     shrink below min-content — so the text did not clip, it SPILLED into the pill.
+
+	   Now: the name takes a modest share, the endpoint takes the rest (it holds the variable
+	   content), and the pill keeps a FIXED 120px on purpose — the state text changes width
+	   between running/stopped/failed/starting, and a content-sized track would shift the
+	   action button horizontally every time a service changed state. */
 	.svc-row {
-		grid-template-columns: minmax(200px, 1fr) 150px 120px auto;
+		grid-template-columns: minmax(140px, 0.8fr) minmax(210px, 1.6fr) 120px auto;
+	}
+	/* `min-width: 0` is the load-bearing half: it overrides the grid item's `auto` minimum so
+	   the cell may shrink and the text ellipsizes instead of overflowing its track. Without
+	   it the other three properties do nothing. */
+	.row .endpoint {
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	/* Same reason, so a long display name shrinks rather than pushing its neighbours. Service
+	   names are ours and short today; this keeps the row structurally sound if one grows. */
+	.row .primary {
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 	.fail-detail {
 		margin: 0 var(--vh-space-4) var(--vh-space-3);
