@@ -53,7 +53,17 @@ Read spec §3.1 and §4.1 first. The measured facts there (bytes not pages; `rc 
 - Modify: `crates/openvhost-proc/src/platform/unix.rs` (add after `process_start_time`'s non-macOS stub, around line 132)
 - Modify: `crates/openvhost-proc/src/platform/windows.rs` (add after `process_start_time`'s stub, around line 86)
 - Modify: `crates/openvhost-proc/src/platform/mod.rs` (add after the `process_start_time` dispatch pair, around line 191)
-- Test: `crates/openvhost-proc/src/platform/unix.rs` (its existing `#[cfg(test)]` module at line 257)
+- Test: `crates/openvhost-proc/src/platform/unix.rs` — **a NEW test module**, not the existing one. The `#[cfg(test)] mod floor_tests` at line 257 is purpose-named for the reaper's pid-floor predicate and carries no lint allowances; the workspace sets `unwrap_used = "warn"` and `expect_used = "warn"` (`Cargo.toml:26-28`) and clippy runs with `-D warnings`, so a module using `.unwrap()` needs the allowance explicitly. Add at the end of the file:
+
+```rust
+#[cfg(all(test, target_os = "macos"))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod rss_tests {
+    use super::*;
+
+    // ... the three tests from Step 1 go here ...
+}
+```
 
 **Interfaces:**
 - Consumes: nothing from earlier tasks.
@@ -61,14 +71,13 @@ Read spec §3.1 and §4.1 first. The measured facts there (bytes not pages; `rc 
 
 - [ ] **Step 1: Write the failing tests**
 
-Append inside the existing `#[cfg(test)] mod tests` in `crates/openvhost-proc/src/platform/unix.rs`:
+Create the `rss_tests` module described under **Files** above and put these three tests in it. The module is already `#[cfg(all(test, target_os = "macos"))]`, so the individual tests need no further `#[cfg]`:
 
 ```rust
     /// A live process must report a non-zero resident size. This is the test that
     /// catches a units mistake or a wrong struct field: `/bin/sleep`'s RSS is a
     /// few hundred KB, so a pages-vs-bytes error would show up as an absurd value
     /// and a wrong-field error as zero.
-    #[cfg(target_os = "macos")]
     #[test]
     fn rss_of_a_live_process_is_plausible() {
         use std::process::{Command, Stdio};
@@ -94,7 +103,6 @@ Append inside the existing `#[cfg(test)] mod tests` in `crates/openvhost-proc/sr
     /// A pid that no longer exists is `Ok(None)`, NOT `Err`. The caller samples
     /// pids the supervisor listed a moment earlier; a process exiting in that gap
     /// is normal and must not surface as a failure (spec §4.1).
-    #[cfg(target_os = "macos")]
     #[test]
     fn rss_of_a_dead_pid_is_none_not_an_error() {
         use std::process::{Command, Stdio};
@@ -113,7 +121,6 @@ Append inside the existing `#[cfg(test)] mod tests` in `crates/openvhost-proc/sr
 
     /// Guarded before any FFI: pid 0 is `kernel_task` and anything above
     /// `i32::MAX` cannot be a pid we spawned.
-    #[cfg(target_os = "macos")]
     #[test]
     fn rss_rejects_pid_zero_and_out_of_range_without_calling_ffi() {
         assert_eq!(process_rss(0).unwrap(), None);
