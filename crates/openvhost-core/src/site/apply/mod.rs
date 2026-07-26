@@ -3,9 +3,11 @@
 //! commit and validate it. See
 //! docs/superpowers/specs/2026-07-27-p1-site-apply-design.md.
 
-// TODO(Task 4): restore `mod plan;` and its re-exports below.
 // TODO(Task 5): restore `mod commit;` and its re-exports below.
 mod error;
+mod plan;
+#[cfg(test)]
+pub(crate) mod tests_support;
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
@@ -16,15 +18,10 @@ use openvhost_conf::{
 };
 
 pub use error::{ApplyError, RollbackReport};
+pub use plan::{ApplyPlan, ChangeKind, FileChange, plan};
 
 use crate::CoreError;
 use crate::site::model::{Site, SiteId};
-// `Docroot`/`Domain`/`PhpVersion`/`SiteName`/`WebServer` are only referenced
-// by the test module's fixtures below; without this gate they are genuinely
-// unused in a non-test build (`cfg(test)` is off) and trip `-D warnings`
-// under plain `cargo clippy`.
-#[cfg(test)]
-use crate::site::model::{Docroot, Domain, PhpVersion, SiteName, WebServer};
 
 /// Darwin's `sun_path` is 104 bytes including the NUL. php-fpm does not reject
 /// a longer path — it warns, truncates, binds the wrong path, and nginx 502s
@@ -147,42 +144,7 @@ pub fn render_set(input: &ApplyInput) -> Result<Vec<GeneratedFile>, ApplyError> 
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
-    fn site(name: &str, domain: &str, php: &str, enabled: bool) -> Site {
-        Site {
-            id: SiteId::new(),
-            name: SiteName::parse(name).unwrap(),
-            domain: Domain::parse(domain).unwrap(),
-            docroot: Docroot::parse("/tmp/projects/app").unwrap(),
-            web_server: WebServer::parse("nginx").unwrap(),
-            php_version: PhpVersion::parse(php).unwrap(),
-            enabled,
-            created_at: 0,
-            updated_at: 0,
-        }
-    }
-
-    fn runtimes(majors: &[&str]) -> InstalledRuntimes {
-        InstalledRuntimes {
-            nginx_bin: PathBuf::from("/opt/homebrew/opt/nginx/bin/nginx"),
-            php: majors
-                .iter()
-                .map(|m| PhpRuntime {
-                    major: (*m).to_string(),
-                    fpm_bin: PathBuf::from(format!("/opt/homebrew/opt/php@{m}/sbin/php-fpm")),
-                })
-                .collect(),
-        }
-    }
-
-    fn input(sites: Vec<Site>, majors: &[&str]) -> ApplyInput {
-        ApplyInput {
-            home: PathBuf::from("/tmp/ovh"),
-            sites,
-            runtimes: runtimes(majors),
-        }
-    }
+    use crate::site::apply::tests_support::{input, runtimes, site};
 
     #[test]
     fn renders_main_catch_all_site_and_pool() {
