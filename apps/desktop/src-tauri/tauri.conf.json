@@ -5,7 +5,7 @@
   "identifier": "dev.openvhost.desktop",
   "build": {
     "beforeDevCommand": "pnpm dev",
-    "devUrl": "http://localhost:5173",
+    "devUrl": "http://localhost:5183",
     "beforeBuildCommand": "pnpm build",
     "frontendDist": "../build"
   },
