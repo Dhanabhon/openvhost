@@ -41,6 +41,12 @@ export class StatsStore {
 
 	private memoryTimer: ReturnType<typeof setInterval> | null = null;
 	private homeTimer: ReturnType<typeof setInterval> | null = null;
+	/**
+	 * `Date.now()` of the last home reading that SUCCEEDED, or `null` if none
+	 * has yet. Lets `start()` skip an immediate re-walk on a resume that lands
+	 * within `HOME_INTERVAL_MS` of that success — see `start()`'s doc comment.
+	 */
+	private lastHomeSuccessAt: number | null = null;
 
 	constructor(private api: StatsApi) {}
 
@@ -60,6 +66,7 @@ export class StatsStore {
 	async refreshHome(): Promise<void> {
 		try {
 			this.homeBytes = (await this.api.homeDiskUsage()).bytes;
+			this.lastHomeSuccessAt = Date.now();
 		} catch (e) {
 			this.homeBytes = null;
 			this.lastError = e as IpcError;
@@ -74,11 +81,24 @@ export class StatsStore {
 	 * Begin polling. Idempotent: a second call while already running is a no-op
 	 * rather than a second set of timers, because a dev-HMR double mount would
 	 * otherwise silently double the sampling rate.
+	 *
+	 * The home walk is additionally guarded at the RESUME seam: the layout
+	 * calls `start()` on every `visibilitychange` back to visible (Cmd+Tab
+	 * between an IDE and this app is the primary interaction), and without
+	 * this guard that would re-walk the disk as often as the cheap memory
+	 * read, defeating the entire reason the two cadences are split (file
+	 * header; spec §4.3/§5). Gated on the last SUCCESS time, not on
+	 * `homeBytes === null`: gating on the value would also suppress the retry
+	 * after a FAILED read for a full interval, which spec §6 wants retried
+	 * instead. The memory read stays unconditional here — it is cheap and the
+	 * strip should feel live on every return.
 	 */
 	start(): void {
 		if (this.memoryTimer !== null) return;
 		void this.refreshMemory();
-		void this.refreshHome();
+		const homeIsFresh =
+			this.lastHomeSuccessAt !== null && Date.now() - this.lastHomeSuccessAt < HOME_INTERVAL_MS;
+		if (!homeIsFresh) void this.refreshHome();
 		this.memoryTimer = setInterval(() => void this.refreshMemory(), MEMORY_INTERVAL_MS);
 		this.homeTimer = setInterval(() => void this.refreshHome(), HOME_INTERVAL_MS);
 	}
