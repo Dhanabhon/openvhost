@@ -94,7 +94,7 @@
 					     diff carries generated config and user-controlled docroot paths, so
 					     `{@html}` is not used anywhere in this file (see the IPC-surface
 					     security review that flagged this). -->
-					<pre class="diff">{#each c.diff.split('\n') as line, i (i)}<span
+					<pre class="diff">{#each c.diff.replace(/\n$/, '').split('\n') as line, i (i)}<span
 								class="line"
 								data-line={line.startsWith('+') ? 'add' : line.startsWith('-') ? 'del' : 'ctx'}
 								>{line}</span

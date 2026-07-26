@@ -10,4 +10,9 @@ listen = {{ socket }}
 pm = ondemand
 pm.max_children = 4
 catch_workers_output = yes
+; Stated explicitly rather than relied on as php-fpm's own default (the same
+; move this project already made for nginx's mandatory `-e`): without
+; try_files $uri =404 at the nginx layer, this is what stops php-fpm from
+; executing a request for a file that isn't actually a .php script.
+security.limit_extensions = .php
 include={{ custom_pool_glob }}

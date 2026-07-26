@@ -54,6 +54,17 @@ describe('ApplyDialog', () => {
 		expect(body).toContain('+/sites/a.conf');
 	});
 
+	// A unified diff always ends in a trailing newline, so `diff.split('\n')`
+	// yields one extra empty segment at the end. Left unstripped, that segment
+	// renders as an empty `<span class="line">` after every file's diff — this
+	// fails if that trailing empty span ever comes back.
+	it('renders no empty line span for a diff ending in a trailing newline', () => {
+		const body = renderDialog({
+			changes: [{ path: '/a.conf', kind: 'added', diff: '+line one\n+line two\n' }]
+		});
+		expect(body).not.toMatch(/<span class="line"[^>]*><\/span>/);
+	});
+
 	it('emits each diff line with no whitespace between the text and its closing tag', () => {
 		// Svelte preserves whitespace verbatim inside <pre>. A newline/indent left
 		// between `{line}` and `</span>` becomes a real text node inside every

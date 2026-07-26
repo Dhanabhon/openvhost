@@ -17,10 +17,6 @@ pub enum CoreError {
         path: PathBuf,
         source: std::io::Error,
     },
-    /// The OpenVHost home is not valid UTF-8, so it cannot be written into
-    /// text configs faithfully.
-    #[error("openvhost home {} is not valid UTF-8", path.display())]
-    HomeNotUtf8 { path: PathBuf },
     /// The php-fpm unix socket path would exceed Darwin's 104-byte
     /// `sun_path`. php-fpm does NOT reject longer paths — it warns, silently
     /// truncates, and binds the wrong path while nginx 502s forever

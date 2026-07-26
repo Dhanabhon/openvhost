@@ -50,9 +50,25 @@ impl Drop for Killed {
 }
 
 /// Minimal HTTP/1.0 GET. Raw TCP keeps this test dependency-free.
+///
+/// `deadline` used to be checked only BETWEEN connection attempts: once
+/// `connect` succeeded, `read_to_string` had no timeout at all, so a wedged
+/// FastCGI backend — exactly the failure this test exists to catch — would
+/// hang the read forever instead of failing the test. A deadline that cannot
+/// fire is as useless as an assertion that cannot fail, so `set_read_timeout`
+/// bounds the read to whatever time is left before `deadline`, and a stalled
+/// backend now surfaces as a normal timed-out `get()` (returning `None`)
+/// rather than a CI job timeout with no diagnostic.
 fn get(port: u16, host: &str, path: &str, deadline: Instant) -> Option<String> {
     while Instant::now() < deadline {
         if let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            // A zero duration means "no timeout at all" to `set_read_timeout`,
+            // which is the exact hang this exists to prevent — floor it to a
+            // small positive value instead of passing `remaining` through
+            // unchecked.
+            let read_timeout = remaining.max(Duration::from_millis(100));
+            let _ = s.set_read_timeout(Some(read_timeout));
             let req = format!("GET {path} HTTP/1.0\r\nHost: {host}\r\n\r\n");
             if s.write_all(req.as_bytes()).is_ok() {
                 let mut buf = String::new();
@@ -215,8 +231,17 @@ async fn site_apply_serves_a_real_site_end_to_end() {
     );
     assert!(css.contains("color: red"));
 
-    // Regression: without `try_files $uri =404` in the PHP location, a file
-    // that is not PHP is executed as PHP through path info.
+    // Regression: `try_files $uri =404` in the PHP location is what stops this
+    // at the nginx layer. Without it, nginx would hand the request to php-fpm
+    // at all, and what happens next is NOT "style.css gets executed as PHP" —
+    // php-fpm's own `security.limit_extensions` default (which OpenVHost does
+    // not otherwise set) refuses to execute a script that isn't named `.php`,
+    // so the observed outcome one layer further down is a 403, not execution.
+    // This project does not want to rely on an inherited php-fpm default for
+    // that refusal, so `security.limit_extensions = .php` is now stated
+    // explicitly in the generated pool config (see pool.conf.tera and its
+    // adapter test) — this assertion is what proves nginx itself never lets
+    // the request reach that far in the first place.
     let exploit = get(LISTEN_PORT, "e2e.localhost", "/style.css/x.php", deadline).unwrap();
     assert!(
         exploit.starts_with("HTTP/1.1 404"),

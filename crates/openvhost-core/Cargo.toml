@@ -22,7 +22,6 @@ specta = ["dep:specta"]
 [dev-dependencies]
 serde_json = "1"
 tempfile = "3"
-openvhost-proc = { path = "../openvhost-proc" }
 tokio = { workspace = true }
 
 [lints]

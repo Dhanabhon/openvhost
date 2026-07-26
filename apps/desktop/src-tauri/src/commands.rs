@@ -436,11 +436,18 @@ pub async fn open_site(
         })
 }
 
-/// `http://<domain>`. Extracted so the one thing worth pinning — that the scheme
-/// is fixed and prepended, never taken from the stored value — is testable
-/// without a live `AppHandle` and a real database.
+/// `http://<domain>:<LISTEN_PORT>`. Extracted so the one thing worth pinning —
+/// that the scheme is fixed and prepended, never taken from the stored value —
+/// is testable without a live `AppHandle` and a real database.
+///
+/// The port is `site::apply::LISTEN_PORT` (8080): every applied site listens
+/// there, not on 80 (spec — port 80 needs the privileged helper, Phase 3), so
+/// a scheme-only URL sends the browser to a port nothing is bound to.
 fn site_url(domain: &str) -> String {
-    format!("http://{domain}")
+    format!(
+        "http://{domain}:{}",
+        openvhost_core::site::apply::LISTEN_PORT
+    )
 }
 
 #[tauri::command]
@@ -1162,11 +1169,24 @@ mod site_ipc_tests {
     /// `javascript:` URL reaching the OS opener. This test is what pins that.
     #[test]
     fn site_url_always_prepends_a_fixed_http_scheme() {
-        assert_eq!(site_url("hello.localhost"), "http://hello.localhost");
+        assert_eq!(site_url("hello.localhost"), "http://hello.localhost:8080");
         // Even if a scheme-looking value somehow reached the column, the result is
         // still an http URL naming it as a host — never a `file:`/`javascript:` URL.
         assert!(site_url("file:///etc/passwd").starts_with("http://"));
         assert!(site_url("javascript:alert(1)").starts_with("http://"));
+    }
+
+    /// Every applied site listens on `LISTEN_PORT` (8080), not 80 — a URL
+    /// missing the port sends the browser to a port nothing is bound to, and
+    /// it connection-errors instead of loading the site. This test fails if
+    /// the port is ever dropped from `site_url`.
+    #[test]
+    fn site_url_includes_the_port_every_site_actually_listens_on() {
+        let url = site_url("hello.localhost");
+        assert!(
+            url.ends_with(&format!(":{}", openvhost_core::site::apply::LISTEN_PORT)),
+            "expected {url:?} to end with the LISTEN_PORT the applied site actually listens on"
+        );
     }
 
     /// The count must report pids that actually produced a figure, not pids that

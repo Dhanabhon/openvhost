@@ -194,9 +194,9 @@
 				     (`config/custom/`) rather than leaving the reader with nowhere safe to put a
 				     customisation. -->
 				<p class="next">
-					Edit the file on disk, then validate again — this page is read-only. Apply
-					regenerates this file from your sites, so hand edits are lost on the next Apply.
-					Add custom directives under <code>config/custom/</code> instead.
+					Edit the file on disk, then validate again — this page is read-only. Apply regenerates
+					this file from your sites, so hand edits are lost on the next Apply. Add custom directives
+					under <code>config/custom/</code> instead.
 				</p>
 			{/if}
 		</div>

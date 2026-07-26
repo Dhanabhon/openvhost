@@ -147,6 +147,12 @@ mod tests {
         assert!(c.contains("error_log = /tmp/ovh/logs/php-fpm.log"));
         assert!(c.contains("listen = /tmp/ovh/run/php-fpm.sock"));
         assert!(c.contains("pm.max_children = 4"));
+        // Stated explicitly rather than relied on as php-fpm's own default —
+        // the same move this project already made for nginx's mandatory
+        // `-e`. Without nginx's `try_files $uri =404`, this is what stops
+        // php-fpm from executing a request for a file that is not actually a
+        // `.php` script (site_apply_e2e.rs's `/style.css/x.php` case).
+        assert!(c.contains("security.limit_extensions = .php"));
         assert!(c.contains("include=/tmp/ovh/config/custom/php/8.4/pool.d/*.conf"));
     }
 }

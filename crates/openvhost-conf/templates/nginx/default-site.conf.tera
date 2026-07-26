@@ -13,8 +13,13 @@ server {
         try_files $uri $uri/ =404;
     }
 
-{{ php_location }}
+    # Must come BEFORE the PHP location below: nginx matches regex locations
+    # in file order and takes the first match, so if this were listed after
+    # the PHP location, a request like /.env.php or /.git/x.php would hit
+    # the PHP location first and execute instead of being denied.
     location ~ /\. {
         deny all;
     }
+
+{{ php_location }}
 }

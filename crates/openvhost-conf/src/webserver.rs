@@ -333,6 +333,31 @@ mod tests {
         assert!(!c.contains("$document_root/index.php"));
     }
 
+    /// nginx matches regex `location` blocks in FILE ORDER and stops at the
+    /// first match, so the dotfile deny must appear before the PHP location —
+    /// otherwise a request like `/.env.php` or `/.git/x.php` hits the PHP
+    /// location first and gets executed instead of denied. Comparing byte
+    /// offsets (rather than just checking both are present) is what actually
+    /// pins the ORDER, not merely their presence.
+    #[test]
+    fn the_dotfile_deny_is_ordered_before_the_php_location() {
+        let c = NginxAdapter
+            .generate_site_config(&unix_ctx())
+            .unwrap()
+            .contents;
+        let deny_pos = c
+            .find("location ~ /\\. {")
+            .unwrap_or_else(|| panic!("dotfile deny block not found in:\n{c}"));
+        let php_pos = c
+            .find("location ~ \\.php$ {")
+            .unwrap_or_else(|| panic!("PHP location not found in:\n{c}"));
+        assert!(
+            deny_pos < php_pos,
+            "the dotfile deny must be listed before the PHP location, since nginx takes the \
+             first matching regex location: deny at {deny_pos}, php at {php_pos} in:\n{c}"
+        );
+    }
+
     #[test]
     fn php_location_refuses_to_execute_a_path_that_is_not_a_file() {
         let c = NginxAdapter
@@ -344,6 +369,35 @@ mod tests {
         assert!(c.contains("try_files $uri =404;"));
         assert!(c.contains("fastcgi_param REDIRECT_STATUS 200;"));
         assert!(c.contains("location ~ /\\. {"));
+    }
+
+    /// Pins the approved spec's (§6.2) `\.php$` location, not the wider
+    /// `[^/]\.php(/|$)` this used to render. The wider regex claims PATH_INFO
+    /// URLs like `/index.php/admin` and 404s them via `try_files`, because
+    /// `/index.php/admin` is not a file; under `\.php$` that URL does not match
+    /// the PHP location at all and instead falls through to `location /`'s
+    /// front-controller `try_files`, which rewrites it to `/index.php` and
+    /// serves it. So a PATH_INFO URL must never be able to reach PHP-FPM's
+    /// PATH_INFO machinery here — it has to reach the front controller
+    /// instead — which is why no `PATH_INFO` fastcgi_param may be emitted
+    /// either: `fastcgi_split_path_info`/`$fastcgi_path_info` are unreachable
+    /// by construction once the location can only ever match a literal
+    /// `.php` suffix.
+    #[test]
+    fn php_location_matches_only_a_literal_php_suffix_and_emits_no_path_info() {
+        let c = NginxAdapter
+            .generate_site_config(&unix_ctx())
+            .unwrap()
+            .contents;
+        assert!(
+            c.contains("location ~ \\.php$ {"),
+            "expected the spec's exact `\\.php$` location, got:\n{c}"
+        );
+        assert!(
+            !c.contains("PATH_INFO"),
+            "PATH_INFO must not be emitted: a PATH_INFO URL has to fall through to the \
+             front controller, not reach php-fpm's PATH_INFO handling"
+        );
     }
 
     #[test]

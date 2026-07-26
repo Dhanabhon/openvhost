@@ -105,9 +105,21 @@ pub fn rollback(plan: &ApplyPlan) -> Result<(), RollbackReport> {
     for c in &plan.changes {
         let r = match c.kind {
             ChangeKind::Added => remove_if_exists(&c.path),
-            ChangeKind::Modified | ChangeKind::Removed => {
-                atomic_write(&c.path, c.before.as_deref().unwrap_or_default())
-            }
+            // `before: None` here is NOT "no previous content" — the
+            // FileChange doc comment on `before` says it is also `None` for
+            // the scan-then-read race in `plan.rs`, where a `Removed` entry's
+            // file genuinely disappeared between being observed and being
+            // read. Falling back to `unwrap_or_default()` there would
+            // atomic_write an EMPTY `.conf` into the generated tree — a file
+            // that never existed, now visible to `owned_files()`, so the next
+            // plan shows a spurious Removed change forever. The honest
+            // action when there is no previous content to restore is to
+            // ensure the path is absent, not to invent zero bytes for it.
+            ChangeKind::Modified => atomic_write(&c.path, c.before.as_deref().unwrap_or_default()),
+            ChangeKind::Removed => match c.before.as_deref() {
+                Some(b) => atomic_write(&c.path, b),
+                None => remove_if_exists(&c.path),
+            },
         };
         if let Err(e) = r {
             stranded.push(c.path.clone());
@@ -288,6 +300,44 @@ mod tests {
             }
             other => panic!("expected ValidationFailed, got {other:?}"),
         }
+    }
+
+    /// Reachable via the documented scan-then-read race in `plan.rs`: a
+    /// `Removed` change whose file disappeared between being observed and
+    /// being read carries `before: None`. Rolling that back must leave the
+    /// path ABSENT — not write a zero-byte `.conf` there, which would make
+    /// `owned_files()` see a file that never existed and show a spurious
+    /// Removed change on every plan from then on.
+    #[test]
+    fn rolling_back_a_removed_change_with_no_before_content_leaves_the_path_absent() {
+        use crate::site::apply::FileChange;
+
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("config/generated/nginx/sites/ghost.conf");
+        // Deliberately not created on disk: this is the race case, where the
+        // file was already gone by the time plan() tried to read it for the
+        // diff.
+        assert!(!path.exists());
+
+        let plan = ApplyPlan {
+            gen_root: home.path().join("config/generated"),
+            main_conf: home.path().join("config/generated/nginx/nginx.conf"),
+            changes: vec![FileChange {
+                path: path.clone(),
+                kind: ChangeKind::Removed,
+                before: None,
+                after: None,
+                diff: String::new(),
+            }],
+        };
+
+        rollback(&plan).unwrap();
+        assert!(
+            !path.exists(),
+            "rollback of a Removed change with no previous content must not create an empty \
+             file at {}",
+            path.display()
+        );
     }
 
     #[test]

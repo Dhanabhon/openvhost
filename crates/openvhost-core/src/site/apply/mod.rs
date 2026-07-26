@@ -22,7 +22,7 @@ pub use error::{ApplyError, RollbackReport};
 pub use plan::{ApplyPlan, ChangeKind, FileChange, plan};
 
 use crate::CoreError;
-use crate::site::model::{Site, SiteId};
+use crate::site::model::{Site, SiteId, WebServer};
 
 /// Darwin's `sun_path` is 104 bytes including the NUL. php-fpm does not reject
 /// a longer path — it warns, truncates, binds the wrong path, and nginx 502s
@@ -56,9 +56,25 @@ pub struct InstalledRuntimes {
 #[derive(Debug, Clone)]
 pub struct ApplyInput {
     pub home: PathBuf,
-    /// ALL sites; `render_set` filters on `enabled` itself.
+    /// ALL sites; `render_set` filters on `is_servable` itself.
     pub sites: Vec<Site>,
     pub runtimes: InstalledRuntimes,
+}
+
+/// Whether a site is one `render_set` may render as nginx: enabled AND its
+/// chosen web server is nginx.
+///
+/// The site editor's own hint text promises that an Apache site "will save,
+/// but it won't be served" (`SiteDrawer.svelte`, `#f-server-hint`, mirrored in
+/// `WebServerRow.svelte`'s unavailable-brand copy). Filtering on `enabled`
+/// alone would silently render an Apache site's docroot into an nginx
+/// `server{}` block — serving it as nginx, which is not what the user chose
+/// and not what the product told them would happen. This is the ONE place
+/// that decides "is this site actually served", so both loops in
+/// `render_set` (site configs and the `MissingRuntime` pre-check) go through
+/// it rather than repeating the predicate and risking the two drifting apart.
+fn is_servable(s: &Site) -> bool {
+    s.enabled && matches!(s.web_server, WebServer::Nginx)
 }
 
 /// The php-fpm socket for one major, guarded against the `sun_path` ceiling.
@@ -94,8 +110,11 @@ pub fn render_set(input: &ApplyInput) -> Result<Vec<GeneratedFile>, ApplyError> 
     let listen = listen_addr();
 
     // Every check that can fail without touching the disk runs first (spec §4.1).
+    // Filtered by `is_servable`, not `enabled` alone: an Apache site is never
+    // rendered, so it must never block the apply on a PHP version it will
+    // never actually need installed.
     let available: Vec<String> = input.runtimes.php.iter().map(|r| r.major.clone()).collect();
-    for site in input.sites.iter().filter(|s| s.enabled) {
+    for site in input.sites.iter().filter(|s| is_servable(s)) {
         if !available.iter().any(|m| m == site.php_version.as_str()) {
             return Err(ApplyError::MissingRuntime {
                 site: site.name.as_str().to_string(),
@@ -116,7 +135,7 @@ pub fn render_set(input: &ApplyInput) -> Result<Vec<GeneratedFile>, ApplyError> 
     };
     out.push(nginx.generate_default_site_config(&input.home, listen, default_upstream.as_ref())?);
 
-    for site in input.sites.iter().filter(|s| s.enabled) {
+    for site in input.sites.iter().filter(|s| is_servable(s)) {
         let major = site.php_version.as_str();
         let ctx = RenderCtx::new(
             input.home.clone(),
@@ -247,6 +266,31 @@ mod tests {
             &["8.4"],
         ));
         assert!(set.is_ok());
+    }
+
+    #[test]
+    fn an_apache_site_is_saved_but_not_rendered() {
+        // The site editor promises an Apache site "will save, but it won't be
+        // served". Rendering it as nginx would silently substitute a different
+        // web server for the one the user chose.
+        //
+        // Also requests a PHP version ("7.4") that is not in the installed set
+        // (only "8.4" is) — because an Apache site is never rendered at all, that
+        // must not block the whole apply. render_set returning Ok here (rather
+        // than MissingRuntime) is what proves the MissingRuntime scan uses the
+        // same is_servable filter as the render loop, not `enabled` alone.
+        let mut apache = site("legacy", "legacy.localhost", "7.4", true);
+        apache.web_server = WebServer::parse("apache").unwrap();
+        let set = render_set(&input(
+            vec![site("app", "app.localhost", "8.4", true), apache],
+            &["8.4"],
+        ))
+        .unwrap();
+        assert!(set.iter().any(|f| f.path.ends_with("app.localhost.conf")));
+        assert!(
+            !set.iter()
+                .any(|f| f.path.ends_with("legacy.localhost.conf"))
+        );
     }
 
     #[test]

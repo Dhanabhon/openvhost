@@ -2725,7 +2725,6 @@ dependencies = [
  "async-trait",
  "dirs",
  "openvhost-conf",
- "openvhost-proc",
  "serde",
  "serde_json",
  "similar",
