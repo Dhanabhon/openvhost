@@ -6,6 +6,10 @@ describe('formatBytes', () => {
 	// Exact strings, because the strip's whole job is to be readable at a glance
 	// and a rounding change is a visible change.
 	it('steps through 1024-based units with the specified precision', () => {
+		// M-b: the B tier's `unit > 0` term (no decimal at the bottom tier, even
+		// though the mantissa is below 10) is deliberate but had no vector.
+		// Deleting it turns this into `5.0 B`.
+		expect(formatBytes(5)).toBe('5 B');
 		expect(formatBytes(999)).toBe('999 B');
 		expect(formatBytes(1024)).toBe('1.0 KB');
 		// The mantissa-10 switch: one decimal below 10, none at or above.
