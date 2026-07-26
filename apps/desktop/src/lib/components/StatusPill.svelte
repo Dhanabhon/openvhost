@@ -2,10 +2,15 @@
 <script lang="ts">
 	import { pillClass, type StateKind } from '../services.derive';
 
-	let { kind, testId }: { kind: StateKind; testId?: string } = $props();
+	// `label` defaults to the state name itself — the Services-panel case, where the pill's whole
+	// job is to name the state. TitleBar overrides it with a count ("3 running") so the window's
+	// summary pill reuses this one dot/colour/shape treatment instead of restating it.
+	let { kind, label, testId }: { kind: StateKind; label?: string; testId?: string } = $props();
 </script>
 
-<span class="pill {pillClass(kind)}" data-testid={testId}><span class="dot"></span>{kind}</span>
+<span class="pill {pillClass(kind)}" data-testid={testId}
+	><span class="dot"></span>{label ?? kind}</span
+>
 
 <style>
 	/* Ported from docs/design/mock.css (.pill, .pill .dot, .pill-*, @keyframes vh-pulse). */

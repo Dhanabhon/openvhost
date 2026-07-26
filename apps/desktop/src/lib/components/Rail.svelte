@@ -20,7 +20,7 @@
 				stroke-width="9"
 				stroke-linecap="round"
 			/>
-			<circle cx="40" cy="32" r="8" fill="#3FB950" />
+			<circle cx="40" cy="32" r="8" fill="var(--vh-run-dot)" />
 		</svg>
 		<span class="name">OpenVHost</span>
 	</div>

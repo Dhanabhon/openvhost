@@ -22,7 +22,14 @@
 	--vh-state-failed: #e5534b;
 	--vh-state-stopped: #8a9099;
 	/* text-safe on light */
-	--vh-state-running-text: #2e8b3d;
+	/* Deepened from brand §4.2's original #2E8B3D, which measured only 4.31:1 on --vh-surface
+	   (#fff — the .pill background) and 3.98:1 on --vh-bg, missing the >= 4.5:1 WCAG AA floor
+	   that §4.3 claims for all text. Same hue (129.8 vs 129.7 deg) and saturation (50.0% vs
+	   50.3%), lightness 36.3% -> 33.7%: the lightest value that clears AA on every light text
+	   surface in this theme — #fff 4.88:1, --vh-bg 4.51:1, --vh-log-bg 4.79:1. (--vh-surface-2,
+	   the rail/titlebar strip, is not in that set: pills always paint their own --vh-surface
+	   background, so run-colored text never lands on it.) */
+	--vh-state-running-text: #2b8139;
 	--vh-state-starting-text: #9a6b14;
 	--vh-state-failed-text: #c13832;
 	--vh-state-stopped-text: #5c636e;
@@ -141,6 +148,19 @@ pre,
 }
 .num {
 	font-variant-numeric: tabular-nums;
+}
+/* Base-layer, not per-component: the uppercase strip heading that titles each region of the
+   shell ("SERVICES", "LOG"). It lives here alongside .mono/.num because it is one shared
+   recipe used by sibling panels — a scoped copy per component is how the two drift apart.
+   Ported from docs/design/mock.css (.section-label). */
+.section-label {
+	font-size: var(--vh-text-caption);
+	font-weight: 600;
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+	color: var(--vh-text-2);
+	padding: 0 var(--vh-space-6);
+	margin: var(--vh-space-4) 0 var(--vh-space-2);
 }
 :focus-visible {
 	outline: 2px solid var(--vh-focus-ring);

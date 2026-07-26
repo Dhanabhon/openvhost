@@ -33,19 +33,12 @@
 </div>
 
 <style>
-	/* Ported from docs/design/mock.css (.section-label, .log, .log .line, .log .ts, .log .lvl,
+	/* Ported from docs/design/mock.css (.log, .log .line, .log .ts, .log .lvl,
 	   .log .lvl-info/.lvl-warn/.lvl-error, .log .msg). Grid widths/gap match the mock's log
 	   line layout (96px timestamp / 56px level / 1fr message) rather than the previous
-	   Tailwind-arbitrary-value grid this replaces. */
-	.section-label {
-		font-size: var(--vh-text-caption);
-		font-weight: 600;
-		letter-spacing: 0.06em;
-		text-transform: uppercase;
-		color: var(--vh-text-2);
-		padding: 0 var(--vh-space-6);
-		margin: var(--vh-space-4) 0 var(--vh-space-2);
-	}
+	   Tailwind-arbitrary-value grid this replaces. `.section-label` is deliberately absent —
+	   ServicesPanel needs the identical heading, so it lives once in the base layer
+	   (lib/styles/tokens.css) rather than as a scoped copy in each panel. */
 	.log {
 		flex: 1;
 		margin: 0 var(--vh-space-6) var(--vh-space-4);

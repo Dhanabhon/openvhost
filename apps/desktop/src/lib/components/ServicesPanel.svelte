@@ -34,23 +34,16 @@
 </section>
 
 <style>
-	/* Ported from docs/design/main-window.html lines 129-176 + mock.css (.strip-head,
-	   .section-label, .panel, .services-panel, .rowlist, .empty, .empty .title). The mock's
-	   `.strip-head` also carries an unwired "Manage packages" link — intentionally dropped for
-	   the same "no fake href='#' control" reason documented in ServiceRow.svelte; add it back,
-	   wired, once package management ships. */
+	/* Ported from docs/design/main-window.html lines 129-176 + mock.css (.strip-head, .panel,
+	   .services-panel, .rowlist, .empty, .empty .title). The mock's `.strip-head` also carries
+	   an unwired "Manage packages" link — intentionally dropped for the same "no fake href='#'
+	   control" reason documented in ServiceRow.svelte; add it back, wired, once package
+	   management ships. `.section-label` is deliberately absent — LogPane needs the identical
+	   heading, so it lives once in the base layer (lib/styles/tokens.css) rather than as a
+	   scoped copy in each panel. */
 	.strip-head {
 		display: flex;
 		align-items: baseline;
-	}
-	.section-label {
-		font-size: var(--vh-text-caption);
-		font-weight: 600;
-		letter-spacing: 0.06em;
-		text-transform: uppercase;
-		color: var(--vh-text-2);
-		padding: 0 var(--vh-space-6);
-		margin: var(--vh-space-4) 0 var(--vh-space-2);
 	}
 	.panel {
 		background: var(--vh-surface);
