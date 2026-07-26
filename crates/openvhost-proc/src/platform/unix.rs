@@ -146,6 +146,20 @@ pub(crate) fn process_start_time(_pid: u32) -> io::Result<Option<ProcStartTime>>
 /// arise in practice.
 #[cfg(target_os = "macos")]
 pub(crate) fn process_rss(pid: u32) -> io::Result<Option<u64>> {
+    // Kept even though it is unfalsifiable through this function's own tests
+    // on this machine: `proc_pidinfo` happens to answer both excluded values
+    // (pid 0 -> EPERM, the wrapped out-of-range value below -> ESRCH) with
+    // `rc <= 0`, which the general fallback further down already turns into
+    // `Ok(None)` — so deleting this guard leaves every test in `rss_tests`
+    // green. That fallback is kernel behaviour we do not control, not a
+    // contract. What we DO control is the cast two lines below: `pid as
+    // libc::c_int` silently WRAPS any pid past `i32::MAX` into a negative
+    // i32, which names something other than the pid the caller actually
+    // asked about instead of reliably erroring — an undefined
+    // reinterpretation, not a guaranteed rejection. This guard turns that
+    // reinterpretation into an explicit "no" before the cast ever happens,
+    // instead of leaning on kernel behaviour we don't control to reject it
+    // for us. Green here is not evidence it's dead code.
     if pid == 0 || pid > i32::MAX as u32 {
         return Ok(None); // pid 0 is kernel_task; out-of-range can't be ours
     }
@@ -361,11 +375,31 @@ mod rss_tests {
             .spawn()
             .unwrap();
         let pid = child.id();
-        let rss = process_rss(pid)
-            .unwrap()
-            .expect("a live process has an RSS");
-        // Lower bound: any real process has more than 64 KB resident.
-        assert!(rss > 64 * 1024, "rss {rss} is implausibly small");
+        // `spawn()` returning does not mean the child has faulted in its
+        // pages yet, so a single sample taken immediately flakes under CPU
+        // contention (observed twice on correct code). Poll instead, up to a
+        // bounded 2s deadline (40 attempts, 50ms apart); if the floor is
+        // never cleared in that window something is genuinely wrong, not
+        // merely slow.
+        const MAX_ATTEMPTS: u32 = 40;
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+        let mut rss = 0u64;
+        for _ in 0..MAX_ATTEMPTS {
+            rss = process_rss(pid)
+                .unwrap()
+                .expect("a live process has an RSS");
+            if rss > 64 * 1024 {
+                break;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        // Lower bound: any real process has more than 64 KB resident. Polled
+        // above instead of sampled once — see the comment there.
+        assert!(
+            rss > 64 * 1024,
+            "rss {rss} never exceeded the floor within {:?}",
+            POLL_INTERVAL * MAX_ATTEMPTS
+        );
         // Upper bound: `sleep` is tiny. 1 GB would mean we read pages as bytes
         // (4096x) or picked up pti_virtual_size instead of pti_resident_size.
         assert!(rss < 1024 * 1024 * 1024, "rss {rss} is implausibly large");
@@ -392,10 +426,15 @@ mod rss_tests {
         assert_eq!(process_rss(pid).unwrap(), None);
     }
 
-    /// Guarded before any FFI: pid 0 is `kernel_task` and anything above
-    /// `i32::MAX` cannot be a pid we spawned.
+    /// pid 0 (`kernel_task`) and any pid above `i32::MAX` are `Ok(None)`. The
+    /// *behaviour* is worth pinning even though — see the comment inside —
+    /// it does not by itself prove the guard in `process_rss` ran.
     #[test]
-    fn rss_rejects_pid_zero_and_out_of_range_without_calling_ffi() {
+    fn rss_of_pid_zero_and_out_of_range_is_none() {
+        // NOT proof the guard above fired: `proc_pidinfo` absorbs both pid 0
+        // (rc == 0, errno == EPERM) and the wrapped out-of-range value
+        // (rc == 0, errno == ESRCH) into its own `rc <= 0 => Ok(None)`
+        // fallback, so this test is green whether or not the guard exists.
         assert_eq!(process_rss(0).unwrap(), None);
         assert_eq!(process_rss(i32::MAX as u32 + 1).unwrap(), None);
     }
