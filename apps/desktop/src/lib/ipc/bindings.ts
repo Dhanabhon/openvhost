@@ -17,10 +17,32 @@ export const commands = {
 	listWebServers: () => typedError<WebServerDto[], IpcError>(__TAURI_INVOKE("list_web_servers")),
 	readWebServerConfig: (id: string) => typedError<string, IpcError>(__TAURI_INVOKE("read_web_server_config", { id })),
 	validateWebServerConfig: (id: string) => typedError<ValidationReportDto, IpcError>(__TAURI_INVOKE("validate_web_server_config", { id })),
+	/**
+	 *  Quit after the UI has confirmed it: stop every pending service, then destroy
+	 *  the window.
+	 * 
+	 *  The mechanics and the reasoning live in `crate::quit` — this is only the IPC
+	 *  boundary. It takes no arguments on purpose: there is nothing to validate, and
+	 *  the command can therefore do exactly one thing no matter who calls it. It is
+	 *  NOT the thing that decides to quit; `quit::request_quit` has already asked the
+	 *  user, and a caller reaching this directly could only do what the close button
+	 *  already does.
+	 */
+	confirmQuit: () => typedError<null, IpcError>(__TAURI_INVOKE("confirm_quit")),
+	/**
+	 *  Tell the Rust side that the quit dialog's listener is registered.
+	 * 
+	 *  Until this lands, a close request is NOT prevented — see `quit::UiReady` for
+	 *  why an emit's return value cannot stand in for this. Idempotent and
+	 *  unauthenticated by design: the only thing a caller can achieve is enabling a
+	 *  confirmation dialog on their own window.
+	 */
+	quitDialogReady: () => typedError<null, IpcError>(__TAURI_INVOKE("quit_dialog_ready")),
 };
 
 /** Events */
 export const events = {
+	quitRequestedEvent: makeEvent<QuitRequestedEvent>("quit-requested-event"),
 	serviceLogEvent: makeEvent<ServiceLogEvent>("service-log-event"),
 	serviceStateEvent: makeEvent<ServiceStateEvent>("service-state-event"),
 };
@@ -65,6 +87,12 @@ export type LogLine = {
 	level: LogLevel,
 	line: string,
 };
+
+/**
+ *  Emitted to the webview when a quit has been requested and prevented. The UI
+ *  answers with the `confirm_quit` command, or does nothing if the user cancels.
+ */
+export type QuitRequestedEvent = Record<string, never>;
 
 export type ServiceLogEvent = {
 	id: string,

@@ -122,6 +122,42 @@ pub async fn stop_service(
     sup.stop(&id).map_err(IpcError::from)
 }
 
+/// Tell the Rust side that the quit dialog's listener is registered.
+///
+/// Until this lands, a close request is NOT prevented — see `quit::UiReady` for
+/// why an emit's return value cannot stand in for this. Idempotent and
+/// unauthenticated by design: the only thing a caller can achieve is enabling a
+/// confirmation dialog on their own window.
+#[tauri::command]
+#[specta::specta]
+pub async fn quit_dialog_ready(app: tauri::AppHandle) -> Result<(), IpcError> {
+    use tauri::Manager;
+    if let Some(ready) = app.try_state::<crate::quit::UiReady>() {
+        ready.mark();
+    }
+    Ok(())
+}
+
+/// Quit after the UI has confirmed it: stop every pending service, then destroy
+/// the window.
+///
+/// The mechanics and the reasoning live in `crate::quit` — this is only the IPC
+/// boundary. It takes no arguments on purpose: there is nothing to validate, and
+/// the command can therefore do exactly one thing no matter who calls it. It is
+/// NOT the thing that decides to quit; `quit::request_quit` has already asked the
+/// user, and a caller reaching this directly could only do what the close button
+/// already does.
+#[tauri::command]
+#[specta::specta]
+pub async fn confirm_quit(app: tauri::AppHandle) -> Result<(), IpcError> {
+    // `Proc`: every way this can fail is about tearing down supervised processes
+    // or the window that hosts them, and the message is rendered verbatim in the
+    // quit dialog.
+    crate::quit::perform_quit(&app)
+        .await
+        .map_err(|message| IpcError::Proc { message })
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn service_log_tail(

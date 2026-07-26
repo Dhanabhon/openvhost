@@ -4,6 +4,7 @@
 //! stays tauri-free and this crate owns the bridge.
 
 mod commands;
+mod quit;
 
 // Ungated: `stack::StackPaths` is a portable type named by `commands.rs` on
 // every target. Only the macOS stack BUILDER inside is `#[cfg]`-gated.
@@ -37,10 +38,13 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::list_web_servers,
             commands::read_web_server_config,
             commands::validate_web_server_config,
+            commands::confirm_quit,
+            commands::quit_dialog_ready,
         ])
         .events(collect_events![
             commands::ServiceStateEvent,
-            commands::ServiceLogEvent
+            commands::ServiceLogEvent,
+            quit::QuitRequestedEvent
         ])
         // `LogLine`/`ServiceLogEvent` carry `ts_ms: u64` (millisecond epoch
         // timestamps). Specta forbids exporting BigInt-style Rust types to
@@ -109,11 +113,54 @@ pub fn run() {
         std::process::exit(1);
     }
 
-    let result = tauri::Builder::default()
+    let mut builder = tauri::Builder::default()
         .invoke_handler(specta_builder.invoke_handler())
-        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_dialog::init());
+
+    // Substitute the app menu so macOS Cmd+Q is interceptable at all — see
+    // `quit`'s module docs: the DEFAULT menu's Quit is wired to the native
+    // `terminate:` selector and kills the process before any handler runs.
+    // Non-macOS gets no default menu from Tauri, so there is nothing to replace.
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder.menu(quit::app_menu);
+    }
+
+    let result = builder
+        .on_menu_event(|app, event| {
+            if event.id() == quit::QUIT_MENU_ITEM_ID {
+                // Ask, don't quit — unless the UI has never acked (see
+                // `quit::UiReady`), in which case no dialog can appear and
+                // asking would make the app unquittable from its own menu.
+                if !quit::request_quit(app) {
+                    let handle = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(e) = quit::perform_quit(&handle).await {
+                            eprintln!("openvhost: quit failed: {e}");
+                        }
+                    });
+                }
+            }
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                // Prevent only if the UI has acked that it is listening (see
+                // `quit::UiReady`). Before that, closing behaves exactly as it
+                // did before this feature rather than wedging on a dialog that
+                // will never render.
+                if quit::request_quit(window.app_handle()) {
+                    api.prevent_close();
+                }
+            }
+        })
         .setup(move |app| {
             specta_builder.mount_events(app);
+
+            // Managed unconditionally, BEFORE the bootstrap below that can bail
+            // out early: `request_quit` treats a missing `UiReady` as "cannot
+            // ask", so failing to manage it on some path would silently disable
+            // the confirmation instead of failing loudly.
+            app.manage(quit::UiReady::default());
 
             // Single-instance lock (design spec §7): reap MUST run only
             // while this is held, otherwise a second live instance would
