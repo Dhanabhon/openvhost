@@ -27,8 +27,16 @@
 
 <!-- No `aria-live`: this updates every 2 seconds and a live region would have a
      screen reader announce resource figures over whatever the user is doing. It is
-     a labelled region they can visit deliberately instead. -->
-<div class="statusbar" aria-label="Resource usage" data-testid="statusbar">
+     a labelled region they can visit deliberately instead.
+
+     `role="region"` is load-bearing, not decorative: a bare `<div>` has the
+     implicit ARIA role `generic`, and `generic` is in the ARIA "name prohibited"
+     category — `aria-label` on it does not compute an accessible name at all, so
+     without the role this strip has no name and is not reachable via landmark/
+     rotor navigation. `region` (over `group`) is deliberate: `region` is a
+     landmark, which is what "visit deliberately" means; `group` is not a
+     landmark and would not show up in that navigation. -->
+<div class="statusbar" role="region" aria-label="Resource usage" data-testid="statusbar">
 	<span>services <span class="num">{memory}</span></span>
 	<span class="sep" aria-hidden="true">·</span>
 	<span class="num">{processes}</span>
@@ -54,7 +62,10 @@
 		color: var(--vh-text-2);
 		font-size: var(--vh-text-caption);
 		/* The strip must never be the reason the window scrolls: it is a fixed grid
-		   row, and a long value ellipsizes rather than pushing the row wider. */
+		   row, so overflow clips (no "…") rather than pushing the row wider or
+		   wrapping it taller. `formatBytes`/`formatProcessCount` only ever emit
+		   short, bounded strings, so clipping is not expected to be reachable in
+		   practice — this is a hard backstop, not a visible ellipsis treatment. */
 		white-space: nowrap;
 		overflow: hidden;
 	}

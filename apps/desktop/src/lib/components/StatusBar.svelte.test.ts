@@ -70,4 +70,15 @@ describe('StatusBar', () => {
 		expect(m).toContain('aria-label="Resource usage"');
 		expect(m).not.toContain('aria-live');
 	});
+
+	// A bare <div> has the implicit ARIA role `generic`, and `generic` is in the
+	// ARIA "name prohibited" category: `aria-label` alone would not compute an
+	// accessible name, and the strip would not be reachable via landmark/rotor
+	// navigation. `role="region"` is what makes the existing `aria-label` name
+	// something and turns the strip into a landmark a screen-reader user can
+	// reach on purpose.
+	it('is a landmark, not a bare unnamed div', () => {
+		const m = html({ servicesBytes: 1024, processCount: 1, homeBytes: 1024 });
+		expect(m).toContain('role="region"');
+	});
 });
