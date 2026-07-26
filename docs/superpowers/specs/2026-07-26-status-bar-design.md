@@ -105,15 +105,30 @@ Mirrors the conventions of the existing `platform::process_start_time`
 
 - guard `pid == 0 || pid > i32::MAX as u32` → `Ok(None)` before any FFI
 - a `// SAFETY:` comment stating the invariants the call relies on
-- `#[cfg(target_os = "macos")]` for the real body, with a non-macOS unix stub returning
-  `Ok(None)` so the crate still compiles on Linux (the P0-8 fix-wave C6 lesson)
+- `#[cfg(target_os = "macos")]` for the real body, with a non-macOS unix stub AND a
+  Windows stub so the crate still compiles on every target (the P0-8 fix-wave C6 lesson)
 - treat an undersized result as no-value rather than trusting a partial struct
 
-**`Ok(None)` and never `Err` for `rc <= 0`.** Per §3.1 the return value cannot separate
-a dead pid from a permission failure, and the caller is a status strip that must absorb
-the race between "the supervisor listed this pid" and "the process exited". Returning
-`Err` would turn a normal, expected race into a visible failure. We only ever read our
-own children, so the permission case does not arise in practice.
+**Three distinct outcomes, and the difference matters:**
+
+| Result | Meaning | Caller does |
+|---|---|---|
+| `Ok(Some(bytes))` | measured | add to the sum, increment `process_count` |
+| `Ok(None)` | no figure for THIS pid — it exited, or is not inspectable | drop it from both; keep going |
+| `Err(_)` | measurement is impossible on this platform at all | abandon the whole read → strip shows `—` |
+
+**`Ok(None)` and never `Err` for `rc <= 0`.** Per §3.1 the return value cannot separate a
+dead pid from a permission failure, and the caller is a status strip sampling pids the
+supervisor listed a moment ago. The gap between "listed" and "exited" is a normal race
+that must not read as a failure. We only ever read our own children, so the permission
+case does not arise in practice.
+
+**The stubs return `Err`, matching `process_start_time`'s existing stubs
+(`unix.rs:127`, `windows.rs:82`) — and that is the correct answer, not merely the
+consistent one.** A stub returning `Ok(None)` would make every pid on an unsupported
+platform "no figure", which the caller sums to `0` with `process_count = 0` and the strip
+renders as `services 0 MB · no processes` — a false statement while services are running.
+`Err` renders `—`, which is true: unknown, not zero.
 
 This is a smaller and cleaner reader than `process_start_time`, which has to read
 `p_starttime` at a verified byte offset because libc exposes no `kinfo_proc`. Here
@@ -142,9 +157,22 @@ services_memory() -> Result<ServicesMemoryDto, IpcError>   // { bytes, process_c
 home_disk_usage()  -> Result<HomeUsageDto, IpcError>       // { bytes }
 ```
 
+`home_disk_usage` runs its walk on `tauri::async_runtime::spawn_blocking`
+(`tauri-2.11.3/src/async_runtime.rs:290`), not inline in the async command: 40 ms (§3.2)
+is long enough to matter on a runtime thread, and the figure is not urgent.
+
 Deliberately **two** commands rather than one combined `system_stats()`, because their
 sampling rates differ by 30× (§5). A single command would force the cheap read to pay
 the expensive one's cost or the expensive read to run 30× more often than it needs to.
+
+**The u64 → JS `number` cast is deliberately checked here, because the codebase
+demands it.** `specta_builder` in `apps/desktop/src-tauri/src/lib.rs` calls
+`.dangerously_cast_bigints_to_number()` and carries a standing warning: "this flag is
+BUILDER-GLOBAL … Any future large-integer field (**byte totals**, counters) must be
+consciously checked to stay < 2^53". Both new fields are byte totals, so this is the case
+that warning was written for. `2^53` bytes is 9 petabytes; a resident set and a home
+directory are many orders of magnitude below it. Safe, and recorded as checked rather
+than assumed.
 
 `services_memory` sums `process_rss` over the live pids in `Supervisor::snapshot()`
 (`ServiceStatus.pid` is already on the wire). It uses `try_state` for the supervisor,
@@ -223,7 +251,9 @@ Frontend:
 
 - `formatBytes` at boundaries, asserting exact strings per §4.4: `0` → `0 MB`,
   `999` → `999 B`, `1024` → `1.0 KB`, `10 * 1024` → `10 KB` (the mantissa-10 switch from
-  one decimal to none), `1024^3 * 1.25` → `1.2 GB`.
+  one decimal to none), `1024^3` → `1.0 GB`, `1024^3 * 12` → `12 GB`. Vectors chosen to
+  be exact in binary floating point on purpose — `1024^3 * 1.25` would be a trap, since
+  `(1.25).toFixed(1)` is `"1.3"`, not `"1.2"`.
 - Store: an api rejection leaves the figure unknown rather than zero (a zero would
   read as "nothing running", which is a different and wrong claim).
 - Store: the hidden-window pause actually stops issuing calls.
