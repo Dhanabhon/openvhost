@@ -166,7 +166,9 @@ impl WebServerAdapter for NginxAdapter {
         tc.insert("php_location", &php_location);
         let contents = render("nginx/default-site.conf", &tc)?;
         Ok(GeneratedFile {
-            path: Self::gen_dir(home).join("sites").join("00-default.conf"),
+            path: Self::gen_dir(home)
+                .join("sites")
+                .join("00-default_server.conf"),
             contents,
         })
     }
@@ -357,7 +359,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             f.path,
-            PathBuf::from("/tmp/ovh/config/generated/nginx/sites/00-default.conf")
+            PathBuf::from("/tmp/ovh/config/generated/nginx/sites/00-default_server.conf")
         );
         let c = &f.contents;
         assert!(c.contains("listen 127.0.0.1:8080 default_server;"));
@@ -380,5 +382,35 @@ mod tests {
         // A fastcgi_pass with no pool behind it is a 502 generator.
         assert!(!c.contains("fastcgi_pass"));
         assert!(!c.contains("location ~ [^/]\\.php"));
+    }
+
+    #[test]
+    fn no_valid_site_can_claim_the_catch_alls_filename() {
+        // The catch-all's name contains `_`, which is outside the hostname charset
+        // RenderCtx enforces for server_name — so a site cannot be named into a
+        // collision with it. This is what makes the catch-all safe without a
+        // duplicate-path check anywhere in the pipeline.
+        let f = NginxAdapter
+            .generate_default_site_config(
+                std::path::Path::new("/tmp/ovh"),
+                "127.0.0.1:8080".parse().unwrap(),
+                None,
+            )
+            .unwrap();
+        let name = f.path.file_name().unwrap().to_string_lossy().into_owned();
+        let stem = name.strip_suffix(".conf").unwrap();
+        assert!(
+            RenderCtx::new(
+                PathBuf::from("/tmp/ovh"),
+                stem,
+                PathBuf::from("/tmp/ovh/www"),
+                "127.0.0.1:8080".parse().unwrap(),
+                "8.4",
+                PhpUpstream::UnixSocket(PathBuf::from("/tmp/ovh/run/php-fpm-8.4.sock")),
+                "php_x",
+            )
+            .is_err(),
+            "a site whose server_name is {stem:?} would collide with the catch-all"
+        );
     }
 }

@@ -18,13 +18,13 @@ use openvhost_conf::{
 pub use error::{ApplyError, RollbackReport};
 
 use crate::CoreError;
-use crate::site::model::Site;
-// `Docroot`/`Domain`/`PhpVersion`/`SiteId`/`SiteName`/`WebServer` are only
-// referenced by the test module's fixtures below; without this gate they are
-// genuinely unused in a non-test build (`cfg(test)` is off) and trip
-// `-D warnings` under plain `cargo clippy`.
+use crate::site::model::{Site, SiteId};
+// `Docroot`/`Domain`/`PhpVersion`/`SiteName`/`WebServer` are only referenced
+// by the test module's fixtures below; without this gate they are genuinely
+// unused in a non-test build (`cfg(test)` is off) and trip `-D warnings`
+// under plain `cargo clippy`.
 #[cfg(test)]
-use crate::site::model::{Docroot, Domain, PhpVersion, SiteId, SiteName, WebServer};
+use crate::site::model::{Docroot, Domain, PhpVersion, SiteName, WebServer};
 
 /// Darwin's `sun_path` is 104 bytes including the NUL. php-fpm does not reject
 /// a longer path — it warns, truncates, binds the wrong path, and nginx 502s
@@ -76,18 +76,16 @@ pub fn socket_path(home: &Path, major: &str) -> Result<PathBuf, ApplyError> {
     Ok(p)
 }
 
-/// nginx `upstream{}` block name: `[a-z0-9_]` only, which `Domain`'s charset
-/// (`[a-z0-9-.]`) reaches with a single substitution.
-fn upstream_name(domain: &str) -> String {
-    let mut s = String::from("php_");
-    for c in domain.chars() {
-        s.push(if c.is_ascii_lowercase() || c.is_ascii_digit() {
-            c
-        } else {
-            '_'
-        });
-    }
-    s
+/// nginx `upstream{}` block name: `[a-z0-9_]`, and genuinely unique per site.
+///
+/// Derived from the site's UUID rather than its domain because a
+/// charset substitution on the domain is not injective — `a-b.example` and
+/// `a.b-example` would both reduce to `php_a_b_example`, and on the Windows
+/// path that means one nginx context defining the same upstream block twice
+/// with different backends. The id is the table's primary key, so uniqueness
+/// is structural.
+fn upstream_name(id: &SiteId) -> String {
+    format!("php_{}", id.as_str().replace('-', ""))
 }
 
 /// The complete desired config set, sorted by path so the output is stable.
@@ -129,7 +127,7 @@ pub fn render_set(input: &ApplyInput) -> Result<Vec<GeneratedFile>, ApplyError> 
             listen,
             major,
             PhpUpstream::UnixSocket(socket_path(&input.home, major)?),
-            upstream_name(site.domain.as_str()),
+            upstream_name(&site.id),
         )?;
         out.push(nginx.generate_site_config(&ctx)?);
     }
@@ -198,7 +196,7 @@ mod tests {
             paths,
             vec![
                 "/tmp/ovh/config/generated/nginx/nginx.conf",
-                "/tmp/ovh/config/generated/nginx/sites/00-default.conf",
+                "/tmp/ovh/config/generated/nginx/sites/00-default_server.conf",
                 "/tmp/ovh/config/generated/nginx/sites/app.localhost.conf",
                 "/tmp/ovh/config/generated/php/8.4/php-fpm.conf",
             ]
@@ -323,5 +321,41 @@ mod tests {
             err,
             ApplyError::Core(CoreError::SocketPathTooLong { .. })
         ));
+    }
+
+    #[test]
+    fn upstream_names_stay_distinct_for_domains_that_flatten_to_one_token() {
+        // `a-b.example` and `a.b-example` both become `a_b_example` under a naive
+        // charset substitution. They must not share an upstream block name.
+        let set = render_set(&input(
+            vec![
+                site("one", "a-b.example", "8.4", true),
+                site("two", "a.b-example", "8.4", true),
+            ],
+            &["8.4"],
+        ))
+        .unwrap();
+        let names: Vec<String> = set
+            .iter()
+            .filter(|f| f.path.extension().is_some_and(|e| e == "conf"))
+            .flat_map(|f| {
+                f.contents
+                    .lines()
+                    .filter(|l| l.trim_start().starts_with("upstream "))
+                    .map(|l| l.trim().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        // The unix path emits no upstream block, so this asserts on the derivation
+        // directly rather than on rendered output.
+        assert!(names.is_empty(), "unix path should emit no upstream block");
+
+        let a = upstream_name(&SiteId::parse("11111111-1111-4111-8111-111111111111").unwrap());
+        let b = upstream_name(&SiteId::parse("22222222-2222-4222-8222-222222222222").unwrap());
+        assert_ne!(a, b);
+        assert!(
+            a.bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+        );
     }
 }
