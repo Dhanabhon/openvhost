@@ -2492,6 +2492,7 @@ name = "openvhost-conf"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "libc",
  "tempfile",
  "tera",
  "thiserror 2.0.19",
@@ -2518,6 +2519,7 @@ dependencies = [
 name = "openvhost-desktop"
 version = "0.1.0"
 dependencies = [
+ "openvhost-conf",
  "openvhost-core",
  "openvhost-proc",
  "serde",
@@ -2528,6 +2530,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-specta",
+ "tempfile",
  "thiserror 2.0.19",
  "tokio",
 ]

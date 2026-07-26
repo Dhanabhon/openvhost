@@ -5,7 +5,8 @@
 
 mod commands;
 
-#[cfg(target_os = "macos")]
+// Ungated: `stack::StackPaths` is a portable type named by `commands.rs` on
+// every target. Only the macOS stack BUILDER inside is `#[cfg]`-gated.
 mod stack;
 
 use std::ffi::OsString;
@@ -33,6 +34,9 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::create_site,
             commands::update_site,
             commands::delete_site,
+            commands::list_web_servers,
+            commands::read_web_server_config,
+            commands::validate_web_server_config,
         ])
         .events(collect_events![
             commands::ServiceStateEvent,
@@ -147,9 +151,33 @@ pub fn run() {
                             ));
                             supervisor.register(demo_ticker_spec());
                             #[cfg(target_os = "macos")]
-                            for spec in stack::macos_stack_specs() {
-                                supervisor.register(spec);
-                            }
+                            let stack_paths = {
+                                let stack = stack::macos_stack();
+                                for spec in stack.specs {
+                                    supervisor.register(spec);
+                                }
+                                stack.paths
+                            };
+                            // No stack builder for this target yet, so `None` is the
+                            // NORMAL state here — the home resolved fine, there is
+                            // simply nothing to point the Web Server page at. See
+                            // `commands::stack_paths` for the message that renders.
+                            #[cfg(not(target_os = "macos"))]
+                            let stack_paths: Option<stack::StackPaths> = None;
+                            // Manage the Option ITSELF, unconditionally. Tauri implements
+                            // `CommandArg` only for `State<'r, T>` — there is no impl for
+                            // `Option<State<'r, T>>` — so a command cannot take an
+                            // optionally-managed state. Making `Option<StackPaths>` the
+                            // managed type is what lets a command distinguish "no stack on
+                            // this platform" from "not wired up", while always having
+                            // something to extract.
+                            //
+                            // Exactly ONE `manage` call per state type: `Manager::manage`
+                            // does NOT overwrite an existing value (its own doc example
+                            // asserts `assert!(!app.manage(MyInt(1)))`), so a "manage None
+                            // early, the real value later" split would silently pin every
+                            // user to `None`.
+                            app.manage(stack_paths);
                             let mut rx = supervisor.subscribe();
                             let handle = app.handle().clone();
                             tauri::async_runtime::spawn(async move {

@@ -9,6 +9,9 @@
 		disabled = false,
 		ariaLabel,
 		focusFallback = false,
+		testId,
+		expanded,
+		controls,
 		onclick,
 		children
 	}: {
@@ -25,6 +28,18 @@
 		 * Edit button) no longer exists in the DOM. Opt-in and defaults to `false`; every
 		 * existing `<Button>` usage is unaffected. */
 		focusFallback?: boolean;
+		/** Test hook on the real `<button>`, following `StatusPill.svelte`'s `testId`
+		 * precedent. Opt-in: omitted means no attribute is emitted at all. */
+		testId?: string;
+		/** Disclosure state for a button that reveals or hides a region — `aria-expanded`
+		 * is a state `role="button"` supports, and it is the only thing that tells a
+		 * screen-reader user whether the region is open. Omitted on plain buttons, which
+		 * must NOT claim to be disclosures. */
+		expanded?: boolean;
+		/** Id of the region a disclosure button controls. Pass it only while that region
+		 * is actually in the DOM — an `aria-controls` IDREF pointing at nothing is worse
+		 * than none. `aria-controls` is a global ARIA property, so it is valid here. */
+		controls?: string;
 		onclick: () => void;
 		children: Snippet;
 	} = $props();
@@ -39,6 +54,9 @@
 		size === 'sm' && 'btn-sm'
 	)}
 	aria-label={ariaLabel}
+	aria-expanded={expanded}
+	aria-controls={controls}
+	data-testid={testId}
 	data-vh-focus-fallback={focusFallback ? '' : undefined}
 	{disabled}
 	{onclick}

@@ -2,10 +2,19 @@
 //! Tauri command surface — thin validation + delegation to openvhost-core
 //! (business logic never lives here; master plan §5).
 
+use std::path::{Path, PathBuf};
+
+// `WebServerAdapter` is imported for its `supports_hot_reload` method: it is a
+// trait method, so the trait must be in scope even though the call site names
+// the concrete `NginxAdapter`.
+use openvhost_conf::WebServerAdapter;
+
 use openvhost_core::{
     CoreInfo, Db, Docroot, Domain, NewSite, PhpVersion, Site, SiteId, SiteName, SiteRepository,
     SqliteSiteRepository, WebServer,
 };
+
+use crate::stack::StackPaths;
 
 /// Serializable command error (spec §7.2). Establishes the pattern:
 /// every command returns `Result<_, IpcError>` and the UI renders failures.
@@ -242,6 +251,342 @@ pub async fn delete_site(db: tauri::State<'_, Db>, id: String) -> Result<bool, I
     Ok(repo.delete(&site_id).await?)
 }
 
+/// The web servers OpenVHost knows about. A CLOSED list: the client sends only
+/// this id — never a path, filename or argument — and every path used by the
+/// commands below is derived server-side from managed state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebServerBrand {
+    Nginx,
+    Apache,
+}
+
+/// A validator invocation, resolved as ONE unit from the parsed brand: which
+/// binary, which config file, and which flags belong together.
+///
+/// Why a type instead of two lookups at the call site. `validate_web_server_config`
+/// used to derive the config from the parsed brand but pass `&p.nginx_bin`
+/// **unconditionally**, so the binary and the validator were not brand-keyed at
+/// all: a future editor who flips Apache to supported and adds an `apache_conf`
+/// arm would get `nginx -t -c apache.conf`, with every test still green. Adding a
+/// brand now cannot compile without adding a variant HERE and an arm at the single
+/// `match` in `validate_web_server_config`.
+///
+/// **Not a security fix, and it must not be described as one.** A mismatched
+/// binary/config pair yields a parse error and a red row: nothing is written,
+/// nothing is disclosed, no privilege is crossed. It is a correctness footgun,
+/// closed structurally because that costs a couple of dozen lines now instead of a
+/// prose guardrail the next editor has to remember — the same move this repo
+/// already made at `89471df`.
+enum ValidationTarget<'a> {
+    /// `<bin> -e <err_log> -t -c <conf>`. Only ever constructed for `Nginx`.
+    NginxT {
+        bin: &'a Path,
+        conf: &'a Path,
+        err_log: PathBuf,
+    },
+}
+
+impl WebServerBrand {
+    /// Exact match only. An unknown id is a validation error rather than a
+    /// fallback: silently treating a typo as nginx would operate on a server
+    /// the caller did not name.
+    fn parse(s: &str) -> Result<Self, IpcError> {
+        match s {
+            "nginx" => Ok(Self::Nginx),
+            "apache" => Ok(Self::Apache),
+            _ => Err(IpcError::Validation {
+                field: "id".into(),
+                message: format!("unknown web server {s:?}"),
+            }),
+        }
+    }
+
+    /// The brand's name as the product spells it. Exists so a message can name the
+    /// brand the caller actually asked for instead of hardcoding one.
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Nginx => "nginx",
+            Self::Apache => "Apache",
+        }
+    }
+
+    /// Whether OpenVHost can actually operate this brand end to end: adapter,
+    /// template, real paths in `StackPaths` and a validator that speaks its
+    /// config. Exhaustive rather than `matches!`, so a third variant has to be
+    /// classified here instead of silently defaulting to unsupported.
+    fn supported(self) -> bool {
+        match self {
+            Self::Nginx => true,
+            // Flipping this to `true` is NOT on its own enough to support Apache.
+            // It also needs its own paths on `StackPaths`, its own arm in
+            // `live_config_path` below, and its own arm in `validation_target` —
+            // which is where a brand gets a validator that speaks its config
+            // rather than being handed `nginx -t`. Until all of those exist, those
+            // two accessors are what stop a supported-but-pathless brand from
+            // being handed nginx's config, or nginx's binary, under an Apache
+            // heading.
+            Self::Apache => false,
+        }
+    }
+
+    /// Reject an unsupported brand BEFORE deriving any path, so the failure is
+    /// "OpenVHost cannot do this" rather than an empty read that reads as "this
+    /// server has no configuration".
+    fn require_supported(self) -> Result<(), IpcError> {
+        if self.supported() {
+            return Ok(());
+        }
+        Err(IpcError::Validation {
+            field: "id".into(),
+            // Keyed off `self`, NOT hardcoded. `supported()`'s exhaustive match
+            // forces a new variant to be classified, but nothing forces this
+            // sentence to be updated — so a hardcoded "Apache" here would answer a
+            // request for Caddy with "OpenVHost cannot serve Apache sites yet", a
+            // wrong statement on the one surface whose entire job is telling the
+            // truth about the machine.
+            message: format!(
+                "OpenVHost cannot serve {} sites yet — it only generates nginx config",
+                self.display_name()
+            ),
+        })
+    }
+
+    /// The live config file for THIS brand — and the only way the commands below
+    /// can obtain a config path at all.
+    ///
+    /// The brand KEYS the path rather than merely gating it: the `match` is
+    /// exhaustive, so a future brand is a compile error here instead of silently
+    /// inheriting nginx's. `require_supported` runs first and inside, so a caller
+    /// cannot reach a path before the gate no matter how the statements are
+    /// ordered, and the user-facing message is unchanged.
+    ///
+    /// `self` is `Copy` and taken by value, so the elided output lifetime binds to
+    /// `paths` — the returned path always borrows from managed state.
+    fn live_config_path(self, paths: &StackPaths) -> Result<&Path, IpcError> {
+        self.require_supported()?;
+        match self {
+            Self::Nginx => Ok(&paths.nginx_conf),
+            // Unreachable while `Nginx` is the only `supported()` brand: the gate
+            // above already returned. Deliberately an error and not
+            // `unreachable!()` — marking Apache supported without giving it a
+            // path here must degrade to an honest failure, never a panic. Adding
+            // a path is also not sufficient by itself; see `supported()`.
+            Self::Apache => Err(IpcError::Core {
+                message: "no live configuration path is known for Apache".into(),
+            }),
+        }
+    }
+
+    /// The WHOLE validator invocation for this brand — binary, config and flags
+    /// together. See [`ValidationTarget`] for why this is a type rather than a
+    /// second path lookup beside an unconditional `&p.nginx_bin`.
+    ///
+    /// `live_config_path` above is deliberately left as it was, for
+    /// `read_web_server_config`: that command needs a config path and nothing else,
+    /// and it is already correctly brand-keyed.
+    ///
+    /// `self` is `Copy` and taken by value, so the elided output lifetime binds to
+    /// `paths` — the borrowed halves always come from managed state.
+    fn validation_target(self, paths: &StackPaths) -> Result<ValidationTarget<'_>, IpcError> {
+        self.require_supported()?;
+        match self {
+            Self::Nginx => Ok(ValidationTarget::NginxT {
+                bin: &paths.nginx_bin,
+                conf: &paths.nginx_conf,
+                // Third occurrence of this literal in the crate; folding the three
+                // behind a `StackPaths::nginx_error_log()` accessor is a recorded
+                // follow-up rather than part of this wave.
+                err_log: paths.home.join("logs/nginx.error.log"),
+            }),
+            // Unreachable while `Nginx` is the only `supported()` brand: the gate
+            // above already returned. Deliberately an error and not
+            // `unreachable!()`, for the same reason as `live_config_path` — marking
+            // a brand supported without giving it a validator here must degrade to
+            // an honest failure, never a panic.
+            Self::Apache => Err(IpcError::Core {
+                message: "no validator invocation is known for Apache".into(),
+            }),
+        }
+    }
+}
+
+/// One row on the Web Server page.
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct WebServerDto {
+    pub id: String,
+    pub display_name: String,
+    pub supported: bool,
+    /// Correlates with the shared services store for live status; `None` when
+    /// the brand is not a supervised service.
+    pub service_id: Option<String>,
+    pub binary_path: Option<String>,
+    pub version: Option<String>,
+    pub supports_hot_reload: bool,
+    pub config_path: Option<String>,
+}
+
+impl WebServerDto {
+    /// Listed so the UI can say plainly that it is not available, rather than
+    /// hiding it and leaving the site editor's Apache option unexplained.
+    fn apache() -> Self {
+        Self {
+            id: "apache".into(),
+            display_name: "Apache".into(),
+            supported: false,
+            service_id: None,
+            binary_path: None,
+            version: None,
+            supports_hot_reload: false,
+            config_path: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidationReportDto {
+    pub ok: bool,
+    pub stderr: String,
+}
+
+/// The managed stack paths, or a rendered error when nothing was managed.
+///
+/// The managed type is `Option<StackPaths>`, not `StackPaths`: tauri implements
+/// `CommandArg` only for `State<'r, T>`, so a command cannot take an
+/// optionally-managed state. Task 2 therefore manages the `Option` itself.
+///
+/// `None` means **no web server stack was managed**. On every target except macOS
+/// that is simply "there is no stack builder yet": the OpenVHost home resolved
+/// perfectly well. macOS can reach it too, though only barely — `stack::macos_stack`
+/// calls `resolve_home()` a SECOND time and returns `paths: None` when that fails.
+/// Practically unreachable, since `resolve_home` is pure over two inputs, does no
+/// IO, and nothing in-process mutates them, so a success at startup followed by a
+/// failure moments later is not a state to design for. It is still why the message
+/// stays platform-agnostic and names neither the platform nor home resolution: on
+/// macOS this outcome IS a home problem, and blaming the platform would send the
+/// reader somewhere there is nothing to find.
+///
+/// This is NOT how a failed startup surfaces. `lib.rs` manages the value inside
+/// the `resolve_home()` + `InstanceLock::acquire` success arm, so the two failure
+/// paths next to it manage **nothing at all**: `State` extraction itself fails
+/// and the user sees Tauri's raw error rather than this text. Of those two, an
+/// unresolvable home is the rare one — `InstanceLock::acquire` returning
+/// `Ok(None)`, i.e. the app was double-launched, is far more likely.
+///
+/// Making those two friendly would take one `app.manage` after the match, with
+/// every arm yielding an `Option<StackPaths>`. Do NOT approximate it by managing
+/// `None` early and the real value later: `Manager::manage` does not overwrite an
+/// existing value (its own doc example asserts `assert!(!app.manage(MyInt(1)))`),
+/// so the second call is a silent no-op that would pin every user to `None`.
+fn stack_paths<'a>(
+    paths: &'a tauri::State<'_, Option<StackPaths>>,
+) -> Result<&'a StackPaths, IpcError> {
+    paths.inner().as_ref().ok_or_else(|| IpcError::Core {
+        message: "no web server stack is configured for this platform".into(),
+    })
+}
+
+/// The page's rows, built from the paths the supervisor actually registered.
+///
+/// Split out of `list_web_servers` so the listing is testable without Tauri or a
+/// live version probe: everything process- or state-dependent arrives as an
+/// argument. A test can therefore pin that Apache is LISTED, not merely
+/// constructible.
+fn web_server_rows(p: &StackPaths, version: Option<String>) -> Vec<WebServerDto> {
+    vec![
+        WebServerDto {
+            id: "nginx".into(),
+            display_name: "nginx".into(),
+            supported: true,
+            service_id: Some("nginx".into()),
+            binary_path: Some(p.nginx_bin.display().to_string()),
+            version,
+            supports_hot_reload: openvhost_conf::NginxAdapter.supports_hot_reload(),
+            config_path: Some(p.nginx_conf.display().to_string()),
+        },
+        WebServerDto::apache(),
+    ]
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn list_web_servers(
+    paths: tauri::State<'_, Option<StackPaths>>,
+) -> Result<Vec<WebServerDto>, IpcError> {
+    let p = stack_paths(&paths)?;
+    // Probing the version SPAWNS `nginx -v`, so merely opening this page starts
+    // a process. Bounded: one short-lived probe, fixed argv, PROBE_TIMEOUT.
+    // `-e` is mandatory on EVERY nginx invocation, `-v` included, so that nothing
+    // this app runs can write into nginx's compiled-in prefix instead of our home
+    // — see `openvhost_conf::probe_nginx_version`'s own doc comment.
+    let err_log = p.home.join("logs/nginx.error.log");
+    let version = openvhost_conf::probe_nginx_version(&p.nginx_bin, &err_log).await;
+    Ok(web_server_rows(p, version))
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn read_web_server_config(
+    paths: tauri::State<'_, Option<StackPaths>>,
+    id: String,
+) -> Result<String, IpcError> {
+    let brand = WebServerBrand::parse(&id)?;
+    let p = stack_paths(&paths)?;
+    // NOT a general file reader: the path is looked up in managed state BY the
+    // parsed brand, so it can neither be aimed at an arbitrary file nor return
+    // one brand's config under another's heading. An unsupported brand yields no
+    // path at all — `live_config_path` gates before it matches.
+    let conf = brand.live_config_path(p)?;
+    // Async read: the file is small, but an `OPENVHOST_HOME` on a stalled network
+    // mount would hang for as long as the mount does. `tokio::fs` hands the read to
+    // the BLOCKING POOL, so the tokio worker is released at the `.await` — the
+    // hazard is pool exhaustion, not a wedged worker, and a blocking-pool task
+    // cannot be cancelled, so a stalled read holds its thread until the mount
+    // answers. That pool is shared with every other blocking operation the app
+    // makes. A plain `std::fs::read_to_string` here would be strictly worse: it
+    // pins a tokio WORKER, and on a desktop-sized worker pool that stalls the
+    // supervisor event pump and every other in-flight command with it. Bounding
+    // concurrent calls and capping the response size are recorded follow-ups.
+    tokio::fs::read_to_string(conf)
+        .await
+        .map_err(|e| IpcError::Core {
+            message: format!("cannot read {}: {e}", conf.display()),
+        })
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn validate_web_server_config(
+    paths: tauri::State<'_, Option<StackPaths>>,
+    id: String,
+) -> Result<ValidationReportDto, IpcError> {
+    let brand = WebServerBrand::parse(&id)?;
+    let p = stack_paths(&paths)?;
+    // The BINARY, the config and the flags are resolved together from the parsed
+    // brand — never a brand-keyed config beside an unconditional nginx binary. A
+    // brand `validation_target` rejects stops here rather than getting a green
+    // "valid" badge for a config nginx never examined.
+    //
+    // Read-only: `validate_live` runs `-t` against the config in place and never
+    // calls `materialize`. `-e` keeps nginx's OWN error log inside our home instead
+    // of its compiled-in prefix; no config file is written. `nginx -t` is not
+    // read-only with respect to the FILESYSTEM, though — it creates whatever
+    // `error_log`/`access_log`/`*_temp_path` the config declares. See spec §3.2.
+    let report = match brand.validation_target(p)? {
+        ValidationTarget::NginxT { bin, conf, err_log } => {
+            openvhost_conf::validate_live(bin, conf, &err_log).await
+        }
+    }
+    .map_err(|e| IpcError::Core {
+        message: e.to_string(),
+    })?;
+    Ok(ValidationReportDto {
+        ok: report.ok,
+        stderr: report.stderr,
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod site_ipc_tests {
@@ -378,5 +723,273 @@ mod site_ipc_tests {
             }
             other => panic!("expected Validation, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod web_server_ipc_tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    /// Not a real installation: `web_server_rows` and `live_config_path` only ever
+    /// move these paths around (nothing here is opened), so distinctive sentinels
+    /// prove a value was passed through rather than re-derived.
+    fn sample_paths() -> StackPaths {
+        StackPaths {
+            home: PathBuf::from("/nonexistent/openvhost-test-home"),
+            nginx_bin: PathBuf::from("/nonexistent/openvhost-test-home/bin/nginx"),
+            nginx_conf: PathBuf::from("/nonexistent/openvhost-test-home/conf/nginx.conf"),
+        }
+    }
+
+    /// Positive mappings only — the CLOSED-list property is pinned by
+    /// `unknown_brand_is_a_validation_error_naming_the_field` below, so this name
+    /// says just what it checks.
+    #[test]
+    fn brand_parses_the_known_ids() {
+        assert_eq!(
+            WebServerBrand::parse("nginx").unwrap(),
+            WebServerBrand::Nginx
+        );
+        assert_eq!(
+            WebServerBrand::parse("apache").unwrap(),
+            WebServerBrand::Apache
+        );
+    }
+
+    /// The client never sends a path — only this id. An unknown id must be a
+    /// validation error, NOT a silent fallback to nginx, or a typo in the UI
+    /// would quietly operate on the wrong server.
+    #[test]
+    fn unknown_brand_is_a_validation_error_naming_the_field() {
+        let e = WebServerBrand::parse("../../etc/passwd").unwrap_err();
+        match e {
+            IpcError::Validation { field, .. } => assert_eq!(field, "id"),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        assert!(
+            WebServerBrand::parse("NGINX").is_err(),
+            "parsing must be exact-match"
+        );
+        assert!(WebServerBrand::parse("").is_err());
+        // Plausible ALIASES, not just hostile input: the closed list is the whole
+        // property, so a convenience arm like `"caddy" => Ok(Self::Nginx)` must
+        // fail here rather than silently operating on a server nobody named.
+        for alias in ["caddy", "apache2", "httpd", "nginx-full", "nginx "] {
+            assert!(
+                WebServerBrand::parse(alias).is_err(),
+                "{alias:?} is not on the closed list and must not parse"
+            );
+        }
+    }
+
+    /// Apache has no adapter and no template, so it must be LISTED but not
+    /// operable — dropping the row would leave the site editor's Apache option
+    /// unexplained, and returning empty output instead of an error would let a UI
+    /// bug render "Apache's config is empty" for "Apache has no config".
+    ///
+    /// Also pins the page's whole purpose: nginx's row reports the paths the
+    /// supervisor registered, verbatim, never anything re-probed.
+    #[test]
+    fn rows_list_apache_and_report_nginx_from_the_given_paths() {
+        let p = sample_paths();
+        let listed = web_server_rows(&p, Some("1.27.3".into()));
+
+        let nginx = listed
+            .iter()
+            .find(|r| r.id == "nginx")
+            .unwrap_or_else(|| panic!("nginx must be listed, got {listed:?}"));
+        assert!(nginx.supported);
+        assert_eq!(nginx.service_id.as_deref(), Some("nginx"));
+        assert_eq!(nginx.version.as_deref(), Some("1.27.3"));
+        let bin = p.nginx_bin.display().to_string();
+        let conf = p.nginx_conf.display().to_string();
+        assert_eq!(nginx.binary_path.as_deref(), Some(bin.as_str()));
+        assert_eq!(nginx.config_path.as_deref(), Some(conf.as_str()));
+
+        let apache = listed
+            .iter()
+            .find(|r| r.id == "apache")
+            .unwrap_or_else(|| panic!("apache must be listed, got {listed:?}"));
+        assert!(!apache.supported);
+        assert!(apache.binary_path.is_none());
+        assert!(apache.config_path.is_none());
+        assert!(apache.service_id.is_none());
+    }
+
+    /// True BY CONSTRUCTION now: the support gate lives inside the only function
+    /// that hands out a path, so no reordering of statements in
+    /// `read_web_server_config`/`validate_web_server_config` can read or validate a
+    /// file before the brand is checked.
+    #[test]
+    fn unsupported_brand_is_rejected_before_any_path_is_touched() {
+        let p = sample_paths();
+        match WebServerBrand::Apache.live_config_path(&p) {
+            Err(IpcError::Validation { field, message }) => {
+                assert_eq!(field, "id");
+                assert!(message.to_lowercase().contains("apache"));
+            }
+            Err(other) => panic!("expected Validation, got {other:?}"),
+            Ok(path) => panic!("apache must not yield a path, got {}", path.display()),
+        }
+        // The supported brand gets ITS OWN config path out of managed state.
+        assert_eq!(
+            WebServerBrand::Nginx.live_config_path(&p).unwrap(),
+            p.nginx_conf.as_path()
+        );
+        assert!(WebServerBrand::Nginx.require_supported().is_ok());
+        assert!(WebServerBrand::Apache.require_supported().is_err());
+    }
+
+    /// The whole validator invocation is brand-keyed, not just its config argument.
+    ///
+    /// The compiler carries most of this: `ValidationTarget` has one variant, so a
+    /// new brand cannot reach `validate_web_server_config` without an arm being
+    /// written for it. What a test can still add is that the ONE variant is wired to
+    /// the right three values out of managed state — including `err_log`, which is
+    /// derived rather than borrowed and so is the piece a refactor can silently
+    /// change.
+    #[test]
+    fn the_validator_invocation_is_resolved_as_one_unit_from_the_brand() {
+        let p = sample_paths();
+        match WebServerBrand::Nginx.validation_target(&p) {
+            Ok(ValidationTarget::NginxT { bin, conf, err_log }) => {
+                assert_eq!(bin, p.nginx_bin.as_path());
+                assert_eq!(conf, p.nginx_conf.as_path());
+                assert_eq!(err_log, p.home.join("logs/nginx.error.log"));
+            }
+            Err(e) => panic!("nginx must yield a validator invocation, got {e:?}"),
+        }
+        // Mirrors `unsupported_brand_is_rejected_before_any_path_is_touched`: the
+        // gate runs INSIDE the accessor, so an unsupported brand cannot obtain a
+        // binary either, no matter how the caller orders its statements.
+        match WebServerBrand::Apache.validation_target(&p) {
+            Err(IpcError::Validation { field, .. }) => assert_eq!(field, "id"),
+            Err(other) => panic!("expected Validation, got {other:?}"),
+            Ok(_) => panic!("apache must not yield a validator invocation"),
+        }
+    }
+
+    /// The unsupported-brand message must name the brand that was ASKED FOR.
+    ///
+    /// With only two variants — one supported — no single mutation can distinguish a
+    /// hardcoded "Apache" from `self.display_name()`, because Apache is the only
+    /// brand that can reach this message today. So the expected substring is
+    /// COMPUTED from the same source the message uses: a message that stops tracking
+    /// `display_name` diverges the moment `display_name` changes, which is the
+    /// earliest point at which the bug becomes observable at all.
+    #[test]
+    fn the_unsupported_message_names_the_brand_that_was_asked_for() {
+        assert_eq!(WebServerBrand::Nginx.display_name(), "nginx");
+        assert_eq!(WebServerBrand::Apache.display_name(), "Apache");
+        let err = WebServerBrand::Apache.require_supported().unwrap_err();
+        match err {
+            IpcError::Validation { field, message } => {
+                assert_eq!(field, "id");
+                assert!(
+                    message.contains(WebServerBrand::Apache.display_name()),
+                    "the message must name the brand asked for, got {message:?}"
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+}
+
+// Unix-only: the stand-in nginx is a `#!/bin/sh` script made executable via
+// `PermissionsExt`, exactly as `openvhost-conf`'s inspect tests do it. Windows
+// has no supported web-server stack yet (`stack::macos_stack` is the only
+// builder), so there is nothing here a Windows run would be covering.
+#[cfg(all(test, unix))]
+#[allow(clippy::unwrap_used)]
+mod list_web_servers_tests {
+    use std::path::{Path, PathBuf};
+
+    use openvhost_conf::WebServerAdapter;
+    use tauri::Manager;
+
+    use super::*;
+
+    /// A stand-in nginx that records its argv and prints a banner on STDERR, where
+    /// real nginx writes it. NOT a mock of the probe: `probe_nginx_version` really
+    /// spawns this, so the argv file is evidence about the actual invocation.
+    fn fake_nginx(dir: &Path, argv_out: &Path, version: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join("nginx");
+        std::fs::write(
+            &p,
+            format!(
+                "#!/bin/sh\necho \"$@\" > \"{}\"\necho 'nginx version: nginx/{version}' 1>&2\n",
+                argv_out.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    /// Drives `list_web_servers` ITSELF, which nothing did before: `web_server_rows`
+    /// takes `version` as a parameter, and that is exactly why the code PRODUCING it
+    /// had no coverage. Replacing the probe with `let version: Option<String> =
+    /// None;` left `cargo test -p openvhost-desktop` and `clippy --all-targets -D
+    /// warnings` both at exit 0 — and it also removed the only read of `p.home`,
+    /// taking the `err_log` derivation with it. The page would then read
+    /// `Version: Unknown` forever, and the spec's central security disclosure —
+    /// that merely navigating to this page spawns `nginx -v` — would silently become
+    /// false in the direction the auditor was told to worry about.
+    ///
+    /// A `tauri::test` mock app is the only way to obtain a `tauri::State`: `State`'s
+    /// single field is private and `StateManager::new` is `pub(crate)`, so there is
+    /// no other constructor. Hence the dev-only `tauri/test` feature.
+    #[tokio::test]
+    async fn list_web_servers_probes_the_version_and_derives_the_error_log_from_home() {
+        let home = tempfile::tempdir().unwrap();
+        let argv = home.path().join("argv.txt");
+        let bin = fake_nginx(home.path(), &argv, "1.27.3");
+
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(Some(StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: bin.clone(),
+            nginx_conf: home.path().join("conf/nginx.conf"),
+        }));
+
+        let rows = list_web_servers(app.state()).await.unwrap();
+        let nginx = rows
+            .iter()
+            .find(|r| r.id == "nginx")
+            .unwrap_or_else(|| panic!("nginx must be listed, got {rows:?}"));
+
+        // 1. The probe RAN, and the version it reported is the one on the row —
+        //    a distinctive value, so a hardcoded string cannot satisfy it either.
+        assert_eq!(nginx.version.as_deref(), Some("1.27.3"));
+
+        // 2. `-e` was derived from `p.home`. Asserted against the argv the fake
+        //    recorded, so it is the real invocation being checked and not a
+        //    re-derivation of the same expression.
+        let recorded = std::fs::read_to_string(&argv).unwrap();
+        let expected_err_log = home.path().join("logs/nginx.error.log");
+        assert!(
+            recorded.contains(&format!("-e {}", expected_err_log.display())),
+            "the version probe must pass -e derived from p.home; argv was: {recorded}"
+        );
+        assert!(recorded.contains("-v"), "argv was: {recorded}");
+
+        // 3. The binary probed is the one managed state named, not a fresh probe.
+        assert_eq!(nginx.binary_path.as_deref(), Some(&*bin.to_string_lossy()));
+
+        // 4. Hot reload is READ OFF the adapter. Compared against the adapter rather
+        //    than against `true`: `NginxAdapter::supports_hot_reload()` returns
+        //    `true` today, so a literal would be satisfied by hardcoding the field.
+        //    This form ties the row to the source of truth, so the two cannot
+        //    disagree even after the adapter's answer changes.
+        assert_eq!(
+            nginx.supports_hot_reload,
+            openvhost_conf::NginxAdapter.supports_hot_reload()
+        );
     }
 }

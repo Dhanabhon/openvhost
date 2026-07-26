@@ -2,13 +2,13 @@
 <script lang="ts">
 	import { resolve } from '$app/paths';
 
-	// 'sites' and 'services' are real destinations. The union stays narrow on purpose —
-	// Logs/Settings join it once their own slices land.
+	// 'sites', 'services' and 'web-server' are real destinations. The union stays narrow on
+	// purpose — Logs/Settings join it once their own slices land.
 	//
 	// Defaults to 'sites' because Sites is what `/` renders: the app's landing page needs no
 	// `active` of its own, and an unset prop can only ever highlight the destination the user
 	// is most likely on. AppShell.svelte defaults the same way — change both together.
-	let { active = 'sites' }: { active?: 'services' | 'sites' } = $props();
+	let { active = 'sites' }: { active?: 'services' | 'sites' | 'web-server' } = $props();
 </script>
 
 <nav class="rail" aria-label="Main">
@@ -64,6 +64,37 @@
 			<path d="M2 9.5h3l2-5 3 9 2-4h4" />
 		</svg>
 		Services
+	</a>
+
+	<!-- Web server: read-only facts about each brand OpenVHost knows — its own `/web-server`
+	     route, after Services because it answers "what would run", which only matters once you
+	     know what IS running. Label is sentence case per brand §5, and matches the site
+	     editor's own "Web server" field label. -->
+	<a
+		class="nav-item"
+		href={resolve('/web-server')}
+		aria-current={active === 'web-server' ? 'page' : undefined}
+	>
+		<!-- Hand-drawn to match the other rail glyphs (18px, currentColor stroke, 1.6 width):
+		     two stacked units with a status lamp each. The real nginx/Apache brand marks are
+		     NOT used here — the rail names a section, not a brand. -->
+		<svg
+			width="18"
+			height="18"
+			viewBox="0 0 18 18"
+			fill="none"
+			stroke="currentColor"
+			stroke-width="1.6"
+			stroke-linecap="round"
+			stroke-linejoin="round"
+			aria-hidden="true"
+		>
+			<rect x="2.5" y="3" width="13" height="5" rx="1.5" />
+			<rect x="2.5" y="10" width="13" height="5" rx="1.5" />
+			<circle cx="5.2" cy="5.5" r="0.2" />
+			<circle cx="5.2" cy="12.5" r="0.2" />
+		</svg>
+		Web server
 	</a>
 
 	<!-- Logs: inert placeholder — full log-viewer redesign is slice B. -->
