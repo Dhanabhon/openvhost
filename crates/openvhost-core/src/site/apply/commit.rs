@@ -44,7 +44,13 @@ impl ConfigValidator for NginxValidator {
 /// different filesystem than the system temp directory. The temp name does
 /// not end in `.conf` so `plan()`'s owned-file scan never mistakes a
 /// leftover for a real site config.
-fn atomic_write(path: &Path, contents: &str) -> Result<(), ApplyError> {
+///
+/// A5: the actual suffix is `uuid::Uuid::new_v4().simple()` — see
+/// `atomic_write`. It is injected here, rather than generated inline, so a
+/// test can pin a known suffix and pre-plant a symlink at the exact temp
+/// path `atomic_write` would otherwise pick unpredictably; production code
+/// never calls this with anything but a fresh random suffix.
+fn atomic_write_with_suffix(path: &Path, contents: &str, suffix: &str) -> Result<(), ApplyError> {
     let parent = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent).map_err(|source| ApplyError::Io {
         op: "create_dir_all",
@@ -52,14 +58,34 @@ fn atomic_write(path: &Path, contents: &str) -> Result<(), ApplyError> {
         source,
     })?;
     let tmp = parent.join(format!(
-        ".{}.tmp",
+        ".{}.{suffix}.tmp",
         path.file_name().unwrap_or_default().to_string_lossy()
     ));
-    std::fs::write(&tmp, contents).map_err(|source| ApplyError::Io {
-        op: "write",
-        path: tmp.clone(),
-        source,
-    })?;
+    // `create_new` opens (and fails on) the path ITSELF rather than whatever
+    // it might point to: POSIX guarantees `O_CREAT|O_EXCL` fails with EEXIST
+    // on a pre-existing symlink regardless of its target, so a pre-planted
+    // `.<name>.<suffix>.tmp` symlink can never be written through — unlike
+    // the old `std::fs::write`, which follows symlinks and would have made
+    // that an arbitrary-file-overwrite primitive. The random suffix on top
+    // means the name cannot be pre-planted in the first place, and keeps two
+    // concurrent applies from colliding on the same temp path.
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|source| ApplyError::Io {
+            op: "create",
+            path: tmp.clone(),
+            source,
+        })?;
+    f.write_all(contents.as_bytes())
+        .map_err(|source| ApplyError::Io {
+            op: "write",
+            path: tmp.clone(),
+            source,
+        })?;
+    drop(f);
     std::fs::rename(&tmp, path).map_err(|source| {
         // Best-effort: the rename error is the one worth propagating, and if
         // this cleanup also fails there is nothing useful left to report.
@@ -70,6 +96,10 @@ fn atomic_write(path: &Path, contents: &str) -> Result<(), ApplyError> {
             source,
         }
     })
+}
+
+fn atomic_write(path: &Path, contents: &str) -> Result<(), ApplyError> {
+    atomic_write_with_suffix(path, contents, &uuid::Uuid::new_v4().simple().to_string())
 }
 
 fn remove_if_exists(path: &Path) -> Result<(), ApplyError> {
@@ -397,6 +427,45 @@ mod tests {
             std::fs::read_to_string(&target)
                 .unwrap()
                 .contains("/tmp/projects/moved")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_preplanted_symlink_at_the_temp_path_is_not_written_through() {
+        // A5: pin a known suffix (production always uses a fresh random uuid;
+        // see `atomic_write`) so this test can plant a symlink at the EXACT
+        // temp path `atomic_write_with_suffix` will try to create, at the
+        // exact spot an attacker who somehow guessed/raced the suffix would
+        // plant one. `create_new` must refuse to follow it — proving the old
+        // `std::fs::write`-based implementation's arbitrary-file-overwrite
+        // primitive is gone.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("app.localhost.conf");
+        let suffix = "deadbeef";
+        let tmp_path = dir.path().join(".app.localhost.conf.deadbeef.tmp");
+
+        let victim = dir.path().join("victim-outside-generated-tree");
+        std::fs::write(&victim, "must not be overwritten\n").unwrap();
+        std::os::unix::fs::symlink(&victim, &tmp_path).unwrap();
+
+        let err = atomic_write_with_suffix(&target, "server {}\n", suffix).unwrap_err();
+        assert!(
+            matches!(err, ApplyError::Io { op: "create", .. }),
+            "got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "must not be overwritten\n",
+            "the symlink's target must be completely untouched"
+        );
+        // The symlink itself must also survive unreplaced — `create_new`
+        // refuses to touch the path at all, it does not swap it out.
+        assert!(
+            std::fs::symlink_metadata(&tmp_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
     }
 

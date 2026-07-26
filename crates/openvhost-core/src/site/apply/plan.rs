@@ -75,6 +75,7 @@ fn read_if_exists(path: &Path) -> Result<Option<String>, ApplyError> {
         };
         return Err(ApplyError::NotAPlainFile {
             path: path.to_path_buf(),
+            expected: "a plain file",
             found,
         });
     }
@@ -141,7 +142,44 @@ fn owned_files(gen_root: &Path) -> Result<Vec<PathBuf>, ApplyError> {
 /// whatever a symlink might point at), or an empty list when the directory
 /// does not exist — a home that has never been applied is not an error
 /// condition.
+///
+/// Refuses to scan anything that is not a REAL directory (A4), checked with
+/// `symlink_metadata` — which does not follow — BEFORE `read_dir` is ever
+/// called. `read_dir` itself silently follows a symlinked directory, so
+/// without this gate a `sites`/`php` scan root replaced by a symlink would
+/// have every `.conf` file inside the symlink's TARGET classified `Removed`
+/// and deleted, and the newly generated set written into that target
+/// instead — outside the confinement the generated tree exists to enforce.
+/// A missing root is still not an error: it means nothing has been applied
+/// here yet, so `owned_files()` reports nothing owned.
 fn read_dir_or_empty(dir: &Path) -> Result<Vec<(PathBuf, std::fs::FileType)>, ApplyError> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) if meta.file_type().is_dir() => {}
+        Ok(meta) => {
+            let file_type = meta.file_type();
+            let found = if file_type.is_symlink() {
+                "a symlink"
+            } else if file_type.is_file() {
+                "a file"
+            } else {
+                "a special file"
+            };
+            return Err(ApplyError::NotAPlainFile {
+                path: dir.to_path_buf(),
+                expected: "a plain directory",
+                found,
+            });
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(ApplyError::Io {
+                op: "read_dir",
+                path: dir.to_path_buf(),
+                source,
+            });
+        }
+    }
+
     let rd = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -430,6 +468,46 @@ mod tests {
                 p.changes.iter().map(|c| &c.diff).collect::<Vec<_>>()
             ),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_scan_root_is_refused_not_followed() {
+        // A4: if `config/generated/nginx/sites` is itself a symlink, `read_dir`
+        // would silently follow it and classify every `.conf` file in the
+        // TARGET directory as `Removed` — planning it for deletion — which is
+        // exactly the confinement break this test exists to catch.
+        let home = tempfile::tempdir().unwrap();
+        let gen_root = home.path().join("config/generated");
+        std::fs::create_dir_all(gen_root.join("nginx")).unwrap();
+
+        // The symlink target: a directory OUTSIDE the generated tree holding a
+        // `.conf` file that must never be touched by planning.
+        let outside = home.path().join("outside-sites");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("victim.conf"), "# not ours\n").unwrap();
+
+        std::os::unix::fs::symlink(&outside, gen_root.join("nginx/sites")).unwrap();
+
+        let i = input_with_home(home.path(), vec![], &["8.4"]);
+        match plan(&i) {
+            Err(ApplyError::NotAPlainFile {
+                path,
+                expected,
+                found,
+            }) => {
+                assert!(path.ends_with("nginx/sites"), "got {path:?}");
+                assert_eq!(expected, "a plain directory");
+                assert_eq!(found, "a symlink");
+            }
+            Err(other) => panic!("expected NotAPlainFile, got {other:?}"),
+            Ok(p) => panic!(
+                "planning followed the symlinked scan root instead of refusing it: {:?}",
+                p.changes.iter().map(|c| &c.path).collect::<Vec<_>>()
+            ),
+        }
+        // The file outside the generated tree must be completely untouched.
+        assert!(outside.join("victim.conf").exists());
     }
 
     #[test]

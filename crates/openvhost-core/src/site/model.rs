@@ -150,18 +150,24 @@ impl PhpVersion {
 }
 
 /// A validated site document root: an absolute path of at most
-/// `DOCROOT_MAX_LEN` bytes with no NUL, `"`, or control byte (the exact
+/// `DOCROOT_MAX_LEN` bytes with no NUL, `"`, `$`, or control byte (the exact
 /// class `openvhost-conf`'s `to_config_path` rejects — config-injection
-/// stopped at ingress). Constructed only via `parse`; the inner value is
-/// guaranteed valid UTF-8.
+/// stopped at ingress). `$` is rejected alongside `"` because nginx's `root`
+/// directive is a complex value that expands variables even inside double
+/// quotes: a docroot containing e.g. `$http_x_root` would render as
+/// `root "<docroot>$http_x_root";`, a directive that still passes
+/// `nginx -t` but resolves the document root (and the PHP script path
+/// derived from it) from an attacker-controlled request header at request
+/// time. Constructed only via `parse`; the inner value is guaranteed valid
+/// UTF-8.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Docroot(String);
 
 impl Docroot {
     /// Validate a docroot string: absolute, at most `DOCROOT_MAX_LEN` bytes,
-    /// valid UTF-8 (it's `&str`), no quote or control character (the exact
-    /// class P0-7's `to_config_path` rejects). NUL is already covered by
-    /// `is_ascii_control`.
+    /// valid UTF-8 (it's `&str`), no quote, dollar sign, or control character
+    /// (the exact class `openvhost-conf`'s `to_config_path` rejects). NUL is
+    /// already covered by `is_ascii_control`.
     pub fn parse(s: &str) -> Result<Self, CoreError> {
         if s.len() > DOCROOT_MAX_LEN {
             return Err(invalid(
@@ -172,8 +178,13 @@ impl Docroot {
         if !Path::new(s).is_absolute() {
             return Err(invalid("docroot", "must be an absolute path"));
         }
-        if s.bytes().any(|b| b == b'"' || b.is_ascii_control()) {
-            return Err(invalid("docroot", "contains a quote or control character"));
+        if s.bytes()
+            .any(|b| b == b'"' || b == b'$' || b.is_ascii_control())
+        {
+            return Err(invalid(
+                "docroot",
+                "contains a quote, dollar sign, or control character",
+            ));
         }
         Ok(Docroot(s.to_string()))
     }
@@ -322,6 +333,14 @@ mod tests {
         for bad in ["relative/path", "/has\"quote", "/has\0nul", "/has\ncontrol"] {
             assert!(Docroot::parse(bad).is_err(), "should reject {bad:?}");
         }
+    }
+
+    #[test]
+    fn docroot_rejects_dollar_sign() {
+        // B1: nginx's `root` expands `$`-variables even inside quotes, so a
+        // `$`-bearing docroot must be rejected at the field boundary rather
+        // than surfacing as a late render failure.
+        assert!(Docroot::parse("/tmp/x$http_evil").is_err());
     }
 
     #[test]

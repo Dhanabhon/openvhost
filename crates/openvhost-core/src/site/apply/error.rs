@@ -54,14 +54,29 @@ pub enum ApplyError {
         #[source]
         source: std::io::Error,
     },
-    /// A generated-config path is occupied by something that is not a plain
-    /// file — a directory, or a symlink pointing who-knows-where.
+    /// A path apply needed is occupied by something of the wrong kind: a
+    /// generated-config path that is not a plain file (a directory, or a
+    /// symlink pointing who-knows-where), or a scan root (`config/generated/
+    /// nginx/sites`, `config/generated/php`) that is not a real directory (a
+    /// symlink, or a plain file).
     ///
-    /// Refused rather than followed or ignored. Following it would read a file
-    /// outside the generated tree into the diff the user is shown, and ignoring
-    /// it would hide the fact that apply cannot write there.
-    #[error("{} is not a plain file (found {found}); refusing to read or replace it", path.display())]
-    NotAPlainFile { path: PathBuf, found: &'static str },
+    /// Refused rather than followed or ignored. For a config path, following
+    /// it would read a file outside the generated tree into the diff the
+    /// user is shown, and ignoring it would hide the fact that apply cannot
+    /// write there. For a scan root, following a symlinked directory would
+    /// let `read_dir` walk into whatever it points at, classify every
+    /// `.conf` file it finds `Removed`, and delete it — a confinement break
+    /// (A4) that per-entry `DirEntry::file_type()` checks cannot catch,
+    /// because they only ever see entries inside whatever `read_dir` already
+    /// opened.
+    #[error("{} is not {expected} (found {found}); refusing to touch it", path.display())]
+    NotAPlainFile {
+        path: PathBuf,
+        /// What apply needed there — `"a plain file"` for a generated-config
+        /// path, `"a plain directory"` for a scan root.
+        expected: &'static str,
+        found: &'static str,
+    },
     /// `nginx -t` rejected the generated set. The tree has been rolled back.
     #[error("the generated config was rejected by the web server:\n{stderr}")]
     ValidationFailed { stderr: String },

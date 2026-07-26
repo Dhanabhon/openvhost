@@ -516,6 +516,20 @@ pub struct ApplyOutcomeDto {
     pub needs_attention: Vec<ServiceProblemDto>,
 }
 
+/// Serializes `apply_sites` end to end (A2): plan -> commit -> validate ->
+/// restart all run while this lock is held, so two overlapping Apply calls
+/// cannot interleave their commit/rollback (one rollback restoring its own
+/// snapshot over the other's writes) or their stop/start of the same
+/// services. `Default` gives `lib.rs` a plain `ApplyLock::default()` to
+/// manage, matching `quit::UiReady`'s pattern next to it.
+///
+/// `plan_site_apply` deliberately does NOT take this lock — it is read-only
+/// and is called after every site mutation to drive the pending-changes
+/// banner, so serializing it against Apply would make that banner block on
+/// an in-flight apply for no safety benefit.
+#[derive(Default)]
+pub struct ApplyLock(pub(crate) tokio::sync::Mutex<()>);
+
 /// Build the apply input from state.db plus the runtimes probed at startup.
 async fn apply_input(
     db: &Db,
@@ -570,7 +584,18 @@ pub async fn apply_sites(
     runtimes: tauri::State<'_, Option<InstalledRuntimes>>,
     paths: tauri::State<'_, Option<StackPaths>>,
     sup: tauri::State<'_, Arc<Supervisor>>,
+    lock: tauri::State<'_, ApplyLock>,
 ) -> Result<ApplyOutcomeDto, IpcError> {
+    // A2: held across the whole plan -> commit -> validate -> restart
+    // sequence below. The plan is recomputed HERE, from state.db, by
+    // design — the frontend never supplies a plan for this command to run,
+    // so anything that changed state.db between the dialog rendering and the
+    // click is included on purpose. The lock therefore bounds the window
+    // between "user saw a diff" and "that diff is what applied", rather than
+    // eliminating it; a full plan-digest re-check is a larger design change
+    // and out of scope here.
+    let _apply_guard = lock.inner().0.lock().await;
+
     let input = apply_input(db.inner(), runtimes.inner(), paths.inner()).await?;
     let Some(stack) = paths.inner().as_ref() else {
         return Err(IpcError::Core {
@@ -578,6 +603,22 @@ pub async fn apply_sites(
         });
     };
     let p = openvhost_core::plan(&input)?;
+
+    // A3: nothing to write means nothing to restart. Without this, Apply
+    // fell through to the restart block unconditionally, so an empty-plan
+    // click (or a double-click firing the command twice) still stopped and
+    // started nginx/php-fpm — an unbounded stop/start primitive against the
+    // user's own stack, and a needless connection drop for every site it
+    // fronts.
+    if p.changes.is_empty() {
+        return Ok(ApplyOutcomeDto {
+            applied: 0,
+            restarted: Vec::new(),
+            not_started: Vec::new(),
+            needs_attention: Vec::new(),
+        });
+    }
+
     let validator = openvhost_core::NginxValidator {
         bin: stack.nginx_bin.clone(),
         err_log: stack.home.join("logs/nginx.error.log"),
@@ -1096,6 +1137,17 @@ mod site_ipc_tests {
                 "docroot",
                 SiteInput {
                     docroot: "/has\"quote".into(),
+                    ..valid_input()
+                },
+            ),
+            (
+                // B1: a `$`-bearing docroot must be rejected at the IPC
+                // ingress — nginx's `root` expands variables even inside
+                // quotes, so this would otherwise become a request-header-
+                // controlled document root that still passes `nginx -t`.
+                "docroot",
+                SiteInput {
+                    docroot: "/tmp/x$http_evil".into(),
                     ..valid_input()
                 },
             ),

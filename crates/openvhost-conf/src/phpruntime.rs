@@ -153,6 +153,11 @@ mod tests {
         // php-fpm from executing a request for a file that is not actually a
         // `.php` script (site_apply_e2e.rs's `/style.css/x.php` case).
         assert!(c.contains("security.limit_extensions = .php"));
+        // A6: stated explicitly rather than relied on as php-fpm's own
+        // default — if that default ever flipped, the desktop app's
+        // inherited environment (whatever a terminal-launched dev build's
+        // shell exports) would be visible to every script the pool runs.
+        assert!(c.contains("clear_env = yes"));
         assert!(c.contains("include=/tmp/ovh/config/custom/php/8.4/pool.d/*.conf"));
     }
 }

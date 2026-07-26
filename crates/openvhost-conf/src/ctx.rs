@@ -121,11 +121,20 @@ impl RenderCtx {
 /// The single chokepoint for embedding a path into a config template: reject
 /// non-UTF-8 (Tera cannot render it), normalize `\` to `/`, strip a `\\?\` /
 /// `\\?\UNC\` verbatim prefix (nginx's parser understands neither), and
-/// reject an embedded `"` or ASCII control character — the crate's central
-/// quoting invariant. Every generated directive double-quotes its path
-/// value, so a path containing `"` (e.g. a docroot of
+/// reject an embedded `"`, ASCII control character, or `$` — the crate's
+/// central quoting invariant. Every generated directive double-quotes its
+/// path value, so a path containing `"` (e.g. a docroot of
 /// `/tmp/x" ; daemon on; #`) would splice an injected directive that still
-/// passes `nginx -t`. A no-op on ordinary, clean unix paths.
+/// passes `nginx -t`. `$` matters for a different reason: nginx's `root` is a
+/// *complex value* that expands variables even inside double quotes, so a
+/// docroot containing e.g. `$http_x_root` renders as
+/// `root "/tmp/projects/app$http_x_root";` — a directive that still passes
+/// `nginx -t` but resolves the document root (and, via
+/// `SCRIPT_FILENAME $document_root$fastcgi_script_name`, the PHP script path)
+/// from an attacker-controlled request header at request time. The same
+/// chokepoint feeds the php-fpm pool template's unquoted INI `listen =`,
+/// `error_log =`, and `include=` lines, where `$` is also expanded. A no-op
+/// on ordinary, clean unix paths.
 pub(crate) fn to_config_path(p: &Path) -> Result<String, ConfError> {
     let s = p
         .to_str()
@@ -135,11 +144,11 @@ pub(crate) fn to_config_path(p: &Path) -> Result<String, ConfError> {
         .map(|rest| format!(r"\\{rest}"))
         .unwrap_or_else(|| s.strip_prefix(r"\\?\").unwrap_or(s).to_string());
     let s = s.replace('\\', "/");
-    if s.contains('"') || s.bytes().any(|b| b.is_ascii_control()) {
+    if s.contains('"') || s.contains('$') || s.bytes().any(|b| b.is_ascii_control()) {
         return Err(ConfError::InvalidField {
             field: "path",
             value: s,
-            reason: "must not contain a double-quote or control character",
+            reason: "must not contain a double-quote, dollar sign, or control character",
         });
     }
     Ok(s)
@@ -255,6 +264,19 @@ mod tests {
         let newline = to_config_path(Path::new("/tmp/x\ny"));
         assert!(matches!(
             newline,
+            Err(ConfError::InvalidField { field: "path", .. })
+        ));
+    }
+
+    #[test]
+    fn to_config_path_rejects_dollar_sign() {
+        // Header-controlled-root vector (B1): nginx's `root` is a complex
+        // value and expands `$`-variables even inside double quotes, so a
+        // docroot containing `$http_evil` would let a request header choose
+        // the document root while `nginx -t` stays green.
+        let hostile = to_config_path(Path::new("/tmp/x$http_evil"));
+        assert!(matches!(
+            hostile,
             Err(ConfError::InvalidField { field: "path", .. })
         ));
     }

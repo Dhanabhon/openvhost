@@ -168,6 +168,15 @@ pub fn run() {
             // the confirmation instead of failing loudly.
             app.manage(quit::UiReady::default());
 
+            // A2: serializes `apply_sites` end to end (plan -> commit -> validate
+            // -> restart) so two overlapping Apply calls cannot interleave their
+            // commit/rollback or their stop/start of the same services. Managed
+            // unconditionally and up front, same reasoning as `UiReady` above —
+            // `apply_sites` also requires `Db`/`Arc<Supervisor>`/`Option<StackPaths>`
+            // to be managed before it is reachable at all, so this is never
+            // observed absent by a caller that could actually invoke the command.
+            app.manage(commands::ApplyLock::default());
+
             // Single-instance lock (design spec §7): reap MUST run only
             // while this is held, otherwise a second live instance would
             // reap the first's HEALTHY services (identity matches — it
