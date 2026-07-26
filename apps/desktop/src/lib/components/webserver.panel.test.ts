@@ -182,19 +182,21 @@ describe('the disclosure and Validate controls', () => {
 });
 
 // The copy added by this slice is the only place the product tells anyone to edit
-// `<home>/conf/nginx.conf` — and `provision_macos_demo_stack` rewrites that file
-// unconditionally on every startup, so the advice has to say so or it is a trap.
+// `<home>/config/generated/nginx/nginx.conf` — and `site::apply` regenerates that
+// file from the user's sites every time Apply runs, so the advice has to say so
+// (and name the `config/custom/` escape hatch) or it is a trap.
 describe('the failed-validation next step', () => {
-	it('warns that OpenVHost rewrites the file at startup', () => {
+	it('warns that Apply regenerates the file from the sites', () => {
 		const t = text(html({ reports: { nginx: { ok: false, stderr: 'nginx: [emerg] boom' } } }));
 		expect(t).toContain('this page is read-only');
-		expect(t.toLowerCase()).toContain('rewrites this file when it starts');
+		expect(t.toLowerCase()).toContain('regenerates this file from your sites');
+		expect(t).toContain('config/custom/');
 	});
 
 	// Nothing to warn about when the config IS valid: no next-step block renders.
 	it('says none of it when the config is valid', () => {
 		const t = text(html({ reports: { nginx: { ok: true, stderr: 'syntax is ok' } } }));
-		expect(t.toLowerCase()).not.toContain('rewrites this file');
+		expect(t.toLowerCase()).not.toContain('regenerates this file');
 	});
 });
 

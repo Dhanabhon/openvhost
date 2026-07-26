@@ -185,17 +185,18 @@
 				<pre>{report.stderr}</pre>
 			{/if}
 			{#if !report.ok}
-				<!-- Says the rewrite out loud. `provision_macos_demo_stack` (openvhost-core's
-				     `platform/macos/demo_stack.rs`) `atomic_write`s `<home>/conf/nginx.conf`
-				     UNCONDITIONALLY, and `stack::macos_stack()` calls it on every startup — so a
-				     hand edit holds until the next launch and then vanishes with no notice. That
-				     is pre-existing P0-4 behaviour rather than this page's, but this sentence is
-				     the only place the product tells anyone to edit that file, so it is the place
-				     that has to be honest about it. If provisioning ever becomes conditional,
-				     this copy changes with it. -->
+				<!-- Says the rewrite out loud. `site::apply` (openvhost-core's
+				     `site/apply/mod.rs`) regenerates `<home>/config/generated/nginx/nginx.conf`
+				     from the user's sites every time Apply runs — so a hand edit here holds only
+				     until the next Apply and then vanishes with no notice. This sentence is the
+				     only place the product tells anyone to edit that file, so it is the place
+				     that has to be honest about it, and it names the escape hatch
+				     (`config/custom/`) rather than leaving the reader with nowhere safe to put a
+				     customisation. -->
 				<p class="next">
-					Edit the file on disk, then validate again — this page is read-only. OpenVHost rewrites
-					this file when it starts, so hand edits are lost on the next launch.
+					Edit the file on disk, then validate again — this page is read-only. Apply
+					regenerates this file from your sites, so hand edits are lost on the next Apply.
+					Add custom directives under <code>config/custom/</code> instead.
 				</p>
 			{/if}
 		</div>

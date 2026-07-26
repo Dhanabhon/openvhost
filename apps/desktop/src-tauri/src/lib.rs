@@ -202,19 +202,22 @@ pub fn run() {
                             ));
                             supervisor.register(demo_ticker_spec());
                             #[cfg(target_os = "macos")]
-                            let stack_paths = {
+                            let (stack_paths, stack_runtimes) = {
                                 let stack = stack::macos_stack();
                                 for spec in stack.specs {
                                     supervisor.register(spec);
                                 }
-                                stack.paths
+                                (stack.paths, stack.runtimes)
                             };
                             // No stack builder for this target yet, so `None` is the
                             // NORMAL state here — the home resolved fine, there is
                             // simply nothing to point the Web Server page at. See
                             // `commands::stack_paths` for the message that renders.
                             #[cfg(not(target_os = "macos"))]
-                            let stack_paths: Option<stack::StackPaths> = None;
+                            let (stack_paths, stack_runtimes): (
+                                Option<stack::StackPaths>,
+                                Option<openvhost_core::InstalledRuntimes>,
+                            ) = (None, None);
                             // Manage the Option ITSELF, unconditionally. Tauri implements
                             // `CommandArg` only for `State<'r, T>` — there is no impl for
                             // `Option<State<'r, T>>` — so a command cannot take an
@@ -229,6 +232,15 @@ pub fn run() {
                             // early, the real value later" split would silently pin every
                             // user to `None`.
                             app.manage(stack_paths);
+                            // Same `Option<T>`-managed-unconditionally shape as `stack_paths`
+                            // above, for the same reason: `Manager::manage` never overwrites,
+                            // so every arm must yield a value rather than some arms skipping
+                            // the call. `None` on a target with no stack builder, or when the
+                            // php-fpm version could not be probed (see `stack::macos_stack`'s
+                            // doc comment) — either way a later command that reads this state
+                            // sees an honest absence rather than a stale value from a call
+                            // that never happened.
+                            app.manage(stack_runtimes);
                             let mut rx = supervisor.subscribe();
                             let handle = app.handle().clone();
                             tauri::async_runtime::spawn(async move {
