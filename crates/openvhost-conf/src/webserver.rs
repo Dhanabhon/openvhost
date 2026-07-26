@@ -15,8 +15,14 @@ use crate::{GeneratedFile, ValidationReport};
 #[async_trait]
 pub trait WebServerAdapter: Send + Sync {
     fn id(&self) -> &'static str;
-    fn generate_main_config(&self, ctx: &RenderCtx) -> Result<GeneratedFile, ConfError>;
+    fn generate_main_config(&self, home: &Path) -> Result<GeneratedFile, ConfError>;
     fn generate_site_config(&self, ctx: &RenderCtx) -> Result<GeneratedFile, ConfError>;
+    fn generate_default_site_config(
+        &self,
+        home: &Path,
+        listen: std::net::SocketAddr,
+        php_upstream: Option<&PhpUpstream>,
+    ) -> Result<GeneratedFile, ConfError>;
     async fn validate(&self, bin: &Path, ctx: &RenderCtx) -> Result<ValidationReport, ConfError>;
     fn supports_hot_reload(&self) -> bool;
 }
@@ -27,6 +33,47 @@ impl NginxAdapter {
     fn gen_dir(home: &Path) -> PathBuf {
         home.join("config/generated/nginx")
     }
+
+    /// The OS branch, in Rust rather than in a Tera conditional: the platform
+    /// seam stays type-checked (spec 2026-07-23 §4).
+    fn upstream_parts(
+        upstream: &PhpUpstream,
+        upstream_name: &str,
+    ) -> Result<(String, String), ConfError> {
+        Ok(match upstream {
+            PhpUpstream::UnixSocket(p) => {
+                let sock = to_config_path(p)?;
+                (String::new(), format!("fastcgi_pass \"unix:{sock}\";"))
+            }
+            PhpUpstream::TcpPorts(ports) => {
+                let mut block = format!("upstream {upstream_name} {{\n");
+                for addr in ports {
+                    block.push_str(&format!("    server {addr} max_fails=1 fail_timeout=1s;\n"));
+                }
+                block.push_str("}\n\n");
+                let pass = format!(
+                    "fastcgi_pass {upstream_name};\n        fastcgi_next_upstream error timeout invalid_header http_500;"
+                );
+                (block, pass)
+            }
+        })
+    }
+
+    /// The PHP `location` block, or an empty string when no PHP runtime is
+    /// installed — a `fastcgi_pass` with no pool behind it only produces 502s.
+    fn php_location(
+        home_str: &str,
+        server_name: &str,
+        php_pass: &str,
+    ) -> Result<String, ConfError> {
+        let mut tc = tera::Context::new();
+        tc.insert("php_pass", php_pass);
+        tc.insert(
+            "custom_site_glob",
+            &format!("{home_str}/config/custom/sites/{server_name}.d/*.conf"),
+        );
+        render("nginx/php-location.conf", &tc)
+    }
 }
 
 #[async_trait]
@@ -35,25 +82,28 @@ impl WebServerAdapter for NginxAdapter {
         "nginx"
     }
 
-    fn generate_main_config(&self, ctx: &RenderCtx) -> Result<GeneratedFile, ConfError> {
-        let home = to_config_path(&ctx.home)?;
+    fn generate_main_config(&self, home: &Path) -> Result<GeneratedFile, ConfError> {
+        let home_str = to_config_path(home)?;
         let mut tc = tera::Context::new();
-        tc.insert("custom_sites_dir", &format!("{home}/config/custom/sites"));
-        tc.insert("pid_path", &format!("{home}/run/nginx.pid"));
-        tc.insert("error_log", &format!("{home}/logs/nginx.error.log"));
-        tc.insert("access_log", &format!("{home}/logs/nginx.access.log"));
-        tc.insert("temp_dir", &format!("{home}/run/nginx"));
+        tc.insert(
+            "custom_sites_dir",
+            &format!("{home_str}/config/custom/sites"),
+        );
+        tc.insert("pid_path", &format!("{home_str}/run/nginx.pid"));
+        tc.insert("error_log", &format!("{home_str}/logs/nginx.error.log"));
+        tc.insert("access_log", &format!("{home_str}/logs/nginx.access.log"));
+        tc.insert("temp_dir", &format!("{home_str}/run/nginx"));
         tc.insert(
             "generated_sites_glob",
-            &format!("{home}/config/generated/nginx/sites/*.conf"),
+            &format!("{home_str}/config/generated/nginx/sites/*.conf"),
         );
         tc.insert(
             "custom_sites_glob",
-            &format!("{home}/config/custom/sites/*.conf"),
+            &format!("{home_str}/config/custom/sites/*.conf"),
         );
         let contents = render("nginx/main.conf", &tc)?;
         Ok(GeneratedFile {
-            path: Self::gen_dir(&ctx.home).join("nginx.conf"),
+            path: Self::gen_dir(home).join("nginx.conf"),
             contents,
         })
     }
@@ -62,25 +112,9 @@ impl WebServerAdapter for NginxAdapter {
         let home = to_config_path(&ctx.home)?;
         let docroot = to_config_path(&ctx.docroot)?;
 
-        // OS branch in Rust: build the upstream block + fastcgi_pass directive.
-        let (php_upstream_block, php_pass) = match &ctx.php_upstream {
-            PhpUpstream::UnixSocket(p) => {
-                let sock = to_config_path(p)?;
-                (String::new(), format!("fastcgi_pass \"unix:{sock}\";"))
-            }
-            PhpUpstream::TcpPorts(ports) => {
-                let mut block = format!("upstream {} {{\n", ctx.upstream_name);
-                for addr in ports {
-                    block.push_str(&format!("    server {addr} max_fails=1 fail_timeout=1s;\n"));
-                }
-                block.push_str("}\n\n");
-                let pass = format!(
-                    "fastcgi_pass {};\n        fastcgi_next_upstream error timeout invalid_header http_500;",
-                    ctx.upstream_name
-                );
-                (block, pass)
-            }
-        };
+        let (php_upstream_block, php_pass) =
+            Self::upstream_parts(&ctx.php_upstream, &ctx.upstream_name)?;
+        let php_location = Self::php_location(&home, &ctx.server_name, &php_pass)?;
 
         let mut tc = tera::Context::new();
         tc.insert(
@@ -88,19 +122,51 @@ impl WebServerAdapter for NginxAdapter {
             &format!("{home}/config/custom/sites/{}.d", ctx.server_name),
         );
         tc.insert("php_upstream_block", &php_upstream_block);
-        tc.insert("php_pass", &php_pass);
+        tc.insert("php_location", &php_location);
         tc.insert("listen_addr", &ctx.listen_addr.to_string());
         tc.insert("server_name", &ctx.server_name);
         tc.insert("docroot", &docroot);
-        tc.insert(
-            "custom_site_glob",
-            &format!("{home}/config/custom/sites/{}.d/*.conf", ctx.server_name),
-        );
         let contents = render("nginx/site.conf", &tc)?;
         Ok(GeneratedFile {
             path: Self::gen_dir(&ctx.home)
                 .join("sites")
                 .join(format!("{}.conf", ctx.server_name)),
+            contents,
+        })
+    }
+
+    fn generate_default_site_config(
+        &self,
+        home: &Path,
+        listen: std::net::SocketAddr,
+        php_upstream: Option<&PhpUpstream>,
+    ) -> Result<GeneratedFile, ConfError> {
+        let home_str = to_config_path(home)?;
+        let docroot = to_config_path(&home.join("www"))?;
+        let php_location = match php_upstream {
+            // `default` is a fixed, safe token: it names the custom-config
+            // directory for the catch-all and the Windows upstream block.
+            Some(up) => {
+                // The catch-all's `upstream{}` block is deliberately dropped
+                // (`_`): on the unix path it is always empty, and the
+                // Windows pool manager is a later phase that will revisit
+                // the catch-all.
+                let (_, pass) = Self::upstream_parts(up, "php_default")?;
+                Self::php_location(&home_str, "default", &pass)?
+            }
+            None => String::new(),
+        };
+        let mut tc = tera::Context::new();
+        tc.insert(
+            "custom_sites_dir",
+            &format!("{home_str}/config/custom/sites"),
+        );
+        tc.insert("listen_addr", &listen.to_string());
+        tc.insert("docroot", &docroot);
+        tc.insert("php_location", &php_location);
+        let contents = render("nginx/default-site.conf", &tc)?;
+        Ok(GeneratedFile {
+            path: Self::gen_dir(home).join("sites").join("00-default.conf"),
             contents,
         })
     }
@@ -115,7 +181,7 @@ impl WebServerAdapter for NginxAdapter {
     async fn validate(&self, bin: &Path, ctx: &RenderCtx) -> Result<ValidationReport, ConfError> {
         // Materialize main + site into ctx.home, pre-create the dirs `nginx -t`
         // needs (run/, run/nginx/, logs/ — NOT www/), then run the validator.
-        let main = self.generate_main_config(ctx)?;
+        let main = self.generate_main_config(&ctx.home)?;
         let site = self.generate_site_config(ctx)?;
         crate::validate::materialize(&[main.clone(), site])?;
         for d in ["run", "run/nginx", "logs"] {
@@ -172,7 +238,7 @@ mod tests {
 
     #[test]
     fn main_config_is_banner_quoted_and_includes() {
-        let f = NginxAdapter.generate_main_config(&unix_ctx()).unwrap();
+        let f = NginxAdapter.generate_main_config(&unix_ctx().home).unwrap();
         assert_eq!(
             f.path,
             PathBuf::from("/tmp/ovh/config/generated/nginx/nginx.conf")
@@ -202,7 +268,7 @@ mod tests {
         assert!(c.contains("server_name myapp.localhost;"));
         assert!(c.contains(r#"root "/tmp/ovh/www";"#));
         assert!(c.contains(r#"fastcgi_pass "unix:/tmp/ovh/run/php-fpm.sock";"#));
-        assert!(c.contains("fastcgi_param SCRIPT_FILENAME $document_root/index.php;"));
+        assert!(c.contains("fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;"));
         // no upstream block for the unix path:
         assert!(!c.contains("upstream "));
     }
@@ -233,8 +299,86 @@ mod tests {
 
     #[test]
     fn generation_is_deterministic() {
-        let a = NginxAdapter.generate_main_config(&unix_ctx()).unwrap();
-        let b = NginxAdapter.generate_main_config(&unix_ctx()).unwrap();
+        let a = NginxAdapter.generate_main_config(&unix_ctx().home).unwrap();
+        let b = NginxAdapter.generate_main_config(&unix_ctx().home).unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn main_config_declares_mime_types() {
+        let f = NginxAdapter
+            .generate_main_config(std::path::Path::new("/tmp/ovh"))
+            .unwrap();
+        let c = &f.contents;
+        // Without a types block nginx labels every response octet-stream and
+        // browsers refuse to apply the stylesheet.
+        assert!(c.contains("text/css                              css;"));
+        assert!(c.contains("application/javascript                js mjs;"));
+        assert!(c.contains("default_type application/octet-stream;"));
+    }
+
+    #[test]
+    fn site_config_serves_static_files_without_php() {
+        let c = NginxAdapter
+            .generate_site_config(&unix_ctx())
+            .unwrap()
+            .contents;
+        // The front controller handles unknown paths; real files are served as files.
+        assert!(c.contains("try_files $uri $uri/ /index.php$is_args$args;"));
+        assert!(c.contains("index index.php index.html;"));
+        // SCRIPT_FILENAME must follow the request, not be pinned to index.php.
+        assert!(c.contains("fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;"));
+        assert!(!c.contains("$document_root/index.php"));
+    }
+
+    #[test]
+    fn php_location_refuses_to_execute_a_path_that_is_not_a_file() {
+        let c = NginxAdapter
+            .generate_site_config(&unix_ctx())
+            .unwrap()
+            .contents;
+        // Without this, an uploaded avatar.jpg containing PHP executes via
+        // /uploads/avatar.jpg/x.php. The guard is the whole defence.
+        assert!(c.contains("try_files $uri =404;"));
+        assert!(c.contains("fastcgi_param REDIRECT_STATUS 200;"));
+        assert!(c.contains("location ~ /\\. {"));
+    }
+
+    #[test]
+    fn default_site_is_the_catch_all_and_can_run_php() {
+        let sock = PathBuf::from("/tmp/ovh/run/php-fpm-8.4.sock");
+        let up = PhpUpstream::UnixSocket(sock);
+        let f = NginxAdapter
+            .generate_default_site_config(
+                std::path::Path::new("/tmp/ovh"),
+                "127.0.0.1:8080".parse().unwrap(),
+                Some(&up),
+            )
+            .unwrap();
+        assert_eq!(
+            f.path,
+            PathBuf::from("/tmp/ovh/config/generated/nginx/sites/00-default.conf")
+        );
+        let c = &f.contents;
+        assert!(c.contains("listen 127.0.0.1:8080 default_server;"));
+        assert!(c.contains("server_name _;"));
+        assert!(c.contains(r#"root "/tmp/ovh/www";"#));
+        assert!(c.contains(r#"fastcgi_pass "unix:/tmp/ovh/run/php-fpm-8.4.sock";"#));
+    }
+
+    #[test]
+    fn default_site_without_php_has_no_fastcgi_at_all() {
+        let f = NginxAdapter
+            .generate_default_site_config(
+                std::path::Path::new("/tmp/ovh"),
+                "127.0.0.1:8080".parse().unwrap(),
+                None,
+            )
+            .unwrap();
+        let c = &f.contents;
+        assert!(c.contains("default_server;"));
+        // A fastcgi_pass with no pool behind it is a 502 generator.
+        assert!(!c.contains("fastcgi_pass"));
+        assert!(!c.contains("location ~ [^/]\\.php"));
     }
 }

@@ -57,7 +57,7 @@ async fn generated_stack_passes_native_validators() {
     // A zero-match `include` glob also passes plain `-t` silently, so `-t`
     // alone can't prove the main->site include seam actually expanded. `-T`
     // test-and-dumps the fully resolved config to stdout instead.
-    let main = NginxAdapter.generate_main_config(&ctx).unwrap();
+    let main = NginxAdapter.generate_main_config(&ctx.home).unwrap();
     let err_log = ctx.home.join("logs/nginx.error.log");
     let dump = tokio::process::Command::new(&brew.nginx)
         .arg("-e")
@@ -122,7 +122,7 @@ async fn both_probes_pass_real_nginx_in_the_assembled_environment() {
          anything about the environment:\n{}",
         generated.stderr
     );
-    let main = NginxAdapter.generate_main_config(&ctx).unwrap();
+    let main = NginxAdapter.generate_main_config(&ctx.home).unwrap();
     let err_log = ctx.home.join("logs/nginx.error.log");
 
     let live = validate_live(&brew.nginx, &main.path, &err_log)

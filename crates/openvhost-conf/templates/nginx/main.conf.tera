@@ -13,6 +13,28 @@ events {}
 
 http {
     access_log "{{ access_log }}";
+    types {
+        text/html                             html htm;
+        text/css                              css;
+        text/xml                              xml;
+        text/plain                            txt;
+        application/javascript                js mjs;
+        application/json                      json map;
+        application/pdf                       pdf;
+        application/zip                       zip;
+        image/svg+xml                         svg svgz;
+        image/png                             png;
+        image/jpeg                            jpeg jpg;
+        image/gif                             gif;
+        image/webp                            webp;
+        image/avif                            avif;
+        image/x-icon                          ico;
+        font/woff                             woff;
+        font/woff2                            woff2;
+        font/ttf                              ttf;
+        video/mp4                             mp4;
+    }
+    default_type application/octet-stream;
     client_body_temp_path "{{ temp_dir }}/client_body";
     proxy_temp_path "{{ temp_dir }}/proxy";
     fastcgi_temp_path "{{ temp_dir }}/fastcgi";

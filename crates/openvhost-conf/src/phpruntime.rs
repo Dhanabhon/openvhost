@@ -7,14 +7,19 @@ use std::path::Path;
 
 use async_trait::async_trait;
 
-use crate::ctx::{RenderCtx, to_config_path};
+use crate::ctx::{PhpUpstream, RenderCtx, to_config_path};
 use crate::engine::render;
 use crate::error::ConfError;
 use crate::{GeneratedFile, ValidationReport};
 
 #[async_trait]
 pub trait PhpRuntimeAdapter: Send + Sync {
-    fn generate_pool_config(&self, ctx: &RenderCtx) -> Result<Option<GeneratedFile>, ConfError>;
+    fn generate_pool_config(
+        &self,
+        home: &Path,
+        major: &str,
+        upstream: &PhpUpstream,
+    ) -> Result<Option<GeneratedFile>, ConfError>;
     async fn validate(
         &self,
         php_bin: &Path,
@@ -26,12 +31,17 @@ pub struct PhpFpmRuntime;
 
 #[async_trait]
 impl PhpRuntimeAdapter for PhpFpmRuntime {
-    fn generate_pool_config(&self, ctx: &RenderCtx) -> Result<Option<GeneratedFile>, ConfError> {
-        let home = to_config_path(&ctx.home)?;
+    fn generate_pool_config(
+        &self,
+        home: &Path,
+        major: &str,
+        upstream: &PhpUpstream,
+    ) -> Result<Option<GeneratedFile>, ConfError> {
+        let home_str = to_config_path(home)?;
         // php-fpm listens on the unix socket named by the upstream on macOS.
-        let socket = match &ctx.php_upstream {
-            crate::PhpUpstream::UnixSocket(p) => to_config_path(p)?,
-            crate::PhpUpstream::TcpPorts(_) => {
+        let socket = match upstream {
+            PhpUpstream::UnixSocket(p) => to_config_path(p)?,
+            PhpUpstream::TcpPorts(_) => {
                 // No php-fpm pool file on the TCP (Windows) path.
                 return Ok(None);
             }
@@ -39,20 +49,19 @@ impl PhpRuntimeAdapter for PhpFpmRuntime {
         let mut tc = tera::Context::new();
         tc.insert(
             "custom_pool_dir",
-            &format!("{home}/config/custom/php/{}/pool.d", ctx.php_major),
+            &format!("{home_str}/config/custom/php/{major}/pool.d"),
         );
-        tc.insert("error_log", &format!("{home}/logs/php-fpm.log"));
+        tc.insert("error_log", &format!("{home_str}/logs/php-fpm.log"));
         tc.insert("socket", &socket);
         tc.insert(
             "custom_pool_glob",
-            &format!("{home}/config/custom/php/{}/pool.d/*.conf", ctx.php_major),
+            &format!("{home_str}/config/custom/php/{major}/pool.d/*.conf"),
         );
         let contents = render("php-fpm/pool.conf", &tc)?;
         Ok(Some(GeneratedFile {
-            path: ctx
-                .home
+            path: home
                 .join("config/generated/php")
-                .join(&ctx.php_major)
+                .join(major)
                 .join("php-fpm.conf"),
             contents,
         }))
@@ -67,7 +76,8 @@ impl PhpRuntimeAdapter for PhpFpmRuntime {
         php_bin: &Path,
         ctx: &RenderCtx,
     ) -> Result<ValidationReport, ConfError> {
-        let Some(pool) = self.generate_pool_config(ctx)? else {
+        let Some(pool) = self.generate_pool_config(&ctx.home, &ctx.php_major, &ctx.php_upstream)?
+        else {
             // No pool file on the TCP/Windows path — nothing to validate here.
             return Ok(ValidationReport {
                 ok: true,
@@ -122,8 +132,9 @@ mod tests {
 
     #[test]
     fn pool_config_is_semicolon_banner_and_per_major() {
+        let ctx = unix_ctx();
         let f = PhpFpmRuntime
-            .generate_pool_config(&unix_ctx())
+            .generate_pool_config(&ctx.home, &ctx.php_major, &ctx.php_upstream)
             .unwrap()
             .unwrap();
         assert_eq!(
