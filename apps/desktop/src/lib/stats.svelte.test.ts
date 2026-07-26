@@ -41,14 +41,25 @@ describe('StatsStore', () => {
 	// The two cadences are the point of the design: memory is one syscall per pid,
 	// the home figure is a directory walk. Sampling them together would either
 	// throttle memory or hammer the disk.
+	//
+	// I2: this is a plan Global Constraint, so it must pin the CONSTANTS
+	// themselves, not just their ratio. Deriving the expected call counts from
+	// the constants (as this test once did) makes it a tautology about the
+	// ratio: MEMORY_INTERVAL_MS 2000 -> 60000 destroys the 30x ratio and still
+	// passes, and MEMORY_INTERVAL_MS 2000 -> 100 with HOME_INTERVAL_MS 60000 ->
+	// 2000 preserves the ratio while hammering the disk with a walk every 2s —
+	// the exact idle-cost regression spec §5 exists to prevent — and also still
+	// passes. Asserting the literals, and hard-coding the expected counts,
+	// makes both mutations fail here.
 	it('samples memory 30x more often than the home size', async () => {
+		expect(MEMORY_INTERVAL_MS).toBe(2000);
+		expect(HOME_INTERVAL_MS).toBe(60000);
 		const a = api();
 		const s = new StatsStore(a);
 		s.start();
 		await vi.advanceTimersByTimeAsync(HOME_INTERVAL_MS);
-		// 1 immediate + HOME_INTERVAL_MS / MEMORY_INTERVAL_MS ticks
-		expect(a.servicesMemory).toHaveBeenCalledTimes(1 + HOME_INTERVAL_MS / MEMORY_INTERVAL_MS);
-		expect(a.homeDiskUsage).toHaveBeenCalledTimes(2); // immediate + one tick
+		expect(a.servicesMemory).toHaveBeenCalledTimes(31); // 1 immediate + 30 ticks @ 2000ms
+		expect(a.homeDiskUsage).toHaveBeenCalledTimes(2); // 1 immediate + 1 tick @ 60000ms
 		s.stop();
 	});
 
@@ -93,6 +104,29 @@ describe('StatsStore', () => {
 		s.stop();
 	});
 
+	// I3: the home-side mirror of the test above. A failed sample must return
+	// the home figure to unknown too, NOT leave it at its last stale value —
+	// same discipline as memory, so a permanently failing home read cannot show
+	// a frozen number forever instead of spec §6's `—`. Succeeding FIRST (and
+	// asserting the real value) before switching to a rejection is what proves
+	// this: a fake that always rejects can never tell "never set" apart from
+	// "reverted by the catch", because `homeBytes` starts at `null` anyway.
+	it('returns the home figure to unknown when a later sample fails', async () => {
+		const a = api();
+		const s = new StatsStore(a);
+		s.start();
+		await vi.advanceTimersByTimeAsync(0);
+		expect(s.homeBytes).toBe(9999);
+
+		(a.homeDiskUsage as unknown as { mockRejectedValue: (e: unknown) => void }).mockRejectedValue({
+			kind: 'core',
+			message: 'nope'
+		});
+		await vi.advanceTimersByTimeAsync(HOME_INTERVAL_MS);
+		expect(s.homeBytes).toBeNull();
+		s.stop();
+	});
+
 	// A failed FIRST home reading is a failure, not "still measuring" — otherwise
 	// the strip says "measuring…" forever.
 	it('clears homePending even when the first home reading fails', async () => {
@@ -111,13 +145,45 @@ describe('StatsStore', () => {
 	});
 
 	// start() twice (a dev-HMR double mount) must not double the polling rate.
+	//
+	// I4: the guard (`if (this.memoryTimer !== null) return`) is checked once,
+	// before EITHER timer is armed, so a second start() must leak neither a
+	// memoryTimer NOR a homeTimer. The original version of this test asserted
+	// only servicesMemory and advanced just MEMORY_INTERVAL_MS * 3 = 6000ms, so
+	// it could never observe a leaked homeTimer (60000ms) — arming homeTimer
+	// unconditionally ahead of the guard leaked one and still passed. Advancing
+	// past HOME_INTERVAL_MS and asserting homeDiskUsage's count too (the same
+	// two-part fix `stop()`'s test already uses above) closes that blind spot.
 	it('is idempotent across a second start', async () => {
 		const a = api();
 		const s = new StatsStore(a);
 		s.start();
 		s.start();
-		await vi.advanceTimersByTimeAsync(MEMORY_INTERVAL_MS * 3);
-		expect(a.servicesMemory).toHaveBeenCalledTimes(4); // 1 immediate + 3 ticks
+		await vi.advanceTimersByTimeAsync(HOME_INTERVAL_MS);
+		expect(a.servicesMemory).toHaveBeenCalledTimes(31); // 1 immediate + 30 ticks @ 2000ms
+		expect(a.homeDiskUsage).toHaveBeenCalledTimes(2); // 1 immediate + 1 tick @ 60000ms
 		s.stop();
+	});
+
+	// I1: the resume seam. `+layout.svelte` calls `start()` on EVERY
+	// `visibilitychange` back to visible, not just once at app launch — Cmd+Tab
+	// between an IDE and this app is the primary interaction. Without a guard,
+	// each resume re-walks the disk as often as the cheap memory read, exactly
+	// defeating the two-cadence split (see the file header). Ten hide/show
+	// cycles inside one HOME_INTERVAL_MS must cost one walk, not ten, while
+	// memory — cheap, and expected to feel live on every return — still samples
+	// on every single resume.
+	it('does not re-walk the home directory on a resume within one HOME_INTERVAL_MS', async () => {
+		const a = api();
+		const s = new StatsStore(a);
+		for (let i = 0; i < 10; i++) {
+			s.start();
+			await vi.advanceTimersByTimeAsync(0);
+			s.stop();
+			// 10 cycles * 2000ms = 20000ms, well inside HOME_INTERVAL_MS (60000ms).
+			await vi.advanceTimersByTimeAsync(2000);
+		}
+		expect(a.servicesMemory).toHaveBeenCalledTimes(10); // every resume
+		expect(a.homeDiskUsage).toHaveBeenCalledTimes(1); // only the first
 	});
 });
