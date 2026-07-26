@@ -400,9 +400,19 @@ mod rss_tests {
             "rss {rss} never exceeded the floor within {:?}",
             POLL_INTERVAL * MAX_ATTEMPTS
         );
-        // Upper bound: `sleep` is tiny. 1 GB would mean we read pages as bytes
-        // (4096x) or picked up pti_virtual_size instead of pti_resident_size.
-        assert!(rss < 1024 * 1024 * 1024, "rss {rss} is implausibly large");
+        // Upper bound: chosen relative to the floor, not to `sleep`'s typical
+        // size. The floor is 64 KB, so a 4096x pages-as-bytes error inflates
+        // ANY value that clears the floor to at least 64 KB * 4096 = 256 MB.
+        // Setting the ceiling below that threshold — 64 MB — makes the
+        // mutation structurally impossible to miss, for every sampled value
+        // that passes the floor, not merely for a typical/large one. 64 MB
+        // still leaves ample headroom over `/bin/sleep`'s real resident size
+        // (single-digit MB at most).
+        assert!(
+            rss < 64 * 1024 * 1024,
+            "rss {rss} is implausibly large (>= 64 MB ceiling, chosen so a \
+             4096x pages-as-bytes error cannot slip past the 64 KB floor)"
+        );
         let _ = child.kill();
         let _ = child.wait();
     }
