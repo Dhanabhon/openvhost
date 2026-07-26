@@ -136,3 +136,36 @@ export async function readWebServerConfig(id: string): Promise<string> {
 export async function validateWebServerConfig(id: string): Promise<ValidationReportDto> {
 	return unwrap(commands.validateWebServerConfig(id));
 }
+
+/**
+ * Stop every running service and tear the window down. Resolves only if the
+ * quit did NOT happen — a successful quit destroys the window mid-call, so the
+ * caller must treat "still here after awaiting" as a failure worth showing
+ * rather than as success.
+ */
+export async function confirmQuit(): Promise<void> {
+	await unwrap(commands.confirmQuit());
+}
+
+/**
+ * Tell the Rust side that {@link onQuitRequested}'s listener is registered.
+ *
+ * Until this lands, a window close is NOT intercepted — so calling it is what
+ * turns the confirmation on, and failing to call it degrades to the old
+ * close-immediately behaviour rather than to an unquittable window.
+ */
+export async function quitDialogReady(): Promise<void> {
+	await unwrap(commands.quitDialogReady());
+}
+
+/**
+ * Subscribe to `quit-requested`, emitted when a close was intercepted. Same
+ * `IpcError` contract as {@link onServiceState}.
+ */
+export async function onQuitRequested(cb: () => void): Promise<() => void> {
+	try {
+		return await events.quitRequestedEvent.listen(() => cb());
+	} catch (e) {
+		throw normalizeError(e);
+	}
+}
