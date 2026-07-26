@@ -12,6 +12,7 @@
 	} from '$lib/ipc';
 	import { errorMessage } from '$lib/errors';
 	import { servicesStore } from '$lib/services.shared.svelte';
+	import { statsStore } from '$lib/stats.shared.svelte';
 	import { pendingServiceNames } from '$lib/services.derive';
 	import QuitDialog from '$lib/components/QuitDialog.svelte';
 
@@ -121,6 +122,26 @@
 			disposed = true;
 			unlisten?.();
 			unlisten = null;
+		};
+	});
+
+	// Sampling is paused whenever the window is hidden. The master plan's first
+	// principle is "lightweight always-on … idle RAM budget for the app itself
+	// < 100 MB. This is why Tauri was chosen over Electron" — an app left open
+	// behind an IDE all day must cost nothing while nobody is looking at it.
+	//
+	// The store owns the timers and the layout owns this listener, so the store
+	// stays DOM-free and unit-testable with fake timers.
+	onMount(() => {
+		const sync = () => {
+			if (document.visibilityState === 'visible') statsStore.start();
+			else statsStore.stop();
+		};
+		sync();
+		document.addEventListener('visibilitychange', sync);
+		return () => {
+			document.removeEventListener('visibilitychange', sync);
+			statsStore.stop();
 		};
 	});
 </script>
