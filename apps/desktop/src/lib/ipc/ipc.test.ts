@@ -13,7 +13,7 @@ vi.mock('@tauri-apps/api/event', () => ({
 	emit: vi.fn()
 }));
 
-import { coreInfo, listServices, onServiceState } from './index';
+import { applySites, coreInfo, listServices, onServiceState, planSiteApply } from './index';
 
 const sample = {
 	appVersion: '0.1.0',
@@ -68,6 +68,52 @@ describe('listServices (non-coreInfo wrapper)', () => {
 		// actually been normalized into an object.
 		expect(() => 'message' in (caught as object)).not.toThrow();
 		expect(caught).toEqual({ kind: 'core', message: 'list transport down' });
+	});
+});
+
+describe('planSiteApply', () => {
+	beforeEach(() => invokeMock.mockReset());
+
+	it('returns the plan data on success', async () => {
+		const plan = { changes: [{ path: '/tmp/ovh/nginx.conf', kind: 'modified', diff: '- a\n+ b' }] };
+		invokeMock.mockResolvedValueOnce(plan);
+		await expect(planSiteApply()).resolves.toEqual(plan);
+		expect(invokeMock).toHaveBeenCalledWith('plan_site_apply');
+	});
+
+	it('throws the normalized IpcError on failure', async () => {
+		invokeMock.mockRejectedValueOnce({
+			kind: 'core',
+			message: 'site legacy needs PHP 7.4, which is not installed (installed: 8.4)'
+		});
+		await expect(planSiteApply()).rejects.toEqual({
+			kind: 'core',
+			message: 'site legacy needs PHP 7.4, which is not installed (installed: 8.4)'
+		});
+	});
+
+	it('normalizes a non-IpcError throw into a core-variant IpcError', async () => {
+		invokeMock.mockRejectedValueOnce(new Error('ipc transport down'));
+		await expect(planSiteApply()).rejects.toEqual({
+			kind: 'core',
+			message: 'Error: ipc transport down'
+		});
+	});
+});
+
+describe('applySites', () => {
+	beforeEach(() => invokeMock.mockReset());
+
+	it('returns the outcome data on success', async () => {
+		const outcome = { applied: 3, restarted: ['php-fpm-8.4', 'nginx'], notStarted: [] };
+		invokeMock.mockResolvedValueOnce(outcome);
+		await expect(applySites()).resolves.toEqual(outcome);
+		expect(invokeMock).toHaveBeenCalledWith('apply_sites');
+	});
+
+	it('throws the normalized IpcError on failure', async () => {
+		invokeMock.mockRejectedValueOnce({ kind: 'core', message: 'apply failed' });
+		await expect(applySites()).rejects.toEqual({ kind: 'core', message: 'apply failed' });
 	});
 });
 

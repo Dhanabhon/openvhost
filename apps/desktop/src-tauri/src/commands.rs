@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use openvhost_conf::WebServerAdapter;
 
 use openvhost_core::{
-    CoreInfo, Db, Docroot, Domain, NewSite, PhpVersion, Site, SiteId, SiteName, SiteRepository,
-    SqliteSiteRepository, WebServer,
+    ApplyError, ApplyInput, ChangeKind, CoreInfo, Db, Docroot, Domain, InstalledRuntimes, NewSite,
+    PhpVersion, Site, SiteId, SiteName, SiteRepository, SqliteSiteRepository, WebServer,
 };
 
 use crate::stack::StackPaths;
@@ -449,6 +449,181 @@ pub async fn delete_site(db: tauri::State<'_, Db>, id: String) -> Result<bool, I
     let site_id = SiteId::parse(&id)?;
     let repo = SqliteSiteRepository::new(db.inner());
     Ok(repo.delete(&site_id).await?)
+}
+
+impl From<ApplyError> for IpcError {
+    fn from(e: ApplyError) -> Self {
+        // Every variant's Display already names the site, the versions or the
+        // stranded paths, so one arm is enough and none of that detail is lost.
+        IpcError::Core {
+            message: e.to_string(),
+        }
+    }
+}
+
+fn change_kind_str(k: ChangeKind) -> &'static str {
+    match k {
+        ChangeKind::Added => "added",
+        ChangeKind::Modified => "modified",
+        ChangeKind::Removed => "removed",
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct FileChangeDto {
+    pub path: String,
+    /// "added" | "modified" | "removed"
+    pub kind: String,
+    pub diff: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplyPlanDto {
+    pub changes: Vec<FileChangeDto>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplyOutcomeDto {
+    /// `u32`, not `usize`: specta rejects pointer-sized ints (see lib.rs).
+    pub applied: u32,
+    pub restarted: Vec<String>,
+    /// Services whose config changed but which were not running, so the new
+    /// config takes effect the next time they start.
+    pub not_started: Vec<String>,
+}
+
+/// Build the apply input from state.db plus the runtimes probed at startup.
+async fn apply_input(
+    db: &Db,
+    runtimes: &Option<InstalledRuntimes>,
+    paths: &Option<StackPaths>,
+) -> Result<ApplyInput, IpcError> {
+    let (Some(runtimes), Some(paths)) = (runtimes.as_ref(), paths.as_ref()) else {
+        return Err(IpcError::Core {
+            message: "no web server stack is configured for this platform".into(),
+        });
+    };
+    let repo = SqliteSiteRepository::new(db);
+    Ok(ApplyInput {
+        home: paths.home.clone(),
+        sites: repo.list().await?,
+        runtimes: runtimes.clone(),
+    })
+}
+
+/// What Apply would change. Read-only and process-free — the pending-changes
+/// banner calls this after every site mutation.
+#[tauri::command]
+#[specta::specta]
+pub async fn plan_site_apply(
+    db: tauri::State<'_, Db>,
+    runtimes: tauri::State<'_, Option<InstalledRuntimes>>,
+    paths: tauri::State<'_, Option<StackPaths>>,
+) -> Result<ApplyPlanDto, IpcError> {
+    let input = apply_input(db.inner(), runtimes.inner(), paths.inner()).await?;
+    let p = openvhost_core::plan(&input)?;
+    Ok(ApplyPlanDto {
+        changes: p
+            .changes
+            .into_iter()
+            .map(|c| FileChangeDto {
+                path: c.path.display().to_string(),
+                kind: change_kind_str(c.kind).to_string(),
+                diff: c.diff,
+            })
+            .collect(),
+    })
+}
+
+/// Apply the sites, then restart whichever affected services are running.
+///
+/// The restart is the app's job, not core's: `openvhost-core` has no supervisor
+/// and must stay usable from the CLI.
+#[tauri::command]
+#[specta::specta]
+pub async fn apply_sites(
+    db: tauri::State<'_, Db>,
+    runtimes: tauri::State<'_, Option<InstalledRuntimes>>,
+    paths: tauri::State<'_, Option<StackPaths>>,
+    sup: tauri::State<'_, Arc<Supervisor>>,
+) -> Result<ApplyOutcomeDto, IpcError> {
+    let input = apply_input(db.inner(), runtimes.inner(), paths.inner()).await?;
+    let Some(stack) = paths.inner().as_ref() else {
+        return Err(IpcError::Core {
+            message: "no web server stack is configured for this platform".into(),
+        });
+    };
+    let p = openvhost_core::plan(&input)?;
+    let validator = openvhost_core::NginxValidator {
+        bin: stack.nginx_bin.clone(),
+        err_log: stack.home.join("logs/nginx.error.log"),
+    };
+    let outcome = openvhost_core::apply(&p, &validator).await?;
+
+    // php-fpm before nginx: nginx connects to the pool socket, so the pool has
+    // to be listening first.
+    let mut ids: Vec<String> = input
+        .runtimes
+        .php
+        .iter()
+        .map(|r| format!("php-fpm-{}", r.major))
+        .collect();
+    ids.push("nginx".to_string());
+
+    // Only restart what is actually running. A stopped service keeps its state;
+    // the new config takes effect when the user starts it.
+    let snapshot = sup.snapshot();
+    let running: Vec<String> = ids
+        .iter()
+        .filter(|id| {
+            snapshot
+                .iter()
+                .any(|s| s.id == **id && matches!(s.state, ServiceState::Running))
+        })
+        .cloned()
+        .collect();
+    let not_started: Vec<String> = ids
+        .iter()
+        .filter(|id| !running.contains(id))
+        .cloned()
+        .collect();
+
+    // Wait for a real Stopped rather than assuming `stop` took effect — the same
+    // reason quit.rs polls instead of firing and hoping.
+    let for_pending = Arc::clone(sup.inner());
+    let watched = running.clone();
+    let for_stop = Arc::clone(sup.inner());
+    crate::quit::stop_all_with(
+        move || {
+            for_pending
+                .snapshot()
+                .into_iter()
+                .filter(|s| watched.contains(&s.id))
+                .filter(|s| !matches!(s.state, ServiceState::Stopped | ServiceState::Failed { .. }))
+                .map(|s| s.id)
+                .collect()
+        },
+        move |id| {
+            let _ = for_stop.stop(id);
+        },
+        std::time::Duration::from_secs(10),
+        std::time::Duration::from_millis(50),
+    )
+    .await;
+
+    for id in &running {
+        sup.start(id)?;
+    }
+
+    Ok(ApplyOutcomeDto {
+        // `u32`, not `usize`: specta rejects pointer-sized ints.
+        applied: u32::try_from(outcome.applied).unwrap_or(u32::MAX),
+        restarted: running,
+        not_started,
+    })
 }
 
 /// The web servers OpenVHost knows about. A CLOSED list: the client sends only
@@ -1195,6 +1370,38 @@ mod web_server_ipc_tests {
                 );
             }
             other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod apply_ipc_tests {
+    use super::*;
+
+    /// The dialog switches on these; a rename here silently breaks its badges.
+    #[test]
+    fn change_kind_maps_to_a_stable_wire_string() {
+        assert_eq!(change_kind_str(ChangeKind::Added), "added");
+        assert_eq!(change_kind_str(ChangeKind::Modified), "modified");
+        assert_eq!(change_kind_str(ChangeKind::Removed), "removed");
+    }
+
+    #[test]
+    fn a_missing_runtime_reaches_the_ui_naming_the_site_and_versions() {
+        let e: IpcError = ApplyError::MissingRuntime {
+            site: "legacy".into(),
+            requested: "7.4".into(),
+            available: vec!["8.4".into()],
+        }
+        .into();
+        match e {
+            IpcError::Core { message } => {
+                assert!(message.contains("legacy"));
+                assert!(message.contains("7.4"));
+                assert!(message.contains("8.4"));
+            }
+            other => panic!("expected Core, got {other:?}"),
         }
     }
 }
