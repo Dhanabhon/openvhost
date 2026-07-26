@@ -146,11 +146,26 @@
 	.site-row {
 		grid-template-columns: minmax(220px, 1.4fr) 110px 90px 120px auto;
 	}
+	/* `justify-content` + symmetric padding: the pill is a GRID ITEM in a fixed
+	   120px track, and a grid item's default `justify-self: stretch` widens this
+	   inline-flex box to the whole track. Without centring, the dot and label stay
+	   packed at the flex start with all the slack piled up on the right, which is
+	   what the badge looked like before. The track stays fixed on purpose (a
+	   content-sized one would shift the action buttons every time the state text
+	   changed width), so the content has to centre inside it rather than the box
+	   shrinking to fit.
+
+	   The padding is symmetric here where the mock's is `2px 10px 2px 7px`. That
+	   asymmetry is right for a pill that HUGS its content — it tightens the visually
+	   lighter dot side — but under centring it just offsets the centred group 1.5px
+	   off true centre. TitleBar's pill still hugs (it is a flex child, not a grid
+	   item) and keeps the mock's asymmetry. */
 	.pill {
 		display: inline-flex;
 		align-items: center;
+		justify-content: center;
 		gap: 6px;
-		padding: 2px 10px 2px 7px;
+		padding: 2px 10px;
 		border-radius: var(--vh-radius-pill);
 		font-size: var(--vh-text-caption);
 		font-weight: 600;
