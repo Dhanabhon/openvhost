@@ -168,6 +168,100 @@ pub async fn service_log_tail(
     sup.log_tail(&id, n as usize).map_err(IpcError::from)
 }
 
+/// Summed resident memory of the supervised services.
+///
+/// `bytes` and `process_count` are both u64/u32 crossing a
+/// `.dangerously_cast_bigints_to_number()` boundary — see `lib.rs`'s standing
+/// warning, which names "byte totals" as the case requiring a conscious check.
+/// `2^53` bytes is 9 petabytes; a resident set is many orders of magnitude
+/// below it. Checked, not assumed.
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ServicesMemoryDto {
+    pub bytes: u64,
+    /// How many pids actually produced a figure — NOT how many services are
+    /// running. See `sum_readings`.
+    pub process_count: u32,
+}
+
+/// Total bytes under the OpenVHost home. Same bigint check as
+/// [`ServicesMemoryDto`]: a home directory is nowhere near 9 PB.
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct HomeUsageDto {
+    pub bytes: u64,
+}
+
+/// Sum the readings that produced a figure, and count them.
+///
+/// Extracted from `services_memory` so the rule is testable without a live
+/// `AppHandle` and a real supervisor: `None` readings (a pid that exited between
+/// the snapshot and the read) drop out of the sum AND the count together, so the
+/// figure and its "N processes" label can never contradict each other.
+/// `saturating_add` so an absurd reading cannot wrap the total into a small,
+/// plausible-looking number.
+fn sum_readings(readings: impl Iterator<Item = Option<u64>>) -> (u64, u32) {
+    let mut bytes: u64 = 0;
+    let mut count: u32 = 0;
+    for r in readings.flatten() {
+        bytes = bytes.saturating_add(r);
+        count = count.saturating_add(1);
+    }
+    (bytes, count)
+}
+
+/// Resident memory of everything the supervisor is running.
+///
+/// `try_state` rather than `State<'_, Arc<Supervisor>>`: the supervisor is only
+/// managed when the setup bootstrap succeeded, and an unmanaged one must give a
+/// clean error the strip renders as "—" rather than Tauri's raw state panic
+/// message. Same precedent as the quit path.
+///
+/// An `Err` from `process_rss` aborts the whole read — it means measurement is
+/// impossible on this platform, and reporting a partial sum as if it were
+/// complete would be a false figure (spec §4.1).
+#[tauri::command]
+#[specta::specta]
+pub async fn services_memory(app: tauri::AppHandle) -> Result<ServicesMemoryDto, IpcError> {
+    use tauri::Manager;
+    let Some(sup) = app.try_state::<Arc<Supervisor>>() else {
+        return Err(IpcError::Proc {
+            message: "the supervisor is not running".to_string(),
+        });
+    };
+    let mut readings: Vec<Option<u64>> = Vec::new();
+    for status in sup.snapshot() {
+        let Some(pid) = status.pid else { continue };
+        readings.push(
+            openvhost_proc::platform::process_rss(pid).map_err(|e| IpcError::Proc {
+                message: e.to_string(),
+            })?,
+        );
+    }
+    let (bytes, process_count) = sum_readings(readings.into_iter());
+    Ok(ServicesMemoryDto {
+        bytes,
+        process_count,
+    })
+}
+
+/// Total size of the OpenVHost home.
+///
+/// The walk runs on `spawn_blocking`, not inline: it measured 40 ms over 6,470
+/// files (spec §3.2), which is long enough to matter on a runtime thread, and
+/// the figure is not urgent.
+#[tauri::command]
+#[specta::specta]
+pub async fn home_disk_usage() -> Result<HomeUsageDto, IpcError> {
+    let bytes = tauri::async_runtime::spawn_blocking(openvhost_core::home_disk_usage)
+        .await
+        .map_err(|e| IpcError::Core {
+            message: format!("the disk-usage task failed to run: {e}"),
+        })?
+        .map_err(IpcError::from)?;
+    Ok(HomeUsageDto { bytes })
+}
+
 /// A site as it crosses IPC. `Site`'s fields are opaque validated newtypes
 /// (deliberately not serializable), so the wire form is plain strings.
 #[derive(Debug, Clone, serde::Serialize, specta::Type)]
@@ -759,6 +853,34 @@ mod site_ipc_tests {
             }
             other => panic!("expected Validation, got {other:?}"),
         }
+    }
+
+    /// The count must report pids that actually produced a figure, not pids that
+    /// were listed. A service that exits between the snapshot and the read drops
+    /// out of BOTH the sum and the count, so the number and its label can never
+    /// disagree (spec §6).
+    #[test]
+    fn memory_sum_counts_only_the_pids_that_answered() {
+        let readings = vec![Some(1000u64), None, Some(2500u64), None];
+        let (bytes, count) = sum_readings(readings.into_iter());
+        assert_eq!(bytes, 3500);
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn memory_sum_of_nothing_is_zero_with_a_zero_count() {
+        let (bytes, count) = sum_readings(std::iter::empty());
+        assert_eq!(bytes, 0);
+        assert_eq!(count, 0);
+    }
+
+    /// Saturating, not wrapping: an absurd reading must not wrap the total to a
+    /// small number that looks plausible.
+    #[test]
+    fn memory_sum_saturates_instead_of_wrapping() {
+        let readings = vec![Some(u64::MAX), Some(1000u64)];
+        let (bytes, _) = sum_readings(readings.into_iter());
+        assert_eq!(bytes, u64::MAX);
     }
 }
 

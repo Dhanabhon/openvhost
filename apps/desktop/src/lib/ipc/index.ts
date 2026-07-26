@@ -3,9 +3,11 @@
 import { commands, events } from './bindings';
 import type {
 	CoreInfo,
+	HomeUsageDto,
 	IpcError,
 	LogLine,
 	ServiceLogEvent,
+	ServicesMemoryDto,
 	ServiceStateEvent,
 	ServiceStatus,
 	SiteDto,
@@ -16,9 +18,11 @@ import type {
 
 export type {
 	CoreInfo,
+	HomeUsageDto,
 	IpcError,
 	LogLine,
 	ServiceLogEvent,
+	ServicesMemoryDto,
 	ServiceStateEvent,
 	ServiceStatus,
 	SiteDto,
@@ -168,4 +172,14 @@ export async function onQuitRequested(cb: () => void): Promise<() => void> {
 	} catch (e) {
 		throw normalizeError(e);
 	}
+}
+
+/** Resident memory of the supervised services, plus how many pids answered. */
+export async function servicesMemory(): Promise<ServicesMemoryDto> {
+	return unwrap(commands.servicesMemory());
+}
+
+/** Total bytes under the OpenVHost home. */
+export async function homeDiskUsage(): Promise<HomeUsageDto> {
+	return unwrap(commands.homeDiskUsage());
 }
