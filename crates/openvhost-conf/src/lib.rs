@@ -14,7 +14,7 @@ mod webserver;
 
 pub use ctx::{GeneratedFile, PhpUpstream, RenderCtx, ValidationReport};
 pub use error::ConfError;
-pub use inspect::{PROBE_TIMEOUT, probe_nginx_version, validate_live};
+pub use inspect::{PROBE_TIMEOUT, probe_nginx_version, probe_php_fpm_version, validate_live};
 pub use phpruntime::{PhpFpmRuntime, PhpRuntimeAdapter};
 pub use validate::{BrewStack, find_brew_binaries};
 pub use webserver::{NginxAdapter, WebServerAdapter};
