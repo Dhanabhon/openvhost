@@ -11,6 +11,7 @@
 //! persistence must go through the public `parse`/`as_str` API like any other
 //! consumer.
 
+pub mod apply;
 pub mod model;
 pub mod repo;
 

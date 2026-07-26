@@ -1,0 +1,327 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//! Turn the enabled sites into the complete generated config set, then plan,
+//! commit and validate it. See
+//! docs/superpowers/specs/2026-07-27-p1-site-apply-design.md.
+
+// TODO(Task 4): restore `mod plan;` and its re-exports below.
+// TODO(Task 5): restore `mod commit;` and its re-exports below.
+mod error;
+
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::path::{Path, PathBuf};
+
+use openvhost_conf::{
+    GeneratedFile, NginxAdapter, PhpFpmRuntime, PhpRuntimeAdapter, PhpUpstream, RenderCtx,
+    WebServerAdapter,
+};
+
+pub use error::{ApplyError, RollbackReport};
+
+use crate::CoreError;
+use crate::site::model::Site;
+// `Docroot`/`Domain`/`PhpVersion`/`SiteId`/`SiteName`/`WebServer` are only
+// referenced by the test module's fixtures below; without this gate they are
+// genuinely unused in a non-test build (`cfg(test)` is off) and trip
+// `-D warnings` under plain `cargo clippy`.
+#[cfg(test)]
+use crate::site::model::{Docroot, Domain, PhpVersion, SiteId, SiteName, WebServer};
+
+/// Darwin's `sun_path` is 104 bytes including the NUL. php-fpm does not reject
+/// a longer path — it warns, truncates, binds the wrong path, and nginx 502s
+/// forever. Refuse early instead.
+pub const MAX_SOCKET_PATH_BYTES: usize = 103;
+
+/// Every site is name-based virtual hosting on one port. Port 80 needs the
+/// privileged helper (Phase 3).
+pub const LISTEN_PORT: u16 = 8080;
+
+pub fn listen_addr() -> SocketAddr {
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, LISTEN_PORT))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhpRuntime {
+    pub major: String,
+    pub fpm_bin: PathBuf,
+}
+
+/// What is installed on this machine. Passed in as data rather than probed
+/// here, so every test constructs it by hand and no test depends on what the
+/// machine running it happens to have. `php` is ordered: the first entry is
+/// the catch-all's runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledRuntimes {
+    pub nginx_bin: PathBuf,
+    pub php: Vec<PhpRuntime>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApplyInput {
+    pub home: PathBuf,
+    /// ALL sites; `render_set` filters on `enabled` itself.
+    pub sites: Vec<Site>,
+    pub runtimes: InstalledRuntimes,
+}
+
+/// The php-fpm socket for one major, guarded against the `sun_path` ceiling.
+pub fn socket_path(home: &Path, major: &str) -> Result<PathBuf, ApplyError> {
+    let p = home.join("run").join(format!("php-fpm-{major}.sock"));
+    let len = p.as_os_str().as_encoded_bytes().len();
+    if len > MAX_SOCKET_PATH_BYTES {
+        return Err(ApplyError::Core(CoreError::SocketPathTooLong {
+            path: p,
+            len,
+        }));
+    }
+    Ok(p)
+}
+
+/// nginx `upstream{}` block name: `[a-z0-9_]` only, which `Domain`'s charset
+/// (`[a-z0-9-.]`) reaches with a single substitution.
+fn upstream_name(domain: &str) -> String {
+    let mut s = String::from("php_");
+    for c in domain.chars() {
+        s.push(if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            c
+        } else {
+            '_'
+        });
+    }
+    s
+}
+
+/// The complete desired config set, sorted by path so the output is stable.
+/// Pure: no filesystem access at all.
+pub fn render_set(input: &ApplyInput) -> Result<Vec<GeneratedFile>, ApplyError> {
+    let nginx = NginxAdapter;
+    let fpm = PhpFpmRuntime;
+    let listen = listen_addr();
+
+    // Every check that can fail without touching the disk runs first (spec §4.1).
+    let available: Vec<String> = input.runtimes.php.iter().map(|r| r.major.clone()).collect();
+    for site in input.sites.iter().filter(|s| s.enabled) {
+        if !available.iter().any(|m| m == site.php_version.as_str()) {
+            return Err(ApplyError::MissingRuntime {
+                site: site.name.as_str().to_string(),
+                requested: site.php_version.as_str().to_string(),
+                available,
+            });
+        }
+    }
+
+    let mut out = vec![nginx.generate_main_config(&input.home)?];
+
+    let default_upstream = match input.runtimes.php.first() {
+        Some(rt) => Some(PhpUpstream::UnixSocket(socket_path(
+            &input.home,
+            &rt.major,
+        )?)),
+        None => None,
+    };
+    out.push(nginx.generate_default_site_config(&input.home, listen, default_upstream.as_ref())?);
+
+    for site in input.sites.iter().filter(|s| s.enabled) {
+        let major = site.php_version.as_str();
+        let ctx = RenderCtx::new(
+            input.home.clone(),
+            site.domain.as_str(),
+            PathBuf::from(site.docroot.as_str()),
+            listen,
+            major,
+            PhpUpstream::UnixSocket(socket_path(&input.home, major)?),
+            upstream_name(site.domain.as_str()),
+        )?;
+        out.push(nginx.generate_site_config(&ctx)?);
+    }
+
+    for rt in &input.runtimes.php {
+        let upstream = PhpUpstream::UnixSocket(socket_path(&input.home, &rt.major)?);
+        if let Some(f) = fpm.generate_pool_config(&input.home, &rt.major, &upstream)? {
+            out.push(f);
+        }
+    }
+
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn site(name: &str, domain: &str, php: &str, enabled: bool) -> Site {
+        Site {
+            id: SiteId::new(),
+            name: SiteName::parse(name).unwrap(),
+            domain: Domain::parse(domain).unwrap(),
+            docroot: Docroot::parse("/tmp/projects/app").unwrap(),
+            web_server: WebServer::parse("nginx").unwrap(),
+            php_version: PhpVersion::parse(php).unwrap(),
+            enabled,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn runtimes(majors: &[&str]) -> InstalledRuntimes {
+        InstalledRuntimes {
+            nginx_bin: PathBuf::from("/opt/homebrew/opt/nginx/bin/nginx"),
+            php: majors
+                .iter()
+                .map(|m| PhpRuntime {
+                    major: (*m).to_string(),
+                    fpm_bin: PathBuf::from(format!("/opt/homebrew/opt/php@{m}/sbin/php-fpm")),
+                })
+                .collect(),
+        }
+    }
+
+    fn input(sites: Vec<Site>, majors: &[&str]) -> ApplyInput {
+        ApplyInput {
+            home: PathBuf::from("/tmp/ovh"),
+            sites,
+            runtimes: runtimes(majors),
+        }
+    }
+
+    #[test]
+    fn renders_main_catch_all_site_and_pool() {
+        let set = render_set(&input(
+            vec![site("app", "app.localhost", "8.4", true)],
+            &["8.4"],
+        ))
+        .unwrap();
+        let paths: Vec<String> = set.iter().map(|f| f.path.display().to_string()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/tmp/ovh/config/generated/nginx/nginx.conf",
+                "/tmp/ovh/config/generated/nginx/sites/00-default.conf",
+                "/tmp/ovh/config/generated/nginx/sites/app.localhost.conf",
+                "/tmp/ovh/config/generated/php/8.4/php-fpm.conf",
+            ]
+        );
+    }
+
+    #[test]
+    fn is_deterministic() {
+        let i = input(vec![site("app", "app.localhost", "8.4", true)], &["8.4"]);
+        assert_eq!(render_set(&i).unwrap(), render_set(&i).unwrap());
+    }
+
+    #[test]
+    fn a_disabled_site_is_not_rendered() {
+        let set = render_set(&input(
+            vec![
+                site("app", "app.localhost", "8.4", true),
+                site("old", "old.localhost", "8.4", false),
+            ],
+            &["8.4"],
+        ))
+        .unwrap();
+        assert!(set.iter().any(|f| f.path.ends_with("app.localhost.conf")));
+        assert!(!set.iter().any(|f| f.path.ends_with("old.localhost.conf")));
+    }
+
+    #[test]
+    fn one_pool_per_installed_major_regardless_of_site_count() {
+        let set = render_set(&input(
+            vec![
+                site("a", "a.localhost", "8.4", true),
+                site("b", "b.localhost", "8.4", true),
+                site("c", "c.localhost", "8.4", true),
+            ],
+            &["8.4"],
+        ))
+        .unwrap();
+        let pools = set
+            .iter()
+            .filter(|f| f.path.ends_with("php-fpm.conf"))
+            .count();
+        assert_eq!(pools, 1);
+    }
+
+    #[test]
+    fn pools_are_rendered_for_installed_majors_nobody_uses() {
+        // The service set follows what is installed, not what sites ask for.
+        let set = render_set(&input(
+            vec![site("a", "a.localhost", "8.4", true)],
+            &["8.3", "8.4"],
+        ))
+        .unwrap();
+        assert!(set.iter().any(|f| f.path.ends_with("php/8.3/php-fpm.conf")));
+        assert!(set.iter().any(|f| f.path.ends_with("php/8.4/php-fpm.conf")));
+    }
+
+    #[test]
+    fn a_site_wanting_an_uninstalled_version_blocks_the_whole_apply() {
+        let err = render_set(&input(
+            vec![
+                site("app", "app.localhost", "8.4", true),
+                site("legacy", "legacy.localhost", "7.4", true),
+            ],
+            &["8.4"],
+        ))
+        .unwrap_err();
+        match err {
+            ApplyError::MissingRuntime {
+                site,
+                requested,
+                available,
+            } => {
+                assert_eq!(site, "legacy");
+                assert_eq!(requested, "7.4");
+                assert_eq!(available, vec!["8.4".to_string()]);
+            }
+            other => panic!("expected MissingRuntime, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_disabled_site_never_blocks_on_a_missing_version() {
+        let set = render_set(&input(
+            vec![site("legacy", "legacy.localhost", "7.4", false)],
+            &["8.4"],
+        ));
+        assert!(set.is_ok());
+    }
+
+    #[test]
+    fn each_site_points_at_the_pool_socket_for_its_own_version() {
+        let set = render_set(&input(
+            vec![
+                site("a", "a.localhost", "8.3", true),
+                site("b", "b.localhost", "8.4", true),
+            ],
+            &["8.3", "8.4"],
+        ))
+        .unwrap();
+        let a = set
+            .iter()
+            .find(|f| f.path.ends_with("a.localhost.conf"))
+            .unwrap();
+        let b = set
+            .iter()
+            .find(|f| f.path.ends_with("b.localhost.conf"))
+            .unwrap();
+        assert!(a.contents.contains("unix:/tmp/ovh/run/php-fpm-8.3.sock"));
+        assert!(b.contents.contains("unix:/tmp/ovh/run/php-fpm-8.4.sock"));
+    }
+
+    #[test]
+    fn a_home_too_deep_for_the_socket_is_refused_before_anything_renders() {
+        let deep = PathBuf::from(format!("/tmp/{}", "d".repeat(120)));
+        let err = render_set(&ApplyInput {
+            home: deep,
+            sites: vec![site("app", "app.localhost", "8.4", true)],
+            runtimes: runtimes(&["8.4"]),
+        })
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ApplyError::Core(CoreError::SocketPathTooLong { .. })
+        ));
+    }
+}
