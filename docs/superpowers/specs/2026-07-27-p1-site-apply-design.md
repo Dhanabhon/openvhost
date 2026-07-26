@@ -102,7 +102,7 @@ the banner refresh cheaply on every site mutation without spawning a process.
 All paths below are relative to `<home>/config/generated/`:
 
 - `nginx/nginx.conf` — one main config.
-- `nginx/sites/00-default.conf` — the catch-all `default_server`.
+- `nginx/sites/00-default_server.conf` — the catch-all `default_server`.
 - `nginx/sites/<domain>.conf` — one per **enabled** site.
 - `php/<major>/php-fpm.conf` — one per **installed** PHP major, not per site.
 
@@ -178,6 +178,19 @@ principle 3 of the plan establishes.
 
 Site config filenames derive from `domain`, which carries a `UNIQUE` constraint in the
 `sites` table, so two enabled sites cannot collide by construction.
+
+**Corrected during implementation:** that argument covers site-versus-site but missed
+site-versus-catch-all. `Domain::parse("00-default")` succeeds, so a site could claim the
+catch-all's original filename and silently overwrite it. The catch-all is therefore named
+`00-default_server.conf`: `_` is outside both `Domain`'s charset and the hostname charset
+`RenderCtx` enforces, which makes the collision unrepresentable rather than merely
+unlikely. No duplicate-path check is needed anywhere in the pipeline.
+
+Likewise the nginx `upstream{}` token is derived from the site's `SiteId` (a UUID, the
+table's primary key) rather than from a charset substitution on the domain. The
+substitution was not injective — `a-b.example` and `a.b-example` both flattened to
+`php_a_b_example` — which on the Windows/TCP path would define one upstream block twice
+with different backends.
 
 ### 4.6 Restart policy
 

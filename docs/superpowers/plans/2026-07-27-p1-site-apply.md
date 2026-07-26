@@ -101,7 +101,7 @@ Two adapter signatures also change here. `generate_main_config` and `generate_po
       upstream: &PhpUpstream,
   ) -> Result<Option<GeneratedFile>, ConfError>;
   ```
-  The catch-all is written to `<home>/config/generated/nginx/sites/00-default.conf`.
+  The catch-all is written to `<home>/config/generated/nginx/sites/00-default_server.conf`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -155,7 +155,7 @@ fn default_site_is_the_catch_all_and_can_run_php() {
         .unwrap();
     assert_eq!(
         f.path,
-        PathBuf::from("/tmp/ovh/config/generated/nginx/sites/00-default.conf")
+        PathBuf::from("/tmp/ovh/config/generated/nginx/sites/00-default_server.conf")
     );
     let c = &f.contents;
     assert!(c.contains("listen 127.0.0.1:8080 default_server;"));
@@ -415,7 +415,7 @@ impl NginxAdapter {
         tc.insert("php_location", &php_location);
         let contents = render("nginx/default-site.conf", &tc)?;
         Ok(GeneratedFile {
-            path: Self::gen_dir(home).join("sites").join("00-default.conf"),
+            path: Self::gen_dir(home).join("sites").join("00-default_server.conf"),
             contents,
         })
     }
@@ -675,7 +675,7 @@ mod tests {
             paths,
             vec![
                 "/tmp/ovh/config/generated/nginx/nginx.conf",
-                "/tmp/ovh/config/generated/nginx/sites/00-default.conf",
+                "/tmp/ovh/config/generated/nginx/sites/00-default_server.conf",
                 "/tmp/ovh/config/generated/nginx/sites/app.localhost.conf",
                 "/tmp/ovh/config/generated/php/8.4/php-fpm.conf",
             ]
@@ -933,14 +933,16 @@ pub fn socket_path(home: &Path, major: &str) -> Result<PathBuf, ApplyError> {
     Ok(p)
 }
 
-/// nginx `upstream{}` block name: `[a-z0-9_]` only, which `Domain`'s charset
-/// (`[a-z0-9-.]`) reaches with a single substitution.
-fn upstream_name(domain: &str) -> String {
-    let mut s = String::from("php_");
-    for c in domain.chars() {
-        s.push(if c.is_ascii_lowercase() || c.is_ascii_digit() { c } else { '_' });
-    }
-    s
+/// nginx `upstream{}` block name: `[a-z0-9_]`, and genuinely unique per site.
+///
+/// Derived from the site's UUID rather than its domain because a charset
+/// substitution on the domain is not injective — `a-b.example` and
+/// `a.b-example` would both reduce to `php_a_b_example`, and on the Windows
+/// path that means one nginx context defining the same upstream block twice
+/// with different backends. The id is the table's primary key, so uniqueness
+/// is structural.
+fn upstream_name(id: &SiteId) -> String {
+    format!("php_{}", id.as_str().replace('-', ""))
 }
 
 /// The complete desired config set, sorted by path so the output is stable.
@@ -979,7 +981,7 @@ pub fn render_set(input: &ApplyInput) -> Result<Vec<GeneratedFile>, ApplyError> 
             listen,
             major,
             PhpUpstream::UnixSocket(socket_path(&input.home, major)?),
-            upstream_name(site.domain.as_str()),
+            upstream_name(&site.id),
         )?;
         out.push(nginx.generate_site_config(&ctx)?);
     }
