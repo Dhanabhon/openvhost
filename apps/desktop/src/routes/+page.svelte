@@ -4,12 +4,12 @@
 	import AppShell from '$lib/components/AppShell.svelte';
 	import SiteDrawer from '$lib/components/SiteDrawer.svelte';
 	import SitesPanel from '$lib/components/SitesPanel.svelte';
-	import { createSite, deleteSite, listSites, updateSite, type SiteDto } from '$lib/ipc';
+	import { createSite, deleteSite, listSites, openSite, updateSite, type SiteDto } from '$lib/ipc';
 	import { runningCount } from '$lib/services.derive';
 	import { servicesStore } from '$lib/services.shared.svelte';
 	import { SitesStore } from '$lib/sites.svelte';
 
-	const store = new SitesStore({ listSites, createSite, updateSite, deleteSite });
+	const store = new SitesStore({ listSites, createSite, updateSite, deleteSite, openSite });
 	// The titlebar's "N running" belongs to every route, so it reads the shared
 	// supervisor state that `routes/+layout.svelte` subscribes to — this page used to
 	// pass a hardcoded 0, which announced "0 running" even with services up.
@@ -48,6 +48,7 @@
 		busy={store.busy}
 		rowErrors={store.rowError}
 		onToggleEnabled={(site, enabled) => void store.setEnabled(site, enabled)}
+		onOpen={(id) => void store.open(id)}
 		onDelete={(id) => void store.removeRow(id)}
 	/>
 	{#if drawerOpen}

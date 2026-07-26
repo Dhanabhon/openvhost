@@ -59,6 +59,25 @@ export const commands = {
 	 *  the figure is not urgent.
 	 */
 	homeDiskUsage: () => typedError<HomeUsageDto, IpcError>(__TAURI_INVOKE("home_disk_usage")),
+	/**
+	 *  Open a site in the user's default browser.
+	 * 
+	 *  **The URL is built HERE, in Rust, and the webview never supplies one.** The
+	 *  obvious alternative — granting the frontend `opener:allow-open-url` and letting
+	 *  it call `openUrl(...)` — would hand the renderer a general "open any URL"
+	 *  primitive. This command narrows that to "open the site with this id": the only
+	 *  thing a caller can influence is which stored row is used, and the scheme is
+	 *  fixed. No capability grant is added to `capabilities/default.json` at all,
+	 *  because the ACL gates the JS-to-plugin path and this calls the plugin's Rust
+	 *  API instead.
+	 * 
+	 *  The domain also already passed `Domain`'s charset guard on its way into
+	 *  state.db, so it cannot carry a scheme, a path, whitespace or a quote. That
+	 *  guard is a charset check and NOT a policy check, though — it does not decide
+	 *  which hosts are ours — so this deliberately hardcodes `http://` rather than
+	 *  letting a stored value choose the scheme.
+	 */
+	openSite: (id: string) => typedError<null, IpcError>(__TAURI_INVOKE("open_site", { id })),
 };
 
 /** Events */

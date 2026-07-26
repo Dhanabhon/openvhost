@@ -9,6 +9,7 @@
 		onAdd,
 		onEdit,
 		onToggleEnabled,
+		onOpen,
 		onDelete,
 		busy = {},
 		rowErrors = {}
@@ -17,6 +18,7 @@
 		onAdd: () => void;
 		onEdit: (site: SiteDto) => void;
 		onToggleEnabled: (site: SiteDto, enabled: boolean) => void;
+		onOpen: (id: string) => void;
 		onDelete: (id: string) => void;
 		/** Both keyed by site id, so a row's state cannot be read off a neighbour. */
 		busy?: Record<string, boolean>;
@@ -57,6 +59,7 @@
 					{site}
 					{onEdit}
 					{onToggleEnabled}
+					{onOpen}
 					{onDelete}
 					busy={busy[site.id] === true}
 					rowError={rowErrors[site.id] ?? ''}

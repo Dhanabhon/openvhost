@@ -34,6 +34,7 @@ function rowHtml(dto: SiteDto, extra: { busy?: boolean; rowError?: string } = {}
 			site: dto,
 			onEdit: () => {},
 			onToggleEnabled: () => {},
+			onOpen: () => {},
 			onDelete: () => {},
 			busy: extra.busy ?? false,
 			rowError: extra.rowError ?? ''
@@ -68,6 +69,25 @@ describe('SiteListRow actions', () => {
 	// destructive control is not reachable in a single click.
 	it('does not render the destructive control before confirming', () => {
 		expect(rowHtml(site(true))).not.toContain('btn-danger');
+	});
+
+	// An icon has no text, so its accessible name is the ONLY thing a screen reader
+	// gets — and every row's glyph is identical, so the name must carry the site.
+	it('names the site on the icon-only open button', () => {
+		const m = rowHtml(site(true));
+		expect(m).toContain('aria-label="Open shop in a browser"');
+		// The glyph itself is decorative once the button is named; announcing it twice
+		// is worse than not announcing it.
+		expect(m).toContain('aria-hidden="true"');
+		// Sighted users get the same sentence on hover, naming the domain.
+		expect(m).toContain('title="Open shop.localhost in a browser"');
+	});
+
+	// A disabled site is not being served, so the button would open a page that
+	// cannot load. This is the whole reason the button is state-aware.
+	it('disables opening for a disabled site but not for an enabled one', () => {
+		expect(rowHtml(site(false))).toContain('aria-label="Open shop in a browser" disabled');
+		expect(rowHtml(site(true))).not.toContain('aria-label="Open shop in a browser" disabled');
 	});
 
 	it('disables the row actions while an action is in flight', () => {

@@ -8,6 +8,7 @@
 		site,
 		onEdit,
 		onToggleEnabled,
+		onOpen,
 		onDelete,
 		busy = false,
 		rowError = ''
@@ -15,6 +16,7 @@
 		site: SiteDto;
 		onEdit: (site: SiteDto) => void;
 		onToggleEnabled: (site: SiteDto, enabled: boolean) => void;
+		onOpen: (id: string) => void;
 		onDelete: (id: string) => void;
 		busy?: boolean;
 		rowError?: string;
@@ -78,6 +80,43 @@
 		</div>
 	{:else}
 		<div class="row-actions">
+			<!-- Icon-only, and first in the group. The row already carries three text
+			     buttons; a fourth word would crowd the strip and push Delete further from
+			     the eye's landing point. `ariaLabel` names the site because an icon has no
+			     text at all — without it a screen reader announces nothing usable, and
+			     every row's button would be identical anyway. `title` gives sighted users
+			     the same sentence on hover, since the glyph alone does not say WHICH site.
+
+			     Disabled when the site is disabled: a disabled site is not being served, so
+			     the button would open a page that cannot load. `busy` covers the in-flight
+			     case, same as the other row actions. -->
+			<Button
+				variant="quiet"
+				size="sm"
+				ariaLabel="Open {site.name} in a browser"
+				disabled={busy || !site.enabled}
+				onclick={() => onOpen(site.id)}
+			>
+				<span class="icon" title="Open {site.domain} in a browser" aria-hidden="true">
+					<svg
+						viewBox="0 0 14 14"
+						width="13"
+						height="13"
+						fill="none"
+						stroke="currentColor"
+						stroke-width="1.5"
+						stroke-linecap="round"
+						stroke-linejoin="round"
+					>
+						<!-- External-link glyph: a box with a corner arrow leaving it. Reads as
+						     "this leaves the app" rather than "play" or "go". -->
+						<path
+							d="M6 2.5H3.2A1.2 1.2 0 0 0 2 3.7v7.1A1.2 1.2 0 0 0 3.2 12h7.1a1.2 1.2 0 0 0 1.2-1.2V8"
+						/>
+						<path d="M8.6 2h3.9v3.9M12.2 2.3 6.6 7.9" />
+					</svg>
+				</span>
+			</Button>
 			<Button
 				variant="quiet"
 				size="sm"
