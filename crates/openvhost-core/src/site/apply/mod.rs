@@ -3,7 +3,7 @@
 //! commit and validate it. See
 //! docs/superpowers/specs/2026-07-27-p1-site-apply-design.md.
 
-// TODO(Task 5): restore `mod commit;` and its re-exports below.
+mod commit;
 mod error;
 mod plan;
 #[cfg(test)]
@@ -17,6 +17,7 @@ use openvhost_conf::{
     WebServerAdapter,
 };
 
+pub use commit::{ApplyOutcome, ConfigValidator, NginxValidator, apply, commit, rollback};
 pub use error::{ApplyError, RollbackReport};
 pub use plan::{ApplyPlan, ChangeKind, FileChange, plan};
 
