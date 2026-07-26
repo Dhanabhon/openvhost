@@ -130,6 +130,67 @@ pub(crate) fn process_start_time(_pid: u32) -> io::Result<Option<ProcStartTime>>
     ))
 }
 
+/// Resident set size in BYTES for a live process.
+///
+/// `pti_resident_size` is in BYTES — not pages, not kilobytes. Verified against
+/// `ps -o rss=` on macOS: 14,254,080 here vs 13,952 KB = 14,286,848 there, a
+/// ratio of 0.998 (the same value sampled a moment apart). Reading it as pages
+/// would be 4096x wrong. (spec §3.1)
+///
+/// `Ok(None)` means "no figure for this pid". `proc_pidinfo` cannot distinguish a
+/// dead pid from one we may not inspect — a nonexistent pid returned `rc == 0`
+/// with `errno == ESRCH`, and pid 1 (launchd) returned `rc == 0` too. Both are
+/// `Ok(None)` deliberately: the caller samples pids the supervisor listed a
+/// moment ago, and a process exiting in that gap is a normal race, not a
+/// failure. We only ever read our own children, so the permission case does not
+/// arise in practice.
+#[cfg(target_os = "macos")]
+pub(crate) fn process_rss(pid: u32) -> io::Result<Option<u64>> {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return Ok(None); // pid 0 is kernel_task; out-of-range can't be ours
+    }
+    // SAFETY: `proc_taskinfo` is a POD of `u64`/`i32` fields (libc 0.2.189,
+    // unix/bsd/apple/mod.rs:585), so an all-zero bit pattern is a valid value.
+    let mut ti: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    // SAFETY: `ti` is a valid writable region of exactly `size` bytes, which is
+    // what PROC_PIDTASKINFO writes; `arg` is unused for this flavor (0). No
+    // pointer is retained past the call.
+    let rc = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTASKINFO,
+            0,
+            &mut ti as *mut libc::proc_taskinfo as *mut libc::c_void,
+            size,
+        )
+    };
+    if rc <= 0 {
+        return Ok(None); // dead pid, or not inspectable — see the doc comment
+    }
+    if rc < size {
+        // Short write: the struct is partial, so the field we want may be
+        // untouched zero rather than a real reading. Report no figure instead of
+        // a fabricated one. (Mirrors process_start_time's undersized-record check.)
+        return Ok(None);
+    }
+    Ok(Some(ti.pti_resident_size))
+}
+
+/// Non-macOS unix `process_rss` is deferred to the Windows/Linux-enablement
+/// phase (macOS-first). Returns `Err`, mirroring `process_start_time`'s stub
+/// above — and `Err` is the CORRECT answer, not merely the consistent one:
+/// `Ok(None)` would make every pid here "no figure", which the caller sums to 0
+/// with a count of 0 and the status strip renders as "services 0 MB · no
+/// processes" — false while services are running. `Err` renders as "—", which
+/// is true: unknown, not zero.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn process_rss(_pid: u32) -> io::Result<Option<u64>> {
+    Err(io::Error::other(
+        "process_rss is not implemented on this platform in v1 (macOS-first)",
+    ))
+}
+
 /// Current boot time via `sysctl(kern.boottime)` — the boot identity.
 ///
 /// `#[allow(dead_code)]` dropped (P0-8 Task 2): `registry::load()` calls this
@@ -276,5 +337,66 @@ mod floor_tests {
         assert!(reap_pid_floor_violation(2).is_none());
         assert!(reap_pid_floor_violation(std::process::id()).is_none());
         assert!(reap_pid_floor_violation(i32::MAX as u32).is_none());
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod rss_tests {
+    use super::*;
+
+    /// A live process must report a non-zero resident size. This is the test that
+    /// catches a units mistake or a wrong struct field: `/bin/sleep`'s RSS is a
+    /// few hundred KB, so a pages-vs-bytes error would show up as an absurd value
+    /// and a wrong-field error as zero.
+    #[test]
+    fn rss_of_a_live_process_is_plausible() {
+        use std::process::{Command, Stdio};
+        #[allow(clippy::zombie_processes)]
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let rss = process_rss(pid)
+            .unwrap()
+            .expect("a live process has an RSS");
+        // Lower bound: any real process has more than 64 KB resident.
+        assert!(rss > 64 * 1024, "rss {rss} is implausibly small");
+        // Upper bound: `sleep` is tiny. 1 GB would mean we read pages as bytes
+        // (4096x) or picked up pti_virtual_size instead of pti_resident_size.
+        assert!(rss < 1024 * 1024 * 1024, "rss {rss} is implausibly large");
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// A pid that no longer exists is `Ok(None)`, NOT `Err`. The caller samples
+    /// pids the supervisor listed a moment earlier; a process exiting in that gap
+    /// is normal and must not surface as a failure (spec §4.1).
+    #[test]
+    fn rss_of_a_dead_pid_is_none_not_an_error() {
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.kill().unwrap();
+        child.wait().unwrap(); // reap, or the zombie still answers
+        assert_eq!(process_rss(pid).unwrap(), None);
+    }
+
+    /// Guarded before any FFI: pid 0 is `kernel_task` and anything above
+    /// `i32::MAX` cannot be a pid we spawned.
+    #[test]
+    fn rss_rejects_pid_zero_and_out_of_range_without_calling_ffi() {
+        assert_eq!(process_rss(0).unwrap(), None);
+        assert_eq!(process_rss(i32::MAX as u32 + 1).unwrap(), None);
     }
 }

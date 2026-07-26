@@ -85,6 +85,15 @@ pub(crate) fn process_start_time(_pid: u32) -> io::Result<Option<ProcStartTime>>
     ))
 }
 
+/// See `unix.rs`'s non-macOS arm for why this returns `Err` rather than
+/// `Ok(None)`: a false zero would read as "nothing running".
+#[cfg(windows)]
+pub(crate) fn process_rss(_pid: u32) -> io::Result<Option<u64>> {
+    Err(io::Error::other(
+        "process_rss is not implemented on Windows in v1 (macOS-first)",
+    ))
+}
+
 /// `#[allow(dead_code)]` dropped (P0-8 Task 2): `registry::load()` calls this
 /// via `platform::current_boot_id()` from production code now, on this
 /// target too (the stub still returns an error — Windows-enablement phase).
