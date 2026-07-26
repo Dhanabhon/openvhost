@@ -19,7 +19,9 @@ pub enum ChangeKind {
 pub struct FileChange {
     pub path: PathBuf,
     pub kind: ChangeKind,
-    /// The contents currently on disk. `None` only for `Added`.
+    /// The contents currently on disk. `None` for `Added`, and also for the
+    /// narrow race where an owned file is observed during the scan but has
+    /// disappeared by the time it is read for the `Removed` diff.
     pub before: Option<String>,
     /// The contents to be written. `None` only for `Removed`.
     pub after: Option<String>,
@@ -61,18 +63,36 @@ fn unified(path: &Path, before: &str, after: &str) -> String {
 /// Generated files this pipeline owns, and therefore may delete: the site
 /// configs and the per-major pools. `config/custom/` is never listed, so it can
 /// never be planned for removal.
+///
+/// Ownership is decided by the entry's own type — reported by `read_dir`
+/// without following the entry — never by `Path::is_file`/`metadata`, which
+/// resolve symlinks. A symlink under the generated tree is not something this
+/// pipeline wrote, so even one pointing at a real `.conf` file must not be
+/// treated as owned: following it would let the plan read (and the apply step
+/// delete) a file outside the confinement boundary the generated tree is
+/// meant to enforce. A directory that merely has a matching name is likewise
+/// excluded so a stray entry can never turn into a propagated I/O error.
 fn owned_files(gen_root: &Path) -> Result<Vec<PathBuf>, ApplyError> {
     let mut out = Vec::new();
     let sites_dir = gen_root.join("nginx/sites");
-    for entry in read_dir_or_empty(&sites_dir)? {
-        if entry.extension().is_some_and(|e| e == "conf") {
-            out.push(entry);
+    for (path, file_type) in read_dir_or_empty(&sites_dir)? {
+        if file_type.is_file() && path.extension().is_some_and(|e| e == "conf") {
+            out.push(path);
         }
     }
     let php_dir = gen_root.join("php");
-    for major_dir in read_dir_or_empty(&php_dir)? {
+    for (major_dir, major_type) in read_dir_or_empty(&php_dir)? {
+        if !major_type.is_dir() {
+            continue;
+        }
         let pool = major_dir.join("php-fpm.conf");
-        if pool.is_file() {
+        // Reached by path rather than by `DirEntry`, so use `symlink_metadata`
+        // (not `Path::is_file`, which follows symlinks) to keep the same
+        // regular-files-only rule for the file inside the major directory.
+        let is_regular_file = std::fs::symlink_metadata(&pool)
+            .map(|m| m.is_file())
+            .unwrap_or(false);
+        if is_regular_file {
             out.push(pool);
         }
     }
@@ -80,9 +100,11 @@ fn owned_files(gen_root: &Path) -> Result<Vec<PathBuf>, ApplyError> {
     Ok(out)
 }
 
-/// Directory entries, or an empty list when the directory does not exist —
-/// a home that has never been applied is not an error condition.
-fn read_dir_or_empty(dir: &Path) -> Result<Vec<PathBuf>, ApplyError> {
+/// Directory entries paired with their own file type (not the type of
+/// whatever a symlink might point at), or an empty list when the directory
+/// does not exist — a home that has never been applied is not an error
+/// condition.
+fn read_dir_or_empty(dir: &Path) -> Result<Vec<(PathBuf, std::fs::FileType)>, ApplyError> {
     let rd = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -101,7 +123,12 @@ fn read_dir_or_empty(dir: &Path) -> Result<Vec<PathBuf>, ApplyError> {
             path: dir.to_path_buf(),
             source,
         })?;
-        out.push(e.path());
+        let file_type = e.file_type().map_err(|source| ApplyError::Io {
+            op: "read_dir",
+            path: e.path(),
+            source,
+        })?;
+        out.push((e.path(), file_type));
     }
     Ok(out)
 }
@@ -158,7 +185,7 @@ pub fn plan(input: &ApplyInput) -> Result<ApplyPlan, ApplyError> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::site::apply::tests_support::{input_with_home, site};
@@ -294,6 +321,48 @@ mod tests {
             p.changes
                 .iter()
                 .any(|c| c.kind == ChangeKind::Removed && c.path.ends_with("ghost.localhost.conf"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stray_directory_or_symlink_does_not_break_planning() {
+        let home = tempfile::tempdir().unwrap();
+        let sites_dir = home.path().join("config/generated/nginx/sites");
+        std::fs::create_dir_all(&sites_dir).unwrap();
+
+        // A directory that merely looks like a config file. Reading it as a string
+        // fails with a non-NotFound error, which must not take the whole plan down:
+        // the pending-changes banner would stop working entirely.
+        std::fs::create_dir_all(sites_dir.join("ghost.conf")).unwrap();
+
+        // A symlink is not something this pipeline wrote, so it is neither owned
+        // nor read. Pointing it outside the generated tree makes the boundary
+        // violation visible if the filter ever regresses.
+        let outside = home.path().join("secret.txt");
+        std::fs::write(&outside, "not for the diff view\n").unwrap();
+        std::os::unix::fs::symlink(&outside, sites_dir.join("linked.conf")).unwrap();
+
+        let i = input_with_home(
+            home.path(),
+            vec![site("app", "app.localhost", "8.4", true)],
+            &["8.4"],
+        );
+        let p = plan(&i).expect("a stray entry must not fail the plan");
+
+        assert!(
+            !p.changes.iter().any(|c| c.path.ends_with("ghost.conf")),
+            "a directory is not an owned config file"
+        );
+        assert!(
+            !p.changes.iter().any(|c| c.path.ends_with("linked.conf")),
+            "a symlink is not an owned config file"
+        );
+        assert!(
+            !p.changes
+                .iter()
+                .any(|c| c.diff.contains("not for the diff view")),
+            "no symlink target's contents may reach the diff shown to the user"
         );
     }
 }
