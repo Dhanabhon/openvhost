@@ -97,8 +97,8 @@
 					<pre class="diff">{#each c.diff.split('\n') as line, i (i)}<span
 								class="line"
 								data-line={line.startsWith('+') ? 'add' : line.startsWith('-') ? 'del' : 'ctx'}
-								>{line}
-							</span>{/each}</pre>
+								>{line}</span
+							>{/each}</pre>
 				</article>
 			{/each}
 		</div>
@@ -120,27 +120,34 @@
 			</p>
 		{/if}
 
-		{#if outcome}
-			{#if hasNeedsAttention}
-				<!-- Rendered INSTEAD of `.ok` below, never alongside it — see the
-				     `needsAttention` doc comment above. -->
-				<div class="warn" data-testid="needs-attention" role="alert">
-					<strong>Needs your attention</strong>
-					<ul>
-						{#each needsAttention as problem (problem.id)}
-							<li><span class="mono">{problem.id}</span>: {problem.reason}</li>
-						{/each}
-					</ul>
-				</div>
-			{:else}
-				<p class="ok" data-testid="apply-success" role="status">
-					Applied.
-					{#if outcome.restarted.length > 0}Restarted {outcome.restarted.join(', ')}.{/if}
-					{#if outcome.notStarted.length > 0}
-						{outcome.notStarted.join(', ')} was not running — the new config applies next time it starts.
-					{/if}
-				</p>
-			{/if}
+		{#if hasNeedsAttention}
+			<!-- Unconditional on `changes`/`error`: a service the pipeline could not
+			     restart still needs the user's eyes even if new, unapplied changes
+			     have appeared since this outcome was produced. Rendered INSTEAD of
+			     `.ok` below, never alongside it — see the `needsAttention` doc
+			     comment above. -->
+			<div class="warn" data-testid="needs-attention" role="alert">
+				<strong>Needs your attention</strong>
+				<ul>
+					{#each needsAttention as problem (problem.id)}
+						<li><span class="mono">{problem.id}</span>: {problem.reason}</li>
+					{/each}
+				</ul>
+			</div>
+		{:else if outcome && changes.length === 0 && error === ''}
+			<!-- `outcome` describes the LAST apply, not the dialog's current state —
+			     it goes stale the instant there is something pending again (the user
+			     closed the dialog, edited an unrelated site, and reopened it) or the
+			     automatic re-plan inside `run()` threw after a successful apply. Either
+			     case would otherwise show "Applied." next to a file that is not live,
+			     or alongside the error explaining why the re-plan failed. -->
+			<p class="ok" data-testid="apply-success" role="status">
+				Applied.
+				{#if outcome.restarted.length > 0}Restarted {outcome.restarted.join(', ')}.{/if}
+				{#if outcome.notStarted.length > 0}
+					{outcome.notStarted.join(', ')} was not running — the new config applies next time it starts.
+				{/if}
+			</p>
 		{/if}
 
 		<footer>

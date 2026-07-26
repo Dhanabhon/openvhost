@@ -64,6 +64,30 @@ describe('ApplyStore', () => {
 		expect(s.pendingCount).toBe(0);
 	});
 
+	it('re-plans after applying instead of assuming everything was written', async () => {
+		// A partial apply leaves work behind. Assuming zero would tell the user
+		// everything is live when it is not — so run() must ask again. The second
+		// plan call returns a non-empty (but different) list: a regression that
+		// replaced `await this.refresh()` with a bare `this.changes = []` would
+		// pass a test whose mock returns `[]` on the second call, so this mock
+		// deliberately does not.
+		let planCalls = 0;
+		const s = new ApplyStore({
+			planSiteApply: async () => {
+				planCalls += 1;
+				return planCalls === 1
+					? { changes: [change('/a.conf', 'added'), change('/b.conf', 'added')] }
+					: { changes: [change('/b.conf', 'added')] };
+			},
+			applySites: async () => ({ applied: 1, restarted: [], notStarted: [], needsAttention: [] })
+		});
+		await s.refresh();
+		expect(s.pendingCount).toBe(2);
+		expect(await s.run()).toBe(true);
+		expect(planCalls).toBe(2);
+		expect(s.pendingCount).toBe(1);
+	});
+
 	it('keeps the changes and shows the validator output when apply fails', async () => {
 		const s = new ApplyStore({
 			planSiteApply: async () => ({ changes: [change('/a.conf', 'added')] }),

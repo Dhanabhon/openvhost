@@ -54,6 +54,20 @@ describe('ApplyDialog', () => {
 		expect(body).toContain('+/sites/a.conf');
 	});
 
+	it('emits each diff line with no whitespace between the text and its closing tag', () => {
+		// Svelte preserves whitespace verbatim inside <pre>. A newline/indent left
+		// between `{line}` and `</span>` becomes a real text node inside every
+		// line's span, and with `.line { display: block }` that renders as a blank
+		// line after every diff line — doubling the diff view's height. A
+		// `toContain` check on the line text alone (as used elsewhere in this file)
+		// cannot see that stray whitespace, so this asserts on the exact substring
+		// spanning the text and its closing tag.
+		const body = renderDialog({
+			changes: [{ path: '/a.conf', kind: 'added', diff: '+added line\n' }]
+		});
+		expect(body).toContain('>+added line</span');
+	});
+
 	it('shows the validator error with its line breaks preserved', () => {
 		const body = renderDialog({ changes: [], error: 'nginx: [emerg] line 1\nline 2' });
 		expect(body).toContain('line 2');
@@ -107,8 +121,14 @@ describe('ApplyDialog', () => {
 			}
 		});
 		expect(body).toContain('nginx stopped and could not be started again.');
-		expect(body).toContain('data-testid="needs-attention"');
-		expect(body).toMatch(/data-testid="needs-attention"[^>]*role="alert"/);
+		// Two separate facts, asserted separately, so reordering the emitted
+		// attributes cannot fail a test that is really about behaviour: the
+		// warning element (a) carries the needs-attention testid and (b) has
+		// role="alert". Isolate the opening tag first so both checks are scoped
+		// to that element rather than anywhere in the document.
+		const warnTag = body.match(/<div[^>]*data-testid="needs-attention"[^>]*>/)?.[0] ?? '';
+		expect(warnTag).toContain('data-testid="needs-attention"');
+		expect(warnTag).toContain('role="alert"');
 		// A needsAttention outcome is not a success and must not render as one — the
 		// plain-success block must not appear alongside it.
 		expect(body).not.toContain('data-testid="apply-success"');
@@ -121,6 +141,42 @@ describe('ApplyDialog', () => {
 		});
 		expect(body).toContain('data-testid="apply-success"');
 		expect(body).not.toContain('data-testid="needs-attention"');
+	});
+
+	it('hides the previous success once there are pending changes again', () => {
+		const body = renderDialog({
+			changes: [c('/sites/new.conf', 'added')],
+			outcome: { applied: 1, restarted: ['nginx'], notStarted: [], needsAttention: [] }
+		});
+		// The outcome describes the LAST apply. With something pending again it would
+		// claim the new file is already live.
+		expect(body).not.toContain('data-testid="apply-success"');
+	});
+
+	it('hides the previous success once run() surfaces an error from the automatic re-plan', () => {
+		const body = renderDialog({
+			changes: [],
+			error: 'nginx is missing',
+			outcome: { applied: 1, restarted: ['nginx'], notStarted: [], needsAttention: [] }
+		});
+		// applySites() can succeed and then the automatic re-plan inside run() can
+		// throw. Showing "Applied." next to that error would contradict it.
+		expect(body).not.toContain('data-testid="apply-success"');
+		expect(body).toContain('data-testid="apply-error"');
+	});
+
+	it('still shows a service that needs attention even when new changes have appeared', () => {
+		const body = renderDialog({
+			changes: [c('/sites/new.conf', 'added')],
+			outcome: {
+				applied: 1,
+				restarted: [],
+				notStarted: [],
+				needsAttention: [{ id: 'nginx', reason: 'stopped, but could not be started again' }]
+			}
+		});
+		expect(body).toContain('data-testid="needs-attention"');
+		expect(body).toContain('nginx');
 	});
 
 	// The IPC surface review that added `needsAttention` also flagged the diff
