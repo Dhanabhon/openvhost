@@ -41,7 +41,13 @@
 	<span class="sep" aria-hidden="true">·</span>
 	<span class="num">{processes}</span>
 	<span class="sep" aria-hidden="true">·</span>
-	<span class="mono">~/.openvhost</span>
+	<!-- Says "home", not the literal `~/.openvhost` default: `resolve_home()`
+	     honours an `OPENVHOST_HOME` override (a supported configuration —
+	     error.rs's own messages tell the user to set it), and this label must
+	     stay true in that case too, not just under the default. Showing the
+	     real resolved path is future work for a `title` attribute; it needs
+	     `HomeUsageDto` to carry the path, which is out of scope here. -->
+	<span class="mono">home</span>
 	<span class="num">{home}</span>
 </div>
 

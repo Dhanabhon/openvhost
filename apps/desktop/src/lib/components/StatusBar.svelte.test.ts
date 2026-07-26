@@ -34,12 +34,14 @@ function text(markup: string): string {
 }
 
 describe('StatusBar', () => {
-	it('shows all three segments when everything is known', () => {
+	// M-c: independent `toContain` calls (as this test used to make) cannot see
+	// ORDER — reversing all six spans still passed every one of them. A single
+	// whole-string assertion pins both the segment order (the one thing spec §1
+	// shows literally) and the `·` separators between them, which nothing here
+	// pinned before.
+	it('shows all three segments, in the order the spec shows, when everything is known', () => {
 		const t = text(html({ servicesBytes: 89128960, processCount: 2, homeBytes: 1288490188 }));
-		expect(t).toContain('services 85 MB');
-		expect(t).toContain('2 processes');
-		expect(t).toContain('~/.openvhost');
-		expect(t).toContain('1.2 GB');
+		expect(t).toBe('services 85 MB · 2 processes · home 1.2 GB');
 	});
 
 	// The failure mode this guards: a failed sample must not read as a measured
