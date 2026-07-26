@@ -75,7 +75,27 @@ pub(crate) fn dir_size_no_follow(root: &Path) -> u64 {
 /// Total bytes under the resolved OpenVHost home. See [`dir_size_no_follow`] for
 /// the symlink and unreadable-directory rules.
 pub fn home_disk_usage() -> Result<u64, CoreError> {
-    Ok(dir_size_no_follow(&resolve_home()?))
+    home_disk_usage_from(
+        std::env::var_os("OPENVHOST_HOME").as_deref(),
+        dirs::home_dir().as_deref(),
+    )
+}
+
+/// Pure core of [`home_disk_usage`], testable without touching process env —
+/// mirrors [`resolve_home_from`]'s seam exactly: resolve `root` from the same
+/// two inputs, then walk it. Without this seam nothing exercises
+/// `home_disk_usage` consulting the resolved home at all: `dir_size_no_follow`
+/// is unit-tested directly against explicit roots, so a mutation discarding
+/// `resolve_home()` entirely (walking some other, wrong path instead) passed
+/// every existing test.
+pub(crate) fn home_disk_usage_from(
+    override_val: Option<&OsStr>,
+    home_dir: Option<&Path>,
+) -> Result<u64, CoreError> {
+    Ok(dir_size_no_follow(&resolve_home_from(
+        override_val,
+        home_dir,
+    )?))
 }
 
 #[cfg(test)]
@@ -193,5 +213,25 @@ mod tests {
     fn a_missing_root_is_zero() {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(dir_size_no_follow(&tmp.path().join("nope")), 0);
+    }
+
+    /// M-e: `home_disk_usage` must actually consult the resolved home, not walk
+    /// some other, hardcoded path. `dir_size_no_follow`'s own tests above prove
+    /// the walk is correct once given a root, and `resolve_home_from`'s tests
+    /// prove resolution is correct in isolation, but nothing before this test
+    /// tied the two together through the function real callers use — so a
+    /// mutation that discards `resolve_home`'s result entirely (e.g. walking
+    /// `/nonexistent-mutation-probe` instead) left every prior test green. This
+    /// uses `home_disk_usage_from` (the env-mutation-free seam) rather than
+    /// `home_disk_usage` itself, matching this crate's existing convention of
+    /// never mutating process env in tests.
+    #[test]
+    fn home_disk_usage_from_walks_the_resolved_home_not_an_arbitrary_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.bin"), vec![0u8; 321]).unwrap();
+        // Via the override branch (as `env_override_wins` does above), so the
+        // resolved root is `tmp.path()` itself, not `tmp.path()/.openvhost`.
+        let bytes = home_disk_usage_from(Some(tmp.path().as_os_str()), None).unwrap();
+        assert_eq!(bytes, 321);
     }
 }
