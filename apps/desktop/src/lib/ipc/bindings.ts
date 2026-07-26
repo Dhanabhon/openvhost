@@ -103,12 +103,19 @@ export const events = {
 export type ApplyOutcomeDto = {
 	/**  `u32`, not `usize`: specta rejects pointer-sized ints (see lib.rs). */
 	applied: number,
+	/**  Stopped and successfully started again on the new config. */
 	restarted: string[],
 	/**
 	 *  Services whose config changed but which were not running, so the new
 	 *  config takes effect the next time they start.
 	 */
 	notStarted: string[],
+	/**
+	 *  Were running and could NOT be brought back — the user has to act.
+	 *  Never empty-and-ignored: a service this pipeline stopped and failed to
+	 *  restart is the one outcome the UI must not present as success.
+	 */
+	needsAttention: ServiceProblemDto[],
 };
 
 export type ApplyPlanDto = {
@@ -181,6 +188,15 @@ export type ServiceLogEvent = {
 	tsMs: number,
 	level: LogLevel,
 	line: string,
+};
+
+export type ServiceProblemDto = {
+	id: string,
+	/**
+	 *  A sentence the UI can show as-is, telling the user what happened and
+	 *  what is left for them to do.
+	 */
+	reason: string,
 };
 
 export type ServiceState = { kind: "stopped" } | { kind: "starting" } | { kind: "running" } | { kind: "failed"; exit: number | null; stderrTail: string[] };

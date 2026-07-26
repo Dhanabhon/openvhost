@@ -486,13 +486,27 @@ pub struct ApplyPlanDto {
 
 #[derive(Debug, Clone, serde::Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
+pub struct ServiceProblemDto {
+    pub id: String,
+    /// A sentence the UI can show as-is, telling the user what happened and
+    /// what is left for them to do.
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct ApplyOutcomeDto {
     /// `u32`, not `usize`: specta rejects pointer-sized ints (see lib.rs).
     pub applied: u32,
+    /// Stopped and successfully started again on the new config.
     pub restarted: Vec<String>,
     /// Services whose config changed but which were not running, so the new
     /// config takes effect the next time they start.
     pub not_started: Vec<String>,
+    /// Were running and could NOT be brought back — the user has to act.
+    /// Never empty-and-ignored: a service this pipeline stopped and failed to
+    /// restart is the one outcome the UI must not present as success.
+    pub needs_attention: Vec<ServiceProblemDto>,
 }
 
 /// Build the apply input from state.db plus the runtimes probed at startup.
@@ -596,7 +610,7 @@ pub async fn apply_sites(
     let for_pending = Arc::clone(sup.inner());
     let watched = running.clone();
     let for_stop = Arc::clone(sup.inner());
-    crate::quit::stop_all_with(
+    let stragglers = crate::quit::stop_all_with(
         move || {
             for_pending
                 .snapshot()
@@ -614,16 +628,58 @@ pub async fn apply_sites(
     )
     .await;
 
-    for id in &running {
-        sup.start(id)?;
-    }
+    // The stop result — not just "we asked it to stop" — decides what happens
+    // next. A straggler that is still shutting down gets a no-op `start` (the
+    // supervisor treats Starting/Running as already-in-progress) and then
+    // finishes stopping moments later, on its own schedule: exactly how a
+    // green Apply leaves a site down. So a straggler is never started; it is
+    // reported instead.
+    let (restarted, needs_attention) = restart_outcome(&running, &stragglers, |id| {
+        sup.start(id).map_err(|e| e.to_string())
+    });
 
     Ok(ApplyOutcomeDto {
         // `u32`, not `usize`: specta rejects pointer-sized ints.
         applied: u32::try_from(outcome.applied).unwrap_or(u32::MAX),
-        restarted: running,
+        restarted,
         not_started,
+        needs_attention,
     })
+}
+
+/// Decide, for each service that was running, what the restart achieved.
+/// Split out from `apply_sites` so the straggler logic is testable without
+/// spawning anything.
+///
+/// Deliberately does not use `?`/early-return on a failed `start`: one
+/// service's failure must not hide the fate of the others, so every id in
+/// `running` is visited regardless of what happened to the ones before it.
+fn restart_outcome(
+    running: &[String],
+    stragglers: &[String],
+    start: impl Fn(&str) -> Result<(), String>,
+) -> (Vec<String>, Vec<ServiceProblemDto>) {
+    let mut restarted = Vec::new();
+    let mut needs_attention = Vec::new();
+    for id in running {
+        if stragglers.contains(id) {
+            needs_attention.push(ServiceProblemDto {
+                id: id.clone(),
+                reason: "did not stop within 10s, so it was left alone — stop it and start it \
+                         again to pick up the new config"
+                    .to_string(),
+            });
+            continue;
+        }
+        match start(id) {
+            Ok(()) => restarted.push(id.clone()),
+            Err(e) => needs_attention.push(ServiceProblemDto {
+                id: id.clone(),
+                reason: format!("stopped, but could not be started again: {e}"),
+            }),
+        }
+    }
+    (restarted, needs_attention)
 }
 
 /// The web servers OpenVHost knows about. A CLOSED list: the client sends only
@@ -1403,6 +1459,49 @@ mod apply_ipc_tests {
             }
             other => panic!("expected Core, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_service_that_did_not_stop_in_time_is_not_started_and_is_reported() {
+        let running = vec!["nginx".to_string(), "php-fpm-8.4".to_string()];
+        let stragglers = vec!["nginx".to_string()];
+        let started = std::cell::RefCell::new(Vec::new());
+        let (restarted, problems) = restart_outcome(&running, &stragglers, |id| {
+            started.borrow_mut().push(id.to_string());
+            Ok(())
+        });
+        // Starting a service that is still shutting down is a no-op that leaves it
+        // stopped moments later — the exact way a green Apply takes a site down.
+        assert_eq!(started.into_inner(), vec!["php-fpm-8.4".to_string()]);
+        assert_eq!(restarted, vec!["php-fpm-8.4".to_string()]);
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].id, "nginx");
+        assert!(problems[0].reason.contains("did not stop"));
+    }
+
+    #[test]
+    fn a_failed_start_is_reported_without_hiding_the_other_services() {
+        let running = vec!["php-fpm-8.4".to_string(), "nginx".to_string()];
+        let (restarted, problems) = restart_outcome(&running, &[], |id| {
+            if id == "php-fpm-8.4" {
+                Err("no such service".into())
+            } else {
+                Ok(())
+            }
+        });
+        // The failure must not abort the loop: nginx still gets its start.
+        assert_eq!(restarted, vec!["nginx".to_string()]);
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].id, "php-fpm-8.4");
+        assert!(problems[0].reason.contains("no such service"));
+    }
+
+    #[test]
+    fn a_clean_restart_reports_no_problems() {
+        let running = vec!["php-fpm-8.4".to_string(), "nginx".to_string()];
+        let (restarted, problems) = restart_outcome(&running, &[], |_| Ok(()));
+        assert_eq!(restarted, running);
+        assert!(problems.is_empty());
     }
 }
 

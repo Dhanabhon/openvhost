@@ -105,7 +105,12 @@ describe('applySites', () => {
 	beforeEach(() => invokeMock.mockReset());
 
 	it('returns the outcome data on success', async () => {
-		const outcome = { applied: 3, restarted: ['php-fpm-8.4', 'nginx'], notStarted: [] };
+		const outcome = {
+			applied: 3,
+			restarted: ['php-fpm-8.4', 'nginx'],
+			notStarted: [],
+			needsAttention: []
+		};
 		invokeMock.mockResolvedValueOnce(outcome);
 		await expect(applySites()).resolves.toEqual(outcome);
 		expect(invokeMock).toHaveBeenCalledWith('apply_sites');

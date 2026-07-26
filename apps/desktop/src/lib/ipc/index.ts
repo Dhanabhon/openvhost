@@ -10,6 +10,7 @@ import type {
 	IpcError,
 	LogLine,
 	ServiceLogEvent,
+	ServiceProblemDto,
 	ServicesMemoryDto,
 	ServiceStateEvent,
 	ServiceStatus,
@@ -28,6 +29,7 @@ export type {
 	IpcError,
 	LogLine,
 	ServiceLogEvent,
+	ServiceProblemDto,
 	ServicesMemoryDto,
 	ServiceStateEvent,
 	ServiceStatus,
@@ -157,7 +159,9 @@ export async function planSiteApply(): Promise<ApplyPlanDto> {
 /**
  * Apply the sites, then restart whichever affected services were running.
  * Services that were not running are reported in `notStarted` instead of
- * being started as a side effect.
+ * being started as a side effect. A service that was running but could not be
+ * cleanly stopped-and-restarted lands in `needsAttention` instead of
+ * `restarted` — the UI must not present that outcome as a success.
  */
 export async function applySites(): Promise<ApplyOutcomeDto> {
 	return unwrap(commands.applySites());
