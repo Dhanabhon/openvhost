@@ -131,6 +131,14 @@ export async function deleteSite(id: string): Promise<boolean> {
 	return unwrap(commands.deleteSite(id));
 }
 
+/**
+ * Open a site in the default browser. Takes an id, NOT a URL — the URL is built in
+ * Rust from the stored row, so this cannot be used to open an arbitrary address.
+ */
+export async function openSite(id: string): Promise<void> {
+	await unwrap(commands.openSite(id));
+}
+
 export async function listWebServers(): Promise<WebServerDto[]> {
 	return unwrap(commands.listWebServers());
 }

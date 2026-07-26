@@ -9,6 +9,7 @@ export interface SitesApi {
 	createSite(input: SiteInput): Promise<SiteDto>;
 	updateSite(id: string, input: SiteInput): Promise<SiteDto>;
 	deleteSite(id: string): Promise<boolean>;
+	openSite(id: string): Promise<void>;
 }
 
 function isValidation(e: unknown): e is { kind: 'validation'; field: string; message: string } {
@@ -161,5 +162,29 @@ export class SitesStore {
 	/** Delete from the list row, surfacing failure on that row. */
 	async removeRow(id: string): Promise<boolean> {
 		return this.mutateRow(id, () => this.api.deleteSite(id));
+	}
+
+	/**
+	 * Open a site in the browser.
+	 *
+	 * Deliberately NOT routed through `mutateRow`: opening a browser changes nothing
+	 * in state.db, so the refetch `mutateRow` performs on success would be a round
+	 * trip that can only produce the list we already have. The busy guard and the
+	 * per-row error channel are still worth reusing — a double-click must not open
+	 * two tabs, and a failure belongs on the row rather than in a page banner.
+	 */
+	async open(id: string): Promise<boolean> {
+		if (this.busy[id] === true) return false;
+		this.busy = { ...this.busy, [id]: true };
+		this.rowError = { ...this.rowError, [id]: '' };
+		try {
+			await this.api.openSite(id);
+		} catch (e) {
+			this.rowError = { ...this.rowError, [id]: errorMessage(e) };
+			return false;
+		} finally {
+			this.busy = { ...this.busy, [id]: false };
+		}
+		return true;
 	}
 }

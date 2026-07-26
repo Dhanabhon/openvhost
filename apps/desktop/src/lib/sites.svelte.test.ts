@@ -35,6 +35,7 @@ function api(overrides: Partial<Record<string, unknown>> = {}): SitesApi {
 		createSite: vi.fn(async () => dto('a', 'shop')),
 		updateSite: vi.fn(async () => dto('a', 'shop')),
 		deleteSite: vi.fn(async () => true),
+		openSite: vi.fn(async () => undefined),
 		...overrides
 	} as unknown as SitesApi;
 }
@@ -191,5 +192,60 @@ describe('SitesStore row actions', () => {
 		);
 		await store.removeRow('a');
 		expect(store.busy.a).not.toBe(true);
+	});
+});
+
+describe('SitesStore.open', () => {
+	// Opening a browser changes nothing in state.db, so a refetch afterwards could
+	// only produce the list we already have. This is the difference from every other
+	// row action, and it is the thing worth pinning.
+	it('does not refetch the list after opening', async () => {
+		const a = api();
+		const s = new SitesStore(a);
+		await s.open('a');
+		expect(a.openSite).toHaveBeenCalledWith('a');
+		expect(a.listSites).not.toHaveBeenCalled();
+	});
+
+	it('puts a failure on the row, not on the page banner', async () => {
+		const s = new SitesStore(
+			api({
+				openSite: vi.fn(async () => {
+					throw { kind: 'core', message: 'no browser' };
+				})
+			})
+		);
+		await s.open('a');
+		expect(s.rowError.a).toContain('no browser');
+		expect(s.error).toBeNull();
+	});
+
+	// A double-click must not open two tabs.
+	it('refuses a second concurrent open on the same row', async () => {
+		let release: (() => void) | undefined;
+		const gate = new Promise<void>((r) => (release = r));
+		const a = api({
+			openSite: vi.fn(async () => {
+				await gate;
+			})
+		});
+		const s = new SitesStore(a);
+		const first = s.open('a');
+		expect(await s.open('a')).toBe(false);
+		expect(a.openSite).toHaveBeenCalledTimes(1);
+		release?.();
+		await first;
+	});
+
+	it('clears busy even when opening throws, so the row is not stuck', async () => {
+		const s = new SitesStore(
+			api({
+				openSite: vi.fn(async () => {
+					throw { kind: 'core', message: 'nope' };
+				})
+			})
+		);
+		await s.open('a');
+		expect(s.busy.a).not.toBe(true);
 	});
 });

@@ -397,6 +397,52 @@ pub async fn update_site(
     Ok(SiteDto::from(repo.update(&updated).await?))
 }
 
+/// Open a site in the user's default browser.
+///
+/// **The URL is built HERE, in Rust, and the webview never supplies one.** The
+/// obvious alternative — granting the frontend `opener:allow-open-url` and letting
+/// it call `openUrl(...)` — would hand the renderer a general "open any URL"
+/// primitive. This command narrows that to "open the site with this id": the only
+/// thing a caller can influence is which stored row is used, and the scheme is
+/// fixed. No capability grant is added to `capabilities/default.json` at all,
+/// because the ACL gates the JS-to-plugin path and this calls the plugin's Rust
+/// API instead.
+///
+/// The domain also already passed `Domain`'s charset guard on its way into
+/// state.db, so it cannot carry a scheme, a path, whitespace or a quote. That
+/// guard is a charset check and NOT a policy check, though — it does not decide
+/// which hosts are ours — so this deliberately hardcodes `http://` rather than
+/// letting a stored value choose the scheme.
+#[tauri::command]
+#[specta::specta]
+pub async fn open_site(
+    db: tauri::State<'_, Db>,
+    app: tauri::AppHandle,
+    id: String,
+) -> Result<(), IpcError> {
+    use tauri_plugin_opener::OpenerExt;
+    let site_id = SiteId::parse(&id)?;
+    let repo = SqliteSiteRepository::new(db.inner());
+    let site = repo.get(&site_id).await?.ok_or_else(|| IpcError::Core {
+        message: format!("site {id} not found"),
+    })?;
+    let url = site_url(site.domain.as_str());
+    // `None` for `with`: let the OS pick the default handler rather than naming a
+    // browser we would then have to keep a list of.
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|e| IpcError::Core {
+            message: e.to_string(),
+        })
+}
+
+/// `http://<domain>`. Extracted so the one thing worth pinning — that the scheme
+/// is fixed and prepended, never taken from the stored value — is testable
+/// without a live `AppHandle` and a real database.
+fn site_url(domain: &str) -> String {
+    format!("http://{domain}")
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn delete_site(db: tauri::State<'_, Db>, id: String) -> Result<bool, IpcError> {
@@ -877,6 +923,19 @@ mod site_ipc_tests {
             }
             other => panic!("expected Validation, got {other:?}"),
         }
+    }
+
+    /// The scheme is PREPENDED and fixed. A stored value must never be able to
+    /// choose it — `Domain`'s guard is a charset check, not a policy check, so it
+    /// is not the thing standing between a stored row and, say, a `file://` or
+    /// `javascript:` URL reaching the OS opener. This test is what pins that.
+    #[test]
+    fn site_url_always_prepends_a_fixed_http_scheme() {
+        assert_eq!(site_url("hello.localhost"), "http://hello.localhost");
+        // Even if a scheme-looking value somehow reached the column, the result is
+        // still an http URL naming it as a host — never a `file:`/`javascript:` URL.
+        assert!(site_url("file:///etc/passwd").starts_with("http://"));
+        assert!(site_url("javascript:alert(1)").starts_with("http://"));
     }
 
     /// The count must report pids that actually produced a figure, not pids that

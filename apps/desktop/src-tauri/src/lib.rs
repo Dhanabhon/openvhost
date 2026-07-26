@@ -42,6 +42,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::quit_dialog_ready,
             commands::services_memory,
             commands::home_disk_usage,
+            commands::open_site,
         ])
         .events(collect_events![
             commands::ServiceStateEvent,
@@ -117,7 +118,8 @@ pub fn run() {
 
     let mut builder = tauri::Builder::default()
         .invoke_handler(specta_builder.invoke_handler())
-        .plugin(tauri_plugin_dialog::init());
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init());
 
     // Substitute the app menu so macOS Cmd+Q is interceptable at all — see
     // `quit`'s module docs: the DEFAULT menu's Quit is wired to the native
