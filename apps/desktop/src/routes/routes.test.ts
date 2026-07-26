@@ -149,6 +149,25 @@ describe('the /services route', () => {
 		expect(body).toContain('aria-label="Start php-fpm"');
 	});
 
+	// The endpoint cell ellipsizes so a long value cannot wrap and inflate the row (the demo
+	// ticker's `endpoint` is a whole sentence, not an address). Truncating without a `title`
+	// would make the tail unreadable with no way to recover it, so the attribute is the half
+	// of that fix worth pinning — the CSS itself is scoped and not visible to SSR.
+	it('keeps a truncated endpoint readable via its title attribute', () => {
+		const long = '__testchild · 1s interval · fails after 45 ticks';
+		servicesStore.services = [{ ...svc('demo-ticker', 'stopped'), endpoint: long }];
+		const { body } = render(ServicesPage);
+		expect(body).toContain(`title="${long}"`);
+	});
+
+	// A service with no endpoint must not render `title=""`, which would show an empty
+	// tooltip on hover. `undefined` omits the attribute; `null` would not.
+	it('renders no title attribute when a service has no endpoint', () => {
+		servicesStore.services = [svc('nginx', 'running')];
+		const { body } = render(ServicesPage);
+		expect(body).not.toContain('title=""');
+	});
+
 	it('marks Services as the current rail destination', () => {
 		const { body } = render(ServicesPage);
 		expect(railLink(body, 'Services').current).toBe(true);
