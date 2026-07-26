@@ -58,11 +58,20 @@ describe('StatsStore', () => {
 		const s = new StatsStore(a);
 		s.start();
 		await vi.advanceTimersByTimeAsync(0);
-		const before = (a.servicesMemory as unknown as { mock: { calls: unknown[] } }).mock.calls
+		const memoryBefore = (a.servicesMemory as unknown as { mock: { calls: unknown[] } }).mock.calls
+			.length;
+		const homeBefore = (a.homeDiskUsage as unknown as { mock: { calls: unknown[] } }).mock.calls
 			.length;
 		s.stop();
-		await vi.advanceTimersByTimeAsync(MEMORY_INTERVAL_MS * 10);
-		expect(a.servicesMemory).toHaveBeenCalledTimes(before);
+		// Advance past HOME_INTERVAL_MS, not just a multiple of MEMORY_INTERVAL_MS: the
+		// home timer only ticks once a minute, so a shorter advance can never observe a
+		// leaked homeTimer even once we also assert on homeDiskUsage below — that
+		// mismatch (asserting the fast call but advancing too little to exercise the
+		// slow one) is exactly how a stop() that forgot to clear homeTimer once passed
+		// this test undetected.
+		await vi.advanceTimersByTimeAsync(HOME_INTERVAL_MS + MEMORY_INTERVAL_MS);
+		expect(a.servicesMemory).toHaveBeenCalledTimes(memoryBefore);
+		expect(a.homeDiskUsage).toHaveBeenCalledTimes(homeBefore);
 	});
 
 	// A failed sample must go back to unknown, NOT to zero: "0 MB · no processes"
