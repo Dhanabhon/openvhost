@@ -28,6 +28,14 @@ pub enum ApplyError {
         #[source]
         source: std::io::Error,
     },
+    /// A generated-config path is occupied by something that is not a plain
+    /// file — a directory, or a symlink pointing who-knows-where.
+    ///
+    /// Refused rather than followed or ignored. Following it would read a file
+    /// outside the generated tree into the diff the user is shown, and ignoring
+    /// it would hide the fact that apply cannot write there.
+    #[error("{} is not a plain file (found {found}); refusing to read or replace it", path.display())]
+    NotAPlainFile { path: PathBuf, found: &'static str },
     /// `nginx -t` rejected the generated set. The tree has been rolled back.
     #[error("the generated config was rejected by the web server:\n{stderr}")]
     ValidationFailed { stderr: String },

@@ -38,16 +38,53 @@ pub struct ApplyPlan {
     pub changes: Vec<FileChange>,
 }
 
+/// Read a generated-config path if it exists, refusing anything that is not a
+/// plain file rather than following or ignoring it.
+///
+/// The entry-type check lives here — behind `symlink_metadata`, which does not
+/// follow a symlink — rather than being duplicated at each call site, so that
+/// both the "desired" loop (Added/Modified) and the stale-scan "Removed" loop
+/// in `plan()` are covered by construction instead of by two checks that can
+/// drift apart. For a *desired* path this error is the honest outcome: apply
+/// genuinely cannot put a config file where a directory or symlink already
+/// sits, and following the symlink would leak its target's contents into the
+/// diff shown to the user. For the stale-scan path, `owned_files()` already
+/// excludes non-regular entries before they ever reach this function, so a
+/// stray directory or symlink there is filtered out earlier and never trips
+/// this error — that filter must stay in place; don't weaken it to "fix" this.
 fn read_if_exists(path: &Path) -> Result<Option<String>, ApplyError> {
-    match std::fs::read_to_string(path) {
-        Ok(s) => Ok(Some(s)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(ApplyError::Io {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(ApplyError::Io {
+                op: "read",
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let file_type = meta.file_type();
+    if !file_type.is_file() {
+        let found = if file_type.is_dir() {
+            "a directory"
+        } else if file_type.is_symlink() {
+            "a symlink"
+        } else {
+            "a special file"
+        };
+        return Err(ApplyError::NotAPlainFile {
+            path: path.to_path_buf(),
+            found,
+        });
+    }
+    std::fs::read_to_string(path)
+        .map(Some)
+        .map_err(|source| ApplyError::Io {
             op: "read",
             path: path.to_path_buf(),
             source,
-        }),
-    }
+        })
 }
 
 fn unified(path: &Path, before: &str, after: &str) -> String {
@@ -364,5 +401,55 @@ mod tests {
                 .any(|c| c.diff.contains("not for the diff view")),
             "no symlink target's contents may reach the diff shown to the user"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_at_a_desired_path_is_refused_not_followed() {
+        let home = tempfile::tempdir().unwrap();
+        let sites_dir = home.path().join("config/generated/nginx/sites");
+        std::fs::create_dir_all(&sites_dir).unwrap();
+
+        let outside = home.path().join("secret.txt");
+        std::fs::write(&outside, "not for the diff view\n").unwrap();
+        // Exactly the path render_set wants to write for this site.
+        std::os::unix::fs::symlink(&outside, sites_dir.join("app.localhost.conf")).unwrap();
+
+        let i = input_with_home(
+            home.path(),
+            vec![site("app", "app.localhost", "8.4", true)],
+            &["8.4"],
+        );
+        match plan(&i) {
+            Err(ApplyError::NotAPlainFile { path, .. }) => {
+                assert!(path.ends_with("app.localhost.conf"));
+            }
+            Err(other) => panic!("expected NotAPlainFile, got {other:?}"),
+            Ok(p) => panic!(
+                "planning followed the symlink instead of refusing it: {:?}",
+                p.changes.iter().map(|c| &c.diff).collect::<Vec<_>>()
+            ),
+        }
+    }
+
+    #[test]
+    fn a_directory_at_a_desired_path_is_reported_clearly() {
+        let home = tempfile::tempdir().unwrap();
+        let sites_dir = home.path().join("config/generated/nginx/sites");
+        // A directory where a config file must go: apply cannot succeed, so this
+        // must say so rather than surfacing a raw "Is a directory" io error.
+        std::fs::create_dir_all(sites_dir.join("app.localhost.conf")).unwrap();
+
+        let i = input_with_home(
+            home.path(),
+            vec![site("app", "app.localhost", "8.4", true)],
+            &["8.4"],
+        );
+        let err = plan(&i).unwrap_err();
+        assert!(
+            matches!(&err, ApplyError::NotAPlainFile { found, .. } if *found == "a directory"),
+            "got {err:?}"
+        );
+        assert!(err.to_string().contains("app.localhost.conf"));
     }
 }
