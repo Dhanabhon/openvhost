@@ -5,6 +5,23 @@ import adapter from '@sveltejs/adapter-static';
 import { sveltekit } from '@sveltejs/kit/vite';
 
 export default defineConfig({
+	// Pinned so this app never squats Vite's default 5173, which any other
+	// Vite/SvelteKit project on this machine will also try to take.
+	//
+	// `strictPort` is the load-bearing half. Without it Vite silently falls forward
+	// to the next free port when its own is busy — but `tauri.conf.json`'s `devUrl`
+	// is a HARDCODED string, so it keeps loading the port it was told about. The
+	// result is a Tauri window that either renders blank or, worse, attaches to a
+	// DIFFERENT project's dev server that happens to hold that port. Failing to
+	// start with "Port 5183 is already in use" is far better than either.
+	//
+	// Keep this in sync with `src-tauri/tauri.conf.json`'s `devUrl`. The two are not
+	// derived from each other, so changing one alone reintroduces exactly the
+	// mismatch described above.
+	server: {
+		port: 5183,
+		strictPort: true
+	},
 	plugins: [
 		tailwindcss(),
 		sveltekit({
