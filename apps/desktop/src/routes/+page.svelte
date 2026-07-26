@@ -41,7 +41,15 @@
 			<span>{'message' in store.error ? store.error.message : ''}</span>
 		</div>
 	{/if}
-	<SitesPanel sites={store.sites} {onAdd} {onEdit} />
+	<SitesPanel
+		sites={store.sites}
+		{onAdd}
+		{onEdit}
+		busy={store.busy}
+		rowErrors={store.rowError}
+		onToggleEnabled={(site, enabled) => void store.setEnabled(site, enabled)}
+		onDelete={(id) => void store.removeRow(id)}
+	/>
 	{#if drawerOpen}
 		<SiteDrawer
 			site={editing}

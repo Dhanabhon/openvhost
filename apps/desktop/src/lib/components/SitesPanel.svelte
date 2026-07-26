@@ -7,11 +7,20 @@
 	let {
 		sites,
 		onAdd,
-		onEdit
+		onEdit,
+		onToggleEnabled,
+		onDelete,
+		busy = {},
+		rowErrors = {}
 	}: {
 		sites: readonly SiteDto[];
 		onAdd: () => void;
 		onEdit: (site: SiteDto) => void;
+		onToggleEnabled: (site: SiteDto, enabled: boolean) => void;
+		onDelete: (id: string) => void;
+		/** Both keyed by site id, so a row's state cannot be read off a neighbour. */
+		busy?: Record<string, boolean>;
+		rowErrors?: Record<string, string>;
 	} = $props();
 
 	const enabledCount = $derived(sites.filter((s) => s.enabled).length);
@@ -44,7 +53,14 @@
 	{:else}
 		<div class="rowlist">
 			{#each sites as site (site.id)}
-				<SiteListRow {site} {onEdit} />
+				<SiteListRow
+					{site}
+					{onEdit}
+					{onToggleEnabled}
+					{onDelete}
+					busy={busy[site.id] === true}
+					rowError={rowErrors[site.id] ?? ''}
+				/>
 			{/each}
 		</div>
 	{/if}
