@@ -60,10 +60,15 @@ fn atomic_write(path: &Path, contents: &str) -> Result<(), ApplyError> {
         path: tmp.clone(),
         source,
     })?;
-    std::fs::rename(&tmp, path).map_err(|source| ApplyError::Io {
-        op: "rename",
-        path: path.to_path_buf(),
-        source,
+    std::fs::rename(&tmp, path).map_err(|source| {
+        // Best-effort: the rename error is the one worth propagating, and if
+        // this cleanup also fails there is nothing useful left to report.
+        let _ = std::fs::remove_file(&tmp);
+        ApplyError::Io {
+            op: "rename",
+            path: path.to_path_buf(),
+            source,
+        }
     })
 }
 
@@ -286,9 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_writes_through_a_temp_file_in_the_same_directory() {
-        // A rename across filesystems fails; a temp file in the target's own
-        // directory is what makes the write atomic.
+    fn commit_leaves_no_temp_files_behind() {
         let home = tempfile::tempdir().unwrap();
         let i = input_with_home(
             home.path(),
@@ -306,6 +309,70 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "temp files must not survive: {leftovers:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_replaces_a_file_by_rename_rather_than_writing_in_place() {
+        use std::os::unix::fs::MetadataExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let i = input_with_home(
+            home.path(),
+            vec![site("app", "app.localhost", "8.4", true)],
+            &["8.4"],
+        );
+        commit(&make_plan(&i).unwrap()).unwrap();
+        let target = home
+            .path()
+            .join("config/generated/nginx/sites/app.localhost.conf");
+        let first_inode = std::fs::metadata(&target).unwrap().ino();
+
+        // Change the site so the same path is rewritten with different content.
+        let mut moved = site("app", "app.localhost", "8.4", true);
+        moved.docroot = crate::site::model::Docroot::parse("/tmp/projects/moved").unwrap();
+        let second = input_with_home(home.path(), vec![moved], &["8.4"]);
+        commit(&make_plan(&second).unwrap()).unwrap();
+
+        let second_inode = std::fs::metadata(&target).unwrap().ino();
+        // A plain std::fs::write would truncate and refill the SAME inode, leaving a
+        // window where a reader sees a half-written config. tmp+rename swaps in a new
+        // inode instead, so the file is never observed partially written.
+        assert_ne!(
+            first_inode, second_inode,
+            "the config was written in place, not swapped in by rename"
+        );
+        assert!(
+            std::fs::read_to_string(&target)
+                .unwrap()
+                .contains("/tmp/projects/moved")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_rename_does_not_leave_its_temp_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("app.localhost.conf");
+        // A directory at the target makes rename fail after the temp write succeeded.
+        std::fs::create_dir_all(target.join("occupied")).unwrap();
+
+        let err = atomic_write(&target, "server {}\n").unwrap_err();
+        assert!(
+            matches!(err, ApplyError::Io { op: "rename", .. }),
+            "got {err:?}"
+        );
+
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp file survived a failed rename: {leftovers:?}"
         );
     }
 }
