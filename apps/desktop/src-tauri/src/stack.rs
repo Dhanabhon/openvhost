@@ -7,17 +7,18 @@
 //! see `openvhost_core::platform::macos::demo_stack::provision_home`, which
 //! creates directories and seeds the welcome page but writes no config.
 
-#[cfg(target_os = "macos")]
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "macos")]
 use openvhost_core::platform::macos::demo_stack::{BrewStack, find_brew_binaries, provision_home};
 #[cfg(target_os = "macos")]
 use openvhost_core::site::apply::LISTEN_PORT;
-#[cfg(target_os = "macos")]
+// Portable: `InstalledRuntimes`/`PhpRuntime` are plain data (see `StackPaths`'s
+// own doc comment for why portable types are named ungated even though only
+// `macos_stack` constructs them today), and `php_fpm_spec` below is called
+// from `commands.rs`, which is ungated too.
 use openvhost_core::{InstalledRuntimes, PhpRuntime};
-#[cfg(target_os = "macos")]
 use openvhost_proc::{ServiceSpec, SpawnSpec};
 
 /// Apple Silicon default paths, used when probing finds nothing: the rows
@@ -57,6 +58,41 @@ pub struct StackPaths {
     pub home: PathBuf,
     pub nginx_bin: PathBuf,
     pub nginx_conf: PathBuf,
+}
+
+/// The `php-fpm-<major>` service row for one runtime: id, display name,
+/// endpoint (the pool's own socket) and the exact spawn spec.
+///
+/// Extracted so `macos_stack` (built once at startup) and the desktop crate's
+/// PHP rescan/install commands (which register a row for a version installed
+/// AFTER launch) build the row identically. Two independent copies of this
+/// spec drifting apart would mean an installed-after-launch version serves
+/// through a subtly different pool than one present at launch — a silent
+/// correctness gap, not a crash, so nothing would fail loudly enough to catch
+/// it.
+///
+/// Portable data construction — like `StackPaths`, only building the STACK
+/// (`macos_stack`) is platform-specific today; this row-shape function is
+/// not.
+pub fn php_fpm_spec(home: &Path, rt: &PhpRuntime) -> ServiceSpec {
+    ServiceSpec {
+        id: format!("php-fpm-{}", rt.major),
+        display_name: format!("PHP-FPM {}", rt.major),
+        endpoint: Some(format!("run/php-fpm-{}.sock", rt.major)),
+        spawn: SpawnSpec {
+            program: rt.fpm_bin.clone(),
+            args: vec![
+                OsString::from("-F"),
+                OsString::from("-O"),
+                OsString::from("-n"),
+                OsString::from("-y"),
+                home.join(format!("config/generated/php/{}/php-fpm.conf", rt.major))
+                    .into_os_string(),
+            ],
+            cwd: None,
+            env: vec![],
+        },
+    }
 }
 
 /// Specs to register, the paths they were built from, and the runtimes probed
@@ -113,24 +149,7 @@ pub fn macos_stack() -> MacosStack {
 
     let mut specs = Vec::new();
     for rt in &php {
-        specs.push(ServiceSpec {
-            id: format!("php-fpm-{}", rt.major),
-            display_name: format!("PHP-FPM {}", rt.major),
-            endpoint: Some(format!("run/php-fpm-{}.sock", rt.major)),
-            spawn: SpawnSpec {
-                program: rt.fpm_bin.clone(),
-                args: vec![
-                    OsString::from("-F"),
-                    OsString::from("-O"),
-                    OsString::from("-n"),
-                    OsString::from("-y"),
-                    home.join(format!("config/generated/php/{}/php-fpm.conf", rt.major))
-                        .into_os_string(),
-                ],
-                cwd: None,
-                env: vec![],
-            },
-        });
+        specs.push(php_fpm_spec(&home, rt));
     }
     specs.push(ServiceSpec {
         id: "nginx".into(),
