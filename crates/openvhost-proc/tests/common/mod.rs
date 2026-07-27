@@ -4,9 +4,27 @@
 //! hence the file-level dead_code allow.
 #![allow(clippy::unwrap_used, clippy::expect_used, dead_code)]
 
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+use openvhost_proc::SpawnSpec;
+
+/// Build a `SpawnSpec` for this crate's own `proc_testchild` helper binary —
+/// the deterministic, cross-platform child used by every test that needs a
+/// real subprocess. `CARGO_BIN_EXE_*` is only populated when compiling an
+/// integration test (see `tests/testchild_bin.rs`), which is why this lives
+/// here rather than as a unit test helper in `src/`.
+pub fn testchild_spec(args: &[&str]) -> SpawnSpec {
+    SpawnSpec {
+        program: PathBuf::from(env!("CARGO_BIN_EXE_proc_testchild")),
+        args: args.iter().map(OsString::from).collect(),
+        cwd: None,
+        env: vec![],
+    }
+}
 
 /// Grab a free ephemeral TCP port: bind :0, read the assignment, release it.
 /// Standard test pattern (see `macos_stack.rs`); the tiny reuse race surfaces

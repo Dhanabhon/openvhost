@@ -14,6 +14,7 @@ pub mod platform;
 mod service_task;
 mod state;
 mod supervisor;
+pub mod task;
 pub mod testchild;
 
 pub use error::ProcError;
@@ -26,3 +27,7 @@ pub use platform::{
     OutputStream, ProcessDriver, SpawnSpec, SpawnedChild, default_driver, default_reaper,
 };
 pub use supervisor::{ServiceSpec, Supervisor};
+// `Stream` is re-exported as `TaskStream`: this crate already exports
+// `StreamSource` from `events`, and two similarly-named types in one
+// namespace is how call sites end up importing the wrong one.
+pub use task::{Stream as TaskStream, TaskEvent, run_task};
