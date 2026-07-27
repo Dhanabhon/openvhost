@@ -78,12 +78,13 @@
 <script lang="ts">
 	import { onMount, untrack } from 'svelte';
 	import { open } from '@tauri-apps/plugin-dialog';
+	import { resolve } from '$app/paths';
 	import type { SiteDto, SiteInput } from '$lib/ipc';
 	import {
 		composeDomain,
 		splitDomain,
+		defaultPhpVersion,
 		phpVersionOptions,
-		PHP_VERSIONS,
 		WEB_SERVERS,
 		type WebServerKind
 	} from '$lib/sites.derive';
@@ -94,12 +95,18 @@
 	let {
 		site,
 		fieldErrors,
+		installed,
 		onSave,
 		onDelete,
 		onClose
 	}: {
 		site: SiteDto | null;
 		fieldErrors: Record<string, string>;
+		/** PHP majors actually installed on this machine (`phpEnvironment()`'s runtimes
+		 * filtered to `installed`), threaded down from `+page.svelte`. See
+		 * `phpVersionOptions`/`defaultPhpVersion` in `$lib/sites.derive` for why this
+		 * replaced a hardcoded list. */
+		installed: readonly string[];
 		onSave: (id: string | null, input: SiteInput) => Promise<boolean>;
 		onDelete: (id: string) => Promise<boolean>;
 		onClose: () => void;
@@ -122,7 +129,7 @@
 	let subdomain = $state(untrack(() => (site ? splitDomain(site.domain) : '')));
 	let docroot = $state(untrack(() => site?.docroot ?? ''));
 	let webServer = $state<WebServerKind>(untrack(() => initialWebServer(site)));
-	let phpVersion = $state(untrack(() => site?.phpVersion ?? PHP_VERSIONS[0]));
+	let phpVersion = $state(untrack(() => site?.phpVersion ?? defaultPhpVersion(installed) ?? ''));
 	let enabled = $state(untrack(() => site?.enabled ?? true));
 
 	// Built once, from the site's STORED version rather than from the live `phpVersion`
@@ -131,7 +138,23 @@
 	// would delete an unlisted version's option the moment the user clicked away from it,
 	// stranding them with no way back. See `phpVersionOptions` for why the option has to
 	// exist at all.
-	const phpOptions = phpVersionOptions(untrack(() => site?.phpVersion));
+	//
+	// `installed` is read the same read-once way: by the time this drawer can mount at
+	// all, `+page.svelte`'s own `phpEnvironment()` call (fired at page load, well before
+	// any Add/Edit button exists to click) has settled, so there is nothing to gain from
+	// tracking it live — and doing so would reopen the same "list changes out from under
+	// an open selection" problem `phpVersion` above is already written to avoid.
+	const phpOptions = phpVersionOptions(
+		untrack(() => site?.phpVersion),
+		untrack(() => installed)
+	);
+
+	// Only true for a brand-new site on a machine with nothing installed: an existing
+	// site's stored version always yields at least its own (possibly "not available")
+	// entry, so `phpOptions` is only ever actually empty here. Save is disabled in this
+	// state (see the drawer-foot below) rather than letting a doomed, invisible PHP
+	// version reach the backend — the exact trap this task closes.
+	const phpUnavailable = phpOptions.length === 0;
 
 	let submitting = $state(false);
 	let confirmingDelete = $state(false);
@@ -555,25 +578,38 @@
 		</div>
 
 		<div class="field">
-			<!-- `for` AND `id` on the same label: `for` names the `<button role="combobox">`
-			     Select renders (a `<button>` is a labelable element, and `combobox` takes no
-			     name from its content), while the `id` lets Select name its popup listbox with
-			     the same words. -->
-			<label for="f-php" id="f-php-label">PHP version</label>
-			<Select
-				id="f-php"
-				labelId="f-php-label"
-				options={phpOptions}
-				bind:value={phpVersion}
-				invalid={Boolean(fieldErrors.php_version)}
-				describedBy={fieldErrors.php_version ? 'f-php-error' : undefined}
-				mono
-			/>
-			<p class="hint">Applies to this site only. Other sites keep their own version.</p>
-			<!-- Backend field name for the PHP version is `php_version` (snake_case) — see the
-			     note above the Name field. -->
-			{#if fieldErrors.php_version}
-				<p class="field-error" id="f-php-error">{fieldErrors.php_version}</p>
+			{#if !phpUnavailable}
+				<!-- `for` AND `id` on the same label: `for` names the `<button role="combobox">`
+				     Select renders (a `<button>` is a labelable element, and `combobox` takes no
+				     name from its content), while the `id` lets Select name its popup listbox with
+				     the same words. -->
+				<label for="f-php" id="f-php-label">PHP version</label>
+				<Select
+					id="f-php"
+					labelId="f-php-label"
+					options={phpOptions}
+					bind:value={phpVersion}
+					invalid={Boolean(fieldErrors.php_version)}
+					describedBy={fieldErrors.php_version ? 'f-php-error' : undefined}
+					mono
+				/>
+				<p class="hint">Applies to this site only. Other sites keep their own version.</p>
+				<!-- Backend field name for the PHP version is `php_version` (snake_case) — see the
+				     note above the Name field. -->
+				{#if fieldErrors.php_version}
+					<p class="field-error" id="f-php-error">{fieldErrors.php_version}</p>
+				{/if}
+			{:else}
+				<!-- No installed PHP version, and none stored yet either (a brand-new site) — the
+				     one case `phpVersionOptions` can actually return empty. An empty `<select>`
+				     above an enabled Save button would let this site be born pointing at nothing,
+				     exactly the trap this task closes: every version in a fixed dropdown that a
+				     later Apply refused. Point at the one place that fixes it instead. -->
+				<p class="hint" id="f-php-unavailable">
+					No PHP version is installed yet — <a href={resolve('/languages')}
+						>install one on the Languages page</a
+					> before adding a site.
+				</p>
 			{/if}
 		</div>
 
@@ -615,7 +651,14 @@
 
 	<div class="drawer-foot">
 		<Button variant="quiet" onclick={onClose}>Cancel</Button>
-		<Button variant="primary" disabled={submitting} onclick={() => void submit()}>Save</Button>
+		<Button
+			variant="primary"
+			testId="drawer-save"
+			disabled={submitting || phpUnavailable}
+			onclick={() => void submit()}
+		>
+			Save
+		</Button>
 	</div>
 </aside>
 
@@ -729,6 +772,12 @@
 		color: var(--vh-text-2);
 		font-size: var(--vh-text-caption);
 		margin: 0;
+	}
+	/* The Languages pointer inside `#f-php-unavailable`'s `.hint` — same link colour as
+	   the Browse control's `.input-suffix--btn` above, since both are "go elsewhere to
+	   fix this" affordances. */
+	.field .hint a {
+		color: var(--vh-link);
 	}
 	/* No mock.css precedent for an inline field error (the mockups never render one) — this
 	   mirrors `.field .hint`'s size/spacing but uses the shared failure-semantic token. */

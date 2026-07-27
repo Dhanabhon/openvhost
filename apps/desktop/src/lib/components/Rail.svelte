@@ -2,13 +2,14 @@
 <script lang="ts">
 	import { resolve } from '$app/paths';
 
-	// 'sites', 'services' and 'web-server' are real destinations. The union stays narrow on
-	// purpose — Logs/Settings join it once their own slices land.
+	// 'sites', 'services', 'web-server' and 'languages' are real destinations. The union stays
+	// narrow on purpose — Logs/Settings join it once their own slices land.
 	//
 	// Defaults to 'sites' because Sites is what `/` renders: the app's landing page needs no
 	// `active` of its own, and an unset prop can only ever highlight the destination the user
 	// is most likely on. AppShell.svelte defaults the same way — change both together.
-	let { active = 'sites' }: { active?: 'services' | 'sites' | 'web-server' } = $props();
+	let { active = 'sites' }: { active?: 'services' | 'sites' | 'web-server' | 'languages' } =
+		$props();
 </script>
 
 <nav class="rail" aria-label="Main">
@@ -95,6 +96,34 @@
 			<circle cx="5.2" cy="12.5" r="0.2" />
 		</svg>
 		Web server
+	</a>
+
+	<!-- Languages: PHP versions today, other runtimes later — its own `/languages` route, after
+	     Web server so the two "what could run" destinations (web server brands, language
+	     runtimes) sit together ahead of the Logs/Settings placeholders. -->
+	<a
+		class="nav-item"
+		href={resolve('/languages')}
+		aria-current={active === 'languages' ? 'page' : undefined}
+	>
+		<!-- Hand-drawn (18px, currentColor stroke, 1.6 width) rather than a real PHP elephant mark
+		     — same reasoning as the web-server icon above: the rail names a section, not a brand.
+		     A version-tag glyph (angle brackets + a tick) reads as "runtime version" generically. -->
+		<svg
+			width="18"
+			height="18"
+			viewBox="0 0 18 18"
+			fill="none"
+			stroke="currentColor"
+			stroke-width="1.6"
+			stroke-linecap="round"
+			stroke-linejoin="round"
+			aria-hidden="true"
+		>
+			<path d="M6.5 5 3 9l3.5 4" />
+			<path d="M11.5 5 15 9l-3.5 4" />
+		</svg>
+		Languages
 	</a>
 
 	<!-- Logs: inert placeholder — full log-viewer redesign is slice B. -->

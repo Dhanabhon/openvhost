@@ -43,12 +43,18 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::services_memory,
             commands::home_disk_usage,
             commands::open_site,
+            commands::open_homebrew_site,
             commands::plan_site_apply,
             commands::apply_sites,
+            commands::php_environment,
+            commands::rescan_php_runtimes,
+            commands::install_php,
+            commands::pending_php_install,
         ])
         .events(collect_events![
             commands::ServiceStateEvent,
             commands::ServiceLogEvent,
+            commands::PhpInstallLogEvent,
             quit::QuitRequestedEvent
         ])
         // `LogLine`/`ServiceLogEvent` carry `ts_ms: u64` (millisecond epoch
@@ -177,6 +183,15 @@ pub fn run() {
             // observed absent by a caller that could actually invoke the command.
             app.manage(commands::ApplyLock::default());
 
+            // Serializes `install_php`: only one brew install can run at a
+            // time. Same unconditional-and-up-front reasoning as `ApplyLock`
+            // above — `install_php` also requires `Db`-adjacent state
+            // (`Arc<Supervisor>`, `Option<StackPaths>`, the runtimes
+            // `RwLock`) to be managed before it is reachable at all, so this
+            // is never observed absent by a caller that could actually
+            // invoke the command.
+            app.manage(commands::InstallLock::default());
+
             // Single-instance lock (design spec §7): reap MUST run only
             // while this is held, otherwise a second live instance would
             // reap the first's HEALTHY services (identity matches — it
@@ -251,7 +266,14 @@ pub fn run() {
                             // doc comment) — either way a later command that reads this state
                             // sees an honest absence rather than a stale value from a call
                             // that never happened.
-                            app.manage(stack_runtimes);
+                            //
+                            // Wrapped in an `RwLock` (unlike `stack_paths` above): Tauri's
+                            // managed state cannot be replaced once set, but the installed PHP
+                            // runtimes CAN change after launch — the Languages page installs a
+                            // version at runtime, and the apply pipeline must see it without a
+                            // relaunch. The lock is the seam a later rescan/install writes
+                            // through; every reader here just takes the read side.
+                            app.manage(std::sync::RwLock::new(stack_runtimes));
                             let mut rx = supervisor.subscribe();
                             let handle = app.handle().clone();
                             tauri::async_runtime::spawn(async move {

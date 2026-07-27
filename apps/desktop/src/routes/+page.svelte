@@ -1,8 +1,10 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { resolve } from '$app/paths';
 	import AppShell from '$lib/components/AppShell.svelte';
 	import ApplyDialog from '$lib/components/ApplyDialog.svelte';
+	import ApplyErrorBanner from '$lib/components/ApplyErrorBanner.svelte';
 	import PendingChangesBanner from '$lib/components/PendingChangesBanner.svelte';
 	import SiteDrawer from '$lib/components/SiteDrawer.svelte';
 	import SitesPanel from '$lib/components/SitesPanel.svelte';
@@ -12,13 +14,16 @@
 		deleteSite,
 		listSites,
 		openSite,
+		phpEnvironment,
 		planSiteApply,
 		updateSite,
+		type PhpEnvironmentDto,
 		type SiteDto,
 		type SiteInput
 	} from '$lib/ipc';
 	import { runningCount } from '$lib/services.derive';
 	import { servicesStore } from '$lib/services.shared.svelte';
+	import { findMissingRuntimeSite } from '$lib/sites.derive';
 	import { ApplyStore } from '$lib/apply.svelte';
 	import { SitesStore } from '$lib/sites.svelte';
 
@@ -29,10 +34,64 @@
 	// pass a hardcoded 0, which announced "0 running" even with services up.
 	const running = $derived(runningCount(servicesStore.services));
 
+	// Threaded into SiteDrawer so its PHP-version picker offers only what this machine
+	// actually has (Task 8): a hardcoded list let every option lead to an Apply the
+	// backend refused. `null` until the first read settles; `phpEnvLoaded` distinguishes
+	// that in-flight state from a genuinely empty result (see `noPhpInstalled` below).
+	let phpEnv = $state<PhpEnvironmentDto | null>(null);
+	let phpEnvLoaded = $state(false);
+	// I2 audit finding: a FAILED read used to be indistinguishable from a
+	// genuinely empty one — both left `phpEnv` at `null`, so `noPhpInstalled`
+	// below fired for either, and every row's missing-runtime badge (fed by
+	// `installedPhpVersions`, `[]` in both cases too) asserted "not installed"
+	// as fact when the honest answer was "we don't know". Tracked separately so
+	// the two cases can render differently.
+	let phpEnvError = $state(false);
+
+	const installedPhpVersions = $derived(
+		(phpEnv?.runtimes ?? []).filter((r) => r.installed).map((r) => r.major)
+	);
+
+	// Whether this machine's PHP environment is actually KNOWN — i.e. the read
+	// settled AND succeeded. `installedPhpVersions` reads `[]` both while this
+	// is false (loading, or the read failed) and when it is genuinely empty;
+	// `noPhpInstalled`/the row badges below must tell those apart rather than
+	// treating "unknown" as "definitely none".
+	const phpEnvKnown = $derived(phpEnvLoaded && !phpEnvError);
+
+	// Gated on `phpEnvKnown`, not just `installedPhpVersions.length === 0`: `null`
+	// (still loading), a failed read, AND a genuinely empty environment all produce
+	// the same empty array, and flashing this banner for any of the first two would
+	// be wrong on any machine that does have a version installed.
+	const noPhpInstalled = $derived(phpEnvKnown && installedPhpVersions.length === 0);
+
+	// The servable site (if any) whose PHP version this machine no longer has —
+	// used only to decide whether the apply-error banner below has a "install
+	// this" remedy to offer. Re-derived from state already on this page rather
+	// than a structured IPC field; see `findMissingRuntimeSite`'s doc comment
+	// and task-9-report.md for why that is the honest tradeoff here.
+	const missingRuntimeSite = $derived(findMissingRuntimeSite(store.sites, installedPhpVersions));
+
 	onMount(() => {
 		void store.load();
 		void applyStore.refresh();
+		void loadPhpEnvironment();
 	});
+
+	async function loadPhpEnvironment(): Promise<void> {
+		try {
+			phpEnv = await phpEnvironment();
+			phpEnvError = false;
+		} catch {
+			// I2 fix: a failed read is not evidence nothing is installed, but it is
+			// also not the same fact as a genuinely empty result — `phpEnvError`
+			// is what lets the markup below tell them apart instead of collapsing
+			// both into "nothing installed".
+			phpEnvError = true;
+		} finally {
+			phpEnvLoaded = true;
+		}
+	}
 
 	let editing = $state<SiteDto | null>(null);
 	let drawerOpen = $state(false);
@@ -96,15 +155,44 @@
 		     Suppressed while the dialog is open: `ApplyDialog` renders this same
 		     `applyStore.error` itself, and a page banner behind the dialog's scrim
 		     would be the QuitDialog lesson in reverse — an error the user cannot
-		     reach or read behind a blurred backdrop. -->
-		<div class="banner-error" role="alert" data-testid="apply-plan-error">
-			<strong>Couldn't apply site changes</strong>
-			<span>{applyStore.error}</span>
+		     reach or read behind a blurred backdrop.
+
+		     `missingRuntimeSite` — see its derivation above — is what turns this
+		     from a dead end into a way out: this is exactly the plan_site_apply
+		     failure a machine that lost a PHP version hits, and until now this
+		     banner named the problem and offered nothing to press. -->
+		<ApplyErrorBanner error={applyStore.error} missing={missingRuntimeSite} onEditSite={onEdit} />
+	{/if}
+	{#if phpEnvError}
+		<!-- I2 fix: a failed `phpEnvironment()` read used to render the SAME
+		     "nothing installed" banner as a genuinely empty environment — a false
+		     claim about the machine, stated as fact. This is the honest version:
+		     the read failed, so nothing below (this banner, Save in the drawer,
+		     the row badges) can say anything about which PHP versions exist. -->
+		<div class="banner-error" role="alert" data-testid="php-env-error-banner">
+			<strong>Could not read the PHP environment</strong>
+			<span
+				>Site rows below cannot show whether their PHP version is installed until this succeeds.</span
+			>
+		</div>
+	{:else if noPhpInstalled}
+		<!-- Sites is the landing page (Rail.svelte's own comment: "`/`, not `/sites`"), so
+		     this is where a first-time user — or one who has never installed PHP — lands
+		     first. Pointing at Languages here, not only inside the drawer, means the guidance
+		     is visible before they even open Add site. -->
+		<div class="banner-info" role="status" data-testid="no-php-banner">
+			<strong>No PHP version is installed yet</strong>
+			<span
+				>Sites need one to run. <a href={resolve('/languages')}
+					>Install a version on the Languages page</a
+				>.</span
+			>
 		</div>
 	{/if}
 	<PendingChangesBanner count={applyStore.pendingCount} onReview={() => (applyDialogOpen = true)} />
 	<SitesPanel
 		sites={store.sites}
+		installed={phpEnvKnown ? installedPhpVersions : null}
 		{onAdd}
 		{onEdit}
 		busy={store.busy}
@@ -117,6 +205,7 @@
 		<SiteDrawer
 			site={editing}
 			fieldErrors={store.fieldErrors}
+			installed={installedPhpVersions}
 			{onSave}
 			onDelete={onDrawerDelete}
 			onClose={() => (drawerOpen = false)}
@@ -152,5 +241,24 @@
 	.banner-error strong {
 		display: block;
 		margin-bottom: 2px;
+	}
+	/* .banner-info: an accent-tinted pointer, not a failure — same recipe as
+	   PendingChangesBanner.svelte's own `.banner` (accent-tinted surface over
+	   `--vh-surface`, distinct from `.banner-error`'s failure tint above), reused here
+	   as a block-level notice rather than that component's flex row + action button. */
+	.banner-info {
+		margin: var(--vh-space-3) var(--vh-space-6) 0;
+		padding: var(--vh-space-3) var(--vh-space-4);
+		border: 1px solid color-mix(in oklab, var(--vh-accent) 35%, transparent);
+		background: color-mix(in oklab, var(--vh-accent) 8%, var(--vh-surface));
+		border-radius: var(--vh-radius-card);
+		font-size: var(--vh-text-table);
+	}
+	.banner-info strong {
+		display: block;
+		margin-bottom: 2px;
+	}
+	.banner-info a {
+		color: var(--vh-link);
 	}
 </style>

@@ -7,8 +7,12 @@ import type {
 	CoreInfo,
 	FileChangeDto,
 	HomeUsageDto,
+	InstallOutcomeDto,
 	IpcError,
 	LogLine,
+	PhpEnvironmentDto,
+	PhpInstallLogEvent,
+	PhpRuntimeDto,
 	ServiceLogEvent,
 	ServiceProblemDto,
 	ServicesMemoryDto,
@@ -26,8 +30,12 @@ export type {
 	CoreInfo,
 	FileChangeDto,
 	HomeUsageDto,
+	InstallOutcomeDto,
 	IpcError,
 	LogLine,
+	PhpEnvironmentDto,
+	PhpInstallLogEvent,
+	PhpRuntimeDto,
 	ServiceLogEvent,
 	ServiceProblemDto,
 	ServicesMemoryDto,
@@ -148,6 +156,18 @@ export async function openSite(id: string): Promise<void> {
 }
 
 /**
+ * Open Homebrew's install page in the user's browser. Zero parameters, and the URL
+ * is a Rust literal (`commands::open_homebrew_site`) — the webview never supplies one.
+ *
+ * This exists because a plain `<a target="_blank">` is inert in this webview: Tauri
+ * only handles a new-window request when the app registers `on_new_window`, which it
+ * does not, so the click would otherwise silently do nothing.
+ */
+export async function openHomebrewSite(): Promise<void> {
+	await unwrap(commands.openHomebrewSite());
+}
+
+/**
  * What Apply would change against the current sites. Read-only and
  * process-free — safe to call after every site mutation for a pending-changes
  * banner.
@@ -218,4 +238,48 @@ export async function servicesMemory(): Promise<ServicesMemoryDto> {
 /** Total bytes under the OpenVHost home. */
 export async function homeDiskUsage(): Promise<HomeUsageDto> {
 	return unwrap(commands.homeDiskUsage());
+}
+
+/**
+ * Read-only PHP environment summary for the Languages page: whether Homebrew
+ * was found, where it looked, and one row per catalogue/installed version.
+ * Spawns nothing — safe to call on page mount and after every install.
+ */
+export async function phpEnvironment(): Promise<PhpEnvironmentDto> {
+	return unwrap(commands.phpEnvironment());
+}
+
+/**
+ * Explicit, user-initiated re-probe behind the "Check again" button. Unlike
+ * {@link phpEnvironment}, this spawns a version probe per candidate binary.
+ */
+export async function rescanPhpRuntimes(): Promise<PhpEnvironmentDto> {
+	return unwrap(commands.rescanPhpRuntimes());
+}
+
+/**
+ * Install a PHP major via Homebrew. Streams its output live through
+ * {@link onPhpInstallLog} while it runs, then resolves with the outcome —
+ * including `detected`, which can be `false` even when `exitCode` is `0`.
+ */
+export async function installPhp(major: string): Promise<InstallOutcomeDto> {
+	return unwrap(commands.installPhp(major));
+}
+
+/** Subscribe to `php-install-log`. Same `IpcError` contract as {@link onServiceState}. */
+export async function onPhpInstallLog(cb: (ev: PhpInstallLogEvent) => void): Promise<() => void> {
+	try {
+		return await events.phpInstallLogEvent.listen((e) => cb(e.payload));
+	} catch (e) {
+		throw normalizeError(e);
+	}
+}
+
+/**
+ * The major currently installing, if any. Read by the quit dialog: a build in
+ * progress is invisible to the services list (it is not a supervised
+ * service), so without this a quit would silently discard it.
+ */
+export async function pendingPhpInstall(): Promise<string | null> {
+	return unwrap(commands.pendingPhpInstall());
 }

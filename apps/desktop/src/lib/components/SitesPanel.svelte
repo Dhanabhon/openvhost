@@ -6,6 +6,7 @@
 
 	let {
 		sites,
+		installed,
 		onAdd,
 		onEdit,
 		onToggleEnabled,
@@ -15,6 +16,11 @@
 		rowErrors = {}
 	}: {
 		sites: readonly SiteDto[];
+		/** PHP majors actually installed on this machine, forwarded to every row
+		 * so `SiteListRow`'s missing-runtime badge can compare against it. See
+		 * that component's `installed` prop doc for why `null` (environment
+		 * unknown) is a distinct case from `[]` (environment known and empty). */
+		installed: readonly string[] | null;
 		onAdd: () => void;
 		onEdit: (site: SiteDto) => void;
 		onToggleEnabled: (site: SiteDto, enabled: boolean) => void;
@@ -57,6 +63,7 @@
 			{#each sites as site (site.id)}
 				<SiteListRow
 					{site}
+					{installed}
 					{onEdit}
 					{onToggleEnabled}
 					{onOpen}

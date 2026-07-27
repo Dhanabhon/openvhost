@@ -190,6 +190,77 @@ pub async fn stop_all(sup: Arc<Supervisor>) -> Vec<String> {
     .await
 }
 
+/// How long [`abort_pending_install`] waits for an in-flight `install_php` run
+/// to actually finish after it is aborted, before giving up on it. Same value
+/// and same reasoning as [`STOP_ALL_TIMEOUT`]: long enough for the abort to be
+/// observed, short enough that quitting is not itself indefinitely blocked by
+/// a run that is somehow wedged.
+pub const INSTALL_ABORT_TIMEOUT: Duration = STOP_ALL_TIMEOUT;
+
+/// Abort an in-flight run, then wait until it has actually finished — i.e.
+/// until its future was genuinely dropped and `openvhost_proc`'s
+/// `KillOnDrop` ran.
+///
+/// Takes closures rather than a real `AbortHandle`, mirroring why
+/// [`stop_all_with`] takes closures instead of a `&Supervisor`: the decision
+/// under test here is "abort, then poll `is_finished` until it is true or the
+/// timeout elapses", and that decision has nothing to do with tokio tasks —
+/// it is reachable from a plain boolean flag a test flips by hand. Returns
+/// whether the run finished before the deadline.
+pub async fn abort_and_wait_with<A, F>(
+    abort: A,
+    is_finished: F,
+    timeout: Duration,
+    poll: Duration,
+) -> bool
+where
+    A: FnOnce(),
+    F: Fn() -> bool,
+{
+    abort();
+
+    // `Instant`, not wall-clock time — same reasoning as `stop_all_with`: a
+    // clock adjustment mid-shutdown must not turn a bounded wait into an
+    // instant give-up or a hang.
+    let started = std::time::Instant::now();
+    loop {
+        if is_finished() {
+            return true;
+        }
+        if started.elapsed() >= timeout {
+            return false;
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+/// [`abort_and_wait_with`] bound to whatever `install_php` may have left
+/// running on `InstallLock`. Returns `true` when there was nothing to abort,
+/// or the abort completed in time; `false` only when a run was in flight and
+/// did not finish before [`INSTALL_ABORT_TIMEOUT`].
+///
+/// `try_state`: `InstallLock` is only managed once the setup bootstrap
+/// reaches that point (see `lib.rs`), same reasoning as every other
+/// `try_state` read in this module — a quit must still work with nothing
+/// managed at all.
+pub async fn abort_pending_install<R: Runtime>(app: &AppHandle<R>) -> bool {
+    let Some(lock) = app.try_state::<crate::commands::InstallLock>() else {
+        return true;
+    };
+    let Some(abort) = lock.running_abort_handle() else {
+        return true;
+    };
+    let for_abort = abort.clone();
+    let for_check = abort;
+    abort_and_wait_with(
+        move || for_abort.abort(),
+        move || for_check.is_finished(),
+        INSTALL_ABORT_TIMEOUT,
+        STOP_POLL_INTERVAL,
+    )
+    .await
+}
+
 /// The app menu, with a Quit that this app can intercept.
 ///
 /// Mirrors `tauri::menu::Menu::default` — same submenus in the same order — with
@@ -277,6 +348,20 @@ pub fn app_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
 /// "does not emit any events and force close the window instead"
 /// (tauri 2.11.3, `Window::destroy`), so it is the only exit that terminates.
 pub async fn perform_quit<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    // FIRST, before touching services or the window at all — this is the C1
+    // audit fix. `install_php`'s `run_task` is only contained by
+    // `KillOnDrop`, which fires when its future is dropped; nothing else in
+    // this app's shutdown path ever drops it. Aborting-and-waiting HERE makes
+    // this the place that does: by the time `stop_all` and `window.destroy()`
+    // below run, any `brew install` that was mid-flight has genuinely been
+    // torn down, group-kill included, rather than left to `process::exit`
+    // with no unwinding at all.
+    if !abort_pending_install(app).await {
+        eprintln!(
+            "openvhost: quitting with a PHP install still not aborted within {INSTALL_ABORT_TIMEOUT:?}"
+        );
+    }
+
     // `try_state`, not `state`: the supervisor is only managed when the setup
     // bootstrap succeeded (it is skipped when OPENVHOST_HOME cannot be resolved
     // or the instance lock is held elsewhere). With no supervisor there is
@@ -301,7 +386,7 @@ pub async fn perform_quit<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> 
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
@@ -412,5 +497,180 @@ mod tests {
     #[test]
     fn stop_all_timeout_outlives_the_supervisor_grace_deadline() {
         assert!(STOP_ALL_TIMEOUT > Duration::from_secs(5));
+    }
+
+    // -----------------------------------------------------------------------
+    // C1: `abort_and_wait_with` / `abort_pending_install`.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn aborts_and_reports_finished_once_is_finished_becomes_true() {
+        let aborted = AtomicUsize::new(0);
+        // Finished only after a couple of polls — the shape of a real task
+        // that takes a moment to actually tear down after being asked to stop.
+        let polls = AtomicUsize::new(0);
+        let finished = abort_and_wait_with(
+            || {
+                aborted.fetch_add(1, Ordering::SeqCst);
+            },
+            || polls.fetch_add(1, Ordering::SeqCst) >= 2,
+            STOP_ALL_TIMEOUT,
+            FAST_POLL,
+        )
+        .await;
+        assert!(finished);
+        assert_eq!(
+            aborted.load(Ordering::SeqCst),
+            1,
+            "abort must fire exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn gives_up_at_the_deadline_when_the_run_never_finishes() {
+        let finished = abort_and_wait_with(
+            || {},
+            || false, // never finishes
+            Duration::from_millis(20),
+            FAST_POLL,
+        )
+        .await;
+        assert!(!finished);
+    }
+
+    #[tokio::test]
+    async fn abort_pending_install_reports_finished_when_nothing_is_running() {
+        // No `InstallLock` managed at all — same "nothing to do" shape
+        // `perform_quit`'s own `try_state` reads handle everywhere else in
+        // this module.
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        assert!(abort_pending_install(app.handle()).await);
+
+        // Managed, but idle: still nothing to abort.
+        app.manage(crate::commands::InstallLock::default());
+        assert!(abort_pending_install(app.handle()).await);
+    }
+
+    /// THE C1 REGRESSION TEST. Reproduces the audit's own repro shape — a
+    /// `run_task` whose child is still alive when the app quits mid-install —
+    /// but drives the abort through `abort_pending_install`, the exact
+    /// function `perform_quit` calls before `window.destroy()`, rather than a
+    /// bare `run.abort()` the way `openvhost-proc`'s own `tests/task_group.rs`
+    /// does. `perform_quit` itself cannot be driven from a test (it also
+    /// requires a real webview window to destroy), so this pins the
+    /// abort-and-wait DECISION instead — same reasoning `stop_all_with` is
+    /// unit-tested separately from `stop_all`.
+    ///
+    /// VACUITY CHECK (see the audit report): with the `abort()` call removed
+    /// from `abort_and_wait_with`, this test fails — the child is still alive
+    /// when the deadline is asserted. Restoring it makes the test pass again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quitting_mid_install_actually_kills_the_still_running_child() {
+        use std::ffi::OsString;
+        use std::path::PathBuf;
+
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(crate::commands::InstallLock::default());
+
+        // A real child, standing in for the tree `brew install` would leave
+        // running: prints its own pid (so the test can check on it with
+        // `kill -0`/`SIGKILL`, the same technique `task_group.rs` uses for its
+        // forked grandchild), then sleeps far longer than this test's
+        // deadline. `exec` replaces the shell with `sleep` so there is exactly
+        // one pid to track, and it stays the process-group leader `run_task`'s
+        // `KillOnDrop` targets.
+        let spec = openvhost_proc::SpawnSpec {
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                OsString::from("-c"),
+                OsString::from("echo pid: $$; exec sleep 100"),
+            ],
+            cwd: None,
+            env: vec![],
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let install_task = tokio::spawn(openvhost_proc::run_task(
+            openvhost_proc::default_driver(),
+            spec,
+            tx,
+        ));
+
+        let lock = app.state::<crate::commands::InstallLock>();
+        lock.inner()
+            .set_running("8.4".to_string(), install_task.abort_handle());
+
+        // Wait for proof the child is actually running before quitting on it.
+        let pid: i32 = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match rx
+                    .recv()
+                    .await
+                    .expect("channel closed before a pid line appeared")
+                {
+                    openvhost_proc::TaskEvent::Line { text, .. } => {
+                        if let Some(rest) = text.strip_prefix("pid: ") {
+                            return rest
+                                .trim()
+                                .parse::<i32>()
+                                .expect("pid line was not a number");
+                        }
+                    }
+                    openvhost_proc::TaskEvent::Finished { .. } => {
+                        panic!("the child exited before printing its pid")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("no pid line within the deadline");
+
+        // SAFETY: signal 0 performs no action; it only checks existence/permission.
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "child {pid} was not alive before quitting on it"
+        );
+
+        // THE CLAIM: this call — not `install_task.abort()` on its own — is
+        // what `perform_quit` makes before `window.destroy()`.
+        let finished = abort_pending_install(app.handle()).await;
+        assert!(
+            finished,
+            "abort_pending_install did not finish within its timeout"
+        );
+
+        // Poll for actual death rather than asserting instantly: abort is
+        // requested, not synchronous with the child's exit.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut still_alive = true;
+        while std::time::Instant::now() < deadline {
+            // SAFETY: signal 0 performs no action; it only checks existence/permission.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                still_alive = false;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Defensive cleanup on both the pass and fail path, same as
+        // `task_group.rs`: a failing run must not leave a stray process on
+        // the developer's machine.
+        if still_alive {
+            // SAFETY: plain kill syscall, cleaning up a leaked descendant.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+
+        assert!(
+            !still_alive,
+            "child {pid} was still alive after abort_pending_install — the future was \
+             never genuinely dropped, so KillOnDrop never ran"
+        );
+
+        let _ = install_task.await;
     }
 }

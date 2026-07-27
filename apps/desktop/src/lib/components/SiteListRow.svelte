@@ -1,11 +1,12 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <script lang="ts">
 	import type { SiteDto } from '$lib/ipc';
-	import { enabledPill } from '$lib/sites.derive';
+	import { enabledPill, phpVersionMissing } from '$lib/sites.derive';
 	import Button from './Button.svelte';
 
 	let {
 		site,
+		installed,
 		onEdit,
 		onToggleEnabled,
 		onOpen,
@@ -14,6 +15,17 @@
 		rowError = ''
 	}: {
 		site: SiteDto;
+		/** PHP majors actually installed on this machine, threaded down from
+		 * `+page.svelte` the same way `SiteDrawer`'s `installed` prop is (Task 8).
+		 * Compared against `site.phpVersion` so a site the machine can no longer
+		 * serve — `brew uninstall php@8.3` strands whatever pointed at 8.3 — is
+		 * flagged the moment it is rendered, not only after a failed Apply.
+		 *
+		 * `null` means the environment is UNKNOWN (I2 audit finding) — still
+		 * loading, or the read failed — not "definitely nothing installed"; see
+		 * `phpVersionMissing`'s doc comment. Suppresses the badge entirely rather
+		 * than rendering it for every row on a load flash or a failed read. */
+		installed: readonly string[] | null;
 		onEdit: (site: SiteDto) => void;
 		onToggleEnabled: (site: SiteDto, enabled: boolean) => void;
 		onOpen: (id: string) => void;
@@ -23,6 +35,7 @@
 	} = $props();
 
 	const pill = $derived(enabledPill(site.enabled));
+	const phpMissing = $derived(phpVersionMissing(site, installed));
 
 	/**
 	 * Two-step delete confirm, held LOCALLY on purpose.
@@ -43,7 +56,25 @@
 		     note on the name cell) and the domain is the row's identifying detail. -->
 		<div class="meta mono" title={site.domain}>{site.domain}</div>
 	</div>
-	<div class="mono num">PHP {site.phpVersion}</div>
+	<div class="mono num">
+		PHP {site.phpVersion}
+		{#if phpMissing}
+			<!-- Same `.badge`-adjacent vocabulary as `ApplyDialog`'s diff badges, but this
+			     one is a warning rather than a diff kind, so it gets `role="status"` and
+			     its own colour rather than reusing `.badge[data-kind]`. No per-site suffix
+			     on the testid (unlike `site-pill-{id}`): the row it lives in is already
+			     uniquely identified by `data-testid="site-{id}"` on the ancestor, and this
+			     is the literal contract this feature was specified against. -->
+			<span
+				class="php-missing"
+				role="status"
+				data-testid="php-missing"
+				title="PHP {site.phpVersion} is not installed on this machine"
+			>
+				not installed
+			</span>
+		{/if}
+	</div>
 	<div class="meta">{site.webServer}</div>
 	<span class="pill {pill.cls}" data-testid="site-pill-{site.id}">
 		<span class="dot"></span>{pill.label}
@@ -181,6 +212,21 @@
 	}
 	.row .mono {
 		font-size: var(--vh-text-table);
+	}
+	/* Warning badge for a site whose stored PHP version this machine does not have.
+	   Reuses the failure palette (`--vh-fail`/`--vh-fail-tint`) that `.row-error` and
+	   the page-level banners already use for this exact semantic, rather than
+	   inventing a second "something is wrong" colour. */
+	.php-missing {
+		display: inline-block;
+		margin-left: 6px;
+		padding: 1px 6px;
+		border-radius: var(--vh-radius-pill);
+		font-size: var(--vh-text-caption);
+		font-weight: 600;
+		color: var(--vh-fail);
+		background: var(--vh-fail-tint);
+		border: 1px solid color-mix(in oklab, var(--vh-fail) 35%, transparent);
 	}
 	.site-row {
 		grid-template-columns: minmax(220px, 1.4fr) 110px 90px 120px auto;

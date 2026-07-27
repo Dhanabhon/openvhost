@@ -48,6 +48,38 @@ owner chose to build on that now rather than wait for our own builds (decision, 
 **This slice therefore ships PHP version management, not a package manager.** MySQL,
 MariaDB and nginx are out of scope (§11).
 
+### 2.1 Homebrew is a bridge, and we should know what removes it
+
+ServBay — the product this plan takes reference notes from (plan §8) — does not use Homebrew
+at all. It builds and hosts its own packages and downloads them at runtime, which is why a
+machine with nothing installed works out of the box. It only points users at Homebrew for
+advanced cases like compiling a custom PHP module. That is the model the plan already
+targets: *"Service binaries are downloaded at runtime, never bundled in the installer"*
+(plan §1), with bundling explicitly rejected in §8.
+
+So depending on Homebrew is a **deliberate temporary bridge**, not the destination. What
+removes it is the plan's own Phase 2 item: *"Own the Phase 2+ package-build pipeline design
+(reproducible builds of PHP/nginx/etc. for our 3–4 targets) — start a docs/build-pipeline.md
+ADR before implementing."*
+
+**One correction to how that item is usually read.** The plan's licensing constraint is
+scoped to *GPL* packages: *"from the moment we distribute OUR OWN builds of GPL packages
+(MySQL/MariaDB etc.)"*. PHP is under the PHP License 3.01 and nginx under BSD 2-clause —
+both permissive, neither carrying a copyleft source-offer duty. **Self-hosting our own PHP
+build is therefore an engineering problem, not a licensing one**, which makes PHP the right
+place to start and MySQL/MariaDB the part that genuinely waits for legal review (plan §7 Q6).
+
+The engineering is still substantial and should not be understated: PHP needs roughly thirty
+dependencies, and unless those are vendored too the resulting `php-fpm` links against
+Homebrew's dylibs and nothing has been gained. Relocatability (`@rpath`, `install_name_tool`),
+macOS quarantine attributes on downloaded binaries, and signing (plan §7 Q5, unresolved) are
+all part of it. Weeks, not days — hence the ADR before the code.
+
+The seam is already in the right place: everything downstream sees only
+`PhpRuntime { major, fpm_bin }`, and the only function that knows Homebrew exists is
+`discover_php_in`. Swapping the source later means adding a sibling that scans `packages/`,
+which `openvhost-pkg` already installs into.
+
 ## 3. Architecture
 
 Three pieces with one responsibility each, so that "run a program" and "know about
@@ -194,7 +226,7 @@ change.
 
 | Condition | What the user sees |
 |---|---|
-| No `brew` found | The paths searched, and how to install Homebrew |
+| No `brew` found | §6.1's guided state — not a bare error |
 | Version outside the catalogue | Rejected at the IPC boundary, naming the field |
 | Already installed | No button; the command refuses if called anyway |
 | `brew install` exits non-zero | The log **stays on screen**, with the closing lines emphasised |
@@ -203,6 +235,35 @@ change.
 The last row is the one worth building deliberately. "Succeeded but nothing changed" is the
 silent-failure class this project has caught in every slice so far; without it a user
 presses Install repeatedly with no way to see why nothing happens.
+
+### 5.0 The dead end this slice exists to close
+
+The failure the owner hit on a real machine, and the reason several of the items below are
+not polish:
+
+> Sites → the PHP dropdown offers 8.4 / 8.3 / 8.2 / 8.1 (a hard-coded constant) → the
+> machine has only 8.5 → **every option leads to the same refusal** → Apply never succeeds →
+> no config is ever written → the browser gets `ERR_CONNECTION_REFUSED`.
+
+Three separate mistakes stacked:
+
+1. **Offering a choice that cannot be satisfied** — the dropdown was unrelated to the machine.
+2. **Defaulting to one of them** — a new site starts at `PHP_VERSIONS[0]`, so it is born broken.
+3. **Reporting the dead end without an exit** — the banner states the problem and offers
+   nothing to press.
+
+Fixing 1 and 2 makes the trap unreachable. **Fixing 3 is still required**, because the machine
+changes outside the app: a user can `brew uninstall php@8.3` at any time and strand a site
+that was fine yesterday. Prevention cannot be complete, so recovery has to exist.
+
+The banner therefore offers the actions that actually resolve it, not just the diagnosis:
+
+- **Install PHP 8.4** → the Languages page, with that version's install started
+- **Change hello to 8.5** → the site editor for that site, with an installed version selected
+
+And the problem is surfaced *before* Apply: a site whose PHP version is not installed carries
+a warning in its row in the Sites list, so it is visible when it is created rather than as a
+surprise later.
 
 ### 5.1 A version that disappears
 
@@ -222,17 +283,79 @@ label for what the section holds: PHP today, and other runtimes later. *Packages
 promise a general package manager the slice deliberately does not build (§2), and would
 have to be renamed the moment MySQL — a service, not a language — arrived.
 
-`/languages` lists one row per catalogue version:
+`/languages` groups its rows **under a language heading — "PHP" — even though PHP is the only
+one**. ServBay's equivalent page groups PHP, Node.js, Python and Go the same way; adopting the
+shape now means adding a runtime later is a new group rather than a redesign.
 
 | Row state | Contents |
 |---|---|
-| Installed | full version (8.3.14) and the path it was found at |
+| Installed | full version (8.3.14), the path it was found at, its **socket path (copyable)**, and **start/stop for that version's pool** |
 | Not installed | an Install button |
 | Installing | every button on the page disabled, live log beneath the row (reusing `LogPane.svelte`) |
 | Failed | the log **kept on screen**, closing lines emphasised, `pre-wrap` |
 
+**Nothing installed at all** is not a list of four disabled rows: it is a single centred call
+to action for the group, the way ServBay presents an uninstalled Node.js. That is the state a
+first-time user lands in, and it should read as an invitation rather than an inventory of
+things they do not have.
+
+One catalogue entry carries a **"recommended"** marker (the newest stable). A first-time user
+should not have to know how 8.1 differs from 8.5 in order to get started.
+
+**Start/stop belongs here as well as on Services** (owner decision, 2026-07-27). The mental
+model is otherwise cleaner — Languages is what is installed, Services is what is running — but
+it costs the user three pages to complete one intention: install on Languages, Apply on Sites,
+Start on Services. ServBay puts the control on the version row and the flow ends where it
+began. The two surfaces must render from the same supervisor state, not from two copies of it.
+
 A row that has just been installed also says a pool must be created, and links to Sites —
 where the banner will already be showing the pending change.
+
+### 6.1 When the machine has nothing — the state that matters most
+
+A user who has never installed PHP very likely has never installed Homebrew either. Saying
+"no brew found, here are the paths we searched" is a dead end one level further up: they came
+to this page to solve a problem and were handed a different one.
+
+The page degrades in three honest steps:
+
+| Machine | The page does |
+|---|---|
+| brew + PHP | the normal list |
+| brew, no PHP | the centred install call to action |
+| **no brew** | explains that OpenVHost uses Homebrew as its PHP source on macOS, shows the install command **as copyable text**, links to brew.sh, and offers **Check again** |
+
+**We do not run Homebrew's installer.** It is a `curl | bash` that asks for `sudo` and changes
+the system broadly — a decision that belongs to the machine's owner, not to an app they opened
+for the first time. It would also simply fail: the process we spawn has no tty to answer a
+sudo prompt, so the user would get a more confusing error than the one we started with.
+
+**Check again** matters more than it looks. The user will leave, install brew in a terminal,
+and come back; without it they must quit and relaunch — the same staleness §4.3 fixes for
+installs, applied to the dependency underneath.
+
+### 6.2 The site editor
+
+**`SiteDrawer`'s PHP dropdown lists only versions that are actually installed** (owner
+decision, 2026-07-27). Today it offers a hard-coded `['8.4','8.3','8.2','8.1']` with no
+relation to the machine — on the machine this was designed against, not one of those four
+is present, so every option leads to an Apply that is refused. Installing more is the
+Languages page's job, not a dropdown's.
+
+**A new site defaults to an installed version** — the newest one — rather than to
+`PHP_VERSIONS[0]`. A site that is broken before the user has touched anything is the second
+of §5.0's three mistakes.
+
+The one exception is the site's **own stored value**, which is prepended and labelled when
+it is not installed. Dropping it would make the `<select>` render blank and silently
+rewrite the site's PHP version to whatever the browser picked instead — the bug PR #13
+fixed. Keeping it is not offering an uninstalled version; it is refusing to change data
+behind the user's back.
+
+**With no PHP installed at all**, the editor does not present an empty `<select>` and a Save
+button that cannot lead anywhere. It says so and links to Languages. The Sites list carries
+the same pointer, because that is the page the app opens on and therefore where a first-time
+user arrives before anywhere else.
 
 **`SiteDrawer`'s PHP dropdown lists only versions that are actually installed** (owner
 decision, 2026-07-27). Today it offers a hard-coded `['8.4','8.3','8.2','8.1']` with no
@@ -319,7 +442,13 @@ so **security-auditor APPROVE is a merge blocker** (CLAUDE.md golden rule 2).
 5. **The rail section is called Languages, not Packages** — it holds runtimes, and the
    slice deliberately is not a package manager (§2). The site editor's PHP dropdown
    lists only installed versions; installing more belongs on that page.
-6. **A hand-maintained catalogue constant**, accepting that it ages, rather than spawning
+6. **Start/stop appears on the Languages row as well as on Services** — duplicating the
+   control is accepted so that install-to-running does not span three pages. Both surfaces
+   read the same supervisor state.
+7. **Homebrew is recorded as a temporary bridge** (§2.1), not the architecture. What removes
+   it is the Phase 2 build pipeline, and the licensing objection to self-hosting applies to
+   MySQL/MariaDB, not to PHP or nginx.
+8. **A hand-maintained catalogue constant**, accepting that it ages, rather than spawning
    `brew` to enumerate formulae on a path that must stay cheap.
 
 ## 10. Out of scope

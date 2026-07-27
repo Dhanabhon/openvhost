@@ -16,22 +16,26 @@ import { render } from 'svelte/server';
 import SiteListRow from './SiteListRow.svelte';
 import type { SiteDto } from '$lib/ipc';
 
-const site = (enabled: boolean): SiteDto => ({
+const site = (enabled: boolean, phpVersion = '8.3'): SiteDto => ({
 	id: 'a1',
 	name: 'shop',
 	domain: 'shop.localhost',
 	docroot: '/srv/www/shop',
 	webServer: 'nginx',
-	phpVersion: '8.3',
+	phpVersion,
 	enabled,
 	createdAt: 1,
 	updatedAt: 1
 });
 
-function rowHtml(dto: SiteDto, extra: { busy?: boolean; rowError?: string } = {}): string {
+function rowHtml(
+	dto: SiteDto,
+	extra: { busy?: boolean; rowError?: string; installed?: readonly string[] | null } = {}
+): string {
 	return render(SiteListRow, {
 		props: {
 			site: dto,
+			installed: extra.installed ?? [dto.phpVersion],
 			onEdit: () => {},
 			onToggleEnabled: () => {},
 			onOpen: () => {},
@@ -103,5 +107,35 @@ describe('SiteListRow actions', () => {
 		expect(failed).toContain('docroot is gone');
 
 		expect(rowHtml(site(true))).not.toContain('role="alert"');
+	});
+
+	// Visible the moment a site is out of sync with this machine, not only as a
+	// surprise after a failed Apply — a machine changes under a site at any time
+	// (`brew uninstall php@8.3`), and Task 8 only ever prevents a NEW site from
+	// choosing a version that is missing.
+	it('warns on the row when a site wants a version that is not installed', () => {
+		const body = rowHtml(site(true, '8.4'), { installed: ['8.5'] });
+		expect(body).toContain('data-testid="php-missing"');
+		expect(body).toContain('8.4');
+	});
+
+	it('does not warn when the version is installed', () => {
+		const body = rowHtml(site(true, '8.5'), { installed: ['8.5'] });
+		expect(body).not.toContain('data-testid="php-missing"');
+	});
+
+	// I2 (branch-review-fix-report.md): `installed: null` means the environment
+	// is UNKNOWN — still loading, or the read failed — not "definitely nothing
+	// installed". Before the fix, `+page.svelte` collapsed both into `[]`, which
+	// flagged EVERY row as "not installed" during the load flash and, worse, on
+	// every failed read. The same site with a KNOWN-empty list (`[]`) still
+	// warns — proving `null` suppresses the badge for its own reason, not
+	// because an empty array happens to never match.
+	it('suppresses the badge when the environment is unknown, even for a version nothing lists', () => {
+		const unknown = rowHtml(site(true, '8.4'), { installed: null });
+		expect(unknown).not.toContain('data-testid="php-missing"');
+
+		const knownEmpty = rowHtml(site(true, '8.4'), { installed: [] });
+		expect(knownEmpty).toContain('data-testid="php-missing"');
 	});
 });

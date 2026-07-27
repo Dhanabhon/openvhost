@@ -108,15 +108,17 @@ pub fn brew_install_spec(brew: &Path, major: &PhpMajor) -> Result<SpawnSpec, Cor
         }
     };
 
-    // brew shells out to git, curl and friends. The supervisor's env
-    // allow-list forwards the parent's PATH, which for an app launched from
-    // Finder is the bare system one — so brew's own prefix is prepended
-    // explicitly rather than hoping the launch context had it.
+    // brew shells out to git, curl and friends, resolved through THIS PATH —
+    // so it inherits the same rule `discover.rs` documents for php-fpm and
+    // nginx: never resolve anything through the process's ambient PATH,
+    // because a ServBay install shadows binaries there. Composed from a
+    // fixed baseline (brew's own bin, then the standard system dirs) rather
+    // than appending the parent's inherited PATH: that inherited value is
+    // attacker-influenced environment the app does not control, and brew's
+    // own prefix does not ship git/curl/tar — prepending it would not have
+    // closed the gap, only hidden it behind "PATH looks populated".
     let mut path = OsString::from(brew_bin);
-    if let Some(inherited) = std::env::var_os("PATH") {
-        path.push(":");
-        path.push(inherited);
-    }
+    path.push(":/usr/bin:/bin:/usr/sbin:/sbin");
 
     Ok(SpawnSpec {
         program: brew.to_path_buf(),
@@ -263,6 +265,52 @@ mod tests {
                 brew_install_spec(std::path::Path::new(bad), &PhpMajor::parse("8.3").unwrap());
             assert!(err.is_err(), "accepted {bad:?}");
         }
+    }
+
+    #[test]
+    fn the_inherited_ambient_path_never_appears_in_the_composed_value() {
+        // The composed PATH must come from a fixed baseline, never the
+        // process's own ambient PATH: a ServBay install shadows `php-fpm`/
+        // `nginx` on that ambient value (see `discover.rs`), and brew's
+        // children (git, curl, tar) would inherit the same shadowing if the
+        // parent's PATH were appended. Set a PATH with an unmistakable
+        // marker directory and assert it never reaches the child's env —
+        // restoring the previous value afterwards so this test cannot leak
+        // into any other test in the same process.
+        const MARKER: &str = "/tmp/openvhost-hostile-shadow-dir-marker";
+        let previous = std::env::var_os("PATH");
+        // SAFETY: no other thread in this test binary reads/writes PATH
+        // concurrently with this single-threaded set/restore pair.
+        unsafe {
+            std::env::set_var("PATH", format!("{MARKER}:/usr/bin"));
+        }
+
+        let spec = brew_install_spec(
+            std::path::Path::new("/opt/homebrew/bin/brew"),
+            &PhpMajor::parse("8.3").unwrap(),
+        )
+        .unwrap();
+
+        // SAFETY: restoring the pre-test value before any assertion can panic
+        // and skip it.
+        unsafe {
+            match &previous {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        let path = spec
+            .env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.to_string_lossy().into_owned())
+            .expect("PATH must be set explicitly");
+        assert!(
+            !path.contains(MARKER),
+            "the inherited ambient PATH leaked into the composed value: {path}"
+        );
+        assert_eq!(path, "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin");
     }
 
     #[test]

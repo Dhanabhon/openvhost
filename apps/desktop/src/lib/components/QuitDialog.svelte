@@ -6,6 +6,7 @@
 
 	let {
 		pending,
+		installingMajor = null,
 		quitting = false,
 		error = '',
 		onCancel,
@@ -13,6 +14,10 @@
 	}: {
 		/** Display names of services a quit would stop. Empty = nothing to lose. */
 		pending: readonly string[];
+		/** The PHP major currently installing via Homebrew, if any. A build in
+		 *  progress is invisible to `pending` — it is not a supervised service —
+		 *  so without this a quit would silently discard it mid-build. */
+		installingMajor?: string | null;
 		/** True while `confirmQuit` is in flight — services are being stopped. */
 		quitting?: boolean;
 		/** A failed quit attempt, rendered in place rather than as a page banner:
@@ -23,9 +28,11 @@
 	} = $props();
 
 	const hasPending = $derived(pending.length > 0);
-	/** "Stop and quit" only when there is something to stop — a button that
-	 *  promises to stop nothing is a small lie the user notices. */
-	const confirmLabel = $derived(hasPending ? 'Stop and quit' : 'Quit');
+	const hasInstall = $derived(installingMajor !== null);
+	/** "Stop and quit" whenever there is something to stop — a running service
+	 *  OR an install in flight — otherwise a button promising to stop nothing
+	 *  is a small lie the user notices. */
+	const confirmLabel = $derived(hasPending || hasInstall ? 'Stop and quit' : 'Quit');
 
 	let dialog = $state<HTMLElement | null>(null);
 
@@ -94,8 +101,13 @@
 			<span class="mono">{formatNameList(pending)}</span>
 			{pending.length === 1 ? 'is' : 'are'} running. Quitting stops
 			{pending.length === 1 ? 'it' : 'them'} first, so nothing is left serving in the background.
-		{:else}
+		{:else if !hasInstall}
 			No services are running. Nothing will be interrupted.
+		{/if}
+		{#if hasInstall}
+			{hasPending ? ' ' : ''}PHP <span class="mono">{installingMajor}</span> is still installing. Quitting
+			stops it immediately and discards the download/build in progress — there is no resuming it, only
+			starting over.
 		{/if}
 	</p>
 

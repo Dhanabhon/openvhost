@@ -3,7 +3,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Let a developer keep several PHP versions on the machine, install another from inside OpenVHost, and point each site at the one it needs.
+**Goal:** Let a developer keep several PHP versions on the machine, install another from inside OpenVHost, and point each site at the one it needs — including on a machine that has never installed PHP, or Homebrew.
 
 **Architecture:** A one-shot task runner in `openvhost-proc` runs a command to completion and streams its output; `openvhost-core::php` knows about Homebrew (where versions live, which ones we offer, how to compose the install command) but executes nothing; the desktop app joins the two, rescans, and registers a `php-fpm-<major>` service row for anything new.
 
@@ -874,9 +874,17 @@ straight into brew install. The composed argv is pinned by a test."
 
 ---
 
+
+> **Tasks 1-3 are merged** (PR #26, `e0816d0`). The tasks below were restructured on
+> 2026-07-27 after the owner hit a real dead end on their own machine (spec §5.0) and after
+> reviewing ServBay's equivalent page (spec §6). Task 6 grew, and two tasks are new: the
+> zero-state/degradation path, and the Sites-side recovery affordances.
+
 ## Task 4: Make the installed-runtime set replaceable
 
-`InstalledRuntimes` is managed state set once at startup, and Tauri cannot replace managed state. Until it can be updated, a version installed after launch is invisible to the apply pipeline — the Languages page would appear to work while changing nothing.
+`InstalledRuntimes` is managed state set once at startup, and Tauri cannot replace managed
+state. Until it can be updated, a version installed after launch is invisible to the apply
+pipeline — the Languages page would appear to work while changing nothing.
 
 **Files:**
 - Modify: `apps/desktop/src-tauri/src/lib.rs`
@@ -884,16 +892,16 @@ straight into brew install. The composed argv is pinned by a test."
 - Test: `apps/desktop/src-tauri/src/commands.rs` (`#[cfg(test)] mod tests`)
 
 **Interfaces:**
-- Produces: the managed type becomes `std::sync::RwLock<Option<InstalledRuntimes>>`. Every reader takes the read lock. A later task takes the write lock after an install.
+- Produces: the managed type becomes `std::sync::RwLock<Option<InstalledRuntimes>>`. Every reader takes the read lock; Task 5 takes the write lock after an install or a rescan.
 
 - [ ] **Step 1: Find every reader**
 
 Run: `grep -rn "InstalledRuntimes" apps/desktop/src-tauri/src`
-There are readers in `apply_input`, `apply_sites` and the setup in `lib.rs`. Read each before changing it — the list in this plan is a starting point, not an inventory.
+There are readers in `apply_input`, `apply_sites` and the setup in `lib.rs`. Read each before changing it — that list is a starting point, not an inventory.
 
 - [ ] **Step 2: Change the managed type**
 
-In `apps/desktop/src-tauri/src/lib.rs`, wrap what is managed:
+In `apps/desktop/src-tauri/src/lib.rs`:
 
 ```rust
 app.manage(std::sync::RwLock::new(stack_runtimes));
@@ -909,7 +917,7 @@ let runtimes = runtimes
     .clone();
 ```
 
-Holding a `std::sync::RwLockReadGuard` across an await point would make the future non-`Send` and fail to compile as a Tauri command — clone first, then await.
+Holding a `std::sync::RwLockReadGuard` across an await point makes the future non-`Send`, which fails to compile as a Tauri command — clone first, then await.
 
 - [ ] **Step 3: Add the test**
 
@@ -940,7 +948,7 @@ fn the_runtime_set_can_be_replaced_after_startup() {
 cargo test -p openvhost-desktop
 cargo test --workspace
 ```
-Expected: PASS. The existing apply tests must be untouched in behaviour — if any needed changing beyond the lock, say so in your report.
+Expected: PASS. The existing apply tests must be unchanged in behaviour — if any needed more than the lock, say so in your report.
 
 - [ ] **Step 5: Gate and commit**
 
@@ -967,16 +975,42 @@ was invisible to apply. Now behind an RwLock, ready for a rescan."
 - Test: `apps/desktop/src-tauri/src/commands.rs`, `apps/desktop/src/lib/ipc/ipc.test.ts`
 
 **Interfaces:**
-- Consumes: `run_task`, `TaskEvent`, `TaskStream` (Task 1); `discover_php_in`, `BREW_PREFIXES`, `CATALOGUE`, `PhpMajor`, `find_brew`, `brew_install_spec` (Tasks 2-3); the `RwLock` state (Task 4); `openvhost_conf::probe_php_fpm_version`; `Supervisor::register`; `stack::php_fpm_spec` — if `stack.rs` builds its php-fpm `ServiceSpec` inline, extract that into a named function so this task and startup build the row the same way rather than twice.
+- Consumes: `run_task`, `TaskEvent`, `TaskStream`; `discover_php_in`, `BREW_PREFIXES`, `CATALOGUE`, `PhpMajor`, `find_brew`, `brew_install_spec` (note: **returns `Result<SpawnSpec, CoreError>`** — it refuses a non-absolute brew path); the `RwLock` from Task 4; `openvhost_conf::probe_php_fpm_version`; `Supervisor::register`. If `stack.rs` builds its php-fpm `ServiceSpec` inline, extract that into a named `php_fpm_spec(home, runtime)` so startup and this task build the row the same way rather than twice.
 - Produces:
   ```rust
-  pub struct PhpRuntimeDto { pub major: String, pub installed: bool, pub full_version: Option<String>, pub path: Option<String> }
+  pub struct PhpRuntimeDto {
+      pub major: String,
+      pub installed: bool,
+      pub recommended: bool,
+      pub full_version: Option<String>,
+      pub path: Option<String>,
+      /// Where this version's pool listens. `None` until installed.
+      pub socket_path: Option<String>,
+      /// The supervisor id for this version's pool, so the UI can drive
+      /// start/stop from the row without inventing the id itself.
+      pub service_id: Option<String>,
+  }
+
+  /// What the Languages page needs to decide which of the three states to show
+  /// (spec §6.1). `brew_found` false means the page must guide, not list.
+  pub struct PhpEnvironmentDto {
+      pub brew_found: bool,
+      pub brew_searched: Vec<String>,
+      pub runtimes: Vec<PhpRuntimeDto>,
+  }
+
   pub struct InstallOutcomeDto { pub major: String, pub exit_code: Option<i32>, pub detected: bool }
-  #[tauri::command] pub async fn list_php_runtimes(...) -> Result<Vec<PhpRuntimeDto>, IpcError>;
+
+  #[tauri::command] pub async fn php_environment(...) -> Result<PhpEnvironmentDto, IpcError>;
+  #[tauri::command] pub async fn rescan_php_runtimes(...) -> Result<PhpEnvironmentDto, IpcError>;
   #[tauri::command] pub async fn install_php(major: String, ...) -> Result<InstallOutcomeDto, IpcError>;
   ```
-  Plus a `PhpInstallLogEvent { major, ts_ms, stream, line }` emitted per output line, following the existing `ServiceLogEvent` pattern.
-  TS names: `listPhpRuntimes()`, `installPhp(major)`, `PhpRuntimeDto.fullVersion`, `InstallOutcomeDto.exitCode`.
+  Plus `PhpInstallLogEvent { major, ts_ms, stream, line }` per output line, following the existing `ServiceLogEvent` pattern.
+  TS: `phpEnvironment()`, `rescanPhpRuntimes()`, `installPhp(major)`, `PhpRuntimeDto.fullVersion`, `.socketPath`, `.serviceId`, `PhpEnvironmentDto.brewFound`, `.brewSearched`.
+
+**Why `php_environment` rather than `list_php_runtimes`:** the page has to distinguish "no PHP" from "no Homebrew", and those are different states with different remedies (spec §6.1). A bare `Vec<PhpRuntimeDto>` cannot express the second, and the page would have to infer it from an error string.
+
+**Why a separate `rescan_php_runtimes`:** the user leaves to install Homebrew in a terminal and comes back. `php_environment` reads cached state and spawns nothing (the property that keeps `plan_site_apply` cheap); `rescan` is the explicit, user-initiated probe behind the **Check again** button.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -987,25 +1021,36 @@ fn every_catalogue_entry_is_listed_with_its_installed_state() {
         major: "8.3".into(),
         fpm_bin: std::path::PathBuf::from("/opt/homebrew/opt/php@8.3/sbin/php-fpm"),
     }];
-    let rows = php_rows(&installed, &["8.3".to_string()], &["8.3.14".to_string()]);
+    let rows = php_rows(std::path::Path::new("/tmp/ovh"), &installed, &[("8.3", "8.3.14")]);
     assert_eq!(rows.len(), openvhost_core::CATALOGUE.len());
     let three = rows.iter().find(|r| r.major == "8.3").unwrap();
     assert!(three.installed);
     assert_eq!(three.full_version.as_deref(), Some("8.3.14"));
+    assert_eq!(three.service_id.as_deref(), Some("php-fpm-8.3"));
+    assert!(three.socket_path.as_deref().is_some_and(|s| s.ends_with("php-fpm-8.3.sock")));
     let one = rows.iter().find(|r| r.major == "8.1").unwrap();
     assert!(!one.installed);
     assert!(one.path.is_none());
+    assert!(one.service_id.is_none(), "a version that is not installed has no pool");
+}
+
+#[test]
+fn exactly_one_catalogue_entry_is_recommended_and_it_is_the_newest() {
+    // A first-time user should not have to know how 8.1 differs from 8.5.
+    let rows = php_rows(std::path::Path::new("/tmp/ovh"), &[], &[]);
+    let rec: Vec<&str> = rows.iter().filter(|r| r.recommended).map(|r| r.major.as_str()).collect();
+    assert_eq!(rec, vec![*openvhost_core::CATALOGUE.last().unwrap()]);
 }
 
 #[test]
 fn an_installed_version_outside_the_catalogue_is_still_listed() {
-    // Otherwise a version the user installed by hand — or one dropped from a
-    // later catalogue — would vanish from the page while still serving sites.
+    // Otherwise a version installed by hand — or dropped from a later
+    // catalogue — vanishes from the page while still serving sites.
     let installed = vec![openvhost_core::PhpRuntime {
         major: "7.4".into(),
         fpm_bin: std::path::PathBuf::from("/opt/homebrew/opt/php@7.4/sbin/php-fpm"),
     }];
-    let rows = php_rows(&installed, &["7.4".to_string()], &["7.4.33".to_string()]);
+    let rows = php_rows(std::path::Path::new("/tmp/ovh"), &installed, &[("7.4", "7.4.33")]);
     assert!(rows.iter().any(|r| r.major == "7.4" && r.installed));
 }
 
@@ -1021,20 +1066,23 @@ fn a_rejected_version_names_the_field_so_the_ui_can_mark_it() {
 }
 ```
 
-`php_rows` is a pure helper you extract so the row-building logic is testable without Tauri state: it takes the discovered runtimes plus their probed full versions and returns `Vec<PhpRuntimeDto>` covering the catalogue union the installed set.
+`php_rows(home, installed, full_versions)` is a pure helper you extract so the row-building logic is testable without Tauri state.
 
-In `ipc.test.ts`, add wrapper tests for `listPhpRuntimes` and `installPhp` following the existing shape (returns `data`, throws the normalized `IpcError`).
+In `ipc.test.ts`, add wrapper tests for `phpEnvironment`, `rescanPhpRuntimes` and `installPhp` following the existing shape.
 
 - [ ] **Step 2: Run to verify failure**
 
 Run: `cargo test -p openvhost-desktop php_rows`
 Expected: FAIL — `php_rows` not found.
 
-- [ ] **Step 3: Implement the commands**
+- [ ] **Step 3: Implement the read commands**
 
-`list_php_runtimes` reads the `RwLock`, probes nothing, and returns `php_rows(...)`. The full version comes from a `probe_php_fpm_version` call made during the last rescan and cached alongside the runtime — if `PhpRuntime` has no field for it, return `None` rather than probing on this path. **This command must not spawn a process**: it is called on page mount and after every install, and the same discipline that keeps `plan_site_apply` cheap applies here.
+`php_environment` reads the `RwLock` and `find_brew()`, probes nothing, and returns
+`PhpEnvironmentDto { brew_found, brew_searched, runtimes: php_rows(...) }`. `brew_searched` is `BREW_PREFIXES` joined with `bin/brew` so the UI can name exactly where it looked. **This command must not spawn a process** — it is called on page mount and after every install, and the discipline that keeps `plan_site_apply` cheap applies here too.
 
-`install_php`:
+`rescan_php_runtimes` does the probing, writes the result into the `RwLock`, registers a service row for any newly found major, and returns the same DTO.
+
+- [ ] **Step 4: Implement `install_php`**
 
 ```rust
 #[tauri::command]
@@ -1043,6 +1091,7 @@ pub async fn install_php(
     app: tauri::AppHandle,
     major: String,
     runtimes: tauri::State<'_, std::sync::RwLock<Option<InstalledRuntimes>>>,
+    paths: tauri::State<'_, Option<StackPaths>>,
     sup: tauri::State<'_, Arc<Supervisor>>,
     lock: tauri::State<'_, InstallLock>,
 ) -> Result<InstallOutcomeDto, IpcError> {
@@ -1052,9 +1101,7 @@ pub async fn install_php(
     // One at a time. `try_lock` rather than `lock`: a second press should be
     // refused with an explanation, not silently queued behind a 20-minute build.
     let Ok(_guard) = lock.0.try_lock() else {
-        return Err(IpcError::Core {
-            message: "an install is already running".into(),
-        });
+        return Err(IpcError::Core { message: "an install is already running".into() });
     };
 
     let before: Vec<String> = runtimes
@@ -1077,11 +1124,14 @@ pub async fn install_php(
         ),
     })?;
 
-    let spec = openvhost_core::brew_install_spec(&brew, &major);
+    // Returns Result: it refuses a non-absolute brew path, because composing
+    // PATH from one yields an empty leading component and exec resolves that
+    // as the working directory.
+    let spec = openvhost_core::brew_install_spec(&brew, &major)?;
     let (tx, mut rx) = tokio::sync::mpsc::channel(256);
 
-    // Forward brew's output to the UI as it arrives, so a long install is
-    // visibly working rather than apparently hung.
+    // Forward brew's output as it arrives, so a long install is visibly
+    // working rather than apparently hung.
     let emitter = app.clone();
     let for_event = major.as_str().to_string();
     let pump = tokio::spawn(async move {
@@ -1104,34 +1154,10 @@ pub async fn install_php(
     let exit_code = openvhost_proc::run_task(openvhost_proc::default_driver(), spec, tx).await?;
     let _ = pump.await;
 
-    // Rescan even on a non-zero exit: brew can fail late having already
-    // linked the formula, and the truth is on disk either way.
-    let found = rescan_php().await;
+    // Rescan even on a non-zero exit: brew can fail late having already linked
+    // the formula, and the truth is on disk either way.
+    let found = rescan_into_state(&runtimes, &sup, &paths).await?;
     let detected = found.iter().any(|r| r.major == major.as_str());
-
-    let new_majors: Vec<String> = found
-        .iter()
-        .map(|r| r.major.clone())
-        .filter(|m| !before.contains(m))
-        .collect();
-
-    {
-        let mut guard = runtimes
-            .write()
-            .map_err(|_| IpcError::Core { message: "runtime list is poisoned".into() })?;
-        if let Some(r) = guard.as_mut() {
-            r.php = found.clone();
-        }
-    }
-
-    // A row per installed major keeps the invariant the apply slice
-    // established: the service set follows what is installed, so apply never
-    // has to add or remove a service.
-    for m in &new_majors {
-        if let Some(rt) = found.iter().find(|r| &r.major == m) {
-            sup.register(crate::stack::php_fpm_spec(&home, rt));
-        }
-    }
 
     Ok(InstallOutcomeDto {
         major: major.as_str().to_string(),
@@ -1141,54 +1167,36 @@ pub async fn install_php(
 }
 ```
 
-`InstallLock` is a newtype over `tokio::sync::Mutex<()>` managed in `lib.rs`, mirroring the apply lock. `now_ms()` and the `.emit()` call follow whatever `ServiceLogEvent` already does in this file — read it rather than inventing a second convention. `home` comes from the managed `StackPaths`, so `install_php` needs that state too; add the parameter.
+`rescan_into_state` is shared with `rescan_php_runtimes`: probe, write the `RwLock`, and
+`sup.register(php_fpm_spec(home, rt))` for each major that was not there before. Registration
+at runtime is supported — `register` takes `&self` and refuses to replace a live entry.
 
-`rescan_php()` is a small async helper next to the command:
+`InstallLock` is a newtype over `tokio::sync::Mutex<()>` managed in `lib.rs`, mirroring the
+apply lock. `now_ms()` and `.emit()` follow whatever `ServiceLogEvent` already does — read it
+rather than inventing a second convention.
 
-```rust
-async fn rescan_php() -> Vec<openvhost_core::PhpRuntime> {
-    let prefixes: Vec<std::path::PathBuf> = openvhost_core::BREW_PREFIXES
-        .iter()
-        .map(std::path::PathBuf::from)
-        .collect();
-    let refs: Vec<&std::path::Path> = prefixes.iter().map(|p| p.as_path()).collect();
-    // `discover_php_in` takes a synchronous probe, but the version probe is
-    // async. Collect the candidates first, probe them, then hand a lookup
-    // closure to the discovery pass — rather than blocking a runtime thread.
-    // Implement whichever way reads cleanest and say which in your report.
-    openvhost_core::discover_php_in(&refs, &|bin| {
-        tauri::async_runtime::block_on(openvhost_conf::probe_php_fpm_version(bin))
-    })
-}
-```
+**`detected: false` with `exit_code: Some(0)` is the case that matters.** brew reporting
+success while no `php-fpm` appears is the silent-failure class this project keeps catching;
+the DTO carries it so the UI can say it plainly instead of showing nothing.
 
-`block_on` inside an async fn will deadlock if it runs on the same single-threaded runtime, so wrap the whole rescan in `tokio::task::spawn_blocking` — or restructure `discover_php_in` to take a pre-built version map. **Pick one, make it work, and state which you chose and why in your report.**
+The probe is async while `discover_php_in` takes a synchronous closure. Resolve that with
+`spawn_blocking` around the whole rescan, or by pre-building a version map and handing
+discovery a lookup — **pick one, make it work, and say which you chose and why in your report.**
 
-`detected: false` with `exit_code: Some(0)` is the case that matters: brew reporting success while no `php-fpm` appears is the silent-failure class this project keeps catching, and the DTO carries it so the UI can say it plainly instead of showing nothing.
+- [ ] **Step 5: Regenerate the bindings**
 
-**`detected: false` with `exit_code: Some(0)` is the case that matters.** brew reporting success while no `php-fpm` appears is the silent-failure class this project keeps catching; the DTO carries it so the UI can say it plainly instead of showing nothing.
-
-Register both commands in `collect_commands![...]` and the event in `collect_events![...]` in `lib.rs`.
-
-- [ ] **Step 4: Regenerate the bindings**
-
-Run: `cargo test -p openvhost-desktop export_bindings`
-Then add the wrappers and types to `apps/desktop/src/lib/ipc/index.ts`. Confirm with `git diff --stat apps/desktop/src/lib/ipc/bindings.ts` that it actually changed — no diff means the export test did not run.
-
-- [ ] **Step 5: Run the tests**
-
-```bash
-cargo test -p openvhost-desktop
-pnpm -C apps/desktop test
-```
-Expected: PASS.
+Run: `cargo test -p openvhost-desktop export_bindings`, add the wrappers and types to
+`apps/desktop/src/lib/ipc/index.ts`, and confirm with
+`git diff --stat apps/desktop/src/lib/ipc/bindings.ts` that it changed. No diff means the
+export test did not run.
 
 - [ ] **Step 6: Gate and commit**
 
 ```bash
 cargo fmt && cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p openvhost-desktop && pnpm -C apps/desktop test
 git add apps/desktop
-git commit -s -m "feat(desktop): list PHP versions and install one via Homebrew"
+git commit -s -m "feat(desktop): expose the PHP environment, install and rescan over IPC"
 ```
 
 - [ ] **Step 7: Prove the runner works against real brew**
@@ -1234,11 +1242,10 @@ async fn brew_version_runs_through_the_task_runner() {
 ```
 
 Run: `cargo test -p openvhost-core --test brew_live -- --nocapture`
-Expected: PASS on a machine with Homebrew; a clear SKIP line otherwise.
 
 - [ ] **Step 8: Request the security audit**
 
-Dispatch the `security-auditor` subagent over the branch diff. Point it at: whether the catalogue allowlist actually closes flag injection, that the argv is composed rather than accepted, that `brew` is located by absolute path and never `PATH`, that the process group covers brew's whole child tree, and that only one install can run at a time. A written APPROVE is required before merge.
+Dispatch the `security-auditor` subagent over the branch diff. Point it at: whether the catalogue allowlist closes flag injection, that the argv is composed rather than accepted, that `brew` is located by absolute path and never `PATH`, that the process group covers brew's whole child tree, and that only one install can run at a time. A written APPROVE is required before merge.
 
 ---
 
@@ -1251,16 +1258,19 @@ Dispatch the `security-auditor` subagent over the branch diff. Point it at: whet
 - Modify: `apps/desktop/src/lib/components/Rail.svelte`
 
 **Interfaces:**
-- Consumes: `listPhpRuntimes()`, `installPhp(major)`, `PhpRuntimeDto`, `InstallOutcomeDto`, and the install-log event from Task 5.
+- Consumes: `phpEnvironment()`, `rescanPhpRuntimes()`, `installPhp(major)`, `startService`/`stopService` (already in `index.ts`), the install-log event.
 - Produces:
   ```ts
   export class LanguagesStore {
-      rows: PhpRuntimeDto[];
+      env: PhpEnvironmentDto | null;
       installing: string;         // '' when idle, otherwise the major
       log: UiLog[];
       error: string;
       outcome: InstallOutcomeDto | null;
+      get brewFound(): boolean;
+      get anyInstalled(): boolean;
       refresh(): Promise<void>;
+      rescan(): Promise<void>;
       install(major: string): Promise<boolean>;
   }
   ```
@@ -1269,9 +1279,22 @@ Dispatch the `security-auditor` subagent over the branch diff. Point it at: whet
 
 ```ts
 it('lists what the backend returns', async () => {
-	const s = new LanguagesStore(api({ rows: [row('8.3', true), row('8.4', false)] }));
+	const s = new LanguagesStore(api({ env: env([row('8.3', true), row('8.4', false)]) }));
 	await s.refresh();
-	expect(s.rows.map((r) => r.major)).toEqual(['8.3', '8.4']);
+	expect(s.env?.runtimes.map((r) => r.major)).toEqual(['8.3', '8.4']);
+});
+
+it('knows the difference between no PHP and no Homebrew', async () => {
+	// Different states, different remedies — the page cannot infer the second
+	// from an empty list.
+	const noPhp = new LanguagesStore(api({ env: { brewFound: true, brewSearched: [], runtimes: [row('8.4', false)] } }));
+	await noPhp.refresh();
+	expect(noPhp.brewFound).toBe(true);
+	expect(noPhp.anyInstalled).toBe(false);
+
+	const noBrew = new LanguagesStore(api({ env: { brewFound: false, brewSearched: ['/opt/homebrew/bin/brew'], runtimes: [] } }));
+	await noBrew.refresh();
+	expect(noBrew.brewFound).toBe(false);
 });
 
 it('marks which version is installing and clears it when done', async () => {
@@ -1285,7 +1308,8 @@ it('marks which version is installing and clears it when done', async () => {
 it('refuses a second install while one is running', async () => {
 	let calls = 0;
 	const s = new LanguagesStore({
-		listPhpRuntimes: async () => [],
+		phpEnvironment: async () => env([]),
+		rescanPhpRuntimes: async () => env([]),
 		installPhp: async () => {
 			calls += 1;
 			await new Promise((r) => setTimeout(r, 5));
@@ -1298,7 +1322,8 @@ it('refuses a second install while one is running', async () => {
 
 it('keeps the log and surfaces the error when the install fails', async () => {
 	const s = new LanguagesStore({
-		listPhpRuntimes: async () => [],
+		phpEnvironment: async () => env([]),
+		rescanPhpRuntimes: async () => env([]),
 		installPhp: async () => {
 			throw { kind: 'core', message: 'brew: no such formula' };
 		}
@@ -1310,22 +1335,23 @@ it('keeps the log and surfaces the error when the install fails', async () => {
 	expect(s.installing).toBe('');
 });
 
-it('re-lists after a successful install rather than assuming the row changed', async () => {
+it('re-reads the environment after a successful install rather than assuming', async () => {
 	// Assuming would show the version as installed even when the rescan did
 	// not find it — the exact case `detected` exists to report.
-	let listCalls = 0;
+	let calls = 0;
 	const s = new LanguagesStore({
-		listPhpRuntimes: async () => {
-			listCalls += 1;
-			return [row('8.4', listCalls > 1)];
+		phpEnvironment: async () => {
+			calls += 1;
+			return env([row('8.4', calls > 1)]);
 		},
+		rescanPhpRuntimes: async () => env([row('8.4', true)]),
 		installPhp: async () => ({ major: '8.4', exitCode: 0, detected: true })
 	});
 	await s.refresh();
-	expect(s.rows[0].installed).toBe(false);
+	expect(s.env?.runtimes[0].installed).toBe(false);
 	await s.install('8.4');
-	expect(listCalls).toBe(2);
-	expect(s.rows[0].installed).toBe(true);
+	expect(calls).toBe(2);
+	expect(s.env?.runtimes[0].installed).toBe(true);
 });
 ```
 
@@ -1336,26 +1362,39 @@ Expected: FAIL — cannot resolve `./languages.svelte`.
 
 - [ ] **Step 3: Implement the store**
 
-Follow `apps/desktop/src/lib/apply.svelte.ts` for shape: an injected API object, `$state` fields, an `errorMessage(e: unknown)` helper, and a re-entrancy guard **in the store** rather than only on the button's `disabled` attribute — deleting an attribute must leave a test failing. `install()` always re-lists on success.
+Follow `apps/desktop/src/lib/apply.svelte.ts` for shape: an injected API object, `$state` fields, an `errorMessage(e: unknown)` helper, and a re-entrancy guard **in the store** rather than only on a button's `disabled` attribute — deleting an attribute must leave a test failing. `install()` always re-reads the environment on success.
 
-- [ ] **Step 4: Write the failing component tests**
+- [ ] **Step 4: Write the failing row tests**
 
 `LanguageRow.svelte.test.ts`, SSR render-to-string in the style of `ApplyDialog.svelte.test.ts`:
 
 ```ts
-it('shows the full version and path when installed', () => {
-	const body = renderRow({ row: r('8.3', true, '8.3.14', '/opt/homebrew/opt/php@8.3/sbin/php-fpm') });
+it('shows the version, path and socket when installed', () => {
+	const body = renderRow({ row: r('8.3', true, { fullVersion: '8.3.14', path: '/opt/homebrew/opt/php@8.3/sbin/php-fpm', socketPath: '/Users/x/.openvhost/run/php-fpm-8.3.sock', serviceId: 'php-fpm-8.3' }) });
 	expect(body).toContain('8.3.14');
 	expect(body).toContain('/opt/homebrew/opt/php@8.3');
+	expect(body).toContain('php-fpm-8.3.sock');
 	expect(body).not.toContain('data-testid="install-8.3"');
 });
 
-it('offers an install button when not installed', () => {
-	const body = renderRow({ row: r('8.4', false) });
-	expect(body).toContain('data-testid="install-8.4"');
+it('offers start and stop for an installed version', () => {
+	// The install-to-running flow otherwise spans three pages.
+	const body = renderRow({ row: r('8.3', true, { serviceId: 'php-fpm-8.3' }), running: false });
+	expect(body).toContain('data-testid="start-php-fpm-8.3"');
 });
 
-it('disables the button while any install is running', () => {
+it('offers no lifecycle control for a version that is not installed', () => {
+	const body = renderRow({ row: r('8.4', false) });
+	expect(body).toContain('data-testid="install-8.4"');
+	expect(body).not.toMatch(/data-testid="(start|stop)-/);
+});
+
+it('marks the recommended version', () => {
+	expect(renderRow({ row: r('8.5', false, { recommended: true }) })).toMatch(/recommended/i);
+	expect(renderRow({ row: r('8.1', false, { recommended: false }) })).not.toMatch(/recommended/i);
+});
+
+it('disables the install button while any install is running', () => {
 	expect(renderRow({ row: r('8.4', false), installing: '8.3' })).toContain('disabled');
 	expect(renderRow({ row: r('8.4', false), installing: '' })).not.toContain('disabled');
 });
@@ -1363,10 +1402,7 @@ it('disables the button while any install is running', () => {
 it('says plainly when brew succeeded but the version was not found', () => {
 	// exitCode 0 with detected false. Without this the user presses Install
 	// again and again with nothing to explain the silence.
-	const body = renderRow({
-		row: r('8.4', false),
-		outcome: { major: '8.4', exitCode: 0, detected: false }
-	});
+	const body = renderRow({ row: r('8.4', false), outcome: { major: '8.4', exitCode: 0, detected: false } });
 	expect(body).toMatch(/could not find|was not found/i);
 	expect(body).not.toContain('data-testid="install-success-8.4"');
 });
@@ -1378,10 +1414,7 @@ it('keeps the failure output on screen with its line breaks', () => {
 });
 
 it('tells the user a pool still has to be created after a successful install', () => {
-	const body = renderRow({
-		row: r('8.4', true, '8.4.12'),
-		outcome: { major: '8.4', exitCode: 0, detected: true }
-	});
+	const body = renderRow({ row: r('8.4', true, { fullVersion: '8.4.12' }), outcome: { major: '8.4', exitCode: 0, detected: true } });
 	expect(body).toMatch(/apply/i);
 });
 ```
@@ -1393,48 +1426,120 @@ Expected: FAIL — component does not exist.
 
 - [ ] **Step 6: Build the components and the route**
 
-`LanguageRow.svelte` — props `{ row, installing, log, error, outcome, onInstall }`. Reuses `LogPane.svelte` (`{ logs: UiLog[] }`, where `UiLog` has `tsMs`, `level`, `line`) beneath the row that is installing. Never `{@html}` anywhere: brew's output is third-party text.
+`LanguageRow.svelte` — props `{ row, running, installing, log, error, outcome, onInstall, onStart, onStop }`. Reuses `LogPane.svelte` (`{ logs: UiLog[] }`, where `UiLog` has `tsMs`, `level`, `line`) beneath the row that is installing. **Never `{@html}`** — brew's output is third-party text.
 
-`routes/languages/+page.svelte` — constructs `LanguagesStore`, calls `refresh()` on mount, subscribes to the install-log event, and renders a page head in the style of `SitesPanel.svelte`'s.
+`routes/languages/+page.svelte` — constructs `LanguagesStore`, calls `refresh()` on mount, subscribes to the install-log event, and **groups rows under a "PHP" heading** even though PHP is the only language, so adding Node.js later is a new group rather than a redesign (spec §6). Start/stop read their running state from the existing services store rather than a second copy.
 
 `Rail.svelte` — a **Languages** nav item after Web Server, matching the existing enabled items (`<a>` with `href={resolve('/languages')}` and `aria-current`), not the `aria-disabled` placeholder style used for Logs and Settings.
 
-- [ ] **Step 7: Run the full frontend gate**
+- [ ] **Step 7: Run the frontend gate**
 
 ```bash
 pnpm -C apps/desktop test
 pnpm -C apps/desktop lint
 pnpm -C apps/desktop exec svelte-check
 ```
-Expected: PASS, 0 errors / 0 warnings.
 
 - [ ] **Step 8: Commit**
 
 ```bash
 git add apps/desktop/src
-git commit -s -m "feat(ui): a Languages page for installing PHP versions
+git commit -s -m "feat(ui): a Languages page for installing and running PHP versions
 
-Reports the case that matters: brew exiting 0 while the version still
-cannot be found, rather than showing nothing and inviting a retry."
+Grouped by language so a second runtime is a new group rather than a
+redesign, with start/stop on the row so install-to-running does not span
+three pages. Reports brew exiting 0 while the version still cannot be
+found, rather than showing nothing and inviting a retry."
 ```
 
 ---
 
-## Task 7: Offer the installed versions in the site editor
+## Task 7: The states a first-time machine actually lands in
+
+The page a user opens when they have never installed PHP — and quite possibly never installed Homebrew. Split from Task 6 because it is the state that decides whether a new user gets anywhere at all, and it deserves its own review rather than being the last thing squeezed into a big task.
 
 **Files:**
-- Modify: `apps/desktop/src/lib/sites.derive.ts`
-- Modify: `apps/desktop/src/lib/sites.derive.test.ts`
+- Create: `apps/desktop/src/lib/components/LanguagesEmpty.svelte` + `LanguagesEmpty.svelte.test.ts`
+- Modify: `apps/desktop/src/routes/languages/+page.svelte`
+
+**Interfaces:**
+- Consumes: `LanguagesStore.brewFound`, `.anyInstalled`, `.rescan()`, `env.brewSearched`.
+
+- [ ] **Step 1: Write the failing tests**
+
+```ts
+it('invites the user to install when brew is present and no PHP is', () => {
+	const body = render({ brewFound: true, anyInstalled: false });
+	expect(body).toContain('data-testid="languages-no-php"');
+	expect(body).toMatch(/install/i);
+	expect(body).not.toContain('data-testid="languages-no-brew"');
+});
+
+it('explains the dependency and how to satisfy it when brew is missing', () => {
+	// Otherwise the user came here to solve a problem and was handed a
+	// different one with no way forward.
+	const body = render({ brewFound: false, brewSearched: ['/opt/homebrew/bin/brew', '/usr/local/bin/brew'] });
+	expect(body).toContain('data-testid="languages-no-brew"');
+	expect(body).toContain('/opt/homebrew/bin/brew');
+	expect(body).toContain('brew.sh');
+	expect(body).toContain('data-testid="languages-check-again"');
+});
+
+it('offers the brew install command as copyable text, never as a button that runs it', () => {
+	// A curl | bash that asks for sudo is the machine owner's decision, and
+	// our spawned process has no tty to answer the prompt anyway.
+	const body = render({ brewFound: false, brewSearched: [] });
+	expect(body).toContain('/bin/bash -c');
+	expect(body).not.toMatch(/data-testid="install-homebrew"/);
+});
+
+it('shows neither empty state once a version is installed', () => {
+	const body = render({ brewFound: true, anyInstalled: true });
+	expect(body).not.toContain('data-testid="languages-no-php"');
+	expect(body).not.toContain('data-testid="languages-no-brew"');
+});
+```
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `pnpm -C apps/desktop test LanguagesEmpty`
+Expected: FAIL — component does not exist.
+
+- [ ] **Step 3: Build it**
+
+Three states, one component, chosen in this order: no brew → no PHP → neither. The no-brew state names every path that was searched (from `brewSearched`, not hardcoded), shows the official install command as selectable text, links to `https://brew.sh`, and offers **Check again**, which calls `rescan()`.
+
+**Do not add a button that runs Homebrew's installer.** State the reason in a comment so nobody adds one later as a convenience.
+
+- [ ] **Step 4: Gate and commit**
+
+```bash
+pnpm -C apps/desktop test && pnpm -C apps/desktop lint && pnpm -C apps/desktop exec svelte-check
+git add apps/desktop/src
+git commit -s -m "feat(ui): guide a machine that has no PHP — or no Homebrew
+
+A user who has never installed PHP has very likely never installed
+Homebrew either, and 'not found, here are the paths' is a dead end one
+level further up. Explains the dependency, offers the command to copy,
+and offers Check again so they need not relaunch the app."
+```
+
+---
+
+## Task 8: Offer the installed versions in the site editor
+
+**Files:**
+- Modify: `apps/desktop/src/lib/sites.derive.ts` + `sites.derive.test.ts`
 - Modify: `apps/desktop/src/lib/components/SiteDrawer.svelte`
 - Modify: `apps/desktop/src/routes/+page.svelte`
 
 **Interfaces:**
-- Consumes: `listPhpRuntimes()` from Task 5.
+- Consumes: `phpEnvironment()`.
 - Produces: `phpVersionOptions(current: string | undefined, installed: readonly string[])` — the existing function gains a second parameter.
 
 - [ ] **Step 1: Write the failing tests**
 
-`sites.derive.ts:33` currently holds `PHP_VERSIONS = ['8.4','8.3','8.2','8.1']`, a closed list unrelated to what is on the machine. Read the existing `phpVersionOptions` tests first and keep their intent — the "stored value stays selectable" behaviour must survive.
+`sites.derive.ts:33` holds `PHP_VERSIONS = ['8.4','8.3','8.2','8.1']`, a closed list unrelated to the machine. Read the existing `phpVersionOptions` tests first and keep their intent — the "stored value stays selectable" behaviour must survive.
 
 ```ts
 it('offers the versions actually installed', () => {
@@ -1461,48 +1566,127 @@ it('still offers something when nothing is installed', () => {
 	expect(opts.length).toBeGreaterThan(0);
 	expect(opts[0].value).toBe('8.3');
 });
+
+it('defaults a new site to the newest installed version', () => {
+	// A site that is broken before the user has touched anything is the
+	// second of the three mistakes in spec §5.0.
+	expect(defaultPhpVersion(['8.1', '8.3', '8.5'])).toBe('8.5');
+});
+
+it('has no default to offer when nothing is installed', () => {
+	expect(defaultPhpVersion([])).toBeUndefined();
+});
 ```
 
 - [ ] **Step 2: Run to verify failure**
 
 Run: `pnpm -C apps/desktop test sites.derive`
-Expected: FAIL — `phpVersionOptions` takes one argument.
+Expected: FAIL — `phpVersionOptions` takes one argument, `defaultPhpVersion` does not exist.
 
 - [ ] **Step 3: Implement**
 
-Change `phpVersionOptions` to take the installed list, keep the prepend-the-stored-value behaviour and its explanatory comment, and delete `PHP_VERSIONS` if nothing else imports it (`grep -rn "PHP_VERSIONS" apps/desktop/src`). If something does, leave it and say what in your report.
+Change `phpVersionOptions` to take the installed list, keep the prepend-the-stored-value behaviour and its explanatory comment, and add `defaultPhpVersion(installed)`. Delete `PHP_VERSIONS` if nothing else imports it (`grep -rn "PHP_VERSIONS" apps/desktop/src`); if something does, leave it and say what in your report.
 
-Thread the installed list from `+page.svelte` (which can call `listPhpRuntimes()` alongside its existing loads) into `SiteDrawer.svelte` as a prop.
+Thread the installed list from `+page.svelte` (which can call `phpEnvironment()` alongside its existing loads) into `SiteDrawer.svelte` as a prop, and use `defaultPhpVersion` for a new site instead of `PHP_VERSIONS[0]`.
 
-- [ ] **Step 4: Run the frontend gate**
+With nothing installed, the drawer says so and links to Languages rather than presenting an empty `<select>` above a Save button that cannot lead anywhere.
 
-```bash
-pnpm -C apps/desktop test
-pnpm -C apps/desktop lint
-pnpm -C apps/desktop exec svelte-check
-```
-Expected: PASS.
-
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Gate and commit**
 
 ```bash
+pnpm -C apps/desktop test && pnpm -C apps/desktop lint && pnpm -C apps/desktop exec svelte-check
 git add apps/desktop/src
 git commit -s -m "feat(ui): offer the installed PHP versions in the site editor
 
-The list was a hard-coded constant that had nothing to do with what was
-on the machine, so a site could be pointed at a version Apply would then
-refuse."
+The list was a hard-coded constant unrelated to the machine, and a new
+site defaulted into it — so a site could be born pointing at a version
+Apply would then refuse."
+```
+
+---
+
+## Task 9: A way out when a site's PHP version is missing
+
+Prevention cannot be complete: a user can `brew uninstall php@8.3` at any time and strand a site that worked yesterday. This is the recovery path.
+
+**Files:**
+- Modify: `apps/desktop/src/routes/+page.svelte`
+- Modify: `apps/desktop/src/lib/components/SiteListRow.svelte` + its test
+- Create/modify: the apply-error banner markup and its test
+
+**Interfaces:**
+- Consumes: `phpEnvironment()` for the installed list; the existing `applyStore.error`.
+
+- [ ] **Step 1: Write the failing tests**
+
+```ts
+it('warns on the row when a site wants a version that is not installed', () => {
+	// Visible when the site is created, rather than as a surprise at Apply.
+	const body = renderRow({ site: site({ phpVersion: '8.4' }), installed: ['8.5'] });
+	expect(body).toContain('data-testid="php-missing"');
+	expect(body).toContain('8.4');
+});
+
+it('does not warn when the version is installed', () => {
+	const body = renderRow({ site: site({ phpVersion: '8.5' }), installed: ['8.5'] });
+	expect(body).not.toContain('data-testid="php-missing"');
+});
+
+it('offers both ways out of a missing-runtime failure', () => {
+	// Stating the problem without an exit is what left the user stuck.
+	const body = renderBanner({
+		error: 'site hello needs PHP 8.4, which is not installed (installed: 8.5)',
+		missing: { site: 'hello', requested: '8.4' }
+	});
+	expect(body).toContain('data-testid="go-install-8.4"');
+	expect(body).toContain('data-testid="edit-site-hello"');
+});
+
+it('shows no actions for a failure that is not about a missing runtime', () => {
+	// A nginx -t syntax error has no "install this" remedy; offering one
+	// would be worse than offering nothing.
+	const body = renderBanner({ error: 'nginx: [emerg] unknown directive', missing: null });
+	expect(body).not.toMatch(/data-testid="go-install-/);
+});
+```
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `pnpm -C apps/desktop test SiteListRow`
+Expected: FAIL — no such testid.
+
+- [ ] **Step 3: Implement**
+
+The row badge compares the site's `phpVersion` against the installed list threaded from `+page.svelte`.
+
+For the banner, the frontend must know *whether* the failure was a missing runtime and *which* version. Do not parse the message string — that is a contract nobody agreed to. Either add a structured field to the error DTO in `commands.rs` (`missingRuntime: { site, requested } | null`) or derive it in the frontend by comparing the site list against the installed list before calling apply. **Pick one, and say which and why in your report** — the structured field is more honest but touches the Rust surface again.
+
+`Install PHP 8.4` navigates to `/languages`; `Edit hello` opens that site's drawer.
+
+- [ ] **Step 4: Gate and commit**
+
+```bash
+pnpm -C apps/desktop test && pnpm -C apps/desktop lint && pnpm -C apps/desktop exec svelte-check
+git add apps/desktop/src
+git commit -s -m "feat(ui): offer a way out when a site's PHP version is missing
+
+The banner stated the problem and offered nothing to press, which is how
+a user ended up with a site that could never apply. Now it offers the two
+actions that resolve it, and the row warns before Apply rather than after."
 ```
 
 ---
 
 ## Definition of Done
 
-- [ ] The Languages page lists every catalogue version plus anything installed outside it, with the installed ones showing their full version and path.
-- [ ] Pressing Install streams brew's output live and finishes with the version installed.
+- [ ] A machine with no PHP shows an invitation to install one, not an inventory of things it lacks.
+- [ ] A machine with no Homebrew is told what OpenVHost needs, given the command, and can press **Check again** without relaunching.
+- [ ] The Languages page lists every catalogue version plus anything installed outside it, marks one as recommended, and shows the full version, path and socket for installed ones.
+- [ ] Pressing Install streams brew's output live and finishes with the version installed and its pool startable from the same row.
 - [ ] A second install cannot start while one is running.
 - [ ] brew exiting 0 without the version appearing is reported in words, not by showing nothing.
-- [ ] A newly installed version appears in the site editor, and the Sites banner offers the pool as a pending change.
+- [ ] A newly installed version appears in the site editor without relaunching, and the Sites banner offers the pool as a pending change.
+- [ ] A new site defaults to an installed version; a site pointing at a missing one is flagged in its row and offers both ways out from the failure banner.
 - [ ] A site can be set to a newly installed version and served by it while another site uses a different one.
 - [ ] `--build-from-source`, `9.9` and `nginx` are all rejected at the IPC boundary naming `php_version`.
 - [ ] security-auditor APPROVE recorded on the branch.

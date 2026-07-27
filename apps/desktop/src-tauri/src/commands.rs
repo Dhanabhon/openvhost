@@ -3,6 +3,7 @@
 //! (business logic never lives here; master plan §5).
 
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 
 // `WebServerAdapter` is imported for its `supports_hot_reload` method: it is a
 // trait method, so the trait must be in scope even though the call site names
@@ -63,6 +64,7 @@ pub fn core_info(simulate_error: Option<bool>) -> Result<CoreInfo, IpcError> {
 use std::sync::Arc;
 
 use openvhost_proc::{LogLevel, LogLine, ProcError, ServiceState, ServiceStatus, Supervisor};
+use tauri_specta::Event;
 
 impl From<ProcError> for IpcError {
     fn from(e: ProcError) -> Self {
@@ -436,6 +438,32 @@ pub async fn open_site(
         })
 }
 
+/// Open Homebrew's install page in the user's browser.
+///
+/// Zero parameters, and the URL is a Rust literal: the webview cannot choose
+/// where this goes. Same reasoning as `open_site` above — granting the
+/// renderer a general "open any URL" primitive is the thing being avoided,
+/// not the act of opening a URL. No capability grant is added to
+/// `capabilities/default.json` for the same reason `open_site` needs none:
+/// this calls the plugin's Rust API, not its JS path, so the ACL (which
+/// gates the JS-to-plugin path) has nothing to do with it.
+///
+/// This exists because a plain `<a target="_blank">` is inert in this
+/// webview: Tauri only handles a new-window request when the app registers
+/// `.on_new_window(...)` on the webview builder, which this app does not, so
+/// WebKit's `WKUIDelegate` is told not to create a window and the click
+/// silently does nothing — no tab, no error, no console warning.
+#[tauri::command]
+#[specta::specta]
+pub async fn open_homebrew_site(app: tauri::AppHandle) -> Result<(), IpcError> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url("https://brew.sh", None::<&str>)
+        .map_err(|e| IpcError::Core {
+            message: e.to_string(),
+        })
+}
+
 /// `http://<domain>:<LISTEN_PORT>`. Extracted so the one thing worth pinning —
 /// that the scheme is fixed and prepended, never taken from the stored value —
 /// is testable without a live `AppHandle` and a real database.
@@ -555,10 +583,19 @@ async fn apply_input(
 #[specta::specta]
 pub async fn plan_site_apply(
     db: tauri::State<'_, Db>,
-    runtimes: tauri::State<'_, Option<InstalledRuntimes>>,
+    runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
     paths: tauri::State<'_, Option<StackPaths>>,
 ) -> Result<ApplyPlanDto, IpcError> {
-    let input = apply_input(db.inner(), runtimes.inner(), paths.inner()).await?;
+    // Clone out of the guard and drop it before the `.await` below: holding a
+    // `std::sync::RwLockReadGuard` across an await point makes this command's
+    // future non-`Send`, which fails to compile.
+    let runtimes = runtimes
+        .read()
+        .map_err(|_| IpcError::Core {
+            message: "runtime list is poisoned".into(),
+        })?
+        .clone();
+    let input = apply_input(db.inner(), &runtimes, paths.inner()).await?;
     let p = openvhost_core::plan(&input)?;
     Ok(ApplyPlanDto {
         changes: p
@@ -581,7 +618,7 @@ pub async fn plan_site_apply(
 #[specta::specta]
 pub async fn apply_sites(
     db: tauri::State<'_, Db>,
-    runtimes: tauri::State<'_, Option<InstalledRuntimes>>,
+    runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
     paths: tauri::State<'_, Option<StackPaths>>,
     sup: tauri::State<'_, Arc<Supervisor>>,
     lock: tauri::State<'_, ApplyLock>,
@@ -596,7 +633,17 @@ pub async fn apply_sites(
     // and out of scope here.
     let _apply_guard = lock.inner().0.lock().await;
 
-    let input = apply_input(db.inner(), runtimes.inner(), paths.inner()).await?;
+    // Clone out of the guard and drop it before the `.await` below: holding a
+    // `std::sync::RwLockReadGuard` across an await point makes this command's
+    // future non-`Send`, which fails to compile.
+    let runtimes = runtimes
+        .read()
+        .map_err(|_| IpcError::Core {
+            message: "runtime list is poisoned".into(),
+        })?
+        .clone();
+
+    let input = apply_input(db.inner(), &runtimes, paths.inner()).await?;
     let Some(stack) = paths.inner().as_ref() else {
         return Err(IpcError::Core {
             message: "no web server stack is configured for this platform".into(),
@@ -1064,6 +1111,829 @@ pub async fn validate_web_server_config(
         ok: report.ok,
         stderr: report.stderr,
     })
+}
+
+// ---------------------------------------------------------------------------
+// PHP versions (Languages page)
+// ---------------------------------------------------------------------------
+
+/// One row on the Languages page: a catalogue version (installed or not), or
+/// an installed version outside the catalogue (spec §6.1's "still listed"
+/// requirement — an install made by hand, or one a later catalogue drops,
+/// must not vanish from the page while it keeps serving sites).
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PhpRuntimeDto {
+    pub major: String,
+    pub installed: bool,
+    pub recommended: bool,
+    /// A more precise version string than `major` (e.g. a patch level), when
+    /// one is known. `None` does NOT mean anything is wrong with this row —
+    /// it means we do not know the patch level. The only prober we have,
+    /// `openvhost_conf::probe_php_fpm_version`, returns `major.minor` and
+    /// never a patch level, so today this is `None` for every row. Echoing
+    /// `major` back into this field instead would render "8.3" twice next to
+    /// each other and imply a patch level was fetched when it was not.
+    pub full_version: Option<String>,
+    pub path: Option<String>,
+    /// Where this version's pool listens. `None` until installed.
+    pub socket_path: Option<String>,
+    /// The supervisor id for this version's pool, so the UI can drive
+    /// start/stop from the row without inventing the id itself.
+    pub service_id: Option<String>,
+}
+
+/// What the Languages page needs to decide which of the three states to show
+/// (spec §6.1). `brew_found` false means the page must guide, not list.
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PhpEnvironmentDto {
+    pub brew_found: bool,
+    pub brew_searched: Vec<String>,
+    pub runtimes: Vec<PhpRuntimeDto>,
+}
+
+/// The outcome of an `install_php` call. `detected: false` alongside
+/// `exit_code: Some(0)` is the case that matters most: brew reporting success
+/// while no `php-fpm` appears afterwards is the silent-failure class this
+/// project keeps catching, so the DTO carries it explicitly rather than
+/// leaving the UI to infer it from an empty rescan.
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallOutcomeDto {
+    pub major: String,
+    pub exit_code: Option<i32>,
+    pub detected: bool,
+}
+
+/// One line of `brew install`'s output, forwarded live while an install runs.
+/// Same shape and reasoning as [`ServiceLogEvent`] — see its declaration —
+/// except `major` names which install this line belongs to, and `stream` is
+/// a plain "stdout"/"stderr" string rather than `LogLevel`: brew's output has
+/// no severity for the supervisor's classifier to assign, only a stream.
+#[derive(Debug, Clone, serde::Serialize, specta::Type, tauri_specta::Event)]
+#[serde(rename_all = "camelCase")]
+pub struct PhpInstallLogEvent {
+    pub major: String,
+    pub ts_ms: u64,
+    pub stream: String,
+    pub line: String,
+}
+
+/// Milliseconds since the epoch, for [`PhpInstallLogEvent::ts_ms`].
+/// `openvhost_proc` has an identical helper, but it is `pub(crate)` there —
+/// this command builds its own event rather than relaying one off the
+/// supervisor's broadcast, so it needs its own clock read.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Build one row per catalogue entry, in catalogue order, plus one row for
+/// every installed runtime that falls outside the catalogue. Pure and
+/// Tauri-free so the row-building logic is testable without a live
+/// `AppHandle` or a real supervisor.
+///
+/// `full_versions` maps a major to a more precise string (e.g. a patch
+/// level) the page can show next to it, when one is actually known. In
+/// production this is empty: the only prober we have,
+/// `openvhost_conf::probe_php_fpm_version`, returns `major.minor` and never
+/// a patch level, so there is nothing more precise to hand in today — and
+/// echoing `major` back in as if it were that string would render "8.3"
+/// twice and imply a patch level had been fetched when it had not. Wiring a
+/// true patch-level prober is future work; keeping this a separate parameter
+/// means that upgrade will not have to touch this function's callers beyond
+/// what they pass in.
+fn php_rows(
+    home: &Path,
+    installed: &[openvhost_core::PhpRuntime],
+    full_versions: &[(&str, &str)],
+) -> Vec<PhpRuntimeDto> {
+    let newest = openvhost_core::CATALOGUE.last().copied();
+    let build = |major: &str, found: Option<&openvhost_core::PhpRuntime>| {
+        let spec = found.map(|rt| crate::stack::php_fpm_spec(home, rt));
+        PhpRuntimeDto {
+            major: major.to_string(),
+            installed: found.is_some(),
+            recommended: Some(major) == newest,
+            full_version: found.and_then(|_| {
+                full_versions
+                    .iter()
+                    .find(|(m, _)| *m == major)
+                    .map(|(_, v)| (*v).to_string())
+            }),
+            path: found.map(|rt| rt.fpm_bin.display().to_string()),
+            socket_path: spec.as_ref().and_then(|s| s.endpoint.clone()),
+            service_id: spec.map(|s| s.id),
+        }
+    };
+
+    let mut rows: Vec<PhpRuntimeDto> = openvhost_core::CATALOGUE
+        .iter()
+        .map(|major| build(major, installed.iter().find(|rt| rt.major == *major)))
+        .collect();
+
+    for rt in installed {
+        if !openvhost_core::CATALOGUE.contains(&rt.major.as_str()) {
+            rows.push(build(&rt.major, Some(rt)));
+        }
+    }
+
+    rows
+}
+
+/// Probe every known Homebrew prefix for installed PHP runtimes.
+///
+/// `openvhost_core::discover_php_in` takes a SYNCHRONOUS probe closure, but
+/// `openvhost_conf::probe_php_fpm_version` is async. Resolved by running the
+/// whole directory walk on `spawn_blocking` and calling the async prober via
+/// `Handle::block_on` from INSIDE that blocking closure: `spawn_blocking`
+/// hands the closure its own blocking-pool thread, not one of the async
+/// worker threads, so blocking there to wait on a future cannot deadlock the
+/// runtime the way calling `block_on` directly inside an async command would.
+///
+/// The other option the task allowed — pre-building a `path -> version` map
+/// by probing candidates asynchronously first, then handing `discover_php_in`
+/// a closure that only reads that map — was passed over because the set of
+/// candidate paths is exactly what `discover_php_in`'s own (private)
+/// directory walk already computes. Re-deriving that candidate list here
+/// first would duplicate discovery logic that already exists and is already
+/// tested, which is the kind of copy-paste drift the project's own
+/// coding-style rules warn against; this approach reuses `discover_php_in`
+/// untouched instead.
+async fn discover_all_php() -> Result<Vec<openvhost_core::PhpRuntime>, IpcError> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let handle = tokio::runtime::Handle::current();
+        let prefixes: Vec<&Path> = openvhost_core::BREW_PREFIXES
+            .iter()
+            .map(Path::new)
+            .collect();
+        openvhost_core::discover_php_in(&prefixes, &|bin| {
+            handle.block_on(openvhost_conf::probe_php_fpm_version(bin))
+        })
+    })
+    .await
+    .map_err(|e| IpcError::Core {
+        message: format!("the PHP discovery task failed to run: {e}"),
+    })
+}
+
+/// Which majors in `found` were not already in `before` — the ones a rescan
+/// should hand to `Supervisor::register`.
+///
+/// Extracted so the "which majors are new" decision is a pure function,
+/// testable without a `Supervisor`. It matters because `Supervisor::register`
+/// only no-ops against a `Starting`/`Running` entry — a `Failed { exit,
+/// stderr_tail }` row, or a `Stopped` one with accumulated log lines, is
+/// REPLACED, which wipes that row's `RingBuffer`, its `stderr_tail` and its
+/// exit code. That is real diagnostic state, readable through
+/// `service_log_tail`, not bookkeeping: it is the answer to "why did this
+/// pool fail to start" for a bystander PHP version that had nothing to do
+/// with whatever prompted this rescan. So only a major that is genuinely new
+/// gets registered; one already known, in whatever state, is left alone.
+///
+/// A major present in `before` but missing from `found` (uninstalled outside
+/// the app) is likewise not returned here — there is no `Supervisor`
+/// unregister, and a row pointing at a now-missing binary simply fails
+/// honestly the next time it is started.
+fn newly_installed_majors(before: &[String], found: &[String]) -> Vec<String> {
+    found
+        .iter()
+        .filter(|major| !before.contains(major))
+        .cloned()
+        .collect()
+}
+
+/// Probe for installed PHP runtimes, write the result into the managed
+/// `RwLock`, and register a supervisor row for every NEWLY discovered major.
+///
+/// Only new majors are registered — see `newly_installed_majors` for why
+/// re-registering an already-known major (even an unchanged one) is not
+/// idempotent in the way it looks: it can silently erase a `Failed` row's
+/// stderr and exit code.
+///
+/// Shared by `rescan_php_runtimes` and `install_php` so the two commands
+/// cannot register two different service shapes for the same version.
+async fn rescan_into_state(
+    runtimes: &RwLock<Option<InstalledRuntimes>>,
+    sup: &Supervisor,
+    paths: &StackPaths,
+) -> Result<Vec<openvhost_core::PhpRuntime>, IpcError> {
+    let before: Vec<String> = runtimes
+        .read()
+        .map_err(|_| IpcError::Core {
+            message: "runtime list is poisoned".into(),
+        })?
+        .as_ref()
+        .map(|r| r.php.iter().map(|rt| rt.major.clone()).collect())
+        .unwrap_or_default();
+
+    let php = discover_all_php().await?;
+    let found: Vec<String> = php.iter().map(|rt| rt.major.clone()).collect();
+    let new_majors = newly_installed_majors(&before, &found);
+
+    // State write BEFORE the supervisor registration below. `apply_sites` and
+    // `plan_site_apply` read the `RwLock`, not the supervisor's row set, to
+    // decide which PHP versions exist — so registering a row first would open
+    // a window where `php-fpm-8.4` is visible and startable in the Services
+    // panel while the apply pipeline still answers `MissingRuntime` for 8.4,
+    // because the state write had not landed yet.
+    *runtimes.write().map_err(|_| IpcError::Core {
+        message: "runtime list is poisoned".into(),
+    })? = Some(InstalledRuntimes {
+        nginx_bin: paths.nginx_bin.clone(),
+        php: php.clone(),
+    });
+
+    for major in new_majors {
+        if let Some(rt) = php.iter().find(|rt| rt.major == major) {
+            sup.register(crate::stack::php_fpm_spec(&paths.home, rt));
+        }
+    }
+
+    Ok(php)
+}
+
+/// `openvhost_core::BREW_PREFIXES` joined with `bin/brew`, so the UI can say
+/// exactly where Homebrew was looked for.
+fn brew_searched_paths() -> Vec<String> {
+    openvhost_core::BREW_PREFIXES
+        .iter()
+        .map(|prefix| Path::new(prefix).join("bin/brew").display().to_string())
+        .collect()
+}
+
+/// Read-only environment summary for the Languages page: whether Homebrew was
+/// found, where it looked, and one row per PHP version (spec §6.1).
+///
+/// Deliberately spawns NOTHING — it reads the managed `RwLock` and calls
+/// `find_brew()` (a filesystem check, not a process). It is called on page
+/// mount and after every install, and the discipline that keeps
+/// `plan_site_apply` cheap (Task 4's managed `RwLock`, read then cloned and
+/// dropped before anything else runs) applies here too. `rescan_php_runtimes`
+/// is the one that actually probes.
+#[tauri::command]
+#[specta::specta]
+pub async fn php_environment(
+    runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
+    paths: tauri::State<'_, Option<StackPaths>>,
+) -> Result<PhpEnvironmentDto, IpcError> {
+    let p = stack_paths(&paths)?;
+    let installed = runtimes
+        .read()
+        .map_err(|_| IpcError::Core {
+            message: "runtime list is poisoned".into(),
+        })?
+        .as_ref()
+        .map(|r| r.php.clone())
+        .unwrap_or_default();
+    // See `php_rows`'s doc comment: there is no patch-level prober yet, so
+    // there is nothing more precise than `major` to hand in here. An empty
+    // map, not a `(major, major)` echo — `full_version` must read as
+    // "unknown", not as a copy of `major`.
+    Ok(PhpEnvironmentDto {
+        brew_found: openvhost_core::find_brew().is_some(),
+        brew_searched: brew_searched_paths(),
+        runtimes: php_rows(&p.home, &installed, &[]),
+    })
+}
+
+/// The explicit, user-initiated re-probe behind Languages' "Check again"
+/// button: the user left to install Homebrew (or a PHP version) in a
+/// terminal and came back. Unlike `php_environment`, this DOES spawn — once
+/// per candidate binary, to read its version — so it is never called
+/// implicitly.
+///
+/// Takes `InstallLock` — the same lock `install_php` holds for its whole
+/// run — across the entire `rescan_into_state` call. Without it, a rescan is
+/// a read-modify-write over the managed `RwLock` with nothing serializing it
+/// against a concurrent install: the rescan can read the OLD set, block on
+/// probing every candidate binary, and only write its (now stale) result
+/// back AFTER an in-flight install finished and wrote the new one — silently
+/// reverting a completed install. `install_php` still returns
+/// `detected: true` for that install, so the row would say "Installed" while
+/// the apply pipeline no longer knows the version exists.
+#[tauri::command]
+#[specta::specta]
+pub async fn rescan_php_runtimes(
+    runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
+    paths: tauri::State<'_, Option<StackPaths>>,
+    sup: tauri::State<'_, Arc<Supervisor>>,
+    lock: tauri::State<'_, InstallLock>,
+) -> Result<PhpEnvironmentDto, IpcError> {
+    let p = stack_paths(&paths)?;
+    // Blocks until any in-flight install has finished, rather than
+    // `try_lock`-and-refuse like `install_php` does: a rescan is cheap and
+    // idempotent, so waiting behind an install and then reading the
+    // now-current state is correct, not merely tolerable — refusing it
+    // outright would trade a wrong answer for no answer.
+    let _guard = lock.inner().guard.lock().await;
+    let installed = rescan_into_state(runtimes.inner(), sup.inner(), p).await?;
+    // See `php_rows`'s doc comment: there is no patch-level prober yet, so
+    // there is nothing more precise than `major` to hand in here. An empty
+    // map, not a `(major, major)` echo — `full_version` must read as
+    // "unknown", not as a copy of `major`.
+    Ok(PhpEnvironmentDto {
+        brew_found: openvhost_core::find_brew().is_some(),
+        brew_searched: brew_searched_paths(),
+        runtimes: php_rows(&p.home, &installed, &[]),
+    })
+}
+
+/// Serializes `install_php`: only one brew install runs at a time. The
+/// call site uses `try_lock`, not `lock` — a second press while an install is
+/// running should be refused with an explanation, not silently queued behind
+/// a build that can take twenty minutes. Mirrors `ApplyLock`'s shape.
+///
+/// Also holds the one thing `perform_quit` needs to make the C1 audit finding
+/// stop being true: the in-flight run's `AbortHandle` (see `running`). The
+/// containment `openvhost_proc::run_task` provides — killing brew's whole
+/// process group — is `KillOnDrop`, which only fires when the run's future is
+/// actually DROPPED. Before this, nothing in production ever dropped it:
+/// `install_php` awaited `run_task` inline, so the future lived exactly as
+/// long as the command handler did, and quitting mid-install went straight to
+/// `window.destroy()` and then `process::exit` with no unwinding at all. Now
+/// `install_php` spawns the run so it has a handle to abort, and `perform_quit`
+/// aborts-and-waits on it BEFORE destroying the window — see `quit.rs`.
+#[derive(Default)]
+pub struct InstallLock {
+    pub(crate) guard: tokio::sync::Mutex<()>,
+    running: std::sync::Mutex<Option<RunningInstall>>,
+}
+
+/// The major and abort handle of the one install `install_php` may have in
+/// flight, so `perform_quit` can both abort it and tell the user what major
+/// they are about to lose.
+struct RunningInstall {
+    major: String,
+    abort: tokio::task::AbortHandle,
+}
+
+impl InstallLock {
+    /// `pub(crate)`, not private: the C1 regression test drives this directly
+    /// to reproduce what `install_php` does — spawn a run, record its abort
+    /// handle — without going through the full IPC command.
+    pub(crate) fn set_running(&self, major: String, abort: tokio::task::AbortHandle) {
+        let mut slot = self
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(RunningInstall { major, abort });
+    }
+
+    fn clear_running(&self) {
+        let mut slot = self
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = None;
+    }
+
+    /// The major currently installing, if any — the quit dialog's copy reads
+    /// this through the `pending_php_install` command.
+    pub(crate) fn running_major(&self) -> Option<String> {
+        self.running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|r| r.major.clone())
+    }
+
+    /// A clone of the in-flight run's abort handle, if any. `AbortHandle` is
+    /// cheap to clone (it is a handle, not the task), so `perform_quit` can
+    /// hold its own copy and call `.abort()`/`.is_finished()` on it without
+    /// disturbing whatever `install_php` itself is doing with the run.
+    pub(crate) fn running_abort_handle(&self) -> Option<tokio::task::AbortHandle> {
+        self.running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|r| r.abort.clone())
+    }
+}
+
+/// Clears `InstallLock`'s running slot when dropped, no matter which of
+/// `install_php`'s several return points (normal completion, a `?` on a
+/// failed rescan, an aborted/panicked task) is the one that fires. Mirrors
+/// `openvhost_proc::task::KillOnDrop`'s own reasoning: a fallible sequence of
+/// early returns is exactly the shape where "remember to clear this" rots the
+/// first time a new early return is added, so the guarantee is a `Drop` impl
+/// instead of a set of matching calls scattered through the function body.
+///
+/// A2 audit finding: also owns the run's own `AbortHandle` and aborts it on
+/// drop, rather than only clearing the slot. There is no live bug today —
+/// Tauri never cancels a command's future on its own, which is exactly why
+/// `perform_quit` needs its own explicit abort-before-`window.destroy()` call
+/// (see `install_php`'s doc comment and `quit.rs`) — but a bare `clear_running`
+/// here inverted the OLD failure mode instead of merely lacking a new one.
+/// Before this branch, dropping the command future killed brew via
+/// `run_task`'s `KillOnDrop` because nothing spawned it — the future WAS the
+/// run. After `install_php` started spawning the run (the C1 fix), the
+/// spawned task keeps executing independent of this guard; if this guard were
+/// ever dropped WITHOUT `install_task.await` above having already run it to
+/// completion (a `?` on an early return added later, a panic unwinding
+/// through this scope), the task would leak — AND the slot `perform_quit`
+/// reads to find something to abort would already be empty, so quit would no
+/// longer find it either. Aborting here closes both: `AbortHandle::abort` is
+/// a no-op on an already-finished task, so this costs nothing on the normal
+/// path where `install_task.await` already completed it.
+struct RunningInstallGuard<'a> {
+    lock: &'a InstallLock,
+    abort: tokio::task::AbortHandle,
+}
+
+impl Drop for RunningInstallGuard<'_> {
+    fn drop(&mut self) {
+        self.abort.abort();
+        self.lock.clear_running();
+    }
+}
+
+/// The major currently installing, if any — for the quit dialog: a build in
+/// progress is invisible to `pending_service_ids` (it is not a supervised
+/// service), so without this the confirmation would silently discard it.
+#[tauri::command]
+#[specta::specta]
+pub async fn pending_php_install(
+    lock: tauri::State<'_, InstallLock>,
+) -> Result<Option<String>, IpcError> {
+    Ok(lock.inner().running_major())
+}
+
+/// Install a PHP major via Homebrew, streaming its output live, then rescan
+/// so the freshly installed version (if it appears) gets a supervisor row.
+///
+/// Every argument that reaches `brew`'s argv is validated or derived from
+/// managed state before this function does anything observable: `major` is
+/// parsed and checked against the catalogue allowlist, `brew` is located by
+/// absolute path (never `PATH`), and `brew_install_spec` itself refuses a
+/// non-absolute `brew` path.
+#[tauri::command]
+#[specta::specta]
+pub async fn install_php(
+    app: tauri::AppHandle,
+    major: String,
+    runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
+    paths: tauri::State<'_, Option<StackPaths>>,
+    sup: tauri::State<'_, Arc<Supervisor>>,
+    lock: tauri::State<'_, InstallLock>,
+) -> Result<InstallOutcomeDto, IpcError> {
+    // Both guard layers, before anything else happens.
+    let major = openvhost_core::PhpMajor::parse(&major)?;
+
+    // One at a time. `try_lock` rather than `lock`: a second press should be
+    // refused with an explanation, not silently queued behind a 20-minute
+    // build.
+    let Ok(_guard) = lock.inner().guard.try_lock() else {
+        return Err(IpcError::Core {
+            message: "an install is already running".into(),
+        });
+    };
+
+    let p = stack_paths(&paths)?;
+
+    let before: Vec<String> = runtimes
+        .read()
+        .map_err(|_| IpcError::Core {
+            message: "runtime list is poisoned".into(),
+        })?
+        .as_ref()
+        .map(|r| r.php.iter().map(|rt| rt.major.clone()).collect())
+        .unwrap_or_default();
+
+    if before.iter().any(|m| m == major.as_str()) {
+        return Err(IpcError::Core {
+            message: format!("PHP {} is already installed", major.as_str()),
+        });
+    }
+
+    let brew = openvhost_core::find_brew().ok_or_else(|| IpcError::Core {
+        message: format!(
+            "Homebrew was not found. Looked for bin/brew under: {}",
+            openvhost_core::BREW_PREFIXES.join(", ")
+        ),
+    })?;
+
+    // Returns Result: it refuses a non-absolute brew path, because composing
+    // PATH from one yields an empty leading component and exec resolves that
+    // as the working directory.
+    let spec = openvhost_core::brew_install_spec(&brew, &major)?;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+
+    // Forward brew's output as it arrives, so a long install is visibly
+    // working rather than apparently hung.
+    let emitter = app.clone();
+    let for_event = major.as_str().to_string();
+    let pump = tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            if let openvhost_proc::TaskEvent::Line { stream, text } = ev {
+                let _ = PhpInstallLogEvent {
+                    major: for_event.clone(),
+                    ts_ms: now_ms(),
+                    stream: match stream {
+                        openvhost_proc::TaskStream::Stdout => "stdout".into(),
+                        openvhost_proc::TaskStream::Stderr => "stderr".into(),
+                    },
+                    line: text,
+                }
+                .emit(&emitter);
+            }
+        }
+    });
+
+    // Spawned rather than awaited inline — the C1 audit fix. Awaiting
+    // `run_task` directly (as this used to) makes ITS future identical to
+    // this command handler's own future, and Tauri never cancels an
+    // in-flight command: a quit mid-install would go straight from
+    // `window.destroy()` to `process::exit`, and `run_task`'s `KillOnDrop`
+    // containment — the whole reason a one-shot task runner exists instead of
+    // a bare `Command::spawn` — would never fire. Spawning gives an
+    // `AbortHandle`, stashed on `InstallLock` for `perform_quit` to use
+    // BEFORE the window goes away, so aborting here genuinely drops the
+    // future and runs `KillOnDrop` for real.
+    let install_task = tokio::spawn(openvhost_proc::run_task(
+        openvhost_proc::default_driver(),
+        spec,
+        tx,
+    ));
+    let abort_handle = install_task.abort_handle();
+    lock.inner()
+        .set_running(major.as_str().to_string(), abort_handle.clone());
+    // Cleared AND aborted on every return path below via `Drop`, including
+    // the two `?`s still to come — see `RunningInstallGuard`'s doc comment
+    // for why that is a `Drop` impl and not a matching call at each return
+    // point, and why it aborts rather than merely clearing the slot.
+    let _running_guard = RunningInstallGuard {
+        lock: lock.inner(),
+        abort: abort_handle,
+    };
+
+    let exit_code = match install_task.await {
+        Ok(result) => result?,
+        // Aborted by `perform_quit`: the task's future was genuinely dropped
+        // (so `KillOnDrop` ran and brew's process group is gone), and this
+        // command has nothing left to report but that it did not finish.
+        Err(join_err) if join_err.is_cancelled() => {
+            return Err(IpcError::Proc {
+                message: "the install was aborted because the app is quitting".into(),
+            });
+        }
+        // Any other join failure (a panic inside `run_task`) is not this
+        // command's fault to hide.
+        Err(join_err) => {
+            return Err(IpcError::Proc {
+                message: format!("the install task ended unexpectedly: {join_err}"),
+            });
+        }
+    };
+    let _ = pump.await;
+
+    // Rescan even on a non-zero exit: brew can fail late having already
+    // linked the formula, and the truth is on disk either way.
+    let found = rescan_into_state(runtimes.inner(), sup.inner(), p).await?;
+    let detected = found.iter().any(|r| r.major == major.as_str());
+
+    Ok(InstallOutcomeDto {
+        major: major.as_str().to_string(),
+        exit_code,
+        detected,
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod php_ipc_tests {
+    use tauri::Manager;
+
+    use super::*;
+
+    #[test]
+    fn every_catalogue_entry_is_listed_with_its_installed_state() {
+        let installed = vec![openvhost_core::PhpRuntime {
+            major: "8.3".into(),
+            fpm_bin: PathBuf::from("/opt/homebrew/opt/php@8.3/sbin/php-fpm"),
+        }];
+        let rows = php_rows(Path::new("/tmp/ovh"), &installed, &[("8.3", "8.3.14")]);
+        assert_eq!(rows.len(), openvhost_core::CATALOGUE.len());
+        let three = rows.iter().find(|r| r.major == "8.3").unwrap();
+        assert!(three.installed);
+        assert_eq!(three.full_version.as_deref(), Some("8.3.14"));
+        assert_eq!(three.service_id.as_deref(), Some("php-fpm-8.3"));
+        assert!(
+            three
+                .socket_path
+                .as_deref()
+                .is_some_and(|s| s.ends_with("php-fpm-8.3.sock"))
+        );
+        let one = rows.iter().find(|r| r.major == "8.1").unwrap();
+        assert!(!one.installed);
+        assert!(one.path.is_none());
+        assert!(
+            one.service_id.is_none(),
+            "a version that is not installed has no pool"
+        );
+    }
+
+    #[test]
+    fn the_patch_level_is_absent_rather_than_a_repeat_of_the_major() {
+        // Our only prober returns major.minor. Echoing it into `full_version`
+        // would render "8.3" twice and imply a patch level we never fetched.
+        let installed = vec![openvhost_core::PhpRuntime {
+            major: "8.3".into(),
+            fpm_bin: PathBuf::from("/opt/homebrew/opt/php@8.3/sbin/php-fpm"),
+        }];
+        let rows = php_rows(Path::new("/tmp/ovh"), &installed, &[]);
+        let three = rows.iter().find(|r| r.major == "8.3").unwrap();
+        assert!(three.installed);
+        assert!(
+            three.full_version.is_none(),
+            "got {:?} — an unknown patch level must be None, not a copy of the major",
+            three.full_version
+        );
+    }
+
+    #[test]
+    fn only_newly_discovered_majors_are_registered() {
+        // Re-registering an existing row replaces it, which wipes a Failed row's
+        // stderr and exit code — the reason a user would be looking at it.
+        let before = ["8.3".to_string(), "8.5".to_string()];
+        let found = ["8.3".to_string(), "8.4".to_string(), "8.5".to_string()];
+        assert_eq!(
+            newly_installed_majors(&before, &found),
+            vec!["8.4".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_rescan_that_finds_nothing_new_registers_nothing() {
+        let before = ["8.3".to_string()];
+        let found = ["8.3".to_string()];
+        assert!(newly_installed_majors(&before, &found).is_empty());
+    }
+
+    #[test]
+    fn a_version_that_disappeared_is_not_treated_as_new() {
+        // brew uninstall outside the app: 8.3 is gone from `found`. Nothing to
+        // register, and nothing to unregister either — the supervisor has no
+        // unregister, and a row pointing at a missing binary fails honestly.
+        let before = ["8.3".to_string(), "8.5".to_string()];
+        let found = ["8.5".to_string()];
+        assert!(newly_installed_majors(&before, &found).is_empty());
+    }
+
+    #[test]
+    fn exactly_one_catalogue_entry_is_recommended_and_it_is_the_newest() {
+        // A first-time user should not have to know how 8.1 differs from 8.5.
+        let rows = php_rows(Path::new("/tmp/ovh"), &[], &[]);
+        let rec: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.recommended)
+            .map(|r| r.major.as_str())
+            .collect();
+        assert_eq!(rec, vec![*openvhost_core::CATALOGUE.last().unwrap()]);
+    }
+
+    #[test]
+    fn an_installed_version_outside_the_catalogue_is_still_listed() {
+        // Otherwise a version installed by hand — or dropped from a later
+        // catalogue — vanishes from the page while still serving sites.
+        let installed = vec![openvhost_core::PhpRuntime {
+            major: "7.4".into(),
+            fpm_bin: PathBuf::from("/opt/homebrew/opt/php@7.4/sbin/php-fpm"),
+        }];
+        let rows = php_rows(Path::new("/tmp/ovh"), &installed, &[("7.4", "7.4.33")]);
+        assert!(rows.iter().any(|r| r.major == "7.4" && r.installed));
+    }
+
+    #[test]
+    fn a_rejected_version_names_the_field_so_the_ui_can_mark_it() {
+        let e: IpcError = openvhost_core::PhpMajor::parse("--build-from-source")
+            .unwrap_err()
+            .into();
+        match e {
+            IpcError::Validation { field, .. } => assert_eq!(field, "php_version"),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// `brew_searched_paths` is what the UI names as "looked here" — pinned
+    /// against the exact prefixes rather than re-deriving the same join, so
+    /// a typo in the join expression fails a test instead of only ever
+    /// showing up in a manual read of the source.
+    #[test]
+    fn brew_searched_paths_names_bin_brew_under_every_prefix() {
+        let searched = brew_searched_paths();
+        assert_eq!(searched.len(), openvhost_core::BREW_PREFIXES.len());
+        for prefix in openvhost_core::BREW_PREFIXES {
+            assert!(
+                searched.contains(&format!("{prefix}/bin/brew")),
+                "expected {prefix}/bin/brew in {searched:?}"
+            );
+        }
+    }
+
+    /// H1 audit finding: `rescan_php_runtimes` must serialize against an
+    /// in-flight `install_php` run rather than reading-modifying-writing the
+    /// managed `RwLock` unguarded. Proven here by holding the SAME
+    /// `InstallLock` guard `install_php` would hold, and asserting the
+    /// spawned rescan cannot complete until that guard is released.
+    ///
+    /// Without the fix, this test does not fail loudly — it is a race the
+    /// old code simply never lost in a single-threaded test, which is exactly
+    /// how the bug survived review. What it proves instead is the mechanism:
+    /// `rescan_php_runtimes` now genuinely blocks on `InstallLock`, which is
+    /// what closes the "Check again races a completed install" window the
+    /// audit describes.
+    #[tokio::test]
+    async fn rescan_blocks_while_an_install_holds_the_lock() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app");
+        app.manage(RwLock::new(None::<InstalledRuntimes>));
+        app.manage(Some(StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: home.path().join("nginx"),
+            nginx_conf: home.path().join("nginx.conf"),
+        }));
+        app.manage(Arc::new(Supervisor::new(openvhost_proc::default_driver())));
+        app.manage(InstallLock::default());
+
+        // Hold the guard the way `install_php`'s `try_lock` would while a
+        // build is running.
+        let lock = app.state::<InstallLock>();
+        let held = lock.inner().guard.lock().await;
+
+        let handle = app.handle().clone();
+        let task = tokio::spawn(async move {
+            rescan_php_runtimes(
+                handle.state::<RwLock<Option<InstalledRuntimes>>>(),
+                handle.state::<Option<StackPaths>>(),
+                handle.state::<Arc<Supervisor>>(),
+                handle.state::<InstallLock>(),
+            )
+            .await
+        });
+
+        // Give the spawned rescan every chance to (wrongly) finish anyway.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !task.is_finished(),
+            "rescan_php_runtimes must not complete while InstallLock is held"
+        );
+
+        drop(held);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("rescan did not unblock after the install lock was released")
+            .expect("rescan task panicked");
+        assert!(result.is_ok(), "got {result:?}");
+    }
+
+    /// A2 audit finding: `RunningInstallGuard::drop` used to clear
+    /// `InstallLock`'s slot without aborting the run it was tracking. There is
+    /// no real supervisor or brew process involved in reproducing this — an
+    /// intentionally never-settling task stands in for "the run", and
+    /// dropping the guard before that task's own future ever completes is
+    /// exactly the shape the fix targets (in production this only happens via
+    /// an early `?` return or a panic unwinding between `set_running` and
+    /// `install_task.await`, but `Drop` cannot tell those apart from an
+    /// explicit `drop(guard)`, so this test exercises the same code path
+    /// directly). Before the fix, this task would still be running (and
+    /// `result` would be `Ok(())` from a `.recv()`/timeout race, never
+    /// `Err(cancelled)`) after the guard went out of scope.
+    #[tokio::test]
+    async fn dropping_the_running_install_guard_aborts_the_task_it_tracks() {
+        let lock = InstallLock::default();
+        let task = tokio::spawn(std::future::pending::<()>());
+        let abort = task.abort_handle();
+        lock.set_running("8.4".to_string(), abort.clone());
+
+        {
+            let _guard = RunningInstallGuard { lock: &lock, abort };
+            // Dropped at the end of this block, same as `install_php`'s
+            // `_running_guard` at the end of its own function body.
+        }
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("task did not settle after the guard was dropped");
+        match result {
+            Err(join_err) => assert!(
+                join_err.is_cancelled(),
+                "expected the guard's Drop impl to cancel the task, got {join_err:?}"
+            ),
+            Ok(()) => {
+                panic!("expected the guard's Drop impl to abort the task, but it ran to completion")
+            }
+        }
+        assert!(
+            lock.running_major().is_none(),
+            "expected the guard's Drop impl to also clear the running slot"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1574,6 +2444,25 @@ mod apply_ipc_tests {
         let (restarted, problems) = restart_outcome(&running, &[], |_| Ok(()));
         assert_eq!(restarted, running);
         assert!(problems.is_empty());
+    }
+
+    #[test]
+    fn the_runtime_set_can_be_replaced_after_startup() {
+        // The Languages page installs a version at runtime; if this state could not
+        // be replaced, apply would never learn about it and Install would appear
+        // to succeed while changing nothing.
+        let state = RwLock::new(None::<InstalledRuntimes>);
+        assert!(state.read().unwrap().is_none());
+        *state.write().unwrap() = Some(InstalledRuntimes {
+            nginx_bin: PathBuf::from("/opt/homebrew/opt/nginx/bin/nginx"),
+            php: vec![openvhost_core::PhpRuntime {
+                major: "8.3".into(),
+                fpm_bin: PathBuf::from("/opt/homebrew/opt/php@8.3/sbin/php-fpm"),
+            }],
+        });
+        let seen = state.read().unwrap().clone().unwrap();
+        assert_eq!(seen.php.len(), 1);
+        assert_eq!(seen.php[0].major, "8.3");
     }
 }
 

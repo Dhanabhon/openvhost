@@ -14,10 +14,16 @@ import { describe, expect, it } from 'vitest';
 import { render } from 'svelte/server';
 import QuitDialog from './QuitDialog.svelte';
 
-function html(props: { pending?: string[]; quitting?: boolean; error?: string }): string {
+function html(props: {
+	pending?: string[];
+	installingMajor?: string | null;
+	quitting?: boolean;
+	error?: string;
+}): string {
 	return render(QuitDialog, {
 		props: {
 			pending: props.pending ?? [],
+			installingMajor: props.installingMajor ?? null,
 			quitting: props.quitting ?? false,
 			error: props.error ?? '',
 			onCancel: () => {},
@@ -73,6 +79,36 @@ describe('QuitDialog', () => {
 
 	it('offers Stop and quit when something is running', () => {
 		expect(html({ pending: ['nginx'] })).toContain('Stop and quit');
+	});
+
+	// The C1 audit fix: a PHP install is invisible to `pending` (it is not a
+	// supervised service), so without its own copy the dialog would promise
+	// "nothing will be interrupted" while a twenty-minute build was about to be
+	// silently discarded.
+	it('names an in-flight PHP install and warns it will be discarded', () => {
+		const t = text(html({ pending: [], installingMajor: '8.4' }));
+		expect(t).toContain('PHP 8.4');
+		expect(t).toContain('is still installing');
+		expect(t).not.toContain('No services are running');
+	});
+
+	it('offers Stop and quit when only an install is in flight, no services', () => {
+		const m = html({ pending: [], installingMajor: '8.4' });
+		expect(m).toContain('Stop and quit');
+		expect(m).not.toContain('>Quit<');
+	});
+
+	it('combines a running service and an in-flight install in one sentence', () => {
+		const t = text(html({ pending: ['nginx'], installingMajor: '8.4' }));
+		expect(t).toContain('nginx is running');
+		expect(t).toContain('PHP 8.4');
+		expect(t).toContain('is still installing');
+	});
+
+	it('says nothing is running and mentions no install when both are idle', () => {
+		const t = text(html({ pending: [], installingMajor: null }));
+		expect(t).toContain('No services are running');
+		expect(t).not.toContain('PHP');
 	});
 
 	// Both buttons disabled: the confirm because stopping is already underway, and
