@@ -318,6 +318,40 @@ fn parse_version_line(line: &str) -> Option<String> {
     Some(token.to_string())
 }
 
+/// The installed php-fpm's `major.minor` (`8.4` from
+/// `PHP 8.4.23 (fpm-fcgi) ...`), or `None` for any failure.
+///
+/// Separate from [`probe_nginx_version`] by contract: php-fpm writes its
+/// banner to STDOUT in a `PHP <version>` shape, where nginx writes
+/// `nginx version: nginx/<version>` to STDERR. Neither parser can read the
+/// other's output.
+///
+/// No `-e` equivalent is needed: php-fpm's `-v` writes nowhere but stdout.
+pub async fn probe_php_fpm_version(bin: &Path) -> Option<String> {
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.arg("-v");
+    let out = run_bounded(&mut cmd).await.ok()?;
+    parse_php_version(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Line-by-line so a preceding warning cannot consume the banner — the same
+/// bug [`parse_version`] documents for nginx.
+fn parse_php_version(stdout: &str) -> Option<String> {
+    stdout.lines().find_map(parse_php_version_line)
+}
+
+fn parse_php_version_line(line: &str) -> Option<String> {
+    let token = line.strip_prefix("PHP ")?.split_whitespace().next()?;
+    let mut parts = token.split('.');
+    let major = parts.next()?;
+    let minor = parts.next()?;
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(major) || !digits(minor) {
+        return None;
+    }
+    Some(format!("{major}.{minor}"))
+}
+
 /// Validate a config file that ALREADY EXISTS, in place. Writes nothing to
 /// `conf` and never calls `materialize`.
 ///
@@ -783,5 +817,22 @@ mod tests {
             parse_version("nginx version: nginx/1.2.3-rc1").as_deref(),
             Some("1.2.3-rc1")
         );
+    }
+
+    #[test]
+    fn parses_the_php_fpm_banner_down_to_major_minor() {
+        let out = "PHP 8.4.23 (fpm-fcgi) (built: Jul 10 2026 10:11:12)\n\
+                   Copyright (c) The PHP Group\n";
+        assert_eq!(parse_php_version(out), Some("8.4".to_string()));
+    }
+
+    #[test]
+    fn rejects_banners_that_are_not_php() {
+        // nginx's banner must never satisfy this parser — the two probes are
+        // separate on purpose.
+        assert_eq!(parse_php_version("nginx version: nginx/1.27.3"), None);
+        assert_eq!(parse_php_version(""), None);
+        assert_eq!(parse_php_version("PHP notaversion"), None);
+        assert_eq!(parse_php_version("PHP 8"), None);
     }
 }

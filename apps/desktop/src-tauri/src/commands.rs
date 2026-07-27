@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use openvhost_conf::WebServerAdapter;
 
 use openvhost_core::{
-    CoreInfo, Db, Docroot, Domain, NewSite, PhpVersion, Site, SiteId, SiteName, SiteRepository,
-    SqliteSiteRepository, WebServer,
+    ApplyError, ApplyInput, ChangeKind, CoreInfo, Db, Docroot, Domain, InstalledRuntimes, NewSite,
+    PhpVersion, Site, SiteId, SiteName, SiteRepository, SqliteSiteRepository, WebServer,
 };
 
 use crate::stack::StackPaths;
@@ -436,11 +436,18 @@ pub async fn open_site(
         })
 }
 
-/// `http://<domain>`. Extracted so the one thing worth pinning — that the scheme
-/// is fixed and prepended, never taken from the stored value — is testable
-/// without a live `AppHandle` and a real database.
+/// `http://<domain>:<LISTEN_PORT>`. Extracted so the one thing worth pinning —
+/// that the scheme is fixed and prepended, never taken from the stored value —
+/// is testable without a live `AppHandle` and a real database.
+///
+/// The port is `site::apply::LISTEN_PORT` (8080): every applied site listens
+/// there, not on 80 (spec — port 80 needs the privileged helper, Phase 3), so
+/// a scheme-only URL sends the browser to a port nothing is bound to.
 fn site_url(domain: &str) -> String {
-    format!("http://{domain}")
+    format!(
+        "http://{domain}:{}",
+        openvhost_core::site::apply::LISTEN_PORT
+    )
 }
 
 #[tauri::command]
@@ -449,6 +456,278 @@ pub async fn delete_site(db: tauri::State<'_, Db>, id: String) -> Result<bool, I
     let site_id = SiteId::parse(&id)?;
     let repo = SqliteSiteRepository::new(db.inner());
     Ok(repo.delete(&site_id).await?)
+}
+
+impl From<ApplyError> for IpcError {
+    fn from(e: ApplyError) -> Self {
+        // Every variant's Display already names the site, the versions or the
+        // stranded paths, so one arm is enough and none of that detail is lost.
+        IpcError::Core {
+            message: e.to_string(),
+        }
+    }
+}
+
+fn change_kind_str(k: ChangeKind) -> &'static str {
+    match k {
+        ChangeKind::Added => "added",
+        ChangeKind::Modified => "modified",
+        ChangeKind::Removed => "removed",
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct FileChangeDto {
+    pub path: String,
+    /// "added" | "modified" | "removed"
+    pub kind: String,
+    pub diff: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplyPlanDto {
+    pub changes: Vec<FileChangeDto>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceProblemDto {
+    pub id: String,
+    /// A sentence the UI can show as-is, telling the user what happened and
+    /// what is left for them to do.
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplyOutcomeDto {
+    /// `u32`, not `usize`: specta rejects pointer-sized ints (see lib.rs).
+    pub applied: u32,
+    /// Stopped and successfully started again on the new config.
+    pub restarted: Vec<String>,
+    /// Services whose config changed but which were not running, so the new
+    /// config takes effect the next time they start.
+    pub not_started: Vec<String>,
+    /// Were running and could NOT be brought back — the user has to act.
+    /// Never empty-and-ignored: a service this pipeline stopped and failed to
+    /// restart is the one outcome the UI must not present as success.
+    pub needs_attention: Vec<ServiceProblemDto>,
+}
+
+/// Serializes `apply_sites` end to end (A2): plan -> commit -> validate ->
+/// restart all run while this lock is held, so two overlapping Apply calls
+/// cannot interleave their commit/rollback (one rollback restoring its own
+/// snapshot over the other's writes) or their stop/start of the same
+/// services. `Default` gives `lib.rs` a plain `ApplyLock::default()` to
+/// manage, matching `quit::UiReady`'s pattern next to it.
+///
+/// `plan_site_apply` deliberately does NOT take this lock — it is read-only
+/// and is called after every site mutation to drive the pending-changes
+/// banner, so serializing it against Apply would make that banner block on
+/// an in-flight apply for no safety benefit.
+#[derive(Default)]
+pub struct ApplyLock(pub(crate) tokio::sync::Mutex<()>);
+
+/// Build the apply input from state.db plus the runtimes probed at startup.
+async fn apply_input(
+    db: &Db,
+    runtimes: &Option<InstalledRuntimes>,
+    paths: &Option<StackPaths>,
+) -> Result<ApplyInput, IpcError> {
+    let (Some(runtimes), Some(paths)) = (runtimes.as_ref(), paths.as_ref()) else {
+        return Err(IpcError::Core {
+            message: "no web server stack is configured for this platform".into(),
+        });
+    };
+    let repo = SqliteSiteRepository::new(db);
+    Ok(ApplyInput {
+        home: paths.home.clone(),
+        sites: repo.list().await?,
+        runtimes: runtimes.clone(),
+    })
+}
+
+/// What Apply would change. Read-only and process-free — the pending-changes
+/// banner calls this after every site mutation.
+#[tauri::command]
+#[specta::specta]
+pub async fn plan_site_apply(
+    db: tauri::State<'_, Db>,
+    runtimes: tauri::State<'_, Option<InstalledRuntimes>>,
+    paths: tauri::State<'_, Option<StackPaths>>,
+) -> Result<ApplyPlanDto, IpcError> {
+    let input = apply_input(db.inner(), runtimes.inner(), paths.inner()).await?;
+    let p = openvhost_core::plan(&input)?;
+    Ok(ApplyPlanDto {
+        changes: p
+            .changes
+            .into_iter()
+            .map(|c| FileChangeDto {
+                path: c.path.display().to_string(),
+                kind: change_kind_str(c.kind).to_string(),
+                diff: c.diff,
+            })
+            .collect(),
+    })
+}
+
+/// Apply the sites, then restart whichever affected services are running.
+///
+/// The restart is the app's job, not core's: `openvhost-core` has no supervisor
+/// and must stay usable from the CLI.
+#[tauri::command]
+#[specta::specta]
+pub async fn apply_sites(
+    db: tauri::State<'_, Db>,
+    runtimes: tauri::State<'_, Option<InstalledRuntimes>>,
+    paths: tauri::State<'_, Option<StackPaths>>,
+    sup: tauri::State<'_, Arc<Supervisor>>,
+    lock: tauri::State<'_, ApplyLock>,
+) -> Result<ApplyOutcomeDto, IpcError> {
+    // A2: held across the whole plan -> commit -> validate -> restart
+    // sequence below. The plan is recomputed HERE, from state.db, by
+    // design — the frontend never supplies a plan for this command to run,
+    // so anything that changed state.db between the dialog rendering and the
+    // click is included on purpose. The lock therefore bounds the window
+    // between "user saw a diff" and "that diff is what applied", rather than
+    // eliminating it; a full plan-digest re-check is a larger design change
+    // and out of scope here.
+    let _apply_guard = lock.inner().0.lock().await;
+
+    let input = apply_input(db.inner(), runtimes.inner(), paths.inner()).await?;
+    let Some(stack) = paths.inner().as_ref() else {
+        return Err(IpcError::Core {
+            message: "no web server stack is configured for this platform".into(),
+        });
+    };
+    let p = openvhost_core::plan(&input)?;
+
+    // A3: nothing to write means nothing to restart. Without this, Apply
+    // fell through to the restart block unconditionally, so an empty-plan
+    // click (or a double-click firing the command twice) still stopped and
+    // started nginx/php-fpm — an unbounded stop/start primitive against the
+    // user's own stack, and a needless connection drop for every site it
+    // fronts.
+    if p.changes.is_empty() {
+        return Ok(ApplyOutcomeDto {
+            applied: 0,
+            restarted: Vec::new(),
+            not_started: Vec::new(),
+            needs_attention: Vec::new(),
+        });
+    }
+
+    let validator = openvhost_core::NginxValidator {
+        bin: stack.nginx_bin.clone(),
+        err_log: stack.home.join("logs/nginx.error.log"),
+    };
+    let outcome = openvhost_core::apply(&p, &validator).await?;
+
+    // php-fpm before nginx: nginx connects to the pool socket, so the pool has
+    // to be listening first.
+    let mut ids: Vec<String> = input
+        .runtimes
+        .php
+        .iter()
+        .map(|r| format!("php-fpm-{}", r.major))
+        .collect();
+    ids.push("nginx".to_string());
+
+    // Only restart what is actually running. A stopped service keeps its state;
+    // the new config takes effect when the user starts it.
+    let snapshot = sup.snapshot();
+    let running: Vec<String> = ids
+        .iter()
+        .filter(|id| {
+            snapshot
+                .iter()
+                .any(|s| s.id == **id && matches!(s.state, ServiceState::Running))
+        })
+        .cloned()
+        .collect();
+    let not_started: Vec<String> = ids
+        .iter()
+        .filter(|id| !running.contains(id))
+        .cloned()
+        .collect();
+
+    // Wait for a real Stopped rather than assuming `stop` took effect — the same
+    // reason quit.rs polls instead of firing and hoping.
+    let for_pending = Arc::clone(sup.inner());
+    let watched = running.clone();
+    let for_stop = Arc::clone(sup.inner());
+    let stragglers = crate::quit::stop_all_with(
+        move || {
+            for_pending
+                .snapshot()
+                .into_iter()
+                .filter(|s| watched.contains(&s.id))
+                .filter(|s| !matches!(s.state, ServiceState::Stopped | ServiceState::Failed { .. }))
+                .map(|s| s.id)
+                .collect()
+        },
+        move |id| {
+            let _ = for_stop.stop(id);
+        },
+        std::time::Duration::from_secs(10),
+        std::time::Duration::from_millis(50),
+    )
+    .await;
+
+    // The stop result — not just "we asked it to stop" — decides what happens
+    // next. A straggler that is still shutting down gets a no-op `start` (the
+    // supervisor treats Starting/Running as already-in-progress) and then
+    // finishes stopping moments later, on its own schedule: exactly how a
+    // green Apply leaves a site down. So a straggler is never started; it is
+    // reported instead.
+    let (restarted, needs_attention) = restart_outcome(&running, &stragglers, |id| {
+        sup.start(id).map_err(|e| e.to_string())
+    });
+
+    Ok(ApplyOutcomeDto {
+        // `u32`, not `usize`: specta rejects pointer-sized ints.
+        applied: u32::try_from(outcome.applied).unwrap_or(u32::MAX),
+        restarted,
+        not_started,
+        needs_attention,
+    })
+}
+
+/// Decide, for each service that was running, what the restart achieved.
+/// Split out from `apply_sites` so the straggler logic is testable without
+/// spawning anything.
+///
+/// Deliberately does not use `?`/early-return on a failed `start`: one
+/// service's failure must not hide the fate of the others, so every id in
+/// `running` is visited regardless of what happened to the ones before it.
+fn restart_outcome(
+    running: &[String],
+    stragglers: &[String],
+    start: impl Fn(&str) -> Result<(), String>,
+) -> (Vec<String>, Vec<ServiceProblemDto>) {
+    let mut restarted = Vec::new();
+    let mut needs_attention = Vec::new();
+    for id in running {
+        if stragglers.contains(id) {
+            needs_attention.push(ServiceProblemDto {
+                id: id.clone(),
+                reason: "did not stop within 10s, so it was left alone — stop it and start it \
+                         again to pick up the new config"
+                    .to_string(),
+            });
+            continue;
+        }
+        match start(id) {
+            Ok(()) => restarted.push(id.clone()),
+            Err(e) => needs_attention.push(ServiceProblemDto {
+                id: id.clone(),
+                reason: format!("stopped, but could not be started again: {e}"),
+            }),
+        }
+    }
+    (restarted, needs_attention)
 }
 
 /// The web servers OpenVHost knows about. A CLOSED list: the client sends only
@@ -862,6 +1141,17 @@ mod site_ipc_tests {
                 },
             ),
             (
+                // B1: a `$`-bearing docroot must be rejected at the IPC
+                // ingress — nginx's `root` expands variables even inside
+                // quotes, so this would otherwise become a request-header-
+                // controlled document root that still passes `nginx -t`.
+                "docroot",
+                SiteInput {
+                    docroot: "/tmp/x$http_evil".into(),
+                    ..valid_input()
+                },
+            ),
+            (
                 "php_version",
                 SiteInput {
                     php_version: "8.x".into(),
@@ -931,11 +1221,24 @@ mod site_ipc_tests {
     /// `javascript:` URL reaching the OS opener. This test is what pins that.
     #[test]
     fn site_url_always_prepends_a_fixed_http_scheme() {
-        assert_eq!(site_url("hello.localhost"), "http://hello.localhost");
+        assert_eq!(site_url("hello.localhost"), "http://hello.localhost:8080");
         // Even if a scheme-looking value somehow reached the column, the result is
         // still an http URL naming it as a host — never a `file:`/`javascript:` URL.
         assert!(site_url("file:///etc/passwd").starts_with("http://"));
         assert!(site_url("javascript:alert(1)").starts_with("http://"));
+    }
+
+    /// Every applied site listens on `LISTEN_PORT` (8080), not 80 — a URL
+    /// missing the port sends the browser to a port nothing is bound to, and
+    /// it connection-errors instead of loading the site. This test fails if
+    /// the port is ever dropped from `site_url`.
+    #[test]
+    fn site_url_includes_the_port_every_site_actually_listens_on() {
+        let url = site_url("hello.localhost");
+        assert!(
+            url.ends_with(&format!(":{}", openvhost_core::site::apply::LISTEN_PORT)),
+            "expected {url:?} to end with the LISTEN_PORT the applied site actually listens on"
+        );
     }
 
     /// The count must report pids that actually produced a figure, not pids that
@@ -1196,6 +1499,81 @@ mod web_server_ipc_tests {
             }
             other => panic!("expected Validation, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod apply_ipc_tests {
+    use super::*;
+
+    /// The dialog switches on these; a rename here silently breaks its badges.
+    #[test]
+    fn change_kind_maps_to_a_stable_wire_string() {
+        assert_eq!(change_kind_str(ChangeKind::Added), "added");
+        assert_eq!(change_kind_str(ChangeKind::Modified), "modified");
+        assert_eq!(change_kind_str(ChangeKind::Removed), "removed");
+    }
+
+    #[test]
+    fn a_missing_runtime_reaches_the_ui_naming_the_site_and_versions() {
+        let e: IpcError = ApplyError::MissingRuntime {
+            site: "legacy".into(),
+            requested: "7.4".into(),
+            available: vec!["8.4".into()],
+        }
+        .into();
+        match e {
+            IpcError::Core { message } => {
+                assert!(message.contains("legacy"));
+                assert!(message.contains("7.4"));
+                assert!(message.contains("8.4"));
+            }
+            other => panic!("expected Core, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_service_that_did_not_stop_in_time_is_not_started_and_is_reported() {
+        let running = vec!["nginx".to_string(), "php-fpm-8.4".to_string()];
+        let stragglers = vec!["nginx".to_string()];
+        let started = std::cell::RefCell::new(Vec::new());
+        let (restarted, problems) = restart_outcome(&running, &stragglers, |id| {
+            started.borrow_mut().push(id.to_string());
+            Ok(())
+        });
+        // Starting a service that is still shutting down is a no-op that leaves it
+        // stopped moments later — the exact way a green Apply takes a site down.
+        assert_eq!(started.into_inner(), vec!["php-fpm-8.4".to_string()]);
+        assert_eq!(restarted, vec!["php-fpm-8.4".to_string()]);
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].id, "nginx");
+        assert!(problems[0].reason.contains("did not stop"));
+    }
+
+    #[test]
+    fn a_failed_start_is_reported_without_hiding_the_other_services() {
+        let running = vec!["php-fpm-8.4".to_string(), "nginx".to_string()];
+        let (restarted, problems) = restart_outcome(&running, &[], |id| {
+            if id == "php-fpm-8.4" {
+                Err("no such service".into())
+            } else {
+                Ok(())
+            }
+        });
+        // The failure must not abort the loop: nginx still gets its start.
+        assert_eq!(restarted, vec!["nginx".to_string()]);
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].id, "php-fpm-8.4");
+        assert!(problems[0].reason.contains("no such service"));
+    }
+
+    #[test]
+    fn a_clean_restart_reports_no_problems() {
+        let running = vec!["php-fpm-8.4".to_string(), "nginx".to_string()];
+        let (restarted, problems) = restart_outcome(&running, &[], |_| Ok(()));
+        assert_eq!(restarted, running);
+        assert!(problems.is_empty());
     }
 }
 

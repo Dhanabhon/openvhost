@@ -78,6 +78,18 @@ export const commands = {
 	 *  letting a stored value choose the scheme.
 	 */
 	openSite: (id: string) => typedError<null, IpcError>(__TAURI_INVOKE("open_site", { id })),
+	/**
+	 *  What Apply would change. Read-only and process-free — the pending-changes
+	 *  banner calls this after every site mutation.
+	 */
+	planSiteApply: () => typedError<ApplyPlanDto, IpcError>(__TAURI_INVOKE("plan_site_apply")),
+	/**
+	 *  Apply the sites, then restart whichever affected services are running.
+	 * 
+	 *  The restart is the app's job, not core's: `openvhost-core` has no supervisor
+	 *  and must stay usable from the CLI.
+	 */
+	applySites: () => typedError<ApplyOutcomeDto, IpcError>(__TAURI_INVOKE("apply_sites")),
 };
 
 /** Events */
@@ -88,6 +100,28 @@ export const events = {
 };
 
 /* Types */
+export type ApplyOutcomeDto = {
+	/**  `u32`, not `usize`: specta rejects pointer-sized ints (see lib.rs). */
+	applied: number,
+	/**  Stopped and successfully started again on the new config. */
+	restarted: string[],
+	/**
+	 *  Services whose config changed but which were not running, so the new
+	 *  config takes effect the next time they start.
+	 */
+	notStarted: string[],
+	/**
+	 *  Were running and could NOT be brought back — the user has to act.
+	 *  Never empty-and-ignored: a service this pipeline stopped and failed to
+	 *  restart is the one outcome the UI must not present as success.
+	 */
+	needsAttention: ServiceProblemDto[],
+};
+
+export type ApplyPlanDto = {
+	changes: FileChangeDto[],
+};
+
 /**
  *  Basic environment facts, assembled by core (not by the Tauri command —
  *  commands stay thin per master plan §5).
@@ -101,6 +135,13 @@ export type CoreInfo = {
 	arch: string,
 	/**  Resolved OpenVHost home directory, for display. */
 	openvhostHome: string,
+};
+
+export type FileChangeDto = {
+	path: string,
+	/**  "added" | "modified" | "removed" */
+	kind: string,
+	diff: string,
 };
 
 /**
@@ -147,6 +188,15 @@ export type ServiceLogEvent = {
 	tsMs: number,
 	level: LogLevel,
 	line: string,
+};
+
+export type ServiceProblemDto = {
+	id: string,
+	/**
+	 *  A sentence the UI can show as-is, telling the user what happened and
+	 *  what is left for them to do.
+	 */
+	reason: string,
 };
 
 export type ServiceState = { kind: "stopped" } | { kind: "starting" } | { kind: "running" } | { kind: "failed"; exit: number | null; stderrTail: string[] };

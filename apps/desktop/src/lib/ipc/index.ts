@@ -2,11 +2,15 @@
 // The ONLY module allowed to touch Tauri IPC (master plan §5).
 import { commands, events } from './bindings';
 import type {
+	ApplyOutcomeDto,
+	ApplyPlanDto,
 	CoreInfo,
+	FileChangeDto,
 	HomeUsageDto,
 	IpcError,
 	LogLine,
 	ServiceLogEvent,
+	ServiceProblemDto,
 	ServicesMemoryDto,
 	ServiceStateEvent,
 	ServiceStatus,
@@ -17,11 +21,15 @@ import type {
 } from './bindings';
 
 export type {
+	ApplyOutcomeDto,
+	ApplyPlanDto,
 	CoreInfo,
+	FileChangeDto,
 	HomeUsageDto,
 	IpcError,
 	LogLine,
 	ServiceLogEvent,
+	ServiceProblemDto,
 	ServicesMemoryDto,
 	ServiceStateEvent,
 	ServiceStatus,
@@ -137,6 +145,26 @@ export async function deleteSite(id: string): Promise<boolean> {
  */
 export async function openSite(id: string): Promise<void> {
 	await unwrap(commands.openSite(id));
+}
+
+/**
+ * What Apply would change against the current sites. Read-only and
+ * process-free — safe to call after every site mutation for a pending-changes
+ * banner.
+ */
+export async function planSiteApply(): Promise<ApplyPlanDto> {
+	return unwrap(commands.planSiteApply());
+}
+
+/**
+ * Apply the sites, then restart whichever affected services were running.
+ * Services that were not running are reported in `notStarted` instead of
+ * being started as a side effect. A service that was running but could not be
+ * cleanly stopped-and-restarted lands in `needsAttention` instead of
+ * `restarted` — the UI must not present that outcome as a success.
+ */
+export async function applySites(): Promise<ApplyOutcomeDto> {
+	return unwrap(commands.applySites());
 }
 
 export async function listWebServers(): Promise<WebServerDto[]> {

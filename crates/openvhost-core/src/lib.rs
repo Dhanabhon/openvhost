@@ -15,6 +15,11 @@ pub use db::Db;
 pub use error::CoreError;
 pub use home::{home_disk_usage, resolve_home};
 pub use info::{CoreInfo, core_info};
+pub use site::apply::{
+    ApplyError, ApplyInput, ApplyOutcome, ApplyPlan, ChangeKind, ConfigValidator, FileChange,
+    InstalledRuntimes, NginxValidator, PhpRuntime, RollbackReport, apply, commit, plan, render_set,
+    rollback,
+};
 pub use site::repo::{SiteRepository, SqliteSiteRepository};
 pub use site::{Docroot, Domain, NewSite, PhpVersion, Site, SiteId, SiteName, WebServer};
 

@@ -106,6 +106,23 @@
 	--vh-fail-tint: color-mix(in oklab, var(--vh-state-failed) 9%, var(--vh-surface));
 	--vh-add-tint: color-mix(in oklab, var(--vh-state-running) 12%, var(--vh-surface));
 	--vh-del-tint: color-mix(in oklab, var(--vh-state-failed) 10%, var(--vh-surface));
+	/* Per-line diff colours (ApplyDialog). `--vh-run` would seem the obvious text
+	   colour for an added line, but it only clears AA against
+	   --vh-surface/--vh-bg/--vh-log-bg (see its own comment above) — measured
+	   against `--vh-add-tint` it lands at 4.41:1, short of the 4.5:1 floor. This
+	   is a new, deeper green for exactly that background: 5.94:1 on
+	   `--vh-diff-add-bg`, 6.57:1 on `--vh-surface`. `--vh-diff-del-text` reuses
+	   `--vh-fail` unchanged — it already measures 4.85:1 on `--vh-diff-del-bg`
+	   (and 5.41:1 on `--vh-surface`), so no new value was needed there.
+
+	   Dark theme: tokens.css is light-only for now (owner decision 2026-07-21,
+	   see the file header) — the `[data-theme='dark']` block below is reserved
+	   and empty. These tokens get dark-mode values in that slice, same as every
+	   other semantic colour in this file. */
+	--vh-diff-add-bg: var(--vh-add-tint);
+	--vh-diff-add-text: #1f6b2c;
+	--vh-diff-del-bg: var(--vh-del-tint);
+	--vh-diff-del-text: var(--vh-fail);
 	--vh-log-bg: #fdfdfb;
 	--vh-shadow-overlay: 0 12px 40px rgb(23 26 33 / 0.18), 0 2px 8px rgb(23 26 33 / 0.1);
 	/* Modal/drawer backdrop scrim. Same value as docs/design/mock.css's `.drawer-backdrop`

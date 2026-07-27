@@ -11,6 +11,8 @@ use crate::error::ConfError;
 
 const MAIN_NGINX: &str = include_str!("../templates/nginx/main.conf.tera");
 const SITE_NGINX: &str = include_str!("../templates/nginx/site.conf.tera");
+const PHP_LOCATION: &str = include_str!("../templates/nginx/php-location.conf.tera");
+const DEFAULT_SITE_NGINX: &str = include_str!("../templates/nginx/default-site.conf.tera");
 const POOL_FPM: &str = include_str!("../templates/php-fpm/pool.conf.tera");
 
 pub(crate) fn engine() -> &'static Tera {
@@ -25,6 +27,8 @@ pub(crate) fn engine() -> &'static Tera {
         if let Err(e) = t.add_raw_templates(vec![
             ("nginx/main.conf", MAIN_NGINX),
             ("nginx/site.conf", SITE_NGINX),
+            ("nginx/php-location.conf", PHP_LOCATION),
+            ("nginx/default-site.conf", DEFAULT_SITE_NGINX),
             ("php-fpm/pool.conf", POOL_FPM),
         ]) {
             panic!("embedded templates must parse: {e}");
