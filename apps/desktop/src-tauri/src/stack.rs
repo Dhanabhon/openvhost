@@ -95,6 +95,26 @@ pub fn php_fpm_spec(home: &Path, rt: &PhpRuntime) -> ServiceSpec {
     }
 }
 
+/// The multi-version PHP walk `macos_stack` performs at startup, factored out
+/// of it so a test can hand it a fake prefix and a fake probe instead of the
+/// machine's real Homebrew installs and a spawned `php-fpm -v`.
+///
+/// This is a thin pass-through to `openvhost_core::discover_php_in`, which
+/// already has its own thorough test suite in
+/// `openvhost-core/src/php/discover.rs` — so this function is NOT here to
+/// re-test that walk's merge rules. It exists so the C2 regression test (see
+/// the `tests` module below) pins that `macos_stack` calls the multi-version
+/// walk at all, rather than only being able to exercise `discover_php_in`
+/// again under a different name and never actually proving the startup path
+/// was rewired to use it.
+#[cfg(target_os = "macos")]
+fn discover_installed_php(
+    prefixes: &[&Path],
+    probe: &dyn Fn(&Path) -> Option<String>,
+) -> Vec<PhpRuntime> {
+    openvhost_core::discover_php_in(prefixes, probe)
+}
+
 /// Specs to register, the paths they were built from, and the runtimes probed
 /// while building them. `paths` is `None` exactly when the home could not be
 /// resolved — the same condition that already produces zero specs.
@@ -131,21 +151,44 @@ pub fn macos_stack() -> MacosStack {
     if let Err(e) = provision_home(&home) {
         eprintln!("stack: provisioning failed (rows registered anyway): {e}");
     }
+    // nginx is unaffected by the C2 fix below: `find_brew_binaries` (or the
+    // Apple Silicon fallback) is still what locates it.
     let brew = find_brew_binaries().unwrap_or_else(fallback_brew);
 
-    // Probing spawns a process, so it happens ONCE here and the result is
-    // managed state. That is what lets `plan_site_apply` stay process-free.
-    let major =
-        tauri::async_runtime::block_on(openvhost_conf::probe_php_fpm_version(&brew.php_fpm));
+    // C2 fix (branch-review-fix-report.md): this used to probe ONLY
+    // `brew.php_fpm` — the single path `find_brew_binaries` returns, which is
+    // `None` unless BOTH nginx and an UNVERSIONED `php` formula share one
+    // prefix. A machine with `php@8.1` and `php@8.3` installed but no bare
+    // `php` formula made `find_brew_binaries` return `None`, so this fell back
+    // to a path that does not exist on that machine, the probe found nothing,
+    // and `php` ended up empty — Languages reported every catalogue version
+    // as not installed and Sites disabled Save, on a machine with two working
+    // PHP runtimes. `discover_php_in` is the multi-version walk the rest of
+    // this slice (`rescan_php_runtimes`, `install_php`) already uses; it now
+    // runs at startup too, so cold start and a live rescan see the same
+    // runtimes through the same code, rather than startup alone using a
+    // narrower single-binary probe.
+    //
+    // `discover_php_in` wants a SYNCHRONOUS probe closure, but
+    // `openvhost_conf::probe_php_fpm_version` is async. `commands.rs`'s
+    // `discover_all_php` (the rescan/install path) resolves that with
+    // `spawn_blocking` + `Handle::block_on` because it runs INSIDE an async
+    // Tauri command, on a tokio worker thread, where calling `block_on`
+    // directly would panic. This function is different: it runs from
+    // `lib.rs`'s `setup()` closure, which is plain synchronous code, not a
+    // tokio worker — the single-probe version of this function already called
+    // `tauri::async_runtime::block_on` directly below, proving that is safe
+    // here. So the closure below does the same thing per candidate instead of
+    // adding a `spawn_blocking` layer that this call site does not need.
+    let prefixes: Vec<&Path> = openvhost_core::BREW_PREFIXES
+        .iter()
+        .map(Path::new)
+        .collect();
+    let php: Vec<PhpRuntime> = discover_installed_php(&prefixes, &|bin| {
+        tauri::async_runtime::block_on(openvhost_conf::probe_php_fpm_version(bin))
+    });
 
     let nginx_conf = home.join("config/generated/nginx/nginx.conf");
-    let php: Vec<PhpRuntime> = major
-        .iter()
-        .map(|m| PhpRuntime {
-            major: m.clone(),
-            fpm_bin: brew.php_fpm.clone(),
-        })
-        .collect();
 
     let mut specs = Vec::new();
     for rt in &php {
@@ -218,5 +261,41 @@ mod tests {
             .position(|a| a == "-c")
             .expect("nginx spawns with -c");
         assert_eq!(args[c + 1], paths.nginx_conf.to_string_lossy());
+    }
+
+    /// C2 (branch-review-fix-report.md): the exact machine shape that used to
+    /// report zero PHP runtimes at startup — `php@8.1` and `php@8.3` both
+    /// installed, but no UNVERSIONED `php` formula for `find_brew_binaries` to
+    /// pair with nginx. Before this fix, `macos_stack` probed only the single
+    /// `find_brew_binaries().php_fpm` path (or its Apple-Silicon fallback,
+    /// which does not exist on this machine either), so it found nothing and
+    /// `php` came back empty. Pin that the startup discovery now finds BOTH
+    /// majors — with no unversioned `php` alias present at all.
+    #[test]
+    fn startup_discovery_finds_multiple_majors_without_an_unversioned_php_formula() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for formula in ["php@8.1", "php@8.3"] {
+            let bin = dir.path().join("opt").join(formula).join("sbin/php-fpm");
+            std::fs::create_dir_all(bin.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&bin, b"#!/bin/sh\n").expect("write fake php-fpm");
+        }
+        // No "opt/php" directory anywhere: the unversioned alias
+        // `find_brew_binaries` requires is genuinely absent.
+        assert!(!dir.path().join("opt/php").exists());
+
+        let probe = |bin: &Path| -> Option<String> {
+            let s = bin.to_string_lossy();
+            if s.contains("php@8.1") {
+                Some("8.1".to_string())
+            } else if s.contains("php@8.3") {
+                Some("8.3".to_string())
+            } else {
+                None
+            }
+        };
+
+        let found = discover_installed_php(&[dir.path()], &probe);
+        let majors: Vec<&str> = found.iter().map(|r| r.major.as_str()).collect();
+        assert_eq!(majors, vec!["8.1", "8.3"], "got {found:?}");
     }
 }
