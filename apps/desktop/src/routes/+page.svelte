@@ -40,16 +40,30 @@
 	// that in-flight state from a genuinely empty result (see `noPhpInstalled` below).
 	let phpEnv = $state<PhpEnvironmentDto | null>(null);
 	let phpEnvLoaded = $state(false);
+	// I2 audit finding: a FAILED read used to be indistinguishable from a
+	// genuinely empty one — both left `phpEnv` at `null`, so `noPhpInstalled`
+	// below fired for either, and every row's missing-runtime badge (fed by
+	// `installedPhpVersions`, `[]` in both cases too) asserted "not installed"
+	// as fact when the honest answer was "we don't know". Tracked separately so
+	// the two cases can render differently.
+	let phpEnvError = $state(false);
 
 	const installedPhpVersions = $derived(
 		(phpEnv?.runtimes ?? []).filter((r) => r.installed).map((r) => r.major)
 	);
 
-	// Gated on `phpEnvLoaded`, not just `installedPhpVersions.length === 0`: both `null`
-	// (still loading) and a genuinely empty environment produce the same empty array, and
-	// flashing this banner during the brief window before the fetch resolves would be
-	// wrong on any machine that does have a version installed.
-	const noPhpInstalled = $derived(phpEnvLoaded && installedPhpVersions.length === 0);
+	// Whether this machine's PHP environment is actually KNOWN — i.e. the read
+	// settled AND succeeded. `installedPhpVersions` reads `[]` both while this
+	// is false (loading, or the read failed) and when it is genuinely empty;
+	// `noPhpInstalled`/the row badges below must tell those apart rather than
+	// treating "unknown" as "definitely none".
+	const phpEnvKnown = $derived(phpEnvLoaded && !phpEnvError);
+
+	// Gated on `phpEnvKnown`, not just `installedPhpVersions.length === 0`: `null`
+	// (still loading), a failed read, AND a genuinely empty environment all produce
+	// the same empty array, and flashing this banner for any of the first two would
+	// be wrong on any machine that does have a version installed.
+	const noPhpInstalled = $derived(phpEnvKnown && installedPhpVersions.length === 0);
 
 	// The servable site (if any) whose PHP version this machine no longer has —
 	// used only to decide whether the apply-error banner below has a "install
@@ -67,12 +81,13 @@
 	async function loadPhpEnvironment(): Promise<void> {
 		try {
 			phpEnv = await phpEnvironment();
+			phpEnvError = false;
 		} catch {
-			// A failed read is not evidence nothing is installed. This page has no error
-			// banner of its own for it (unlike `store.error`/`applyStore.error`); the safe
-			// fallback — leave `phpEnv` at `null`, so `installedPhpVersions` stays empty and
-			// the drawer/banner guide toward Languages — is the same one a genuinely empty
-			// result already produces, so nothing further is needed here.
+			// I2 fix: a failed read is not evidence nothing is installed, but it is
+			// also not the same fact as a genuinely empty result — `phpEnvError`
+			// is what lets the markup below tell them apart instead of collapsing
+			// both into "nothing installed".
+			phpEnvError = true;
 		} finally {
 			phpEnvLoaded = true;
 		}
@@ -148,7 +163,19 @@
 		     banner named the problem and offered nothing to press. -->
 		<ApplyErrorBanner error={applyStore.error} missing={missingRuntimeSite} onEditSite={onEdit} />
 	{/if}
-	{#if noPhpInstalled}
+	{#if phpEnvError}
+		<!-- I2 fix: a failed `phpEnvironment()` read used to render the SAME
+		     "nothing installed" banner as a genuinely empty environment — a false
+		     claim about the machine, stated as fact. This is the honest version:
+		     the read failed, so nothing below (this banner, Save in the drawer,
+		     the row badges) can say anything about which PHP versions exist. -->
+		<div class="banner-error" role="alert" data-testid="php-env-error-banner">
+			<strong>Could not read the PHP environment</strong>
+			<span
+				>Site rows below cannot show whether their PHP version is installed until this succeeds.</span
+			>
+		</div>
+	{:else if noPhpInstalled}
 		<!-- Sites is the landing page (Rail.svelte's own comment: "`/`, not `/sites`"), so
 		     this is where a first-time user — or one who has never installed PHP — lands
 		     first. Pointing at Languages here, not only inside the drawer, means the guidance
@@ -165,7 +192,7 @@
 	<PendingChangesBanner count={applyStore.pendingCount} onReview={() => (applyDialogOpen = true)} />
 	<SitesPanel
 		sites={store.sites}
-		installed={installedPhpVersions}
+		installed={phpEnvKnown ? installedPhpVersions : null}
 		{onAdd}
 		{onEdit}
 		busy={store.busy}

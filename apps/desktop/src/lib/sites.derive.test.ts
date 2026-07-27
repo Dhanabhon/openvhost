@@ -106,6 +106,17 @@ describe('phpVersionMissing', () => {
 	it('is false when the stored version is installed', () => {
 		expect(phpVersionMissing(site({ phpVersion: '8.5' }), ['8.5'])).toBe(false);
 	});
+
+	// I2 (branch-review-fix-report.md): `null` means the environment is UNKNOWN
+	// (still loading, or the read failed) — a distinct fact from "known and
+	// empty" (`[]`), which the caller used to collapse into the same `[]` via
+	// `phpEnv?.runtimes ?? []`. This must return `false` (no badge) for `null`
+	// even though the SAME site would be flagged against an empty-but-KNOWN
+	// list — otherwise "unknown" would just be a slower way of saying "missing".
+	it('is false (no badge) when the environment is unknown, unlike a known-empty one', () => {
+		expect(phpVersionMissing(site({ phpVersion: '8.4' }), null)).toBe(false);
+		expect(phpVersionMissing(site({ phpVersion: '8.4' }), [])).toBe(true);
+	});
 });
 
 describe('findMissingRuntimeSite', () => {

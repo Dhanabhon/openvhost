@@ -112,12 +112,20 @@ function compareVersions(a: string, b: string): number {
  * moment a site is out of sync, not only after a failed Apply) and, via
  * `findMissingRuntimeSite` below, to decide whether the apply-error banner has
  * a "install this" remedy to offer at all.
+ *
+ * `installed: null` means UNKNOWN (I2 audit finding), not "definitely empty" —
+ * the caller's `phpEnvironment()` read is still loading or it failed outright.
+ * `[]` and `null` used to be the same value (`phpEnv?.runtimes ?? []`), which
+ * flagged every site as missing its runtime during the load flash and, worse,
+ * kept flagging every site as a stated fact when the read had actually failed.
+ * `null` returns `false` here — no badge — because "we don't know" must never
+ * render as "this is broken".
  */
 export function phpVersionMissing(
 	site: Pick<SiteDto, 'phpVersion'>,
-	installed: readonly string[]
+	installed: readonly string[] | null
 ): boolean {
-	return !installed.includes(site.phpVersion);
+	return installed !== null && !installed.includes(site.phpVersion);
 }
 
 /**

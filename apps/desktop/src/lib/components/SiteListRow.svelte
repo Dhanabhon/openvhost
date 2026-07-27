@@ -19,8 +19,13 @@
 		 * `+page.svelte` the same way `SiteDrawer`'s `installed` prop is (Task 8).
 		 * Compared against `site.phpVersion` so a site the machine can no longer
 		 * serve — `brew uninstall php@8.3` strands whatever pointed at 8.3 — is
-		 * flagged the moment it is rendered, not only after a failed Apply. */
-		installed: readonly string[];
+		 * flagged the moment it is rendered, not only after a failed Apply.
+		 *
+		 * `null` means the environment is UNKNOWN (I2 audit finding) — still
+		 * loading, or the read failed — not "definitely nothing installed"; see
+		 * `phpVersionMissing`'s doc comment. Suppresses the badge entirely rather
+		 * than rendering it for every row on a load flash or a failed read. */
+		installed: readonly string[] | null;
 		onEdit: (site: SiteDto) => void;
 		onToggleEnabled: (site: SiteDto, enabled: boolean) => void;
 		onOpen: (id: string) => void;

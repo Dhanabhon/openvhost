@@ -30,7 +30,7 @@ const site = (enabled: boolean, phpVersion = '8.3'): SiteDto => ({
 
 function rowHtml(
 	dto: SiteDto,
-	extra: { busy?: boolean; rowError?: string; installed?: readonly string[] } = {}
+	extra: { busy?: boolean; rowError?: string; installed?: readonly string[] | null } = {}
 ): string {
 	return render(SiteListRow, {
 		props: {
@@ -122,5 +122,20 @@ describe('SiteListRow actions', () => {
 	it('does not warn when the version is installed', () => {
 		const body = rowHtml(site(true, '8.5'), { installed: ['8.5'] });
 		expect(body).not.toContain('data-testid="php-missing"');
+	});
+
+	// I2 (branch-review-fix-report.md): `installed: null` means the environment
+	// is UNKNOWN — still loading, or the read failed — not "definitely nothing
+	// installed". Before the fix, `+page.svelte` collapsed both into `[]`, which
+	// flagged EVERY row as "not installed" during the load flash and, worse, on
+	// every failed read. The same site with a KNOWN-empty list (`[]`) still
+	// warns — proving `null` suppresses the badge for its own reason, not
+	// because an empty array happens to never match.
+	it('suppresses the badge when the environment is unknown, even for a version nothing lists', () => {
+		const unknown = rowHtml(site(true, '8.4'), { installed: null });
+		expect(unknown).not.toContain('data-testid="php-missing"');
+
+		const knownEmpty = rowHtml(site(true, '8.4'), { installed: [] });
+		expect(knownEmpty).toContain('data-testid="php-missing"');
 	});
 });

@@ -18,8 +18,9 @@
 		sites: readonly SiteDto[];
 		/** PHP majors actually installed on this machine, forwarded to every row
 		 * so `SiteListRow`'s missing-runtime badge can compare against it. See
-		 * that component's `installed` prop doc for why. */
-		installed: readonly string[];
+		 * that component's `installed` prop doc for why `null` (environment
+		 * unknown) is a distinct case from `[]` (environment known and empty). */
+		installed: readonly string[] | null;
 		onAdd: () => void;
 		onEdit: (site: SiteDto) => void;
 		onToggleEnabled: (site: SiteDto, enabled: boolean) => void;
