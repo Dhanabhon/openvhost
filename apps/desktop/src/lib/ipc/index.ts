@@ -7,8 +7,12 @@ import type {
 	CoreInfo,
 	FileChangeDto,
 	HomeUsageDto,
+	InstallOutcomeDto,
 	IpcError,
 	LogLine,
+	PhpEnvironmentDto,
+	PhpInstallLogEvent,
+	PhpRuntimeDto,
 	ServiceLogEvent,
 	ServiceProblemDto,
 	ServicesMemoryDto,
@@ -26,8 +30,12 @@ export type {
 	CoreInfo,
 	FileChangeDto,
 	HomeUsageDto,
+	InstallOutcomeDto,
 	IpcError,
 	LogLine,
+	PhpEnvironmentDto,
+	PhpInstallLogEvent,
+	PhpRuntimeDto,
 	ServiceLogEvent,
 	ServiceProblemDto,
 	ServicesMemoryDto,
@@ -218,4 +226,39 @@ export async function servicesMemory(): Promise<ServicesMemoryDto> {
 /** Total bytes under the OpenVHost home. */
 export async function homeDiskUsage(): Promise<HomeUsageDto> {
 	return unwrap(commands.homeDiskUsage());
+}
+
+/**
+ * Read-only PHP environment summary for the Languages page: whether Homebrew
+ * was found, where it looked, and one row per catalogue/installed version.
+ * Spawns nothing — safe to call on page mount and after every install.
+ */
+export async function phpEnvironment(): Promise<PhpEnvironmentDto> {
+	return unwrap(commands.phpEnvironment());
+}
+
+/**
+ * Explicit, user-initiated re-probe behind the "Check again" button. Unlike
+ * {@link phpEnvironment}, this spawns a version probe per candidate binary.
+ */
+export async function rescanPhpRuntimes(): Promise<PhpEnvironmentDto> {
+	return unwrap(commands.rescanPhpRuntimes());
+}
+
+/**
+ * Install a PHP major via Homebrew. Streams its output live through
+ * {@link onPhpInstallLog} while it runs, then resolves with the outcome —
+ * including `detected`, which can be `false` even when `exitCode` is `0`.
+ */
+export async function installPhp(major: string): Promise<InstallOutcomeDto> {
+	return unwrap(commands.installPhp(major));
+}
+
+/** Subscribe to `php-install-log`. Same `IpcError` contract as {@link onServiceState}. */
+export async function onPhpInstallLog(cb: (ev: PhpInstallLogEvent) => void): Promise<() => void> {
+	try {
+		return await events.phpInstallLogEvent.listen((e) => cb(e.payload));
+	} catch (e) {
+		throw normalizeError(e);
+	}
 }

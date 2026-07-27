@@ -13,7 +13,17 @@ vi.mock('@tauri-apps/api/event', () => ({
 	emit: vi.fn()
 }));
 
-import { applySites, coreInfo, listServices, onServiceState, planSiteApply } from './index';
+import {
+	applySites,
+	coreInfo,
+	installPhp,
+	listServices,
+	onPhpInstallLog,
+	onServiceState,
+	phpEnvironment,
+	planSiteApply,
+	rescanPhpRuntimes
+} from './index';
 
 const sample = {
 	appVersion: '0.1.0',
@@ -124,6 +134,148 @@ describe('applySites', () => {
 
 // `ServicesStore`'s own tests live in `../services.svelte.test.ts` (alongside
 // `sites.svelte.test.ts`) — this file is about the IPC barrel.
+
+describe('phpEnvironment', () => {
+	beforeEach(() => invokeMock.mockReset());
+
+	it('returns the environment data on success', async () => {
+		const env = {
+			brewFound: true,
+			brewSearched: ['/opt/homebrew/bin/brew', '/usr/local/bin/brew'],
+			runtimes: [
+				{
+					major: '8.3',
+					installed: true,
+					recommended: false,
+					fullVersion: '8.3',
+					path: '/opt/homebrew/opt/php@8.3/sbin/php-fpm',
+					socketPath: 'run/php-fpm-8.3.sock',
+					serviceId: 'php-fpm-8.3'
+				}
+			]
+		};
+		invokeMock.mockResolvedValueOnce(env);
+		await expect(phpEnvironment()).resolves.toEqual(env);
+		expect(invokeMock).toHaveBeenCalledWith('php_environment');
+	});
+
+	it('throws the normalized IpcError on failure', async () => {
+		invokeMock.mockRejectedValueOnce({
+			kind: 'core',
+			message: 'no web server stack is configured for this platform'
+		});
+		await expect(phpEnvironment()).rejects.toEqual({
+			kind: 'core',
+			message: 'no web server stack is configured for this platform'
+		});
+	});
+
+	it('normalizes a non-IpcError throw into a core-variant IpcError', async () => {
+		invokeMock.mockRejectedValueOnce(new Error('ipc transport down'));
+		await expect(phpEnvironment()).rejects.toEqual({
+			kind: 'core',
+			message: 'Error: ipc transport down'
+		});
+	});
+});
+
+describe('rescanPhpRuntimes', () => {
+	beforeEach(() => invokeMock.mockReset());
+
+	it('returns the environment data on success', async () => {
+		const env = { brewFound: false, brewSearched: ['/opt/homebrew/bin/brew'], runtimes: [] };
+		invokeMock.mockResolvedValueOnce(env);
+		await expect(rescanPhpRuntimes()).resolves.toEqual(env);
+		expect(invokeMock).toHaveBeenCalledWith('rescan_php_runtimes');
+	});
+
+	it('throws the normalized IpcError on failure', async () => {
+		invokeMock.mockRejectedValueOnce({ kind: 'core', message: 'runtime list is poisoned' });
+		await expect(rescanPhpRuntimes()).rejects.toEqual({
+			kind: 'core',
+			message: 'runtime list is poisoned'
+		});
+	});
+});
+
+describe('installPhp', () => {
+	beforeEach(() => invokeMock.mockReset());
+
+	it('passes the major through and returns the outcome on success', async () => {
+		const outcome = { major: '8.4', exitCode: 0, detected: true };
+		invokeMock.mockResolvedValueOnce(outcome);
+		await expect(installPhp('8.4')).resolves.toEqual(outcome);
+		expect(invokeMock).toHaveBeenCalledWith('install_php', { major: '8.4' });
+	});
+
+	it('surfaces exitCode 0 with detected false rather than hiding it', async () => {
+		// The silent-failure case this project keeps catching: brew reports
+		// success but the version never appears. The wrapper must not paper
+		// over that combination — it is exactly what the caller has to render.
+		const outcome = { major: '8.4', exitCode: 0, detected: false };
+		invokeMock.mockResolvedValueOnce(outcome);
+		await expect(installPhp('8.4')).resolves.toEqual(outcome);
+	});
+
+	it('throws the normalized IpcError when an install is already running', async () => {
+		invokeMock.mockRejectedValueOnce({
+			kind: 'core',
+			message: 'an install is already running'
+		});
+		await expect(installPhp('8.4')).rejects.toEqual({
+			kind: 'core',
+			message: 'an install is already running'
+		});
+	});
+
+	it('throws a Validation IpcError naming php_version for a rejected version', async () => {
+		invokeMock.mockRejectedValueOnce({
+			kind: 'validation',
+			field: 'php_version',
+			message: '"--build-from-source" is not a major.minor version'
+		});
+		await expect(installPhp('--build-from-source')).rejects.toEqual({
+			kind: 'validation',
+			field: 'php_version',
+			message: '"--build-from-source" is not a major.minor version'
+		});
+	});
+});
+
+describe('onPhpInstallLog', () => {
+	beforeEach(() => listenMock.mockReset());
+
+	it('resolves to the unlisten function the transport returns', async () => {
+		const unlisten = vi.fn();
+		listenMock.mockResolvedValueOnce(unlisten);
+		await expect(onPhpInstallLog(() => {})).resolves.toBe(unlisten);
+		expect(listenMock).toHaveBeenCalledWith('php-install-log-event', expect.any(Function));
+	});
+
+	it('delivers the event payload to the callback', async () => {
+		const seen: unknown[] = [];
+		listenMock.mockImplementationOnce(async (_name: string, cb: (e: unknown) => void) => {
+			cb({
+				event: 'php-install-log-event',
+				id: 1,
+				payload: { major: '8.4', tsMs: 1234, stream: 'stdout', line: '==> Installing php@8.4' }
+			});
+			return vi.fn();
+		});
+		await onPhpInstallLog((ev) => seen.push(ev));
+		expect(seen).toEqual([
+			{ major: '8.4', tsMs: 1234, stream: 'stdout', line: '==> Installing php@8.4' }
+		]);
+	});
+
+	it('normalizes a raw transport failure into a core-variant IpcError', async () => {
+		listenMock.mockRejectedValueOnce(new Error('event transport down'));
+		await expect(onPhpInstallLog(() => {})).rejects.toEqual({
+			kind: 'core',
+			message: 'Error: event transport down'
+		});
+	});
+});
 
 describe('onServiceState', () => {
 	beforeEach(() => listenMock.mockReset());
