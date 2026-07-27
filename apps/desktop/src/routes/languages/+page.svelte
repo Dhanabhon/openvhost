@@ -81,14 +81,19 @@
 	     becomes a new group here rather than a redesign of this page.
 
 	     Task 7's empty states: `LanguagesEmpty` reads `store.brewFound` and
-	     `store.anyInstalled` to distinguish "no Homebrew at all" (the rowlist below
-	     is hidden entirely in that case — every Install button in it would just
-	     fail with no brew to run) from "Homebrew found, nothing installed yet" (it
-	     renders ABOVE the rowlist as one clear invitation, and the rowlist stays
-	     visible below with its own working per-version Install buttons — the
-	     invitation does not replace them). Once a version is installed,
-	     `LanguagesEmpty` renders nothing and the rowlist is the whole UI, same as
-	     before this task. -->
+	     `store.anyInstalled` to distinguish "no Homebrew at all" from "Homebrew
+	     found, nothing installed yet", rendering ABOVE the rowlist in both cases
+	     (never in place of it — see the rowlist's own condition below) as one
+	     clear invitation/explanation rather than four rows all failing the same
+	     way. Once a version is installed, `LanguagesEmpty` renders nothing and
+	     the rowlist is the whole UI, same as before this task.
+
+	     The rowlist itself is hidden only when there is truly nothing to show it
+	     for: no brew AND nothing installed. `anyInstalled` alone is enough to keep
+	     it visible even without brew — an already-installed, already-running
+	     php-fpm pool does not need brew to serve, or to Start/Stop, so a brew
+	     that went missing after setup (uninstalled, PATH changed) must not hide
+	     it from view. -->
 	<section class="panel languages-panel" aria-label="PHP" data-testid="languages">
 		{#if store.error !== '' && store.env === null}
 			<div class="empty">
@@ -102,7 +107,7 @@
 				brewSearched={store.env.brewSearched}
 				onRescan={() => void store.rescan()}
 			/>
-			{#if store.brewFound}
+			{#if store.brewFound || store.anyInstalled}
 				<div class="rowlist">
 					{#each store.env.runtimes as runtime (runtime.major)}
 						<LanguageRow
