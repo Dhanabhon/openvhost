@@ -7,6 +7,7 @@
 	import { runningCount } from '$lib/services.derive';
 	import AppShell from '$lib/components/AppShell.svelte';
 	import LanguageRow from '$lib/components/LanguageRow.svelte';
+	import LanguagesEmpty from '$lib/components/LanguagesEmpty.svelte';
 
 	const store = new LanguagesStore({ phpEnvironment, rescanPhpRuntimes, installPhp });
 	const running = $derived(runningCount(servicesStore.services));
@@ -79,10 +80,15 @@
 	     today: a second runtime (Node.js, Python, Go — see ServBay's equivalent page)
 	     becomes a new group here rather than a redesign of this page.
 
-	     Task 7 owns the empty states: `store.brewFound` and `store.anyInstalled`
-	     already distinguish "no Homebrew at all" from "Homebrew found, nothing
-	     installed yet" — a `LanguagesEmpty.svelte` slots in here, in place of (or
-	     above) `.rowlist` below, once that task lands. -->
+	     Task 7's empty states: `LanguagesEmpty` reads `store.brewFound` and
+	     `store.anyInstalled` to distinguish "no Homebrew at all" (the rowlist below
+	     is hidden entirely in that case — every Install button in it would just
+	     fail with no brew to run) from "Homebrew found, nothing installed yet" (it
+	     renders ABOVE the rowlist as one clear invitation, and the rowlist stays
+	     visible below with its own working per-version Install buttons — the
+	     invitation does not replace them). Once a version is installed,
+	     `LanguagesEmpty` renders nothing and the rowlist is the whole UI, same as
+	     before this task. -->
 	<section class="panel languages-panel" aria-label="PHP" data-testid="languages">
 		{#if store.error !== '' && store.env === null}
 			<div class="empty">
@@ -90,21 +96,29 @@
 				<p>{store.error}</p>
 			</div>
 		{:else if store.env}
-			<div class="rowlist">
-				{#each store.env.runtimes as runtime (runtime.major)}
-					<LanguageRow
-						row={runtime}
-						running={isRunning(runtime.serviceId)}
-						installing={store.installing}
-						log={store.logFor(runtime.major)}
-						error={runtime.major === lastAttempted ? store.error : ''}
-						outcome={store.outcome}
-						onInstall={(major) => void onInstall(major)}
-						onStart={(id) => void servicesStore.start(id)}
-						onStop={(id) => void servicesStore.stop(id)}
-					/>
-				{/each}
-			</div>
+			<LanguagesEmpty
+				brewFound={store.brewFound}
+				anyInstalled={store.anyInstalled}
+				brewSearched={store.env.brewSearched}
+				onRescan={() => void store.rescan()}
+			/>
+			{#if store.brewFound}
+				<div class="rowlist">
+					{#each store.env.runtimes as runtime (runtime.major)}
+						<LanguageRow
+							row={runtime}
+							running={isRunning(runtime.serviceId)}
+							installing={store.installing}
+							log={store.logFor(runtime.major)}
+							error={runtime.major === lastAttempted ? store.error : ''}
+							outcome={store.outcome}
+							onInstall={(major) => void onInstall(major)}
+							onStart={(id) => void servicesStore.start(id)}
+							onStop={(id) => void servicesStore.stop(id)}
+						/>
+					{/each}
+				</div>
+			{/if}
 		{/if}
 	</section>
 </AppShell>
