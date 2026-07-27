@@ -42,7 +42,7 @@ Precisely what changes in `provision_macos_demo_stack`:
 |---|---|
 | Creating `conf/`, `www/`, `run/`, `run/nginx/`, `logs/` | **kept** — the generated tree still needs them, minus `conf/` |
 | Writing `conf/nginx.conf` and `conf/php-fpm.conf` | **removed** — replaced by the generated set |
-| Seeding `www/index.php` with phpinfo | **kept** — it becomes the catch-all's welcome page (§6.3) |
+| Seeding `www/index.php` | **kept** — it becomes the catch-all's welcome page (§6.3), with its contents replaced (see below) |
 | `MAX_SOCKET_PATH_BYTES` guard | **kept**, now applied to the per-major socket (§4.7) |
 
 `stack.rs` correspondingly points the nginx `ServiceSpec` at
@@ -289,9 +289,20 @@ Two of these lines are load-bearing beyond correctness:
 ### 6.3 `nginx/default-site.conf.tera` — new
 
 The catch-all: `listen … default_server;` with `server_name _;`, rooted at `home/www`,
-serving the existing phpinfo page as a welcome screen and using the first installed PHP
-major. It needs its own template because `_` is not a hostname and `RenderCtx`'s
-validator correctly rejects it.
+serving a welcome page and using the first installed PHP major. It needs its own template
+because `_` is not a hostname and `RenderCtx`'s validator correctly rejects it.
+
+**Revised during implementation (owner, 2026-07-27).** The design originally kept P0-4's
+`phpinfo()` page here. The security audit rated that Medium and the owner agreed to change
+it: `server_name _` answers *any* unmatched `Host` on `127.0.0.1:8080`, which makes the
+page readable by every local process and, under DNS rebinding, by an ordinary web page —
+handing out absolute paths, the loaded-extension inventory and every `php.ini` value.
+
+The replacement is a small HTML page that echoes `PHP_VERSION`. It stays a `.php` file on
+purpose: the page exists to prove the nginx→php-fpm handshake works, and a static file
+would pass that check without PHP running at all. The E2E asserts both directions — the
+version appears, and a literal `PHP_VERSION` does not (which would mean the file was served
+as text rather than executed).
 
 With zero sites, or a request for an unmatched host, this is what answers — so nginx
 always has at least one `server` block and always starts. When no PHP runtime is

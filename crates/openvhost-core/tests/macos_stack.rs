@@ -33,7 +33,23 @@ fn provisioning_creates_the_directories_and_seeds_the_welcome_page() {
     }
     let index = home.path().join("www/index.php");
     assert!(index.is_file());
-    assert!(std::fs::read_to_string(index).unwrap().contains("phpinfo"));
+    let page = std::fs::read_to_string(index).unwrap();
+    assert!(
+        page.contains("PHP_VERSION"),
+        "the page must still prove PHP runs"
+    );
+    assert!(
+        page.contains("DO NOT EDIT"),
+        "it is rewritten every launch, so say so"
+    );
+    // The catch-all answers ANY unmatched Host on 127.0.0.1:8080, which makes it
+    // readable by any local process and, under DNS rebinding, by a web page.
+    // phpinfo() there would hand out absolute paths, the extension inventory and
+    // every php.ini value (security audit A1).
+    assert!(
+        !page.contains("phpinfo"),
+        "the landing page must not disclose phpinfo to an unmatched host"
+    );
 }
 
 #[test]

@@ -248,11 +248,28 @@ async fn site_apply_serves_a_real_site_end_to_end() {
         "path-info guard failed:\n{exploit}"
     );
 
-    // The catch-all answers a host that matches no site.
+    // The catch-all answers a host that matches no site, and PHP really ran:
+    // the landing page echoes PHP_VERSION, so a literal "PHP_VERSION" in the
+    // response would mean the file was served as text instead of executed.
     let fallback = get(LISTEN_PORT, "nothing.localhost", "/index.php", deadline).unwrap();
     assert!(
-        fallback.contains("phpinfo") || fallback.contains("PHP Version"),
-        "catch-all did not serve the seeded phpinfo page:\n{fallback}"
+        fallback.contains("OpenVHost is running"),
+        "catch-all did not serve the landing page:\n{fallback}"
+    );
+    assert!(
+        !fallback.contains("PHP_VERSION"),
+        "the landing page was served as text, not executed:\n{fallback}"
+    );
+    // A version PHP would actually print, e.g. "PHP 8.4.23 answered".
+    assert!(
+        fallback.contains(&format!("PHP {major}.")),
+        "the catch-all did not report the installed PHP version:\n{fallback}"
+    );
+    // Whatever else changes about this page, it must not become phpinfo() again
+    // (security audit A1): the catch-all answers any unmatched Host.
+    assert!(
+        !fallback.contains("phpinfo()") && !fallback.contains("Configuration File (php.ini)"),
+        "the catch-all is disclosing phpinfo:\n{fallback}"
     );
 
     // Teardown proof: drop both guards explicitly (rather than letting scope
