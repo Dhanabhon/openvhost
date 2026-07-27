@@ -1101,6 +1101,13 @@ pub struct PhpRuntimeDto {
     pub major: String,
     pub installed: bool,
     pub recommended: bool,
+    /// A more precise version string than `major` (e.g. a patch level), when
+    /// one is known. `None` does NOT mean anything is wrong with this row —
+    /// it means we do not know the patch level. The only prober we have,
+    /// `openvhost_conf::probe_php_fpm_version`, returns `major.minor` and
+    /// never a patch level, so today this is `None` for every row. Echoing
+    /// `major` back into this field instead would render "8.3" twice next to
+    /// each other and imply a patch level was fetched when it was not.
     pub full_version: Option<String>,
     pub path: Option<String>,
     /// Where this version's pool listens. `None` until installed.
@@ -1163,14 +1170,16 @@ fn now_ms() -> u64 {
 /// Tauri-free so the row-building logic is testable without a live
 /// `AppHandle` or a real supervisor.
 ///
-/// `full_versions` maps a major to the more precise string the page shows
-/// next to it. In production this is built from the same probe that already
-/// produced `installed`'s majors — `openvhost_conf::probe_php_fpm_version`
-/// only ever reports `major.minor`, never a patch level, so today's
-/// production value is identical to `major` for every installed row. Wiring
-/// a true patch-level prober is future work; keeping it a separate parameter
-/// here means that upgrade will not have to touch this function's callers
-/// beyond what they pass in.
+/// `full_versions` maps a major to a more precise string (e.g. a patch
+/// level) the page can show next to it, when one is actually known. In
+/// production this is empty: the only prober we have,
+/// `openvhost_conf::probe_php_fpm_version`, returns `major.minor` and never
+/// a patch level, so there is nothing more precise to hand in today — and
+/// echoing `major` back in as if it were that string would render "8.3"
+/// twice and imply a patch level had been fetched when it had not. Wiring a
+/// true patch-level prober is future work; keeping this a separate parameter
+/// means that upgrade will not have to touch this function's callers beyond
+/// what they pass in.
 fn php_rows(
     home: &Path,
     installed: &[openvhost_core::PhpRuntime],
@@ -1245,13 +1254,39 @@ async fn discover_all_php() -> Result<Vec<openvhost_core::PhpRuntime>, IpcError>
     })
 }
 
-/// Probe for installed PHP runtimes, write the result into the managed
-/// `RwLock`, and register a supervisor row for every major found.
+/// Which majors in `found` were not already in `before` — the ones a rescan
+/// should hand to `Supervisor::register`.
 ///
-/// Registering unconditionally for every discovered major (not only "new"
-/// ones) is safe and idempotent: `Supervisor::register` no-ops against a live
-/// entry and otherwise just (re)inserts a `Stopped` row from the freshly
-/// built spec, so a version already registered is left exactly as it was.
+/// Extracted so the "which majors are new" decision is a pure function,
+/// testable without a `Supervisor`. It matters because `Supervisor::register`
+/// only no-ops against a `Starting`/`Running` entry — a `Failed { exit,
+/// stderr_tail }` row, or a `Stopped` one with accumulated log lines, is
+/// REPLACED, which wipes that row's `RingBuffer`, its `stderr_tail` and its
+/// exit code. That is real diagnostic state, readable through
+/// `service_log_tail`, not bookkeeping: it is the answer to "why did this
+/// pool fail to start" for a bystander PHP version that had nothing to do
+/// with whatever prompted this rescan. So only a major that is genuinely new
+/// gets registered; one already known, in whatever state, is left alone.
+///
+/// A major present in `before` but missing from `found` (uninstalled outside
+/// the app) is likewise not returned here — there is no `Supervisor`
+/// unregister, and a row pointing at a now-missing binary simply fails
+/// honestly the next time it is started.
+fn newly_installed_majors(before: &[String], found: &[String]) -> Vec<String> {
+    found
+        .iter()
+        .filter(|major| !before.contains(major))
+        .cloned()
+        .collect()
+}
+
+/// Probe for installed PHP runtimes, write the result into the managed
+/// `RwLock`, and register a supervisor row for every NEWLY discovered major.
+///
+/// Only new majors are registered — see `newly_installed_majors` for why
+/// re-registering an already-known major (even an unchanged one) is not
+/// idempotent in the way it looks: it can silently erase a `Failed` row's
+/// stderr and exit code.
 ///
 /// Shared by `rescan_php_runtimes` and `install_php` so the two commands
 /// cannot register two different service shapes for the same version.
@@ -1260,10 +1295,22 @@ async fn rescan_into_state(
     sup: &Supervisor,
     paths: &StackPaths,
 ) -> Result<Vec<openvhost_core::PhpRuntime>, IpcError> {
-    let php = discover_all_php().await?;
+    let before: Vec<String> = runtimes
+        .read()
+        .map_err(|_| IpcError::Core {
+            message: "runtime list is poisoned".into(),
+        })?
+        .as_ref()
+        .map(|r| r.php.iter().map(|rt| rt.major.clone()).collect())
+        .unwrap_or_default();
 
-    for rt in &php {
-        sup.register(crate::stack::php_fpm_spec(&paths.home, rt));
+    let php = discover_all_php().await?;
+    let found: Vec<String> = php.iter().map(|rt| rt.major.clone()).collect();
+
+    for major in newly_installed_majors(&before, &found) {
+        if let Some(rt) = php.iter().find(|rt| rt.major == major) {
+            sup.register(crate::stack::php_fpm_spec(&paths.home, rt));
+        }
     }
 
     *runtimes.write().map_err(|_| IpcError::Core {
@@ -1309,16 +1356,14 @@ pub async fn php_environment(
         .as_ref()
         .map(|r| r.php.clone())
         .unwrap_or_default();
-    // See `php_rows`'s doc comment: today this is identical to each
-    // runtime's `major`, since the probe never reports a patch level.
-    let full_versions: Vec<(&str, &str)> = installed
-        .iter()
-        .map(|rt| (rt.major.as_str(), rt.major.as_str()))
-        .collect();
+    // See `php_rows`'s doc comment: there is no patch-level prober yet, so
+    // there is nothing more precise than `major` to hand in here. An empty
+    // map, not a `(major, major)` echo — `full_version` must read as
+    // "unknown", not as a copy of `major`.
     Ok(PhpEnvironmentDto {
         brew_found: openvhost_core::find_brew().is_some(),
         brew_searched: brew_searched_paths(),
-        runtimes: php_rows(&p.home, &installed, &full_versions),
+        runtimes: php_rows(&p.home, &installed, &[]),
     })
 }
 
@@ -1336,14 +1381,14 @@ pub async fn rescan_php_runtimes(
 ) -> Result<PhpEnvironmentDto, IpcError> {
     let p = stack_paths(&paths)?;
     let installed = rescan_into_state(runtimes.inner(), sup.inner(), p).await?;
-    let full_versions: Vec<(&str, &str)> = installed
-        .iter()
-        .map(|rt| (rt.major.as_str(), rt.major.as_str()))
-        .collect();
+    // See `php_rows`'s doc comment: there is no patch-level prober yet, so
+    // there is nothing more precise than `major` to hand in here. An empty
+    // map, not a `(major, major)` echo — `full_version` must read as
+    // "unknown", not as a copy of `major`.
     Ok(PhpEnvironmentDto {
         brew_found: openvhost_core::find_brew().is_some(),
         brew_searched: brew_searched_paths(),
-        runtimes: php_rows(&p.home, &installed, &full_versions),
+        runtimes: php_rows(&p.home, &installed, &[]),
     })
 }
 
@@ -1480,6 +1525,53 @@ mod php_ipc_tests {
             one.service_id.is_none(),
             "a version that is not installed has no pool"
         );
+    }
+
+    #[test]
+    fn the_patch_level_is_absent_rather_than_a_repeat_of_the_major() {
+        // Our only prober returns major.minor. Echoing it into `full_version`
+        // would render "8.3" twice and imply a patch level we never fetched.
+        let installed = vec![openvhost_core::PhpRuntime {
+            major: "8.3".into(),
+            fpm_bin: PathBuf::from("/opt/homebrew/opt/php@8.3/sbin/php-fpm"),
+        }];
+        let rows = php_rows(Path::new("/tmp/ovh"), &installed, &[]);
+        let three = rows.iter().find(|r| r.major == "8.3").unwrap();
+        assert!(three.installed);
+        assert!(
+            three.full_version.is_none(),
+            "got {:?} — an unknown patch level must be None, not a copy of the major",
+            three.full_version
+        );
+    }
+
+    #[test]
+    fn only_newly_discovered_majors_are_registered() {
+        // Re-registering an existing row replaces it, which wipes a Failed row's
+        // stderr and exit code — the reason a user would be looking at it.
+        let before = ["8.3".to_string(), "8.5".to_string()];
+        let found = ["8.3".to_string(), "8.4".to_string(), "8.5".to_string()];
+        assert_eq!(
+            newly_installed_majors(&before, &found),
+            vec!["8.4".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_rescan_that_finds_nothing_new_registers_nothing() {
+        let before = ["8.3".to_string()];
+        let found = ["8.3".to_string()];
+        assert!(newly_installed_majors(&before, &found).is_empty());
+    }
+
+    #[test]
+    fn a_version_that_disappeared_is_not_treated_as_new() {
+        // brew uninstall outside the app: 8.3 is gone from `found`. Nothing to
+        // register, and nothing to unregister either — the supervisor has no
+        // unregister, and a row pointing at a missing binary fails honestly.
+        let before = ["8.3".to_string(), "8.5".to_string()];
+        let found = ["8.5".to_string()];
+        assert!(newly_installed_majors(&before, &found).is_empty());
     }
 
     #[test]

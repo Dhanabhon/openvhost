@@ -256,6 +256,15 @@ export type PhpRuntimeDto = {
 	major: string,
 	installed: boolean,
 	recommended: boolean,
+	/**
+	 *  A more precise version string than `major` (e.g. a patch level), when
+	 *  one is known. `None` does NOT mean anything is wrong with this row —
+	 *  it means we do not know the patch level. The only prober we have,
+	 *  `openvhost_conf::probe_php_fpm_version`, returns `major.minor` and
+	 *  never a patch level, so today this is `None` for every row. Echoing
+	 *  `major` back into this field instead would render "8.3" twice next to
+	 *  each other and imply a patch level was fetched when it was not.
+	 */
 	fullVersion: string | null,
 	path: string | null,
 	/**  Where this version's pool listens. `None` until installed. */
