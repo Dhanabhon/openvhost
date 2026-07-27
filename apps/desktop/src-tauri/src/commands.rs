@@ -3,6 +3,7 @@
 //! (business logic never lives here; master plan §5).
 
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 
 // `WebServerAdapter` is imported for its `supports_hot_reload` method: it is a
 // trait method, so the trait must be in scope even though the call site names
@@ -555,10 +556,19 @@ async fn apply_input(
 #[specta::specta]
 pub async fn plan_site_apply(
     db: tauri::State<'_, Db>,
-    runtimes: tauri::State<'_, Option<InstalledRuntimes>>,
+    runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
     paths: tauri::State<'_, Option<StackPaths>>,
 ) -> Result<ApplyPlanDto, IpcError> {
-    let input = apply_input(db.inner(), runtimes.inner(), paths.inner()).await?;
+    // Clone out of the guard and drop it before the `.await` below: holding a
+    // `std::sync::RwLockReadGuard` across an await point makes this command's
+    // future non-`Send`, which fails to compile.
+    let runtimes = runtimes
+        .read()
+        .map_err(|_| IpcError::Core {
+            message: "runtime list is poisoned".into(),
+        })?
+        .clone();
+    let input = apply_input(db.inner(), &runtimes, paths.inner()).await?;
     let p = openvhost_core::plan(&input)?;
     Ok(ApplyPlanDto {
         changes: p
@@ -581,7 +591,7 @@ pub async fn plan_site_apply(
 #[specta::specta]
 pub async fn apply_sites(
     db: tauri::State<'_, Db>,
-    runtimes: tauri::State<'_, Option<InstalledRuntimes>>,
+    runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
     paths: tauri::State<'_, Option<StackPaths>>,
     sup: tauri::State<'_, Arc<Supervisor>>,
     lock: tauri::State<'_, ApplyLock>,
@@ -596,7 +606,17 @@ pub async fn apply_sites(
     // and out of scope here.
     let _apply_guard = lock.inner().0.lock().await;
 
-    let input = apply_input(db.inner(), runtimes.inner(), paths.inner()).await?;
+    // Clone out of the guard and drop it before the `.await` below: holding a
+    // `std::sync::RwLockReadGuard` across an await point makes this command's
+    // future non-`Send`, which fails to compile.
+    let runtimes = runtimes
+        .read()
+        .map_err(|_| IpcError::Core {
+            message: "runtime list is poisoned".into(),
+        })?
+        .clone();
+
+    let input = apply_input(db.inner(), &runtimes, paths.inner()).await?;
     let Some(stack) = paths.inner().as_ref() else {
         return Err(IpcError::Core {
             message: "no web server stack is configured for this platform".into(),
@@ -1574,6 +1594,25 @@ mod apply_ipc_tests {
         let (restarted, problems) = restart_outcome(&running, &[], |_| Ok(()));
         assert_eq!(restarted, running);
         assert!(problems.is_empty());
+    }
+
+    #[test]
+    fn the_runtime_set_can_be_replaced_after_startup() {
+        // The Languages page installs a version at runtime; if this state could not
+        // be replaced, apply would never learn about it and Install would appear
+        // to succeed while changing nothing.
+        let state = RwLock::new(None::<InstalledRuntimes>);
+        assert!(state.read().unwrap().is_none());
+        *state.write().unwrap() = Some(InstalledRuntimes {
+            nginx_bin: PathBuf::from("/opt/homebrew/opt/nginx/bin/nginx"),
+            php: vec![openvhost_core::PhpRuntime {
+                major: "8.3".into(),
+                fpm_bin: PathBuf::from("/opt/homebrew/opt/php@8.3/sbin/php-fpm"),
+            }],
+        });
+        let seen = state.read().unwrap().clone().unwrap();
+        assert_eq!(seen.php.len(), 1);
+        assert_eq!(seen.php[0].major, "8.3");
     }
 }
 

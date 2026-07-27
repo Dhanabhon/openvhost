@@ -251,7 +251,14 @@ pub fn run() {
                             // doc comment) — either way a later command that reads this state
                             // sees an honest absence rather than a stale value from a call
                             // that never happened.
-                            app.manage(stack_runtimes);
+                            //
+                            // Wrapped in an `RwLock` (unlike `stack_paths` above): Tauri's
+                            // managed state cannot be replaced once set, but the installed PHP
+                            // runtimes CAN change after launch — the Languages page installs a
+                            // version at runtime, and the apply pipeline must see it without a
+                            // relaunch. The lock is the seam a later rescan/install writes
+                            // through; every reader here just takes the read side.
+                            app.manage(std::sync::RwLock::new(stack_runtimes));
                             let mut rx = supervisor.subscribe();
                             let handle = app.handle().clone();
                             tauri::async_runtime::spawn(async move {
