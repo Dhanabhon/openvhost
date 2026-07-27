@@ -1521,12 +1521,32 @@ impl InstallLock {
 /// early returns is exactly the shape where "remember to clear this" rots the
 /// first time a new early return is added, so the guarantee is a `Drop` impl
 /// instead of a set of matching calls scattered through the function body.
+///
+/// A2 audit finding: also owns the run's own `AbortHandle` and aborts it on
+/// drop, rather than only clearing the slot. There is no live bug today —
+/// Tauri never cancels a command's future on its own, which is exactly why
+/// `perform_quit` needs its own explicit abort-before-`window.destroy()` call
+/// (see `install_php`'s doc comment and `quit.rs`) — but a bare `clear_running`
+/// here inverted the OLD failure mode instead of merely lacking a new one.
+/// Before this branch, dropping the command future killed brew via
+/// `run_task`'s `KillOnDrop` because nothing spawned it — the future WAS the
+/// run. After `install_php` started spawning the run (the C1 fix), the
+/// spawned task keeps executing independent of this guard; if this guard were
+/// ever dropped WITHOUT `install_task.await` above having already run it to
+/// completion (a `?` on an early return added later, a panic unwinding
+/// through this scope), the task would leak — AND the slot `perform_quit`
+/// reads to find something to abort would already be empty, so quit would no
+/// longer find it either. Aborting here closes both: `AbortHandle::abort` is
+/// a no-op on an already-finished task, so this costs nothing on the normal
+/// path where `install_task.await` already completed it.
 struct RunningInstallGuard<'a> {
     lock: &'a InstallLock,
+    abort: tokio::task::AbortHandle,
 }
 
 impl Drop for RunningInstallGuard<'_> {
     fn drop(&mut self) {
+        self.abort.abort();
         self.lock.clear_running();
     }
 }
@@ -1638,12 +1658,17 @@ pub async fn install_php(
         spec,
         tx,
     ));
+    let abort_handle = install_task.abort_handle();
     lock.inner()
-        .set_running(major.as_str().to_string(), install_task.abort_handle());
-    // Cleared on every return path below via `Drop`, including the two `?`s
-    // still to come — see `RunningInstallGuard`'s doc comment for why that is
-    // a `Drop` impl and not a matching call at each return point.
-    let _running_guard = RunningInstallGuard { lock: lock.inner() };
+        .set_running(major.as_str().to_string(), abort_handle.clone());
+    // Cleared AND aborted on every return path below via `Drop`, including
+    // the two `?`s still to come — see `RunningInstallGuard`'s doc comment
+    // for why that is a `Drop` impl and not a matching call at each return
+    // point, and why it aborts rather than merely clearing the slot.
+    let _running_guard = RunningInstallGuard {
+        lock: lock.inner(),
+        abort: abort_handle,
+    };
 
     let exit_code = match install_task.await {
         Ok(result) => result?,
@@ -1865,6 +1890,49 @@ mod php_ipc_tests {
             .expect("rescan did not unblock after the install lock was released")
             .expect("rescan task panicked");
         assert!(result.is_ok(), "got {result:?}");
+    }
+
+    /// A2 audit finding: `RunningInstallGuard::drop` used to clear
+    /// `InstallLock`'s slot without aborting the run it was tracking. There is
+    /// no real supervisor or brew process involved in reproducing this — an
+    /// intentionally never-settling task stands in for "the run", and
+    /// dropping the guard before that task's own future ever completes is
+    /// exactly the shape the fix targets (in production this only happens via
+    /// an early `?` return or a panic unwinding between `set_running` and
+    /// `install_task.await`, but `Drop` cannot tell those apart from an
+    /// explicit `drop(guard)`, so this test exercises the same code path
+    /// directly). Before the fix, this task would still be running (and
+    /// `result` would be `Ok(())` from a `.recv()`/timeout race, never
+    /// `Err(cancelled)`) after the guard went out of scope.
+    #[tokio::test]
+    async fn dropping_the_running_install_guard_aborts_the_task_it_tracks() {
+        let lock = InstallLock::default();
+        let task = tokio::spawn(std::future::pending::<()>());
+        let abort = task.abort_handle();
+        lock.set_running("8.4".to_string(), abort.clone());
+
+        {
+            let _guard = RunningInstallGuard { lock: &lock, abort };
+            // Dropped at the end of this block, same as `install_php`'s
+            // `_running_guard` at the end of its own function body.
+        }
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("task did not settle after the guard was dropped");
+        match result {
+            Err(join_err) => assert!(
+                join_err.is_cancelled(),
+                "expected the guard's Drop impl to cancel the task, got {join_err:?}"
+            ),
+            Ok(()) => {
+                panic!("expected the guard's Drop impl to abort the task, but it ran to completion")
+            }
+        }
+        assert!(
+            lock.running_major().is_none(),
+            "expected the guard's Drop impl to also clear the running slot"
+        );
     }
 }
 
