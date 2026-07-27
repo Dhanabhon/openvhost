@@ -21,13 +21,29 @@ fn is_php_formula(name: &str) -> bool {
     name == "php" || name.starts_with("php@")
 }
 
+/// Two preferences apply when merging discovered runtimes, and they can
+/// disagree:
+///
+/// 1. **Earlier prefix wins.** `BREW_PREFIXES` is ordered Apple Silicon
+///    before Intel precisely so a native binary is preferred over a Rosetta
+///    one. A later prefix must never overwrite an earlier one.
+/// 2. **Versioned path beats the `php` alias**, within the *same* prefix:
+///    `php` is an alias that moves the day brew upgrades the current
+///    formula, while `php@8.5` keeps pointing at 8.5.
+///
+/// Preference 1 takes precedence over preference 2: the alias-vs-versioned
+/// override only applies when the incoming candidate comes from the same
+/// prefix as the existing entry. A stale alias path is cosmetic (discovery
+/// reruns on every rescan), but running the wrong architecture is not.
 pub fn discover_php_in(
     prefixes: &[&Path],
     probe: &dyn Fn(&Path) -> Option<String>,
 ) -> Vec<PhpRuntime> {
-    let mut found: Vec<PhpRuntime> = Vec::new();
+    // Track which prefix (by index into `prefixes`) produced each entry so
+    // the alias override below can check "same prefix" before firing.
+    let mut found: Vec<(usize, PhpRuntime)> = Vec::new();
 
-    for prefix in prefixes {
+    for (prefix_idx, prefix) in prefixes.iter().enumerate() {
         let opt = prefix.join("opt");
         let Ok(entries) = std::fs::read_dir(&opt) else {
             continue; // a prefix that is not installed is not an error
@@ -50,11 +66,15 @@ pub fn discover_php_in(
             let Some(major) = probe(&bin) else {
                 continue;
             };
-            match found.iter_mut().find(|r| r.major == major) {
-                // Already known. Prefer the versioned path: `php` is an alias
-                // that moves the day brew upgrades the current formula, while
-                // `php@8.5` keeps pointing at 8.5.
-                Some(existing) => {
+            match found.iter_mut().find(|(_, r)| r.major == major) {
+                // Already known. Only apply the alias→versioned override
+                // when this candidate comes from the same prefix as the
+                // existing entry — a later prefix must never overwrite an
+                // earlier one, aliased or not.
+                Some((existing_prefix_idx, existing)) => {
+                    if *existing_prefix_idx != prefix_idx {
+                        continue;
+                    }
                     let existing_is_alias = existing
                         .fpm_bin
                         .parent()
@@ -65,14 +85,18 @@ pub fn discover_php_in(
                         existing.fpm_bin = bin;
                     }
                 }
-                None => found.push(PhpRuntime {
-                    major,
-                    fpm_bin: bin,
-                }),
+                None => found.push((
+                    prefix_idx,
+                    PhpRuntime {
+                        major,
+                        fpm_bin: bin,
+                    },
+                )),
             }
         }
     }
 
+    let mut found: Vec<PhpRuntime> = found.into_iter().map(|(_, runtime)| runtime).collect();
     found.sort_by(|a, b| a.major.cmp(&b.major));
     found
 }
@@ -164,5 +188,39 @@ mod tests {
         let found = discover_php_in(&[a.path(), b.path()], &probe_from(merged));
         assert_eq!(found.len(), 1);
         assert!(found[0].fpm_bin.starts_with(a.path()));
+    }
+
+    #[test]
+    fn a_later_prefix_never_replaces_an_earlier_one_even_with_a_versioned_path() {
+        // Apple Silicon has only the `php` alias for 8.3; Intel has php@8.3.
+        // Preferring the versioned path here would run a Rosetta binary while a
+        // native one is installed — the exact thing the prefix order exists to
+        // prevent. Path staleness is cosmetic; the wrong architecture is not.
+        let (silicon, v1) = fake_prefix(&[("php", "8.3")]);
+        let (intel, v2) = fake_prefix(&[("php@8.3", "8.3")]);
+        let mut merged = v1;
+        merged.extend(v2);
+
+        let found = discover_php_in(&[silicon.path(), intel.path()], &probe_from(merged));
+        assert_eq!(found.len(), 1);
+        assert!(
+            found[0].fpm_bin.starts_with(silicon.path()),
+            "a later prefix replaced an earlier one: {:?}",
+            found[0].fpm_bin
+        );
+    }
+
+    #[test]
+    fn within_one_prefix_the_versioned_path_still_beats_the_alias() {
+        // The other preference must survive the fix: inside a single prefix,
+        // `php@8.5` is the stable path and `php` is the alias that moves.
+        let (dir, versions) = fake_prefix(&[("php", "8.5"), ("php@8.5", "8.5")]);
+        let found = discover_php_in(&[dir.path()], &probe_from(versions));
+        assert_eq!(found.len(), 1);
+        assert!(
+            found[0].fpm_bin.to_string_lossy().contains("php@8.5"),
+            "the versioned path should still win inside one prefix: {:?}",
+            found[0].fpm_bin
+        );
     }
 }
