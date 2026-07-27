@@ -18,6 +18,7 @@ pub struct TestchildArgs {
     pub ignore_stop: bool,
     pub fail_after: Option<u64>,
     pub http_port: Option<u16>,
+    pub spawn_child: bool,
 }
 
 impl Default for TestchildArgs {
@@ -29,6 +30,7 @@ impl Default for TestchildArgs {
             ignore_stop: false,
             fail_after: None,
             http_port: None,
+            spawn_child: false,
         }
     }
 }
@@ -55,6 +57,7 @@ pub fn parse(args: &[String]) -> Result<TestchildArgs, String> {
             }
             "--fail-after" => out.fail_after = Some(next_u64("--fail-after")?),
             "--ignore-stop" => out.ignore_stop = true,
+            "--spawn-child" => out.spawn_child = true,
             "--http" => {
                 out.http_port = Some(
                     it.next()
@@ -77,6 +80,20 @@ pub fn run(args: TestchildArgs) -> i32 {
     if args.ignore_stop {
         install_ignore_stop();
     }
+    if args.spawn_child {
+        match spawn_grandchild() {
+            Ok(pid) => {
+                let stdout = std::io::stdout();
+                let mut lock = stdout.lock();
+                let _ = writeln!(lock, "child-pid: {pid}");
+                let _ = lock.flush();
+            }
+            Err(e) => {
+                eprintln!("proc_testchild: failed to spawn grandchild: {e}");
+                return 1;
+            }
+        }
+    }
     let stdout = std::io::stdout();
     for i in 1..=args.lines {
         if let Some(n) = args.fail_after {
@@ -93,6 +110,27 @@ pub fn run(args: TestchildArgs) -> i32 {
         std::thread::sleep(std::time::Duration::from_millis(args.interval_ms));
     }
     args.exit_code
+}
+
+/// Spawn a long-lived grandchild by re-executing this same binary with
+/// `--lines 100000 --interval-ms 200 --ignore-stop` — the cheapest way to get
+/// something that stays alive and does not exit on its own, since the binary
+/// is already on disk and already knows how to ignore a polite stop.
+///
+/// Deliberately does NOT call `.process_group(..)` on the child: the whole
+/// point is that this process inherits ITS OWN process group (set by the
+/// caller of `proc_testchild` — see `platform/unix.rs`'s `process_group(0)`),
+/// so the grandchild becomes a member of the same group under test. Setting a
+/// new group here would defeat the test this flag exists to support.
+fn spawn_grandchild() -> std::io::Result<u32> {
+    let exe = std::env::current_exe()?;
+    let child = std::process::Command::new(exe)
+        .args(["--lines", "100000", "--interval-ms", "200", "--ignore-stop"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    Ok(child.id())
 }
 
 /// Minimal HTTP/1.1 server: serve a fixed `200` + `E2E_BODY` on every
@@ -174,6 +212,7 @@ mod tests {
             "--ignore-stop",
             "--fail-after",
             "1",
+            "--spawn-child",
         ]))
         .unwrap();
         assert_eq!(
@@ -185,6 +224,7 @@ mod tests {
                 ignore_stop: true,
                 fail_after: Some(1),
                 http_port: None,
+                spawn_child: true,
             }
         );
     }

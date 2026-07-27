@@ -3,7 +3,9 @@
 //! Poll-with-timeout only — never sleep-and-hope.
 #![allow(clippy::unwrap_used)]
 
-use std::ffi::OsString;
+mod common;
+use common::testchild_spec;
+
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -25,15 +27,6 @@ const STOP_TIMEOUT: Duration = if cfg!(windows) {
 } else {
     Duration::from_secs(3)
 };
-
-fn testchild_spec(args: &[&str]) -> SpawnSpec {
-    SpawnSpec {
-        program: PathBuf::from(env!("CARGO_BIN_EXE_proc_testchild")),
-        args: args.iter().map(OsString::from).collect(),
-        cwd: None,
-        env: vec![],
-    }
-}
 
 fn svc(id: &str, args: &[&str]) -> ServiceSpec {
     ServiceSpec {
