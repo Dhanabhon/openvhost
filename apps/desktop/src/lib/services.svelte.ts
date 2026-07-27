@@ -44,6 +44,33 @@ export class ServicesStore {
 		return (this.snapshot ??= this.fetchServices());
 	}
 
+	/**
+	 * Force a fresh `listServices()` round trip, discarding any memoized
+	 * result — the escape hatch for a caller that KNOWS the set of registered
+	 * services changed underneath this store.
+	 *
+	 * I1 audit finding (branch-review-fix-report.md): `Supervisor::register`
+	 * emits no event, and `applyState` below only maps over the services
+	 * ALREADY in `this.services` — a `StateChanged` for an id it does not
+	 * recognize is silently dropped (see that method's own doc comment). So
+	 * installing a PHP version after launch registers a real supervisor row
+	 * that this store never learns about: the Languages page would offer
+	 * Start, the click would genuinely start the pool, and the row would keep
+	 * saying Start forever. `languages/+page.svelte` calls this after a
+	 * successful `install()`/`rescan()` — the two moments it KNOWS the
+	 * registered set may have grown.
+	 *
+	 * This is the cheap, contained fix. The more durable one — `register`
+	 * itself emitting an event, and `applyState` appending an unknown id
+	 * instead of dropping it — is a larger cross-crate change (Rust event +
+	 * IPC + this store) and is recorded as a follow-up rather than folded into
+	 * this fix.
+	 */
+	reload(): Promise<void> {
+		this.snapshot = null;
+		return this.loadServices();
+	}
+
 	private async fetchServices(): Promise<void> {
 		try {
 			this.services = await this.api.listServices();
@@ -102,6 +129,12 @@ export class ServicesStore {
 		this.error = error;
 	}
 
+	/** `.map` over the EXISTING list — a `StateChanged` for an id not already in
+	 *  `this.services` (a supervisor row registered after this store's one
+	 *  `loadServices()` snapshot) matches nothing and is silently dropped. See
+	 *  `reload()`'s doc comment (I1 audit finding) for why that made an
+	 *  installed-after-launch PHP version's row never reach this store at all
+	 *  until relaunch, and for the cheap fix vs. the more durable one. */
 	applyState(ev: ServiceStateEvent): void {
 		this.services = this.services.map((s) =>
 			s.id === ev.id

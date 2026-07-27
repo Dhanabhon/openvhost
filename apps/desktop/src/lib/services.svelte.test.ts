@@ -118,6 +118,51 @@ describe('ServicesStore actions', () => {
 		expect(store.services[0]?.state.kind).toBe('running');
 	});
 
+	// I1 audit finding: `Supervisor::register` emits no event, so a service
+	// registered AFTER this store's one `loadServices()` snapshot arrives here
+	// only as a `StateChanged` for an id `.map` has never seen — and `.map`
+	// over the EXISTING array can only ever match or leave alone, never add.
+	// This is the drop `reload()` exists to work around; pinned directly so a
+	// future "helpful" rewrite of `applyState` cannot silently start growing
+	// the list instead (which would be a real, and different, behaviour change)
+	// without a test noticing either way.
+	it('drops a StateChanged event for an id it has never registered', async () => {
+		const store = new ServicesStore(api());
+		await store.loadServices();
+		store.applyState({ id: 'php-fpm-8.4', state: { kind: 'running' }, detail: null });
+		expect(store.services.map((s) => s.id)).toEqual(['demo-ticker']);
+		expect(store.services.some((s) => s.id === 'php-fpm-8.4')).toBe(false);
+	});
+});
+
+describe('ServicesStore.reload', () => {
+	// I1's cheap fix: `reload()` is the escape hatch a caller (the Languages
+	// page, after a successful install/rescan) uses to see a newly-registered
+	// service without a relaunch — proven here by having `listServices` return
+	// a DIFFERENT set on its second call and asserting `reload()` actually
+	// re-fetches rather than returning the memoized first snapshot the way
+	// `loadServices()` would.
+	it('forces a fresh fetch even after loadServices() has already memoized one', async () => {
+		const listServices = vi
+			.fn<() => Promise<ServiceStatus[]>>()
+			.mockResolvedValueOnce([svc('demo-ticker', 'stopped')])
+			.mockResolvedValueOnce([svc('demo-ticker', 'stopped'), svc('php-fpm-8.4', 'stopped')]);
+		const store = new ServicesStore(api({ listServices }));
+
+		await store.loadServices();
+		expect(store.services.map((s) => s.id)).toEqual(['demo-ticker']);
+
+		// A second `loadServices()` would return the SAME memoized promise and
+		// NOT call the api again — this is exactly what made the newly
+		// registered service invisible without `reload()`.
+		await store.loadServices();
+		expect(listServices).toHaveBeenCalledTimes(1);
+
+		await store.reload();
+		expect(listServices).toHaveBeenCalledTimes(2);
+		expect(store.services.map((s) => s.id)).toEqual(['demo-ticker', 'php-fpm-8.4']);
+	});
+
 	it('start()/stop() call through to the api', async () => {
 		const a = api();
 		const store = new ServicesStore(a);

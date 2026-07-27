@@ -26,7 +26,38 @@
 
 	async function onInstall(major: string): Promise<void> {
 		lastAttempted = major;
-		await store.install(major);
+		const installed = await store.install(major);
+		if (installed) {
+			// I1 audit finding: `Supervisor::register` emits no event, and
+			// `ServicesStore.loadServices()` memoizes its first successful
+			// fetch — so a major installed AFTER launch registers a real
+			// supervisor row that the services store never learns about. The
+			// row would offer Start, the click would genuinely start the
+			// pool, and the row would keep saying Start forever (the Services
+			// page would not list it either) until the app relaunched.
+			//
+			// This is the cheap, contained fix: force a fresh fetch right
+			// after a successful install, since that is the one moment this
+			// page KNOWS the registered-service set may have changed. The
+			// more durable fix — `Supervisor::register` emitting an event and
+			// `ServicesStore.applyState` appending an unknown id instead of
+			// silently dropping its `StateChanged` (see that method) — is a
+			// larger cross-crate change (Rust event + IPC + this store) and is
+			// recorded as a follow-up rather than part of this fix.
+			await servicesStore.reload();
+		}
+	}
+
+	/**
+	 * The "Check again" button's handler — wraps `store.rescan()` with the same
+	 * services-store reload as `onInstall`, for the same reason: a rescan can
+	 * also register a newly-discovered major's supervisor row (see
+	 * `rescan_into_state` on the Rust side), and that row is just as invisible
+	 * to `servicesStore` as one `install_php` registers.
+	 */
+	async function onRescan(): Promise<void> {
+		await store.rescan();
+		await servicesStore.reload();
 	}
 
 	/**
@@ -120,7 +151,7 @@
 				brewFound={store.brewFound}
 				anyInstalled={store.anyInstalled}
 				brewSearched={store.env.brewSearched}
-				onRescan={() => void store.rescan()}
+				onRescan={() => void onRescan()}
 				onOpenBrewSite={() => void openHomebrewSite().catch((e) => store.fail(e))}
 			/>
 			{#if store.brewFound}
@@ -133,11 +164,7 @@
 				     yet" and "brew, already installed") so it never sits next to
 				     `LanguagesEmpty`'s own no-brew copy of the same control. -->
 				<div class="check-again">
-					<Button
-						size="sm"
-						testId="languages-check-again-header"
-						onclick={() => void store.rescan()}
-					>
+					<Button size="sm" testId="languages-check-again-header" onclick={() => void onRescan()}>
 						Check again
 					</Button>
 				</div>
