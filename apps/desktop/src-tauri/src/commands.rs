@@ -12,7 +12,8 @@ use openvhost_conf::WebServerAdapter;
 
 use openvhost_core::{
     ApplyError, ApplyInput, ChangeKind, CoreInfo, Db, Docroot, Domain, InstalledRuntimes, NewSite,
-    PhpVersion, Site, SiteId, SiteName, SiteRepository, SqliteSiteRepository, WebServer,
+    PhpVersion, Site, SiteId, SiteName, SiteRepository, SqliteSiteRepository,
+    SqliteWebServerSettings, WebServer, WebServerSettingsRepository,
 };
 
 use crate::stack::StackPaths;
@@ -559,6 +560,17 @@ pub struct ApplyOutcomeDto {
 pub struct ApplyLock(pub(crate) tokio::sync::Mutex<()>);
 
 /// Build the apply input from state.db plus the runtimes probed at startup.
+///
+/// The nginx settings are read here, alongside the sites, so BOTH entry points
+/// to the pipeline (`plan_site_apply` for the pending-changes banner and
+/// `apply_sites` for the apply itself) see the same stored values. Reading them
+/// per call rather than caching is deliberate: `apply_sites` recomputes its plan
+/// from state.db under the apply lock, and a cached copy would let a settings
+/// save land between the diff the user saw and the config that got written.
+///
+/// A consequence to expect rather than treat as a bug: saving a setting makes
+/// the Sites page's pending-changes banner light up too. It is the same pending
+/// change — one config set, one plan.
 async fn apply_input(
     db: &Db,
     runtimes: &Option<InstalledRuntimes>,
@@ -570,10 +582,14 @@ async fn apply_input(
         });
     };
     let repo = SqliteSiteRepository::new(db);
+    let settings = SqliteWebServerSettings::new(db);
     Ok(ApplyInput {
         home: paths.home.clone(),
         sites: repo.list().await?,
         runtimes: runtimes.clone(),
+        // Absent row => documented defaults, and nothing is written. See
+        // `WebServerSettingsRepository::get`.
+        settings: settings.get().await?,
     })
 }
 

@@ -59,6 +59,17 @@ pub struct ApplyInput {
     /// ALL sites; `render_set` filters on `is_servable` itself.
     pub sites: Vec<Site>,
     pub runtimes: InstalledRuntimes,
+    /// The editable nginx settings, as stored (`settings_repo`). Data in,
+    /// like `sites` and `runtimes` — this module never reads them from the
+    /// database itself, so the CLI and the desktop app supply the same
+    /// struct and every test constructs it by hand.
+    ///
+    /// These reach exactly one generated file, the main config. That is what
+    /// keeps the Web server page a second ENTRY POINT to this pipeline
+    /// rather than a second pipeline: `plan` sees `nginx.conf` as Modified
+    /// and the existing diff, `nginx -t`, rollback and restart cover it
+    /// unchanged.
+    pub settings: WebServerSettings,
 }
 
 /// Whether a site is one `render_set` may render as nginx: enabled AND its
@@ -124,11 +135,10 @@ pub fn render_set(input: &ApplyInput) -> Result<Vec<GeneratedFile>, ApplyError> 
         }
     }
 
-    // TASK 4 replaces this with the settings stored in state.db (via
-    // `settings_repo`), threaded through `ApplyInput`. Until then the
-    // generated main config carries the documented defaults, which is what
-    // this pipeline already produced implicitly.
-    let mut out = vec![nginx.generate_main_config(&input.home, &WebServerSettings::default())?];
+    // The stored settings, threaded in through `ApplyInput` (the caller reads
+    // them from `settings_repo`). The main config is the ONLY file they touch;
+    // if that ever stops being true, the test below fails loudly.
+    let mut out = vec![nginx.generate_main_config(&input.home, &input.settings)?];
 
     let default_upstream = match input.runtimes.php.first() {
         Some(rt) => Some(PhpUpstream::UnixSocket(socket_path(
@@ -169,6 +179,28 @@ pub fn render_set(input: &ApplyInput) -> Result<Vec<GeneratedFile>, ApplyError> 
 mod tests {
     use super::*;
     use crate::site::apply::tests_support::{input, runtimes, site};
+
+    #[test]
+    fn changing_a_setting_changes_exactly_the_main_config() {
+        // The whole architecture in one assertion: settings feed the generator, so
+        // the existing plan/diff/validate/rollback pipeline covers them with no
+        // second path. If this ever needs more than one file, something has leaked.
+        let base = input(vec![site("app", "app.localhost", "8.4", true)], &["8.4"]);
+        let mut changed = base.clone();
+        changed.settings.fastcgi_read_timeout = openvhost_conf::Seconds::parse(900).unwrap();
+
+        let before = render_set(&base).unwrap();
+        let after = render_set(&changed).unwrap();
+
+        let differing: Vec<String> = before
+            .iter()
+            .zip(after.iter())
+            .filter(|(a, b)| a.contents != b.contents)
+            .map(|(a, _)| a.path.display().to_string())
+            .collect();
+        assert_eq!(differing.len(), 1, "got {differing:?}");
+        assert!(differing[0].ends_with("nginx/nginx.conf"));
+    }
 
     #[test]
     fn renders_main_catch_all_site_and_pool() {
@@ -326,6 +358,7 @@ mod tests {
             home: deep,
             sites: vec![site("app", "app.localhost", "8.4", true)],
             runtimes: runtimes(&["8.4"]),
+            settings: WebServerSettings::default(),
         })
         .unwrap_err();
         assert!(matches!(

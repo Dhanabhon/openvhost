@@ -7,6 +7,8 @@
 
 use std::path::{Path, PathBuf};
 
+use openvhost_conf::WebServerSettings;
+
 use crate::site::model::{Docroot, Domain, PhpVersion, Site, SiteId, SiteName, WebServer};
 
 use super::{ApplyInput, InstalledRuntimes, PhpRuntime};
@@ -50,5 +52,10 @@ pub(crate) fn input_with_home(home: &Path, sites: Vec<Site>, majors: &[&str]) ->
         home: home.to_path_buf(),
         sites,
         runtimes: runtimes(majors),
+        // The defaults, so every existing test keeps asserting on exactly the
+        // output it asserted on before settings became an input. Tests that
+        // care about a specific value overwrite this field on the returned
+        // struct.
+        settings: WebServerSettings::default(),
     }
 }
