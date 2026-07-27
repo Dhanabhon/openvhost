@@ -3,6 +3,8 @@
 // domains resolve without touching the hosts file, which is why this slice
 // needs no privileged helper. Custom TLDs are a later slice.
 
+import type { SiteDto } from './ipc';
+
 const LOCALHOST_SUFFIX = '.localhost';
 
 /** Compose the stored domain from the subdomain the user types. */
@@ -96,4 +98,58 @@ function compareVersions(a: string, b: string): number {
 	const [aMajor, aMinor] = a.split('.').map(Number);
 	const [bMajor, bMinor] = b.split('.').map(Number);
 	return aMajor !== bMajor ? aMajor - bMajor : aMinor - bMinor;
+}
+
+/**
+ * True when a site's stored PHP version is not among what this machine actually
+ * has installed right now.
+ *
+ * Task 8 (`phpVersionOptions`/`defaultPhpVersion` above) stops a NEW site from
+ * ever choosing a version this machine lacks. It cannot stop the machine from
+ * changing under an EXISTING one — `brew uninstall php@8.3` strands a site that
+ * applied cleanly yesterday — so this has to warn independent of whether Apply
+ * has ever run against the site. Used both for the row-level badge (visible the
+ * moment a site is out of sync, not only after a failed Apply) and, via
+ * `findMissingRuntimeSite` below, to decide whether the apply-error banner has
+ * a "install this" remedy to offer at all.
+ */
+export function phpVersionMissing(
+	site: Pick<SiteDto, 'phpVersion'>,
+	installed: readonly string[]
+): boolean {
+	return !installed.includes(site.phpVersion);
+}
+
+/**
+ * The first enabled, nginx-served site whose stored PHP version this machine
+ * does not have — or `null` when no such site exists.
+ *
+ * Mirrors `render_set`'s `MissingRuntime` pre-check
+ * (`crates/openvhost-core/src/site/apply/mod.rs`): same filter (`is_servable`:
+ * `enabled && web_server == nginx` — a disabled site, or one bound to a web
+ * server that is never actually rendered, cannot make Apply fail on a runtime
+ * it will never need) and the same "first offender in list order" behaviour,
+ * since that pre-check returns on the first mismatch rather than collecting
+ * every one.
+ *
+ * Deliberately RE-DERIVED here rather than carried over IPC as a structured
+ * error field (see task-9-report.md, "which option and why", for the full
+ * tradeoff): `phpEnvironment()` and `plan_site_apply()`/`apply_sites()` all read
+ * the same cached `RwLock<Option<InstalledRuntimes>>` in `commands.rs`, so this
+ * and the backend's own check are already looking at the same source of truth
+ * — they can only disagree in the same narrow window (a rescan landing between
+ * this read and the failed apply) that a structured field would too.
+ *
+ * `null` gates the apply-error banner's action buttons: a failure with no PHP
+ * remedy (an `nginx -t` syntax error, say) must offer nothing rather than an
+ * "install this" button that fixes nothing.
+ */
+export function findMissingRuntimeSite(
+	sites: readonly SiteDto[],
+	installed: readonly string[]
+): SiteDto | null {
+	const found = sites.find(
+		(s) => s.enabled && s.webServer === 'nginx' && phpVersionMissing(s, installed)
+	);
+	return found ?? null;
 }

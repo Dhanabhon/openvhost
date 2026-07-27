@@ -4,6 +4,7 @@
 	import { resolve } from '$app/paths';
 	import AppShell from '$lib/components/AppShell.svelte';
 	import ApplyDialog from '$lib/components/ApplyDialog.svelte';
+	import ApplyErrorBanner from '$lib/components/ApplyErrorBanner.svelte';
 	import PendingChangesBanner from '$lib/components/PendingChangesBanner.svelte';
 	import SiteDrawer from '$lib/components/SiteDrawer.svelte';
 	import SitesPanel from '$lib/components/SitesPanel.svelte';
@@ -22,6 +23,7 @@
 	} from '$lib/ipc';
 	import { runningCount } from '$lib/services.derive';
 	import { servicesStore } from '$lib/services.shared.svelte';
+	import { findMissingRuntimeSite } from '$lib/sites.derive';
 	import { ApplyStore } from '$lib/apply.svelte';
 	import { SitesStore } from '$lib/sites.svelte';
 
@@ -48,6 +50,13 @@
 	// flashing this banner during the brief window before the fetch resolves would be
 	// wrong on any machine that does have a version installed.
 	const noPhpInstalled = $derived(phpEnvLoaded && installedPhpVersions.length === 0);
+
+	// The servable site (if any) whose PHP version this machine no longer has —
+	// used only to decide whether the apply-error banner below has a "install
+	// this" remedy to offer. Re-derived from state already on this page rather
+	// than a structured IPC field; see `findMissingRuntimeSite`'s doc comment
+	// and task-9-report.md for why that is the honest tradeoff here.
+	const missingRuntimeSite = $derived(findMissingRuntimeSite(store.sites, installedPhpVersions));
 
 	onMount(() => {
 		void store.load();
@@ -131,11 +140,13 @@
 		     Suppressed while the dialog is open: `ApplyDialog` renders this same
 		     `applyStore.error` itself, and a page banner behind the dialog's scrim
 		     would be the QuitDialog lesson in reverse — an error the user cannot
-		     reach or read behind a blurred backdrop. -->
-		<div class="banner-error" role="alert" data-testid="apply-plan-error">
-			<strong>Couldn't apply site changes</strong>
-			<span>{applyStore.error}</span>
-		</div>
+		     reach or read behind a blurred backdrop.
+
+		     `missingRuntimeSite` — see its derivation above — is what turns this
+		     from a dead end into a way out: this is exactly the plan_site_apply
+		     failure a machine that lost a PHP version hits, and until now this
+		     banner named the problem and offered nothing to press. -->
+		<ApplyErrorBanner error={applyStore.error} missing={missingRuntimeSite} onEditSite={onEdit} />
 	{/if}
 	{#if noPhpInstalled}
 		<!-- Sites is the landing page (Rail.svelte's own comment: "`/`, not `/sites`"), so
@@ -154,6 +165,7 @@
 	<PendingChangesBanner count={applyStore.pendingCount} onReview={() => (applyDialogOpen = true)} />
 	<SitesPanel
 		sites={store.sites}
+		installed={installedPhpVersions}
 		{onAdd}
 		{onEdit}
 		busy={store.busy}

@@ -4,9 +4,25 @@ import {
 	composeDomain,
 	defaultPhpVersion,
 	enabledPill,
+	findMissingRuntimeSite,
+	phpVersionMissing,
 	phpVersionOptions,
 	splitDomain
 } from './sites.derive';
+import type { SiteDto } from './ipc';
+
+const site = (overrides: Partial<SiteDto> = {}): SiteDto => ({
+	id: 'a1',
+	name: 'hello',
+	domain: 'hello.localhost',
+	docroot: '/srv/www/hello',
+	webServer: 'nginx',
+	phpVersion: '8.4',
+	enabled: true,
+	createdAt: 1,
+	updatedAt: 1,
+	...overrides
+});
 
 describe('composeDomain / splitDomain', () => {
 	it('composes a subdomain onto .localhost', () => {
@@ -76,5 +92,44 @@ describe('defaultPhpVersion', () => {
 	it('compares major.minor numerically, not lexically', () => {
 		// "8.9" > "8.10" as strings, but 8.10 is the newer release.
 		expect(defaultPhpVersion(['8.9', '8.10'])).toBe('8.10');
+	});
+});
+
+describe('phpVersionMissing', () => {
+	// Task 8 stops a NEW site from choosing a version this machine lacks, but the
+	// machine can change under an EXISTING one (`brew uninstall php@8.3`) at any
+	// time, so this has to warn independent of whether Apply has ever run.
+	it('is true when the stored version is not installed', () => {
+		expect(phpVersionMissing(site({ phpVersion: '8.4' }), ['8.5'])).toBe(true);
+	});
+
+	it('is false when the stored version is installed', () => {
+		expect(phpVersionMissing(site({ phpVersion: '8.5' }), ['8.5'])).toBe(false);
+	});
+});
+
+describe('findMissingRuntimeSite', () => {
+	// Mirrors `render_set`'s `MissingRuntime` pre-check in
+	// crates/openvhost-core/src/site/apply/mod.rs: enabled + nginx (`is_servable`),
+	// first offender in list order. A disabled site's stale version is not a
+	// reason Apply would fail, so it must not gate the banner's actions.
+	it('finds the first enabled, nginx-served site missing its PHP version', () => {
+		const found = findMissingRuntimeSite(
+			[
+				site({ id: 'a1', name: 'shop', phpVersion: '8.5' }),
+				site({ id: 'a2', name: 'hello', phpVersion: '8.4' })
+			],
+			['8.5']
+		);
+		expect(found?.name).toBe('hello');
+	});
+
+	it('ignores a disabled site even if its version is missing', () => {
+		const found = findMissingRuntimeSite([site({ enabled: false, phpVersion: '8.4' })], ['8.5']);
+		expect(found).toBeNull();
+	});
+
+	it('is null when every servable site has an installed version', () => {
+		expect(findMissingRuntimeSite([site({ phpVersion: '8.5' })], ['8.5'])).toBeNull();
 	});
 });
