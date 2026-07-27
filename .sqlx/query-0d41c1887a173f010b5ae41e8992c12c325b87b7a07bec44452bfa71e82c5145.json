@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO web_server_settings (id, worker_connections, client_max_body_size, keepalive_timeout, tcp_nodelay, fastcgi_connect_timeout, fastcgi_send_timeout, fastcgi_read_timeout, gzip, gzip_comp_level, gzip_types, updated_at) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET worker_connections = excluded.worker_connections, client_max_body_size = excluded.client_max_body_size, keepalive_timeout = excluded.keepalive_timeout, tcp_nodelay = excluded.tcp_nodelay, fastcgi_connect_timeout = excluded.fastcgi_connect_timeout, fastcgi_send_timeout = excluded.fastcgi_send_timeout, fastcgi_read_timeout = excluded.fastcgi_read_timeout, gzip = excluded.gzip, gzip_comp_level = excluded.gzip_comp_level, gzip_types = excluded.gzip_types, updated_at = excluded.updated_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 11
+    },
+    "nullable": []
+  },
+  "hash": "0d41c1887a173f010b5ae41e8992c12c325b87b7a07bec44452bfa71e82c5145"
+}
