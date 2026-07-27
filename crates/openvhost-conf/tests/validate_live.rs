@@ -247,6 +247,125 @@ async fn non_default_settings_pass_real_nginx() {
     }
 }
 
+/// The FULL DOCUMENTED MAXIMUM of `gzip_types`: [`GzipTypes::MAX_TOKENS`]
+/// tokens of exactly [`GzipTypes::MAX_TOKEN_LEN`] bytes each. Every value here
+/// is one this crate's own parser accepts and therefore one a user can save
+/// from the Web server page.
+///
+/// This is the case the unit tests structurally cannot cover. The token cap
+/// used to be 128 bytes on the theory that it only had to stop a smuggled
+/// payload, and every unit test agreed with itself about that number — but
+/// nginx's gzip filter hashes the type list into a bucket of
+/// `ngx_cacheline_size` (64) that no directive resizes, which fits 46 bytes
+/// per type and no more. Anything longer makes nginx reject THE WHOLE
+/// CONFIGURATION:
+///
+/// ```text
+/// nginx: [emerg] could not build test_types_hash, you should increase test_types_hash_bucket_size: 64
+/// ```
+///
+/// and `save_web_server_settings` does not run `nginx -t`, so the value lands
+/// in `state.db` silently and every later apply — including one for an
+/// unrelated site edited on the Sites page — fails validation and rolls back
+/// with an error naming nothing the user touched. Only a real nginx can say
+/// where that boundary is, so only a real nginx can keep the constant honest.
+#[tokio::test]
+async fn the_documented_gzip_types_maximum_loads_in_real_nginx() {
+    // Deliberately FAILS rather than skipping, like
+    // `both_probes_pass_real_nginx_in_the_assembled_environment` above and for
+    // the same reason: this is the ONLY check that the token cap is a number
+    // nginx can load. GitHub CI is disabled on this repo and local gates are
+    // the merge gate, so a skip here reads as a pass for the one fact this
+    // test exists to establish.
+    let Some(brew) = find_brew_binaries() else {
+        panic!(
+            "Homebrew nginx not found, so the gzip_types maximum could not be checked against \
+             a real nginx. This test must not skip: it is the only proof that \
+             GzipTypes::MAX_TOKEN_LEN is a length nginx's fixed test_types bucket accepts. \
+             Install it (brew install nginx) and re-run."
+        );
+    };
+    let (_home, ctx) = temp_home_ctx();
+
+    // Unique, MIME-shaped, each exactly MAX_TOKEN_LEN bytes.
+    let list = (0..GzipTypes::MAX_TOKENS)
+        .map(|i| {
+            let suffix = format!("{i:04}");
+            let filler = "a".repeat(GzipTypes::MAX_TOKEN_LEN - "text/".len() - suffix.len());
+            format!("text/{filler}{suffix}")
+        })
+        .collect::<Vec<_>>();
+    for t in &list {
+        assert_eq!(t.len(), GzipTypes::MAX_TOKEN_LEN);
+    }
+    let joined = list.join(" ");
+
+    let settings = WebServerSettings {
+        gzip: OnOff::new(true),
+        gzip_types: GzipTypes::parse(&joined).unwrap(),
+        ..WebServerSettings::default()
+    };
+    let main_path = materialize_with(&ctx, &settings);
+    let err_log = ctx.home.join("logs/nginx.error.log");
+
+    let report = validate_live(&brew.nginx, &main_path, &err_log)
+        .await
+        .unwrap();
+    assert!(
+        report.ok,
+        "real `nginx -t` REJECTED the documented maximum of gzip_types \
+         ({} tokens x {} bytes) — a value the Web server page accepts, saves \
+         without validation, and then makes every later apply fail:\n{}",
+        GzipTypes::MAX_TOKENS,
+        GzipTypes::MAX_TOKEN_LEN,
+        report.stderr
+    );
+}
+
+/// The largest `client_max_body_size` values [`BodySize`] accepts, each loaded
+/// by a real nginx. Shape alone (`^\d+[kKmMgG]?$`) does not decide this:
+/// nginx multiplies digits by unit into an `off_t` and refuses the config with
+/// `"client_max_body_size" directive invalid value` past `i64::MAX`, so the
+/// four boundaries the parser enforces are only meaningful if nginx agrees
+/// with them exactly.
+#[tokio::test]
+async fn the_largest_body_sizes_we_accept_load_in_real_nginx() {
+    // Fails rather than skips, for the same reason as the case above: these
+    // numbers are claims about another program's arithmetic.
+    let Some(brew) = find_brew_binaries() else {
+        panic!(
+            "Homebrew nginx not found, so the client_max_body_size boundaries could not be \
+             checked against a real nginx. This test must not skip: it is the only proof \
+             that BodySize's upper bound matches ngx_conf_set_off_slot. Install it \
+             (brew install nginx) and re-run."
+        );
+    };
+    for value in [
+        "9223372036854775807",
+        "8589934591g",
+        "8796093022207m",
+        "9007199254740991k",
+    ] {
+        let (_home, ctx) = temp_home_ctx();
+        let settings = WebServerSettings {
+            client_max_body_size: BodySize::parse(value).unwrap(),
+            ..WebServerSettings::default()
+        };
+        let main_path = materialize_with(&ctx, &settings);
+        let err_log = ctx.home.join("logs/nginx.error.log");
+        let report = validate_live(&brew.nginx, &main_path, &err_log)
+            .await
+            .unwrap();
+        assert!(
+            report.ok,
+            "real `nginx -t` REJECTED client_max_body_size {value:?}, which \
+             `BodySize::parse` accepts — the parser's upper bound is above \
+             nginx's:\n{}",
+            report.stderr
+        );
+    }
+}
+
 /// An empty `gzip_types` list is a legitimate setting ("compress nothing
 /// beyond nginx's built-in text/html"). This is the case that turns into a
 /// bare `gzip_types;` if the renderer emits the directive unconditionally —

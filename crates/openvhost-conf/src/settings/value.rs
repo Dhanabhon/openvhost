@@ -30,21 +30,87 @@ use crate::error::ConfError;
 /// development-appropriate default is safe to choose here.
 const DEFAULT_GZIP_TYPES: &str = "text/plain text/css application/json application/javascript application/xml image/svg+xml font/woff2";
 
-/// Longest a single `gzip_types` token may be, in bytes. Real MIME types
-/// (`application/vnd.openxmlformats-officedocument.wordprocessingml.document`
-/// is 68 bytes) fit comfortably; this just keeps a single token from being
-/// used to smuggle an arbitrarily long payload.
-const GZIP_TYPE_TOKEN_MAX_LEN: usize = 128;
+/// Longest a single `gzip_types` token may be, in bytes. **This is nginx's
+/// limit, not ours, and it is not generous.**
+///
+/// nginx's gzip filter puts its type list in a hash whose bucket size is
+/// hardcoded: `ngx_http_merge_types()` passes `hash.bucket_size =
+/// ngx_cacheline_size` (64 on every platform this app ships on). Of that,
+/// `ngx_hash_init` spends `sizeof(void *)` on the bucket terminator, leaving
+/// 56 usable, and each entry costs `NGX_HASH_ELT_SIZE` = `sizeof(void *) +
+/// align(len + 2, sizeof(void *))` = `8 + align(len + 2, 8)`. That fits only
+/// while `len <= 46`. Measured against Homebrew nginx 1.31.3: a 46-byte token
+/// loads, a 47-byte one makes nginx refuse the *entire* configuration with
+///
+/// ```text
+/// nginx: [emerg] could not build test_types_hash, you should increase test_types_hash_bucket_size: 64
+/// ```
+///
+/// **A MIME type longer than this simply cannot be compressed by nginx, and
+/// there is no directive that changes it.** `types_hash_bucket_size` and
+/// `types_hash_max_size` govern the `types {}` MIME map, a different hash;
+/// the gzip module's `test_types` hash ignores both and uses the cacheline
+/// size. Real casualties exist —
+/// `application/vnd.openxmlformats-officedocument.wordprocessingml.document`
+/// is 71 bytes and can never appear in `gzip_types`. Rejecting it here, at
+/// the field, is the only place a user can be told so; accepted, it is saved
+/// to `state.db` without validation and then breaks *every* subsequent apply,
+/// including ones for unrelated sites.
+///
+/// 46 is taken as-is rather than shaded down for headroom. The only platform
+/// that would need less is one with a 32-byte `ngx_cacheline_size`, where the
+/// same arithmetic allows 14 bytes — that would reject
+/// `application/javascript` (22 bytes) and most of the default list, so it is
+/// not a cap this feature can ship with in exchange for headroom nowhere
+/// needed.
+const GZIP_TYPE_TOKEN_MAX_LEN: usize = 46;
 
 /// Most tokens `gzip_types` accepts in one setting. nginx's own default list
 /// has a handful of entries; 64 is generous headroom without being
 /// unbounded.
 const GZIP_TYPES_MAX_TOKENS: usize = 64;
 
-fn invalid(field: &'static str, value: impl Into<String>, reason: &'static str) -> ConfError {
+/// Longest a `client_max_body_size` value may be, in bytes. The largest size
+/// nginx itself accepts is `9223372036854775807` — 19 digits — so 19 digits
+/// plus a one-byte unit suffix is every value that can possibly be valid,
+/// with the suffix cases (at most 11 digits) far below it.
+///
+/// Without a bound here this is the one unbounded field in the settings: a
+/// ten-million-digit value parses, renders a 10 MB `nginx.conf`, is stored as
+/// a 10 MB `TEXT` column, and is carried in full both before *and* after in
+/// every apply plan sent to the webview.
+const BODY_SIZE_MAX_LEN: usize = 20;
+
+/// Longest an offending value may be when echoed back in a rejection message.
+///
+/// Rejection messages travel over IPC into the DOM, and the values they quote
+/// are hostile input by definition — the branch fires *because* the value is
+/// unacceptable, and several of these fields are unbounded before `parse`
+/// sees them. Echoing the whole thing turns the code whose job is to refuse
+/// oversized input into an amplifier for it (a measured 5 MB token produced a
+/// 5,000,053-byte error string). 64 characters is enough to recognise what
+/// was typed.
+const ERROR_VALUE_MAX_CHARS: usize = 64;
+
+/// `value`, cut to [`ERROR_VALUE_MAX_CHARS`] characters with an ellipsis if it
+/// is longer. Takes `&str` and allocates only the part it keeps, so a
+/// megabyte-long input is never copied.
+fn truncate_echo(value: &str) -> String {
+    match value.char_indices().nth(ERROR_VALUE_MAX_CHARS) {
+        // `char_indices` gives a char boundary, so this slice is always valid.
+        Some((cut, _)) => format!("{}…", &value[..cut]),
+        None => value.to_string(),
+    }
+}
+
+/// Build an [`ConfError::InvalidField`], truncating the echoed value.
+///
+/// Truncation lives here rather than at each call site so that every
+/// rejection branch in this module gets it, including ones added later.
+fn invalid(field: &'static str, value: &str, reason: &'static str) -> ConfError {
     ConfError::InvalidField {
         field,
-        value: value.into(),
+        value: truncate_echo(value),
         reason,
     }
 }
@@ -64,7 +130,7 @@ impl WorkerConnections {
         } else {
             Err(invalid(
                 "worker_connections",
-                v.to_string(),
+                &v.to_string(),
                 "must be between 1 and 65535",
             ))
         }
@@ -92,7 +158,7 @@ impl Seconds {
         } else {
             Err(invalid(
                 "seconds",
-                v.to_string(),
+                &v.to_string(),
                 "must be between 1 and 86400",
             ))
         }
@@ -116,7 +182,7 @@ impl GzipLevel {
         } else {
             Err(invalid(
                 "gzip_comp_level",
-                v.to_string(),
+                &v.to_string(),
                 "must be between 1 and 9",
             ))
         }
@@ -133,28 +199,75 @@ impl GzipLevel {
 /// trailing content: this is rendered directly as `client_max_body_size
 /// {value};`, so anything past that shape is either meaningless to nginx or
 /// a way to inject extra directive text.
+///
+/// The shape is not the whole rule. A value that matches it can still be
+/// **too long** (this field arrives as free text with no length limit of its
+/// own — see [`BODY_SIZE_MAX_LEN`]) or **numerically out of range**: nginx
+/// parses this directive with `ngx_conf_set_off_slot`, which multiplies the
+/// digits by the unit and rejects anything past `NGX_MAX_OFF_T_VALUE`
+/// (`i64::MAX`). `99999999999999999999g` and `18446744073709551616m` are both
+/// `^\d+[kKmMgG]?$` and both make nginx emit `"client_max_body_size"
+/// directive invalid value`. [`BodySize::parse`] checks all three, so a value
+/// this type accepts is a value nginx will load.
+///
+/// `0` is accepted and means **no limit at all** — that is nginx's own
+/// meaning for it (the body-size check is disabled), not an oversight. It
+/// reads like "allow nothing", so the Web server form's hint says outright
+/// what it does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BodySize(String);
 
 impl BodySize {
-    /// Parse a body-size value, `^\d+[kKmMgG]?$`.
+    /// Longest accepted value, in bytes — see [`BODY_SIZE_MAX_LEN`].
+    pub const MAX_LEN: usize = BODY_SIZE_MAX_LEN;
+
+    /// Parse a body-size value: `^\d+[kKmMgG]?$`, at most
+    /// [`BodySize::MAX_LEN`] bytes, and within the range nginx's own
+    /// `ngx_conf_set_off_slot` accepts (`digits * unit <= i64::MAX`).
     pub fn parse(s: &str) -> Result<Self, ConfError> {
-        let digits = match s.bytes().last() {
+        if s.len() > BODY_SIZE_MAX_LEN {
+            return Err(invalid(
+                "client_max_body_size",
+                s,
+                "too long: at most 20 characters (nginx's largest accepted size is 19 digits)",
+            ));
+        }
+        let last = s.bytes().last();
+        let digits = match last {
             Some(b) if b.is_ascii_alphabetic() => &s[..s.len() - 1],
             _ => s,
         };
-        let suffix_ok = match s.bytes().last() {
-            Some(b) if b.is_ascii_alphabetic() => {
-                matches!(b, b'k' | b'K' | b'm' | b'M' | b'g' | b'G')
-            }
-            _ => true,
+        let unit: Option<u64> = match last {
+            Some(b'k' | b'K') => Some(1024),
+            Some(b'm' | b'M') => Some(1024 * 1024),
+            Some(b'g' | b'G') => Some(1024 * 1024 * 1024),
+            // Any other trailing letter is not a unit nginx knows.
+            Some(b) if b.is_ascii_alphabetic() => None,
+            _ => Some(1),
         };
         let digits_ok = !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
-        if !digits_ok || !suffix_ok {
+        let Some(unit) = unit.filter(|_| digits_ok) else {
             return Err(invalid(
                 "client_max_body_size",
-                s.to_string(),
+                s,
                 "must match ^\\d+[kKmMgG]?$",
+            ));
+        };
+        // nginx multiplies the digits by the unit into an `off_t`. A value
+        // that overflows that is rejected by nginx at load time, so it must be
+        // rejected here rather than saved and discovered on the next apply.
+        let in_range = digits
+            .parse::<u64>()
+            .ok()
+            .and_then(|n| n.checked_mul(unit))
+            .is_some_and(|bytes| bytes <= i64::MAX as u64);
+        if !in_range {
+            return Err(invalid(
+                "client_max_body_size",
+                s,
+                "larger than nginx accepts: the size in bytes must fit in a signed 64-bit \
+                 offset (at most 9223372036854775807, 8589934591g, 8796093022207m or \
+                 9007199254740991k)",
             ));
         }
         Ok(Self(s.to_string()))
@@ -219,6 +332,15 @@ fn is_mime_shaped(token: &str) -> bool {
 pub struct GzipTypes(Vec<String>);
 
 impl GzipTypes {
+    /// Most tokens one list may hold — see [`GZIP_TYPES_MAX_TOKENS`].
+    pub const MAX_TOKENS: usize = GZIP_TYPES_MAX_TOKENS;
+
+    /// Longest a single token may be, in bytes. **An nginx limit** — see
+    /// [`GZIP_TYPE_TOKEN_MAX_LEN`] for the arithmetic behind the number.
+    /// Public so the live-nginx suite can render the documented maximum of
+    /// this field and prove a real nginx loads it.
+    pub const MAX_TOKEN_LEN: usize = GZIP_TYPE_TOKEN_MAX_LEN;
+
     /// Parse a whitespace-separated `gzip_types` list. At most
     /// [`GZIP_TYPES_MAX_TOKENS`] tokens, each at most
     /// [`GZIP_TYPE_TOKEN_MAX_LEN`] bytes and MIME-shaped (case-insensitively
@@ -234,24 +356,24 @@ impl GzipTypes {
         let mut types = Vec::new();
         for token in s.split_whitespace() {
             if types.len() >= GZIP_TYPES_MAX_TOKENS {
-                return Err(invalid(
-                    "gzip_types",
-                    s.to_string(),
-                    "at most 64 types are allowed",
-                ));
+                return Err(invalid("gzip_types", s, "at most 64 types are allowed"));
             }
             if token.len() > GZIP_TYPE_TOKEN_MAX_LEN {
                 return Err(invalid(
                     "gzip_types",
-                    token.to_string(),
-                    "token exceeds 128 bytes",
+                    token,
+                    "this type is longer than nginx can compress: nginx hashes the gzip type \
+                     list into a fixed 64-byte bucket, which fits at most 46 bytes per type, \
+                     and refuses to start with the whole configuration rejected above that. \
+                     The bucket is not configurable — types_hash_bucket_size applies to a \
+                     different hash. Remove this type",
                 ));
             }
             let lowered = token.to_ascii_lowercase();
             if !is_mime_shaped(&lowered) {
                 return Err(invalid(
                     "gzip_types",
-                    token.to_string(),
+                    token,
                     "each token must look like a MIME type (type/subtype), using only a-z, 0-9, '.', '+', '-'",
                 ));
             }
@@ -356,12 +478,65 @@ mod tests {
 
     #[test]
     fn body_size_accepts_digits_with_optional_unit_rejects_the_rest() {
+        // `0` is deliberate: nginx reads it as "no body-size limit at all".
+        // It is legitimate nginx, so it parses — the Web server form's hint is
+        // what stops a user reading it as "allow nothing".
         for good in ["0", "256", "256m", "256M", "1g", "1G", "10k", "10K"] {
             assert!(BodySize::parse(good).is_ok(), "should accept {good:?}");
         }
         for bad in ["", "m", "256mb", "-1", "1.5m", "256 m", "256;m", "256m;"] {
             assert!(BodySize::parse(bad).is_err(), "should reject {bad:?}");
         }
+    }
+
+    #[test]
+    fn body_size_rejects_what_is_shaped_right_but_nginx_still_refuses() {
+        // `^\d+[kKmMgG]?$` is not the whole rule. nginx parses this directive
+        // with `ngx_conf_set_off_slot`, which multiplies digits by unit and
+        // rejects anything past NGX_MAX_OFF_T_VALUE — all of these match the
+        // regex and all of them make a real nginx emit
+        // `"client_max_body_size" directive invalid value`.
+        for bad in [
+            "9223372036854775808",  // i64::MAX + 1
+            "18446744073709551616", // u64::MAX + 1, so not even a u64
+            "18446744073709551616m",
+            "99999999999999999999g",
+            "8589934592g",       // one past the largest g nginx takes
+            "8796093022208m",    // one past the largest m
+            "9007199254740992k", // one past the largest k
+        ] {
+            assert!(BodySize::parse(bad).is_err(), "nginx refuses {bad:?}");
+        }
+        // The exact boundaries nginx does accept (measured against Homebrew
+        // nginx 1.31.3 — see `the_largest_body_sizes_we_accept_load_in_real_
+        // nginx` in tests/validate_live.rs).
+        for good in [
+            "9223372036854775807",
+            "8589934591g",
+            "8796093022207m",
+            "9007199254740991k",
+        ] {
+            assert!(BodySize::parse(good).is_ok(), "nginx accepts {good:?}");
+        }
+    }
+
+    #[test]
+    fn body_size_is_bounded_in_length_not_just_in_shape() {
+        // This field arrives as free text with no length limit of its own.
+        // Unbounded, a ten-million-digit value parses, renders a 10 MB
+        // nginx.conf, is stored as a 10 MB TEXT column, and is carried in full
+        // twice over in every apply plan sent to the webview.
+        let ten_million_digits = "1".repeat(10_000_000);
+        assert!(BodySize::parse(&ten_million_digits).is_err());
+
+        // The boundary is "every value nginx could possibly accept": 19 digits
+        // (i64::MAX) plus a unit suffix.
+        assert_eq!(BodySize::MAX_LEN, 20);
+        let at_max = format!("{}k", "0".repeat(BodySize::MAX_LEN - 2));
+        assert_eq!(at_max.len(), BodySize::MAX_LEN - 1);
+        assert!(BodySize::parse(&at_max).is_ok());
+        let over_max = "1".repeat(BodySize::MAX_LEN + 1);
+        assert!(BodySize::parse(&over_max).is_err());
     }
 
     #[test]
@@ -442,10 +617,24 @@ mod tests {
         }
     }
 
+    /// A MIME-shaped token of exactly `len` bytes.
+    fn token_of_len(len: usize) -> String {
+        assert!(len > 5, "a token needs room for the `text/` prefix");
+        format!("text/{}", "a".repeat(len - 5))
+    }
+
     #[test]
     fn gzip_types_enforces_token_and_count_limits() {
-        let overlong_token = format!("text/{}", "a".repeat(GZIP_TYPE_TOKEN_MAX_LEN));
-        assert!(GzipTypes::parse(&overlong_token).is_err());
+        // The boundary is nginx's, not ours: exactly GZIP_TYPE_TOKEN_MAX_LEN
+        // bytes must be accepted (a real nginx loads it — see
+        // `the_documented_gzip_types_maximum_loads_in_real_nginx` in
+        // tests/validate_live.rs) and one byte more must not.
+        let at_max = token_of_len(GZIP_TYPE_TOKEN_MAX_LEN);
+        assert_eq!(at_max.len(), GZIP_TYPE_TOKEN_MAX_LEN);
+        assert!(GzipTypes::parse(&at_max).is_ok(), "{at_max:?} is the limit");
+
+        let over_max = token_of_len(GZIP_TYPE_TOKEN_MAX_LEN + 1);
+        assert!(GzipTypes::parse(&over_max).is_err());
 
         let too_many = (0..GZIP_TYPES_MAX_TOKENS + 1)
             .map(|i| format!("text/t{i}"))
@@ -458,6 +647,84 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert!(GzipTypes::parse(&exactly_max).is_ok());
+    }
+
+    #[test]
+    fn the_gzip_token_cap_is_the_one_nginx_can_actually_load() {
+        // Pinned to nginx's own arithmetic rather than to a round number, so
+        // that "tidying up" the constant fails here with the reason attached:
+        // bucket = ngx_cacheline_size (64), usable = bucket - sizeof(void *),
+        // and each entry costs sizeof(void *) + align(len + 2, sizeof(void *)).
+        const PTR: usize = 8;
+        const BUCKET: usize = 64;
+        let elt_size = |len: usize| PTR + (len + 2).div_ceil(PTR) * PTR;
+        assert!(
+            elt_size(GZIP_TYPE_TOKEN_MAX_LEN) <= BUCKET - PTR,
+            "a token of the cap does not fit nginx's test_types bucket"
+        );
+        assert!(
+            elt_size(GZIP_TYPE_TOKEN_MAX_LEN + 1) > BUCKET - PTR,
+            "the cap is below what nginx would accept, for no reason"
+        );
+        // The measured value on Homebrew nginx 1.31.3: 46 loads, 47 gives
+        // `could not build test_types_hash`.
+        assert_eq!(GZIP_TYPE_TOKEN_MAX_LEN, 46);
+    }
+
+    #[test]
+    fn a_real_office_mime_type_is_refused_with_a_reason_naming_nginx() {
+        // The type the old doc comment cited as proof the cap was generous.
+        // It is 71 bytes: nginx cannot compress it at any setting, and the
+        // rejection has to say so rather than just "too long".
+        let docx = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+        assert_eq!(docx.len(), 71);
+        let e = GzipTypes::parse(docx).unwrap_err();
+        match e {
+            ConfError::InvalidField { field, reason, .. } => {
+                assert_eq!(field, "gzip_types");
+                assert!(reason.contains("nginx"), "not actionable: {reason:?}");
+                assert!(reason.contains("46"), "the limit is unnamed: {reason:?}");
+            }
+            other => panic!("expected InvalidField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_rejection_never_echoes_more_than_a_recognisable_prefix() {
+        // Rejection messages cross IPC into the DOM, and every value they
+        // quote was refused for being unacceptable — several of these fields
+        // are unbounded before `parse` sees them, so echoing the whole thing
+        // makes the rejection path an amplifier for the input it is rejecting.
+        let huge_token = format!("text/{}", "a".repeat(200_000));
+        let huge_list = (0..GZIP_TYPES_MAX_TOKENS + 50)
+            .map(|i| format!("text/t{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let huge_size = "9".repeat(100_000);
+        let cases: [(&str, ConfError); 3] = [
+            ("overlong token", GzipTypes::parse(&huge_token).unwrap_err()),
+            ("too many tokens", GzipTypes::parse(&huge_list).unwrap_err()),
+            ("overlong size", BodySize::parse(&huge_size).unwrap_err()),
+        ];
+        for (label, e) in cases {
+            match e {
+                ConfError::InvalidField { value, .. } => {
+                    assert!(
+                        value.chars().count() <= ERROR_VALUE_MAX_CHARS + 1,
+                        "{label}: echoed {} chars back",
+                        value.chars().count()
+                    );
+                    assert!(value.ends_with('…'), "{label}: not marked as truncated");
+                }
+                other => panic!("{label}: expected InvalidField, got {other:?}"),
+            }
+        }
+        // A value that fits is still quoted in full — truncation must not cost
+        // the user the ability to see what they typed.
+        match BodySize::parse("256mb").unwrap_err() {
+            ConfError::InvalidField { value, .. } => assert_eq!(value, "256mb"),
+            other => panic!("expected InvalidField, got {other:?}"),
+        }
     }
 
     #[test]

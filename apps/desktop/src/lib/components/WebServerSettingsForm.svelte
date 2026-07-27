@@ -199,7 +199,8 @@
 						/>
 						<p class="hint" id={hintId('client_max_body_size')}>
 							The largest request body nginx accepts — a database import or a media upload dies here
-							first. A number, optionally followed by k, m or g.
+							first. A number, optionally followed by k, m or g. Careful with 0: nginx reads it as
+							no limit at all, not as “reject every upload”.
 						</p>
 						{@render fieldError('client_max_body_size')}
 					</div>
