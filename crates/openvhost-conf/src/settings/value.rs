@@ -165,19 +165,31 @@ impl BodySize {
     }
 }
 
-/// Whether a token is a plausible MIME type shape: `type/subtype`, each side
-/// non-empty and built only from characters MIME type/subtype names actually
-/// use (`RFC 6838`-ish: alphanumerics, `-`, `.`, `+`, `_`). No whitespace, no
-/// `;`, no `{`/`}`/`"`/`$` — the characters that would let a token close the
-/// directive and open new configuration.
+/// Whether a token (already lowercased by the caller) is a plausible MIME
+/// type shape: `type/subtype`, each side matching spec §6's
+/// `^[a-z0-9][a-z0-9.+-]*/[a-z0-9][a-z0-9.+-]*$` — a leading letter or digit,
+/// then any run of lowercase alphanumerics plus `-`, `.`, `+`. Deliberately
+/// narrower than RFC 6838's full token charset: no `_`, no leading `-`/`.`/
+/// `+`, no uppercase. Lowercase-only matches what nginx configs
+/// conventionally contain and what every real compressible type looks like
+/// (`application/vnd.ms-fontobject`, `text/x-component`,
+/// `image/svg+xml`), and a narrower guard is the right default for a value
+/// that lands in a config file. No whitespace, no `;`, no `{`/`}`/`"`/`$` —
+/// the characters that would let a token close the directive and open new
+/// configuration.
 fn is_mime_shaped(token: &str) -> bool {
     let Some((ty, subtype)) = token.split_once('/') else {
         return false;
     };
     let is_token_chars = |s: &str| {
-        !s.is_empty()
-            && s.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'+' | b'_'))
+        let mut bytes = s.bytes();
+        let Some(first) = bytes.next() else {
+            return false;
+        };
+        (first.is_ascii_lowercase() || first.is_ascii_digit())
+            && bytes.all(|b| {
+                b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'.' | b'+')
+            })
     };
     is_token_chars(ty) && is_token_chars(subtype)
 }
@@ -193,16 +205,41 @@ fn is_mime_shaped(token: &str) -> bool {
 /// built-in `text/html`", which is nginx's own behaviour with no
 /// `gzip_types` directive at all — the honest way to express "no extra
 /// types", not an oversight.
+///
+/// **Case:** MIME type/subtype tokens are case-insensitive by spec, and the
+/// charset this type enforces is lowercase-only (see [`is_mime_shaped`]), so
+/// `parse` lowercases each token *before* checking its shape. `TEXT/HTML`
+/// therefore parses successfully and is stored, and later rendered by
+/// [`GzipTypes::as_directive`], as `text/html` — rejecting a valid-but-
+/// uppercase MIME type with a bare "invalid" message would be a bad
+/// experience for input that is not actually wrong. A token that is
+/// malformed for reasons other than case (stray punctuation, an
+/// underscore, a leading `-`) is still rejected, naming the original token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GzipTypes(Vec<String>);
 
 impl GzipTypes {
     /// Parse a whitespace-separated `gzip_types` list. At most
     /// [`GZIP_TYPES_MAX_TOKENS`] tokens, each at most
-    /// [`GZIP_TYPE_TOKEN_MAX_LEN`] bytes and MIME-shaped.
+    /// [`GZIP_TYPE_TOKEN_MAX_LEN`] bytes and MIME-shaped (case-insensitively
+    /// — see the type docs).
+    ///
+    /// The token-count cap is enforced *inside* the loop, not after
+    /// collecting every token into a `Vec` first: `gzip_types` is free text
+    /// with no upper length limit before this function sees it, so an input
+    /// with millions of whitespace-separated tokens must be rejected after
+    /// looking at [`GZIP_TYPES_MAX_TOKENS`] of them, not after allocating a
+    /// `String` for every single one.
     pub fn parse(s: &str) -> Result<Self, ConfError> {
         let mut types = Vec::new();
         for token in s.split_whitespace() {
+            if types.len() >= GZIP_TYPES_MAX_TOKENS {
+                return Err(invalid(
+                    "gzip_types",
+                    s.to_string(),
+                    "at most 64 types are allowed",
+                ));
+            }
             if token.len() > GZIP_TYPE_TOKEN_MAX_LEN {
                 return Err(invalid(
                     "gzip_types",
@@ -210,21 +247,15 @@ impl GzipTypes {
                     "token exceeds 128 bytes",
                 ));
             }
-            if !is_mime_shaped(token) {
+            let lowered = token.to_ascii_lowercase();
+            if !is_mime_shaped(&lowered) {
                 return Err(invalid(
                     "gzip_types",
                     token.to_string(),
-                    "each token must look like a MIME type (type/subtype)",
+                    "each token must look like a MIME type (type/subtype), using only a-z, 0-9, '.', '+', '-'",
                 ));
             }
-            types.push(token.to_string());
-        }
-        if types.len() > GZIP_TYPES_MAX_TOKENS {
-            return Err(invalid(
-                "gzip_types",
-                s.to_string(),
-                "at most 64 types are allowed",
-            ));
+            types.push(lowered);
         }
         Ok(Self(types))
     }
