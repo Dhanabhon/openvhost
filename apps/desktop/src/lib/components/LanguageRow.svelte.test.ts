@@ -129,4 +129,47 @@ describe('LanguageRow', () => {
 		});
 		expect(body).toMatch(/apply/i);
 	});
+
+	// C1 (branch-review-fix-report.md): `install_php` returns `Ok(..)` with a
+	// non-zero `exitCode` for a brew run that genuinely failed — that is an
+	// OUTCOME to render, not a thrown `error`. Before the fix nothing rendered
+	// it at all: `error` stays '' (nothing threw), `notFound` requires
+	// `exitCode === 0`, and the log itself was hidden by an `isInstalling` gate
+	// that had already flipped false by the time this outcome exists.
+	it('renders a failed brew exit instead of nothing', () => {
+		const body = renderRow({
+			row: r('8.4', false),
+			outcome: { major: '8.4', exitCode: 1, detected: false }
+		});
+		expect(body).toMatch(/exited with code 1/i);
+		expect(body).toMatch(/php 8\.4/i);
+	});
+
+	it('renders a killed-by-signal brew run (no exit code at all) as failed too', () => {
+		const body = renderRow({
+			row: r('8.4', false),
+			outcome: { major: '8.4', exitCode: null, detected: false }
+		});
+		expect(body).toMatch(/killed/i);
+	});
+
+	// The log must survive past the moment `installing` resets to '' — that
+	// reset happens in `install()`'s `finally`, BEFORE the row re-renders with
+	// the settled (possibly failed) outcome, which is exactly when the log is
+	// most needed. `installing: ''` here reproduces that post-settle render.
+	it('keeps a non-empty log on screen once the install has settled, not only while installing', () => {
+		const body = renderRow({
+			row: r('8.4', false),
+			installing: '',
+			log: [{ id: '8.4', tsMs: 1, level: 'info', line: 'Error: dependency foo failed to build' }],
+			outcome: { major: '8.4', exitCode: 1, detected: false }
+		});
+		expect(body).toContain('Error: dependency foo failed to build');
+	});
+
+	it('renders nothing extra when there is no outcome at all', () => {
+		const body = renderRow({ row: r('8.4', false) });
+		expect(body).not.toMatch(/exited with code/i);
+		expect(body).not.toMatch(/killed/i);
+	});
 });

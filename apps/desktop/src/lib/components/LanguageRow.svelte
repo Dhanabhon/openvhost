@@ -44,6 +44,14 @@
 		rowOutcome !== null && rowOutcome.exitCode === 0 && !rowOutcome.detected
 	);
 	const justInstalled = $derived(rowOutcome !== null && rowOutcome.detected && row.installed);
+	/** C1 audit finding: `install_php` returns `Ok(InstallOutcomeDto { exit_code:
+	 *  Some(1), detected: false })` for a brew run that genuinely failed — a
+	 *  non-zero exit (or `None`, killed by a signal) is an OUTCOME to render, not
+	 *  a thrown error, so `error` above never carries it. `exitCode !== 0` covers
+	 *  both: `1` (or any other non-zero code) and `null` (no code at all) are both
+	 *  "not a clean exit". Checked before `notFound`/`justInstalled` in the
+	 *  markup below — those only make sense once `exitCode === 0`. */
+	const failed = $derived(rowOutcome !== null && rowOutcome.exitCode !== 0);
 </script>
 
 <div class="row lang-row" data-testid="lang-row-{row.major}">
@@ -109,7 +117,13 @@
 	</div>
 </div>
 
-{#if isInstalling && log.length > 0}
+{#if log.length > 0}
+	<!-- C1 fix: no longer gated on `isInstalling`. `install()`'s `finally` resets
+	     `installing` to '' BEFORE this row re-renders with the settled outcome, so
+	     gating on it made the log vanish at the exact moment — a failed or killed
+	     install — a user most needs to read it. `log` is already scoped to this
+	     row's own major (`store.logFor`) and only cleared at the START of this
+	     row's NEXT attempt, so it safely survives here on its own. -->
 	<LogPane logs={log} />
 {/if}
 
@@ -120,7 +134,21 @@
 	<p class="error" role="alert" style="white-space: pre-wrap">{error}</p>
 {/if}
 
-{#if notFound}
+{#if failed}
+	<!-- C1 fix: brew's own non-zero exit (or a signal kill, `exitCode === null`)
+	     used to render NOTHING — no error (nothing threw), no `notFound` (that
+	     branch requires `exitCode === 0`), and by then the log had already been
+	     hidden by the `isInstalling` gate above. Spec §6 calls this a "Failed" row
+	     state; this is it. -->
+	<p class="error" role="alert">
+		{#if rowOutcome?.exitCode !== null && rowOutcome?.exitCode !== undefined}
+			brew exited with code {rowOutcome.exitCode} while installing PHP {row.major}.
+		{:else}
+			brew was killed before installing PHP {row.major} finished.
+		{/if}
+		Check the log above for what brew actually did.
+	</p>
+{:else if notFound}
 	<p class="warn" role="alert">
 		Homebrew reported success installing PHP {row.major}, but the version was not found afterwards.
 		Check the log above for what brew actually did.
