@@ -68,6 +68,21 @@ describe('LanguageRow', () => {
 		expect(body).not.toContain('data-testid="install-8.3"');
 	});
 
+	// The "one line" branch-review-fix-report.md finding: `fullVersion` is
+	// `null` for every row in production (no patch-level prober exists yet), so
+	// falling back to `row.major` in the version column printed the major a
+	// SECOND time right next to the "PHP 8.3" heading — implying a patch level
+	// had been fetched when it had not. An em dash is the honest "unknown".
+	it('shows an em dash rather than repeating the major when the patch level is unknown', () => {
+		const body = renderRow({ row: r('8.3', true, { fullVersion: null }) });
+		// The version column is the FIRST `meta mono` cell (path/socket follow with
+		// their own extra classes) — matched by class rather than an exact literal
+		// string so a scoped-style hash suffix on the class attribute cannot break
+		// this assertion for reasons unrelated to what it is pinning.
+		const versionCell = body.match(/<div class="meta mono[^"]*">([^<]*)<\/div>/);
+		expect(versionCell?.[1]).toBe('—');
+	});
+
 	it('offers start and stop for an installed version', () => {
 		// The install-to-running flow otherwise spans three pages.
 		const body = renderRow({ row: r('8.3', true, { serviceId: 'php-fpm-8.3' }), running: false });

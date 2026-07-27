@@ -54,7 +54,17 @@
 		{/if}
 	</div>
 
-	<div class="meta mono">{row.installed ? (row.fullVersion ?? row.major) : '—'}</div>
+	<!-- The duplication fix this line undoes if it drifts back: `row.fullVersion`
+	     is `None` for every row in production today (no patch-level prober
+	     exists yet — see `PhpRuntimeDto::full_version`'s own doc comment on the
+	     Rust side), and it is ALSO `None` for a row that is not installed at
+	     all (`php_rows` only sets it when `found.is_some()`). Falling back to
+	     `row.major` here would print "8.3" a second time right next to the
+	     "PHP 8.3" heading, implying a patch level was fetched when it was not —
+	     the exact thing the Rust-side fix (`the_patch_level_is_absent_rather_
+	     than_a_repeat_of_the_major`) removed, reappearing one layer up. An em
+	     dash is the honest "unknown", same as the path/socket columns below. -->
+	<div class="meta mono">{row.fullVersion ?? '—'}</div>
 
 	<!-- `title` so the full value stays reachable when the cell ellipsizes, same
 	     reasoning as ServiceRow.svelte's endpoint column. -->
