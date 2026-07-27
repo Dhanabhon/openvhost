@@ -365,6 +365,27 @@ mod tests {
     }
 
     #[test]
+    fn body_size_handles_the_edge_cases_traced_by_review() {
+        // A leading sign is not part of `\d+` — nginx's own directive has no
+        // notion of a signed size.
+        assert!(
+            BodySize::parse("+256m").is_err(),
+            "a leading '+' is not part of \\d+"
+        );
+        // Leading zeros are still a run of digits — `\d+` does not forbid them.
+        assert!(
+            BodySize::parse("007m").is_ok(),
+            "leading zeros are still \\d+"
+        );
+        // `٣` is Arabic-Indic digit three (U+0663) — a Unicode decimal digit,
+        // but not one of the ASCII bytes '0'..='9' the parser checks for.
+        assert!(
+            BodySize::parse("٣m").is_err(),
+            "a non-ASCII Unicode digit is not ASCII \\d"
+        );
+    }
+
+    #[test]
     fn gzip_types_accepts_a_mime_shaped_list_and_blank_means_empty() {
         let t = GzipTypes::parse("text/plain text/css application/json").unwrap();
         assert_eq!(t.as_directive(), "text/plain text/css application/json");
@@ -372,6 +393,37 @@ mod tests {
         // Deliberate: whitespace-only means "no extra types", not an error.
         let empty = GzipTypes::parse("   ").unwrap();
         assert_eq!(empty.as_directive(), "");
+    }
+
+    #[test]
+    fn gzip_types_lowercases_a_valid_but_uppercase_token_instead_of_rejecting_it() {
+        // TEXT/HTML is a perfectly valid MIME type spelled in the wrong case
+        // for our charset. Rejecting it with a bare "invalid" message would
+        // be a bad experience for input that isn't actually wrong, so `parse`
+        // lowercases before validating and stores the lowercased form.
+        let t = GzipTypes::parse("TEXT/HTML").unwrap();
+        assert_eq!(t.as_directive(), "text/html");
+    }
+
+    #[test]
+    fn is_mime_shaped_rejects_what_the_old_alphanumeric_charset_wrongly_accepted() {
+        // Spec §6 fixes the per-token rule as
+        // `^[a-z0-9][a-z0-9.+-]*/[a-z0-9][a-z0-9.+-]*$` — lowercase only, no
+        // underscore, no leading punctuation. These three are exactly the
+        // cases a `char::is_ascii_alphanumeric() || '-'|'.'|'+'|'_'` charset
+        // would have let through and the documented regex forbids.
+        assert!(
+            !is_mime_shaped("TEXT/HTML"),
+            "uppercase is outside the documented lowercase-only charset"
+        );
+        assert!(
+            !is_mime_shaped("_/_"),
+            "underscore is not in the documented charset at all"
+        );
+        assert!(
+            !is_mime_shaped("-a/-a"),
+            "a token may not start with punctuation"
+        );
     }
 
     #[test]
@@ -430,5 +482,31 @@ mod tests {
         assert!(GzipLevel::parse(d.gzip_comp_level.get()).is_ok());
         assert!(BodySize::parse(d.client_max_body_size.as_str()).is_ok());
         assert!(GzipTypes::parse(&d.gzip_types.as_directive()).is_ok());
+    }
+
+    #[test]
+    fn defaults_match_the_documented_table_in_spec_section_5() {
+        // `every_default_would_survive_its_own_parser` only proves internal
+        // self-consistency (every default is inside the range its own parser
+        // enforces) — it says nothing about whether those defaults are the
+        // ones spec §5 actually documents. This pins each one to its literal
+        // value from that table, so a future silent drift (e.g. someone
+        // "tidies up" `unchecked_defaults` and changes a constant) fails a
+        // test instead of shipping a config the spec does not describe.
+        let d = WebServerSettings::default();
+        assert_eq!(d.worker_connections.get(), 1024);
+        assert_eq!(d.client_max_body_size.as_str(), "256m");
+        assert_eq!(d.keepalive_timeout.get(), 65);
+        assert!(d.tcp_nodelay.is_on());
+        assert_eq!(d.fastcgi_connect_timeout.get(), 60);
+        assert_eq!(d.fastcgi_send_timeout.get(), 300);
+        assert_eq!(d.fastcgi_read_timeout.get(), 300);
+        assert!(!d.gzip.is_on());
+        assert_eq!(d.gzip_comp_level.get(), 1);
+        assert_eq!(
+            d.gzip_types.as_directive(),
+            "text/plain text/css application/json application/javascript application/xml \
+             image/svg+xml font/woff2"
+        );
     }
 }
