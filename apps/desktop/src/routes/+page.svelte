@@ -1,6 +1,7 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { resolve } from '$app/paths';
 	import AppShell from '$lib/components/AppShell.svelte';
 	import ApplyDialog from '$lib/components/ApplyDialog.svelte';
 	import PendingChangesBanner from '$lib/components/PendingChangesBanner.svelte';
@@ -12,8 +13,10 @@
 		deleteSite,
 		listSites,
 		openSite,
+		phpEnvironment,
 		planSiteApply,
 		updateSite,
+		type PhpEnvironmentDto,
 		type SiteDto,
 		type SiteInput
 	} from '$lib/ipc';
@@ -29,10 +32,42 @@
 	// pass a hardcoded 0, which announced "0 running" even with services up.
 	const running = $derived(runningCount(servicesStore.services));
 
+	// Threaded into SiteDrawer so its PHP-version picker offers only what this machine
+	// actually has (Task 8): a hardcoded list let every option lead to an Apply the
+	// backend refused. `null` until the first read settles; `phpEnvLoaded` distinguishes
+	// that in-flight state from a genuinely empty result (see `noPhpInstalled` below).
+	let phpEnv = $state<PhpEnvironmentDto | null>(null);
+	let phpEnvLoaded = $state(false);
+
+	const installedPhpVersions = $derived(
+		(phpEnv?.runtimes ?? []).filter((r) => r.installed).map((r) => r.major)
+	);
+
+	// Gated on `phpEnvLoaded`, not just `installedPhpVersions.length === 0`: both `null`
+	// (still loading) and a genuinely empty environment produce the same empty array, and
+	// flashing this banner during the brief window before the fetch resolves would be
+	// wrong on any machine that does have a version installed.
+	const noPhpInstalled = $derived(phpEnvLoaded && installedPhpVersions.length === 0);
+
 	onMount(() => {
 		void store.load();
 		void applyStore.refresh();
+		void loadPhpEnvironment();
 	});
+
+	async function loadPhpEnvironment(): Promise<void> {
+		try {
+			phpEnv = await phpEnvironment();
+		} catch {
+			// A failed read is not evidence nothing is installed. This page has no error
+			// banner of its own for it (unlike `store.error`/`applyStore.error`); the safe
+			// fallback — leave `phpEnv` at `null`, so `installedPhpVersions` stays empty and
+			// the drawer/banner guide toward Languages — is the same one a genuinely empty
+			// result already produces, so nothing further is needed here.
+		} finally {
+			phpEnvLoaded = true;
+		}
+	}
 
 	let editing = $state<SiteDto | null>(null);
 	let drawerOpen = $state(false);
@@ -102,6 +137,20 @@
 			<span>{applyStore.error}</span>
 		</div>
 	{/if}
+	{#if noPhpInstalled}
+		<!-- Sites is the landing page (Rail.svelte's own comment: "`/`, not `/sites`"), so
+		     this is where a first-time user — or one who has never installed PHP — lands
+		     first. Pointing at Languages here, not only inside the drawer, means the guidance
+		     is visible before they even open Add site. -->
+		<div class="banner-info" role="status" data-testid="no-php-banner">
+			<strong>No PHP version is installed yet</strong>
+			<span
+				>Sites need one to run. <a href={resolve('/languages')}
+					>Install a version on the Languages page</a
+				>.</span
+			>
+		</div>
+	{/if}
 	<PendingChangesBanner count={applyStore.pendingCount} onReview={() => (applyDialogOpen = true)} />
 	<SitesPanel
 		sites={store.sites}
@@ -117,6 +166,7 @@
 		<SiteDrawer
 			site={editing}
 			fieldErrors={store.fieldErrors}
+			installed={installedPhpVersions}
 			{onSave}
 			onDelete={onDrawerDelete}
 			onClose={() => (drawerOpen = false)}
@@ -152,5 +202,24 @@
 	.banner-error strong {
 		display: block;
 		margin-bottom: 2px;
+	}
+	/* .banner-info: an accent-tinted pointer, not a failure — same recipe as
+	   PendingChangesBanner.svelte's own `.banner` (accent-tinted surface over
+	   `--vh-surface`, distinct from `.banner-error`'s failure tint above), reused here
+	   as a block-level notice rather than that component's flex row + action button. */
+	.banner-info {
+		margin: var(--vh-space-3) var(--vh-space-6) 0;
+		padding: var(--vh-space-3) var(--vh-space-4);
+		border: 1px solid color-mix(in oklab, var(--vh-accent) 35%, transparent);
+		background: color-mix(in oklab, var(--vh-accent) 8%, var(--vh-surface));
+		border-radius: var(--vh-radius-card);
+		font-size: var(--vh-text-table);
+	}
+	.banner-info strong {
+		display: block;
+		margin-bottom: 2px;
+	}
+	.banner-info a {
+		color: var(--vh-link);
 	}
 </style>

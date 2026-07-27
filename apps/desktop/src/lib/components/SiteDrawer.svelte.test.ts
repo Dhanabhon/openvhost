@@ -23,8 +23,13 @@
 import { describe, expect, it } from 'vitest';
 import { render } from 'svelte/server';
 import SiteDrawer, { filterDomainInput, filterNameInput } from './SiteDrawer.svelte';
-import { PHP_VERSIONS, WEB_SERVERS } from '$lib/sites.derive';
+import { WEB_SERVERS } from '$lib/sites.derive';
 import type { SiteDto } from '$lib/ipc';
+
+/** Stand-in for "what's actually installed on this machine" — same values the old
+ * hardcoded `PHP_VERSIONS` list held, so every pre-existing assertion below keeps its
+ * original expected output even though the source of the list changed. */
+const INSTALLED = ['8.4', '8.3', '8.2', '8.1'];
 
 const site = (phpVersion: string): SiteDto => ({
 	id: 'a',
@@ -38,12 +43,19 @@ const site = (phpVersion: string): SiteDto => ({
 	updatedAt: 1
 });
 
-/** The drawer's markup, rendered for `dto` (`null` = the Add form). */
-function drawerHtml(dto: SiteDto | null, fieldErrors: Record<string, string> = {}): string {
+/** The drawer's markup, rendered for `dto` (`null` = the Add form). `installed`
+ * defaults to {@link INSTALLED} so every existing assertion below is unaffected;
+ * the "nothing installed" describe block overrides it to `[]`. */
+function drawerHtml(
+	dto: SiteDto | null,
+	fieldErrors: Record<string, string> = {},
+	installed: readonly string[] = INSTALLED
+): string {
 	return render(SiteDrawer, {
 		props: {
 			site: dto,
 			fieldErrors,
+			installed,
 			onSave: async () => true,
 			onDelete: async () => true,
 			onClose: () => {}
@@ -142,9 +154,9 @@ describe('SiteDrawer PHP version', () => {
 		expect(selectedLabels(drawerHtml(null))).toEqual(['8.4']);
 	});
 
-	it('offers every version in PHP_VERSIONS', () => {
+	it('offers every installed version', () => {
 		const labels = phpOptions(drawerHtml(site('8.0'))).map((o) => o.label);
-		expect(labels).toEqual(['8.0 — not available', ...PHP_VERSIONS]);
+		expect(labels).toEqual(['8.0 — not available', ...INSTALLED]);
 	});
 
 	// The native `<select>` is gone; what replaces it has to be a real listbox, not a
@@ -193,6 +205,35 @@ describe('SiteDrawer PHP version', () => {
 		expect(text(drawerHtml(site('8.3')))).toContain(
 			'Applies to this site only. Other sites keep their own version.'
 		);
+	});
+});
+
+describe('SiteDrawer PHP version — nothing installed', () => {
+	// The trap this task closes, reproduced directly: a brand-new site with no PHP
+	// version installed anywhere must not present a combobox with nothing real behind
+	// it, above a Save button that would carry an empty/invalid version to the backend.
+	it('does not render a combobox when adding a site with nothing installed', () => {
+		expect(drawerHtml(null, {}, [])).not.toContain('role="combobox"');
+	});
+
+	it('says nothing is installed and points at the Languages page', () => {
+		const html = drawerHtml(null, {}, []);
+		expect(text(html)).toContain('No PHP version is installed yet');
+		expect(html).toContain('href="/languages"');
+	});
+
+	it('disables Save so the doomed-to-fail site cannot be submitted', () => {
+		const save = tagWith(drawerHtml(null, {}, []), 'data-testid="drawer-save"');
+		expect(save).toContain('disabled');
+	});
+
+	// The one case `phpVersionOptions` can never actually leave empty: an existing
+	// site's own stored version is always represented, even unannotated-available, so
+	// editing must stay fully possible with nothing installed.
+	it('still lets an existing site with an uninstalled stored version be edited', () => {
+		const html = drawerHtml(site('8.3'), {}, []);
+		expect(html).toContain('role="combobox"');
+		expect(tagWith(html, 'data-testid="drawer-save"')).not.toContain('disabled');
 	});
 });
 
