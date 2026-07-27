@@ -179,10 +179,19 @@ pre,
 	padding: 0 var(--vh-space-6);
 	margin: var(--vh-space-4) 0 var(--vh-space-2);
 }
+/* One ring, clearly outside the control.
+   `outline-offset: 2px` rather than 1px because several controls carry a 1px
+   border of their own (`.btn-quiet`, inputs): at 1px the ring sat directly
+   against that border and the pair read as a doubled frame — visible on the
+   quit dialog's Cancel button, whose grey border is muddied by the green ring
+   right beside it. Two pixels of gap keeps the ring and the border legible as
+   separate things.
+   No `border-radius` here: an outline already follows the element's own radius,
+   so setting one only mutated the ELEMENT's shape while focused — a pill or a
+   card would snap to 6px corners the moment it took focus. */
 :focus-visible {
 	outline: 2px solid var(--vh-focus-ring);
-	outline-offset: 1px;
-	border-radius: var(--vh-radius-control);
+	outline-offset: 2px;
 }
 ::placeholder {
 	color: var(--vh-text-2);
