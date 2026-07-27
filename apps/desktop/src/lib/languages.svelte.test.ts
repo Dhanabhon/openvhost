@@ -101,6 +101,58 @@ describe('LanguagesStore', () => {
 		expect(s.installing).toBe('');
 	});
 
+	it("does not carry one version's output into the next attempt", async () => {
+		// Install 8.4, watch it fail, then try 8.3: the 8.3 row must not show
+		// 8.4's error output as if it were its own.
+		const s = new LanguagesStore({
+			phpEnvironment: async () => env([row('8.3', false), row('8.4', false)]),
+			rescanPhpRuntimes: async () => env([]),
+			installPhp: async () => {
+				throw { kind: 'core', message: 'boom' };
+			}
+		});
+		s.appendLog('8.4', 'fetching php@8.4');
+		await s.install('8.4');
+		expect(s.logFor('8.4').length).toBe(1);
+
+		await s.install('8.3');
+		expect(s.logFor('8.4')).toEqual([]);
+		expect(s.logFor('8.3')).toEqual([]);
+	});
+
+	it('attributes output to the version it came from', () => {
+		const s = new LanguagesStore(api());
+		s.appendLog('8.3', 'fetching');
+		expect(s.logFor('8.3').length).toBe(1);
+		expect(s.logFor('8.4')).toEqual([]);
+	});
+
+	it('caps the log so a long install cannot grow without bound', () => {
+		const s = new LanguagesStore(api());
+		for (let i = 0; i < 500; i += 1) s.appendLog('8.3', `line ${i}`);
+		expect(s.logFor('8.3').length).toBeLessThanOrEqual(200);
+		// The tail is what matters when something fails.
+		expect(s.logFor('8.3').at(-1)?.line).toBe('line 499');
+	});
+
+	it('keeps the last known environment when a refresh fails', async () => {
+		// A failed re-read is not evidence that the machine lost its PHP.
+		let calls = 0;
+		const s = new LanguagesStore({
+			phpEnvironment: async () => {
+				calls += 1;
+				if (calls === 1) return env([row('8.3', true)]);
+				throw { kind: 'core', message: 'transient' };
+			},
+			rescanPhpRuntimes: async () => env([]),
+			installPhp: async () => ({ major: '8.3', exitCode: 0, detected: true })
+		});
+		await s.refresh();
+		await s.refresh();
+		expect(s.error).toContain('transient');
+		expect(s.env?.runtimes.length).toBe(1);
+	});
+
 	it('re-reads the environment after a successful install rather than assuming', async () => {
 		// Assuming would show the version as installed even when the rescan did
 		// not find it — the exact case `detected` exists to report.

@@ -12,12 +12,14 @@
 	const running = $derived(runningCount(servicesStore.services));
 
 	/**
-	 * Which major the on-screen log/error belong to. `LanguagesStore.installing`
+	 * Which major the on-screen error belongs to. `LanguagesStore.installing`
 	 * resets to '' the instant `install()` settles — success or failure — so
-	 * without a separate marker the row that just finished would lose its log
-	 * and error the moment the user most needs to read them. Set when an
-	 * install starts and left alone afterwards (unlike `store.outcome`, which
-	 * already carries its own `major` and needs no such tracking).
+	 * without a separate marker the row that just finished would lose its
+	 * error the moment the user most needs to read it. Set when an install
+	 * starts and left alone afterwards (unlike `store.outcome`, which already
+	 * carries its own `major`, and unlike the log, which `store.logFor` now
+	 * attributes itself — `store.error` carries no major of its own, so this
+	 * is still what scopes it to a row).
 	 */
 	let lastAttempted = $state('');
 
@@ -94,7 +96,7 @@
 						row={runtime}
 						running={isRunning(runtime.serviceId)}
 						installing={store.installing}
-						log={runtime.major === lastAttempted ? store.log : []}
+						log={store.logFor(runtime.major)}
 						error={runtime.major === lastAttempted ? store.error : ''}
 						outcome={store.outcome}
 						onInstall={(major) => void onInstall(major)}
