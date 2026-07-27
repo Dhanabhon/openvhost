@@ -70,15 +70,26 @@ export class LanguagesStore {
 		}
 	}
 
-	/** The "Check again" button: unlike {@link refresh}, this spawns a probe
-	 *  per candidate binary — explicit and user-initiated only. */
+	/**
+	 * The "Check again" button: unlike {@link refresh}, this spawns a probe
+	 * per candidate binary — explicit and user-initiated only.
+	 *
+	 * This is the only recovery path once a user has gone off to install
+	 * Homebrew (or a PHP version) by hand and come back — it is either this or
+	 * quitting and relaunching the app. A transient failure here is not
+	 * evidence the PHP environment vanished, same reasoning as {@link refresh}:
+	 * overwriting `env` with `null` would blank the empty-state guidance the
+	 * user is actively following out from under them. So a failure keeps
+	 * whatever `env` already held and only sets `error`; `env` starts `null`
+	 * and stays `null` on a first-load failure, since there is nothing yet to
+	 * keep.
+	 */
 	async rescan(): Promise<void> {
 		this.error = '';
 		try {
 			this.env = await this.api.rescanPhpRuntimes();
 		} catch (e) {
 			this.error = errorMessage(e);
-			this.env = null;
 		}
 	}
 

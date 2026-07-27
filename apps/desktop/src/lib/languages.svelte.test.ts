@@ -153,6 +153,26 @@ describe('LanguagesStore', () => {
 		expect(s.env?.runtimes.length).toBe(1);
 	});
 
+	it('keeps the last known environment when a rescan fails', async () => {
+		// "Check again" is the user's only recovery path once they've gone off to
+		// install Homebrew themselves — a transient failure here must not blank
+		// the page and erase the guidance they were just following.
+		let calls = 0;
+		const s = new LanguagesStore({
+			phpEnvironment: async () => env([row('8.3', true)]),
+			rescanPhpRuntimes: async () => {
+				calls += 1;
+				if (calls === 1) return env([row('8.3', true)]);
+				throw { kind: 'core', message: 'transient' };
+			},
+			installPhp: async () => ({ major: '8.3', exitCode: 0, detected: true })
+		});
+		await s.rescan();
+		await s.rescan();
+		expect(s.error).toContain('transient');
+		expect(s.env?.runtimes.length).toBe(1);
+	});
+
 	it('re-reads the environment after a successful install rather than assuming', async () => {
 		// Assuming would show the version as installed even when the rescan did
 		// not find it — the exact case `detected` exists to report.
