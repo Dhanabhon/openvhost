@@ -9,9 +9,9 @@
 		onEditSite
 	}: {
 		/**
-		 * `applyStore.error` verbatim — a failed `plan_site_apply` (e.g.
+		 * `applyStore.error` verbatim — a failed `plan_config_apply` (e.g.
 		 * `MissingRuntime`/`NotAPlainFile`, which fail the whole call) or a
-		 * failed `apply_sites` once the dialog is closed with changes still
+		 * failed `apply_config` once the dialog is closed with changes still
 		 * pending. Rendered as-is, never parsed: see `missing` below for why
 		 * the "is this a missing runtime?" question is answered separately.
 		 */

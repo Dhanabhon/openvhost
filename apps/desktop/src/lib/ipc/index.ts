@@ -21,7 +21,8 @@ import type {
 	SiteDto,
 	SiteInput,
 	ValidationReportDto,
-	WebServerDto
+	WebServerDto,
+	WebServerSettingsDto
 } from './bindings';
 
 export type {
@@ -44,7 +45,8 @@ export type {
 	SiteDto,
 	SiteInput,
 	ValidationReportDto,
-	WebServerDto
+	WebServerDto,
+	WebServerSettingsDto
 };
 
 function isIpcError(e: unknown): e is IpcError {
@@ -168,23 +170,43 @@ export async function openHomebrewSite(): Promise<void> {
 }
 
 /**
- * What Apply would change against the current sites. Read-only and
- * process-free — safe to call after every site mutation for a pending-changes
- * banner.
+ * What Apply would change across the whole generated config — the sites AND
+ * the editable nginx settings, which are one config set and therefore one
+ * plan. Read-only and process-free: safe to call after every site mutation and
+ * every settings save for a pending-changes banner.
  */
-export async function planSiteApply(): Promise<ApplyPlanDto> {
-	return unwrap(commands.planSiteApply());
+export async function planConfigApply(): Promise<ApplyPlanDto> {
+	return unwrap(commands.planConfigApply());
 }
 
 /**
- * Apply the sites, then restart whichever affected services were running.
- * Services that were not running are reported in `notStarted` instead of
- * being started as a side effect. A service that was running but could not be
+ * Write the generated config, then restart whichever affected services were
+ * running. Services that were not running are reported in `notStarted` instead
+ * of being started as a side effect. A service that was running but could not be
  * cleanly stopped-and-restarted lands in `needsAttention` instead of
  * `restarted` — the UI must not present that outcome as a success.
  */
-export async function applySites(): Promise<ApplyOutcomeDto> {
-	return unwrap(commands.applySites());
+export async function applyConfig(): Promise<ApplyOutcomeDto> {
+	return unwrap(commands.applyConfig());
+}
+
+/**
+ * The stored nginx settings, or the documented defaults when nothing has been
+ * saved yet. Reading never writes a row.
+ */
+export async function webServerSettings(): Promise<WebServerSettingsDto> {
+	return unwrap(commands.webServerSettings());
+}
+
+/**
+ * Validate and store the nginx settings. Does NOT apply them: the live config
+ * changes only through {@link applyConfig}, which shows a diff first. A
+ * rejected field throws an `IpcError` of kind `validation` naming that field
+ * (snake_case, like the site editor's), and nothing is written — the values
+ * already stored are left exactly as they were.
+ */
+export async function saveWebServerSettings(input: WebServerSettingsDto): Promise<void> {
+	await unwrap(commands.saveWebServerSettings(input));
 }
 
 export async function listWebServers(): Promise<WebServerDto[]> {

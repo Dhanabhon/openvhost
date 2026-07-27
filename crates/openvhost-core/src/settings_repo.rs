@@ -67,6 +67,18 @@ fn from_conf_err(e: ConfError) -> CoreError {
     }
 }
 
+/// Same as [`from_conf_err`], but relabels the error with `column` first.
+///
+/// Four columns (`keepalive_timeout` and the three `fastcgi_*_timeout`s) are
+/// all `Seconds`, and `Seconds::parse` takes only a value — so on its own it
+/// reports `field: "seconds"` for every one of them, and a corrupt row tells
+/// the reader nothing about which column to look at. See
+/// [`openvhost_conf::ConfError::with_field`] for why the relabel lives there
+/// rather than in `Seconds::parse`'s signature.
+fn seconds_err(column: &'static str) -> impl Fn(ConfError) -> CoreError {
+    move |e| from_conf_err(e.with_field(column))
+}
+
 /// A SQLite `INTEGER` column decodes to `i64`; the newtypes take `u32`. A
 /// value that does not fit (negative, or past `u32::MAX`) is exactly the
 /// kind of hand-edited corruption re-validation exists to catch, so it maps
@@ -92,23 +104,23 @@ impl TryFrom<WebServerSettingsRow> for WebServerSettings {
             client_max_body_size: BodySize::parse(&r.client_max_body_size)
                 .map_err(from_conf_err)?,
             keepalive_timeout: Seconds::parse(to_u32("keepalive_timeout", r.keepalive_timeout)?)
-                .map_err(from_conf_err)?,
+                .map_err(seconds_err("keepalive_timeout"))?,
             tcp_nodelay: OnOff::new(r.tcp_nodelay != 0),
             fastcgi_connect_timeout: Seconds::parse(to_u32(
                 "fastcgi_connect_timeout",
                 r.fastcgi_connect_timeout,
             )?)
-            .map_err(from_conf_err)?,
+            .map_err(seconds_err("fastcgi_connect_timeout"))?,
             fastcgi_send_timeout: Seconds::parse(to_u32(
                 "fastcgi_send_timeout",
                 r.fastcgi_send_timeout,
             )?)
-            .map_err(from_conf_err)?,
+            .map_err(seconds_err("fastcgi_send_timeout"))?,
             fastcgi_read_timeout: Seconds::parse(to_u32(
                 "fastcgi_read_timeout",
                 r.fastcgi_read_timeout,
             )?)
-            .map_err(from_conf_err)?,
+            .map_err(seconds_err("fastcgi_read_timeout"))?,
             gzip: OnOff::new(r.gzip != 0),
             gzip_comp_level: GzipLevel::parse(to_u32("gzip_comp_level", r.gzip_comp_level)?)
                 .map_err(from_conf_err)?,
@@ -316,22 +328,16 @@ mod tests {
         assert_names_field(repo.get().await, "gzip_types");
     }
 
-    /// `Seconds::parse` takes only the out-of-range value (see its signature
-    /// in `openvhost_conf::settings::value`), so `ConfError::InvalidField`
-    /// always reports `field: "seconds"` regardless of which of the four
-    /// `Seconds`-typed columns produced it — a limitation of the current API,
-    /// not of this test. **Task 5 of the current plan is to have every
-    /// `Seconds` call site pass its own field name through**, so a future
-    /// version of this test can assert per-column names the way
-    /// `worker_connections`/`gzip_comp_level`/`gzip_types`/
-    /// `client_max_body_size` do above. Until then, this is one test over all
-    /// four columns (not four tests pretending to be independent) that
-    /// proves each column is still independently re-validated: a dropped
-    /// `Seconds::parse` call on any one of them fails only that iteration,
-    /// naming the column in the panic message, even though the error itself
-    /// cannot distinguish them yet.
+    /// All four `Seconds`-typed columns, each asserting its OWN name.
+    ///
+    /// `Seconds::parse` takes only the out-of-range value, so on its own it
+    /// reports `field: "seconds"` for every one of these — which is no column
+    /// at all. [`seconds_err`] relabels it, and this is what holds that true:
+    /// dropping the relabel on any single column fails that iteration with
+    /// `"seconds"` instead of the column's name, and dropping the
+    /// `Seconds::parse` call entirely fails it with a passing read.
     #[tokio::test]
-    async fn a_corrupt_seconds_field_is_rejected_on_read_for_every_seconds_column() {
+    async fn a_corrupt_seconds_field_is_rejected_on_read_and_names_its_own_column() {
         let seconds_columns = [
             "keepalive_timeout",
             "fastcgi_connect_timeout",
@@ -355,10 +361,7 @@ mod tests {
 
             match repo.get().await {
                 Err(CoreError::Validation { field, .. }) => {
-                    assert_eq!(
-                        field, "seconds",
-                        "{column}: Seconds::parse always names its field \"seconds\" today"
-                    );
+                    assert_eq!(field, column, "the error must name the column that broke");
                 }
                 other => panic!("{column}: expected CoreError::Validation, got {other:?}"),
             }

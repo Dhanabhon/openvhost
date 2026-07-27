@@ -14,16 +14,19 @@ vi.mock('@tauri-apps/api/event', () => ({
 }));
 
 import {
-	applySites,
+	applyConfig,
 	coreInfo,
 	installPhp,
 	listServices,
 	onPhpInstallLog,
 	onServiceState,
 	phpEnvironment,
-	planSiteApply,
-	rescanPhpRuntimes
+	planConfigApply,
+	rescanPhpRuntimes,
+	saveWebServerSettings,
+	webServerSettings
 } from './index';
+import type { WebServerSettingsDto } from './index';
 
 const sample = {
 	appVersion: '0.1.0',
@@ -81,14 +84,14 @@ describe('listServices (non-coreInfo wrapper)', () => {
 	});
 });
 
-describe('planSiteApply', () => {
+describe('planConfigApply', () => {
 	beforeEach(() => invokeMock.mockReset());
 
 	it('returns the plan data on success', async () => {
 		const plan = { changes: [{ path: '/tmp/ovh/nginx.conf', kind: 'modified', diff: '- a\n+ b' }] };
 		invokeMock.mockResolvedValueOnce(plan);
-		await expect(planSiteApply()).resolves.toEqual(plan);
-		expect(invokeMock).toHaveBeenCalledWith('plan_site_apply');
+		await expect(planConfigApply()).resolves.toEqual(plan);
+		expect(invokeMock).toHaveBeenCalledWith('plan_config_apply');
 	});
 
 	it('throws the normalized IpcError on failure', async () => {
@@ -96,7 +99,7 @@ describe('planSiteApply', () => {
 			kind: 'core',
 			message: 'site legacy needs PHP 7.4, which is not installed (installed: 8.4)'
 		});
-		await expect(planSiteApply()).rejects.toEqual({
+		await expect(planConfigApply()).rejects.toEqual({
 			kind: 'core',
 			message: 'site legacy needs PHP 7.4, which is not installed (installed: 8.4)'
 		});
@@ -104,14 +107,14 @@ describe('planSiteApply', () => {
 
 	it('normalizes a non-IpcError throw into a core-variant IpcError', async () => {
 		invokeMock.mockRejectedValueOnce(new Error('ipc transport down'));
-		await expect(planSiteApply()).rejects.toEqual({
+		await expect(planConfigApply()).rejects.toEqual({
 			kind: 'core',
 			message: 'Error: ipc transport down'
 		});
 	});
 });
 
-describe('applySites', () => {
+describe('applyConfig', () => {
 	beforeEach(() => invokeMock.mockReset());
 
 	it('returns the outcome data on success', async () => {
@@ -122,13 +125,85 @@ describe('applySites', () => {
 			needsAttention: []
 		};
 		invokeMock.mockResolvedValueOnce(outcome);
-		await expect(applySites()).resolves.toEqual(outcome);
-		expect(invokeMock).toHaveBeenCalledWith('apply_sites');
+		await expect(applyConfig()).resolves.toEqual(outcome);
+		expect(invokeMock).toHaveBeenCalledWith('apply_config');
 	});
 
 	it('throws the normalized IpcError on failure', async () => {
 		invokeMock.mockRejectedValueOnce({ kind: 'core', message: 'apply failed' });
-		await expect(applySites()).rejects.toEqual({ kind: 'core', message: 'apply failed' });
+		await expect(applyConfig()).rejects.toEqual({ kind: 'core', message: 'apply failed' });
+	});
+});
+
+const settings: WebServerSettingsDto = {
+	workerConnections: 2048,
+	clientMaxBodySize: '512m',
+	keepaliveTimeout: 30,
+	tcpNodelay: false,
+	fastcgiConnectTimeout: 10,
+	fastcgiSendTimeout: 120,
+	fastcgiReadTimeout: 900,
+	gzip: true,
+	gzipCompLevel: 6,
+	gzipTypes: 'text/css application/json'
+};
+
+describe('webServerSettings', () => {
+	beforeEach(() => invokeMock.mockReset());
+
+	it('returns the stored settings on success', async () => {
+		invokeMock.mockResolvedValueOnce(settings);
+		await expect(webServerSettings()).resolves.toEqual(settings);
+		expect(invokeMock).toHaveBeenCalledWith('web_server_settings');
+	});
+
+	it('throws the normalized IpcError on failure', async () => {
+		// A hand-edited state.db row is rejected on read, and the failure has
+		// to reach the page rather than leaving the form blank and silent.
+		invokeMock.mockRejectedValueOnce({
+			kind: 'validation',
+			field: 'gzip_comp_level',
+			message: '"99" must be between 1 and 9'
+		});
+		await expect(webServerSettings()).rejects.toEqual({
+			kind: 'validation',
+			field: 'gzip_comp_level',
+			message: '"99" must be between 1 and 9'
+		});
+	});
+});
+
+describe('saveWebServerSettings', () => {
+	beforeEach(() => invokeMock.mockReset());
+
+	it('sends the whole DTO under `input`', async () => {
+		invokeMock.mockResolvedValueOnce(null);
+		await expect(saveWebServerSettings(settings)).resolves.toBeUndefined();
+		expect(invokeMock).toHaveBeenCalledWith('save_web_server_settings', { input: settings });
+	});
+
+	it('surfaces a validation error naming the field, so the form can mark it', async () => {
+		// snake_case on purpose: `fieldErrors` is keyed by the BACKEND's field
+		// names, the same convention the site editor already uses. A camelCase
+		// key here would mark nothing.
+		invokeMock.mockRejectedValueOnce({
+			kind: 'validation',
+			field: 'fastcgi_read_timeout',
+			message: '"0" must be between 1 and 86400'
+		});
+		await expect(saveWebServerSettings({ ...settings, fastcgiReadTimeout: 0 })).rejects.toEqual({
+			kind: 'validation',
+			field: 'fastcgi_read_timeout',
+			message: '"0" must be between 1 and 86400'
+		});
+	});
+
+	it('normalizes a non-IpcError throw into a core-variant IpcError', async () => {
+		invokeMock.mockRejectedValueOnce(new Error('ipc transport down'));
+		await expect(saveWebServerSettings(settings)).rejects.toEqual({
+			kind: 'core',
+			message: 'Error: ipc transport down'
+		});
 	});
 });
 

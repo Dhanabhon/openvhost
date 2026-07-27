@@ -9,11 +9,11 @@ function api(
 	overrides: Partial<{ plan: ApplyPlanDto; outcome: ApplyOutcomeDto; fail: unknown }> = {}
 ) {
 	return {
-		planSiteApply: async () => {
+		planConfigApply: async () => {
 			if (overrides.fail) throw overrides.fail;
 			return overrides.plan ?? { changes: [] };
 		},
-		applySites: async () => {
+		applyConfig: async () => {
 			if (overrides.fail) throw overrides.fail;
 			return overrides.outcome ?? { applied: 0, restarted: [], notStarted: [], needsAttention: [] };
 		}
@@ -51,8 +51,8 @@ describe('ApplyStore', () => {
 		// "second plan call sees the post-apply state" behaviour under test.
 		let applied = false;
 		const s = new ApplyStore({
-			planSiteApply: async () => ({ changes: applied ? [] : [change('/a.conf', 'added')] }),
-			applySites: async () => {
+			planConfigApply: async () => ({ changes: applied ? [] : [change('/a.conf', 'added')] }),
+			applyConfig: async () => {
 				applied = true;
 				return { applied: 1, restarted: ['nginx'], notStarted: [], needsAttention: [] };
 			}
@@ -73,13 +73,13 @@ describe('ApplyStore', () => {
 		// deliberately does not.
 		let planCalls = 0;
 		const s = new ApplyStore({
-			planSiteApply: async () => {
+			planConfigApply: async () => {
 				planCalls += 1;
 				return planCalls === 1
 					? { changes: [change('/a.conf', 'added'), change('/b.conf', 'added')] }
 					: { changes: [change('/b.conf', 'added')] };
 			},
-			applySites: async () => ({ applied: 1, restarted: [], notStarted: [], needsAttention: [] })
+			applyConfig: async () => ({ applied: 1, restarted: [], notStarted: [], needsAttention: [] })
 		});
 		await s.refresh();
 		expect(s.pendingCount).toBe(2);
@@ -90,8 +90,8 @@ describe('ApplyStore', () => {
 
 	it('keeps the changes and shows the validator output when apply fails', async () => {
 		const s = new ApplyStore({
-			planSiteApply: async () => ({ changes: [change('/a.conf', 'added')] }),
-			applySites: async () => {
+			planConfigApply: async () => ({ changes: [change('/a.conf', 'added')] }),
+			applyConfig: async () => {
 				throw { kind: 'core', message: 'nginx: [emerg] unknown directive' };
 			}
 		});
@@ -105,8 +105,8 @@ describe('ApplyStore', () => {
 	it('refuses a second concurrent apply', async () => {
 		let calls = 0;
 		const s = new ApplyStore({
-			planSiteApply: async () => ({ changes: [change('/a.conf', 'added')] }),
-			applySites: async () => {
+			planConfigApply: async () => ({ changes: [change('/a.conf', 'added')] }),
+			applyConfig: async () => {
 				calls += 1;
 				await new Promise((r) => setTimeout(r, 5));
 				return { applied: 1, restarted: [], notStarted: [], needsAttention: [] };
@@ -123,8 +123,8 @@ describe('ApplyStore', () => {
 	// succeed, so the store must keep it verbatim rather than folding it away.
 	it('keeps needsAttention on the outcome after a run', async () => {
 		const s = new ApplyStore({
-			planSiteApply: async () => ({ changes: [change('/a.conf', 'added')] }),
-			applySites: async () => ({
+			planConfigApply: async () => ({ changes: [change('/a.conf', 'added')] }),
+			applyConfig: async () => ({
 				applied: 1,
 				restarted: [],
 				notStarted: [],

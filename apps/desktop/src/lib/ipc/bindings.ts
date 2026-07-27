@@ -97,17 +97,45 @@ export const commands = {
 	 */
 	openHomebrewSite: () => typedError<null, IpcError>(__TAURI_INVOKE("open_homebrew_site")),
 	/**
-	 *  What Apply would change. Read-only and process-free — the pending-changes
-	 *  banner calls this after every site mutation.
+	 *  What Apply would change across the WHOLE generated config — the sites and
+	 *  the editable nginx settings both feed `apply_input`, so this is one plan
+	 *  over one config set, not a site-only view. (That is the rename: the old
+	 *  `plan_site_apply` would have told the reader this covered only sites.)
+	 * 
+	 *  Read-only and process-free — the pending-changes banner calls this after
+	 *  every site mutation and after every settings save.
 	 */
-	planSiteApply: () => typedError<ApplyPlanDto, IpcError>(__TAURI_INVOKE("plan_site_apply")),
+	planConfigApply: () => typedError<ApplyPlanDto, IpcError>(__TAURI_INVOKE("plan_config_apply")),
 	/**
-	 *  Apply the sites, then restart whichever affected services are running.
+	 *  Write the generated config — sites AND the editable nginx settings — then
+	 *  restart whichever affected services are running.
 	 * 
 	 *  The restart is the app's job, not core's: `openvhost-core` has no supervisor
 	 *  and must stay usable from the CLI.
 	 */
-	applySites: () => typedError<ApplyOutcomeDto, IpcError>(__TAURI_INVOKE("apply_sites")),
+	applyConfig: () => typedError<ApplyOutcomeDto, IpcError>(__TAURI_INVOKE("apply_config")),
+	/**
+	 *  The stored nginx settings, or the documented defaults when the user has
+	 *  never saved any.
+	 */
+	webServerSettings: () => typedError<WebServerSettingsDto, IpcError>(__TAURI_INVOKE("web_server_settings")),
+	/**
+	 *  Validate and store the nginx settings. Does **not** apply them.
+	 * 
+	 *  Applying is the user's next, explicit step through `plan_config_apply` /
+	 *  `apply_config` — the same pipeline the sites go through, which is why there
+	 *  is no settings-only apply command. A second apply path would mean two ways
+	 *  for the live config to change, only one of which shows a diff first.
+	 * 
+	 *  It also does not run `nginx -t` before saving. Storing a value that nginx
+	 *  would reject is recoverable (the row is just a row, and the apply pipeline
+	 *  validates and rolls back before anything goes live); a pre-save check here
+	 *  would have to render the CANDIDATE values into a real config and run
+	 *  `validate_live` against them, because `WebServerAdapter::validate` renders
+	 *  with *defaults* on purpose and only answers "is the shape valid?" — it would
+	 *  wave through a combination nginx actually rejects.
+	 */
+	saveWebServerSettings: (input: WebServerSettingsDto) => typedError<null, IpcError>(__TAURI_INVOKE("save_web_server_settings", { input })),
 	/**
 	 *  Read-only environment summary for the Languages page: whether Homebrew was
 	 *  found, where it looked, and one row per PHP version (spec §6.1).
@@ -115,7 +143,7 @@ export const commands = {
 	 *  Deliberately spawns NOTHING — it reads the managed `RwLock` and calls
 	 *  `find_brew()` (a filesystem check, not a process). It is called on page
 	 *  mount and after every install, and the discipline that keeps
-	 *  `plan_site_apply` cheap (Task 4's managed `RwLock`, read then cloned and
+	 *  `plan_config_apply` cheap (Task 4's managed `RwLock`, read then cloned and
 	 *  dropped before anything else runs) applies here too. `rescan_php_runtimes`
 	 *  is the one that actually probes.
 	 */
@@ -414,6 +442,32 @@ export type WebServerDto = {
 	version: string | null,
 	supportsHotReload: boolean,
 	configPath: string | null,
+};
+
+/**
+ *  The editable nginx settings as they cross IPC.
+ * 
+ *  `WebServerSettings`' fields are opaque validated newtypes that carry no
+ *  `specta::Type` (and cannot get one without making `openvhost-conf` an IPC
+ *  crate), so the wire form is plain primitives. `u32`, never `usize`: specta
+ *  rejects pointer-sized ints — see the standing note in `lib.rs`.
+ * 
+ *  `camelCase` on the wire like every other DTO here, so TypeScript sees
+ *  `fastcgiReadTimeout`/`clientMaxBodySize`. Note that the *validation* field
+ *  names in [`IpcError::Validation`] are snake_case, because that is what the
+ *  existing `fieldErrors` seam is keyed by (see `From<ConfError> for IpcError`).
+ */
+export type WebServerSettingsDto = {
+	workerConnections: number,
+	clientMaxBodySize: string,
+	keepaliveTimeout: number,
+	tcpNodelay: boolean,
+	fastcgiConnectTimeout: number,
+	fastcgiSendTimeout: number,
+	fastcgiReadTimeout: number,
+	gzip: boolean,
+	gzipCompLevel: number,
+	gzipTypes: string,
 };
 
 /* Tauri Specta runtime */

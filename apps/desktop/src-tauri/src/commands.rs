@@ -38,6 +38,35 @@ pub enum IpcError {
     Validation { field: String, message: String },
 }
 
+impl From<openvhost_conf::ConfError> for IpcError {
+    /// A failed `parse` on one of the nginx settings newtypes becomes a
+    /// field-shaped error the form can mark; everything else (render failures,
+    /// IO, validator problems) becomes a banner.
+    ///
+    /// `field` is the newtype's own `&'static str`, which is deliberately the
+    /// **snake_case DTO field name** (`gzip_comp_level`, `client_max_body_size`)
+    /// — the existing `fieldErrors` seam is keyed by the backend's snake_case
+    /// names, not the camelCase wire names (see `SiteDrawer.svelte`, which
+    /// reads `fieldErrors.web_server` and `fieldErrors.php_version`). Inventing
+    /// a second convention here would mean the settings form silently marked
+    /// nothing.
+    fn from(e: openvhost_conf::ConfError) -> Self {
+        match e {
+            openvhost_conf::ConfError::InvalidField {
+                field,
+                value,
+                reason,
+            } => IpcError::Validation {
+                field: field.to_string(),
+                message: format!("{value:?} {reason}"),
+            },
+            other => IpcError::Core {
+                message: other.to_string(),
+            },
+        }
+    }
+}
+
 impl From<openvhost_core::CoreError> for IpcError {
     fn from(e: openvhost_core::CoreError) -> Self {
         match e {
@@ -545,14 +574,14 @@ pub struct ApplyOutcomeDto {
     pub needs_attention: Vec<ServiceProblemDto>,
 }
 
-/// Serializes `apply_sites` end to end (A2): plan -> commit -> validate ->
+/// Serializes `apply_config` end to end (A2): plan -> commit -> validate ->
 /// restart all run while this lock is held, so two overlapping Apply calls
 /// cannot interleave their commit/rollback (one rollback restoring its own
 /// snapshot over the other's writes) or their stop/start of the same
 /// services. `Default` gives `lib.rs` a plain `ApplyLock::default()` to
 /// manage, matching `quit::UiReady`'s pattern next to it.
 ///
-/// `plan_site_apply` deliberately does NOT take this lock — it is read-only
+/// `plan_config_apply` deliberately does NOT take this lock — it is read-only
 /// and is called after every site mutation to drive the pending-changes
 /// banner, so serializing it against Apply would make that banner block on
 /// an in-flight apply for no safety benefit.
@@ -562,9 +591,9 @@ pub struct ApplyLock(pub(crate) tokio::sync::Mutex<()>);
 /// Build the apply input from state.db plus the runtimes probed at startup.
 ///
 /// The nginx settings are read here, alongside the sites, so BOTH entry points
-/// to the pipeline (`plan_site_apply` for the pending-changes banner and
-/// `apply_sites` for the apply itself) see the same stored values. Reading them
-/// per call rather than caching is deliberate: `apply_sites` recomputes its plan
+/// to the pipeline (`plan_config_apply` for the pending-changes banner and
+/// `apply_config` for the apply itself) see the same stored values. Reading them
+/// per call rather than caching is deliberate: `apply_config` recomputes its plan
 /// from state.db under the apply lock, and a cached copy would let a settings
 /// save land between the diff the user saw and the config that got written.
 ///
@@ -593,11 +622,16 @@ async fn apply_input(
     })
 }
 
-/// What Apply would change. Read-only and process-free — the pending-changes
-/// banner calls this after every site mutation.
+/// What Apply would change across the WHOLE generated config — the sites and
+/// the editable nginx settings both feed `apply_input`, so this is one plan
+/// over one config set, not a site-only view. (That is the rename: the old
+/// `plan_site_apply` would have told the reader this covered only sites.)
+///
+/// Read-only and process-free — the pending-changes banner calls this after
+/// every site mutation and after every settings save.
 #[tauri::command]
 #[specta::specta]
-pub async fn plan_site_apply(
+pub async fn plan_config_apply(
     db: tauri::State<'_, Db>,
     runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
     paths: tauri::State<'_, Option<StackPaths>>,
@@ -626,13 +660,14 @@ pub async fn plan_site_apply(
     })
 }
 
-/// Apply the sites, then restart whichever affected services are running.
+/// Write the generated config — sites AND the editable nginx settings — then
+/// restart whichever affected services are running.
 ///
 /// The restart is the app's job, not core's: `openvhost-core` has no supervisor
 /// and must stay usable from the CLI.
 #[tauri::command]
 #[specta::specta]
-pub async fn apply_sites(
+pub async fn apply_config(
     db: tauri::State<'_, Db>,
     runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
     paths: tauri::State<'_, Option<StackPaths>>,
@@ -759,7 +794,7 @@ pub async fn apply_sites(
 }
 
 /// Decide, for each service that was running, what the restart achieved.
-/// Split out from `apply_sites` so the straggler logic is testable without
+/// Split out from `apply_config` so the straggler logic is testable without
 /// spawning anything.
 ///
 /// Deliberately does not use `?`/early-return on a failed `start`: one
@@ -1130,6 +1165,161 @@ pub async fn validate_web_server_config(
 }
 
 // ---------------------------------------------------------------------------
+// Editable nginx settings (Web server page)
+// ---------------------------------------------------------------------------
+
+/// The editable nginx settings as they cross IPC.
+///
+/// `WebServerSettings`' fields are opaque validated newtypes that carry no
+/// `specta::Type` (and cannot get one without making `openvhost-conf` an IPC
+/// crate), so the wire form is plain primitives. `u32`, never `usize`: specta
+/// rejects pointer-sized ints — see the standing note in `lib.rs`.
+///
+/// `camelCase` on the wire like every other DTO here, so TypeScript sees
+/// `fastcgiReadTimeout`/`clientMaxBodySize`. Note that the *validation* field
+/// names in [`IpcError::Validation`] are snake_case, because that is what the
+/// existing `fieldErrors` seam is keyed by (see `From<ConfError> for IpcError`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct WebServerSettingsDto {
+    pub worker_connections: u32,
+    pub client_max_body_size: String,
+    pub keepalive_timeout: u32,
+    pub tcp_nodelay: bool,
+    pub fastcgi_connect_timeout: u32,
+    pub fastcgi_send_timeout: u32,
+    pub fastcgi_read_timeout: u32,
+    pub gzip: bool,
+    pub gzip_comp_level: u32,
+    pub gzip_types: String,
+}
+
+impl Default for WebServerSettingsDto {
+    /// Derived from [`openvhost_conf::WebServerSettings::default`], never from
+    /// literals repeated here. A DTO that hardcoded its own defaults would be a
+    /// second source of truth, and the two would drift the first time spec §5's
+    /// table changed on one side only.
+    fn default() -> Self {
+        Self::from(openvhost_conf::WebServerSettings::default())
+    }
+}
+
+/// Parse a `Seconds` field, reporting the DTO field name rather than
+/// `Seconds::parse`'s own `"seconds"`.
+///
+/// Four settings are `Seconds` and `Seconds::parse` takes only a value, so
+/// untouched it names a field called `"seconds"` — which exists on no form. The
+/// UI would highlight nothing and the user would be told only that something
+/// is wrong. See `ConfError::with_field` for why the relabel lives on the error
+/// rather than in `Seconds::parse`'s signature.
+fn seconds_field(v: u32, field: &'static str) -> Result<openvhost_conf::Seconds, IpcError> {
+    openvhost_conf::Seconds::parse(v).map_err(|e| IpcError::from(e.with_field(field)))
+}
+
+impl TryFrom<WebServerSettingsDto> for openvhost_conf::WebServerSettings {
+    type Error = IpcError;
+
+    /// THE IPC INGRESS GUARD for the settings, the same shape as
+    /// `TryFrom<SiteInput>` above: every field goes through its newtype's
+    /// `parse`, so nothing unvalidated can reach `state.db` — and from there a
+    /// generated nginx config. The repository's re-validate-on-read is the
+    /// second line of defence against a hand-edited row, not the first against
+    /// a hostile caller.
+    ///
+    /// `?` short-circuits on the first bad field, exactly like the site guard,
+    /// and each error names its own field so the form marks that input. Nothing
+    /// is written when any field is rejected, so the other fields keep the
+    /// values already stored.
+    fn try_from(d: WebServerSettingsDto) -> Result<Self, IpcError> {
+        Ok(openvhost_conf::WebServerSettings {
+            worker_connections: openvhost_conf::WorkerConnections::parse(d.worker_connections)?,
+            client_max_body_size: openvhost_conf::BodySize::parse(&d.client_max_body_size)?,
+            keepalive_timeout: seconds_field(d.keepalive_timeout, "keepalive_timeout")?,
+            tcp_nodelay: openvhost_conf::OnOff::new(d.tcp_nodelay),
+            fastcgi_connect_timeout: seconds_field(
+                d.fastcgi_connect_timeout,
+                "fastcgi_connect_timeout",
+            )?,
+            fastcgi_send_timeout: seconds_field(d.fastcgi_send_timeout, "fastcgi_send_timeout")?,
+            fastcgi_read_timeout: seconds_field(d.fastcgi_read_timeout, "fastcgi_read_timeout")?,
+            gzip: openvhost_conf::OnOff::new(d.gzip),
+            gzip_comp_level: openvhost_conf::GzipLevel::parse(d.gzip_comp_level)?,
+            gzip_types: openvhost_conf::GzipTypes::parse(&d.gzip_types)?,
+        })
+    }
+}
+
+impl From<openvhost_conf::WebServerSettings> for WebServerSettingsDto {
+    fn from(s: openvhost_conf::WebServerSettings) -> Self {
+        WebServerSettingsDto {
+            worker_connections: s.worker_connections.get(),
+            client_max_body_size: s.client_max_body_size.as_str().to_string(),
+            keepalive_timeout: s.keepalive_timeout.get(),
+            tcp_nodelay: s.tcp_nodelay.is_on(),
+            fastcgi_connect_timeout: s.fastcgi_connect_timeout.get(),
+            fastcgi_send_timeout: s.fastcgi_send_timeout.get(),
+            fastcgi_read_timeout: s.fastcgi_read_timeout.get(),
+            gzip: s.gzip.is_on(),
+            gzip_comp_level: s.gzip_comp_level.get(),
+            gzip_types: s.gzip_types.as_directive(),
+        }
+    }
+}
+
+/// The read and save bodies, over a plain `&Db` rather than `tauri::State`.
+///
+/// Split out of the two commands below so the boundary's actual behaviour —
+/// that a rejected field is named, and that nothing is written when it is — is
+/// reachable from a test with an in-memory database, instead of needing a mock
+/// Tauri app to obtain a `State`.
+async fn read_settings(db: &Db) -> Result<WebServerSettingsDto, IpcError> {
+    let repo = SqliteWebServerSettings::new(db);
+    // Absent row => documented defaults, and nothing is written. See
+    // `WebServerSettingsRepository::get`.
+    Ok(WebServerSettingsDto::from(repo.get().await?))
+}
+
+async fn write_settings(db: &Db, input: WebServerSettingsDto) -> Result<(), IpcError> {
+    // Guard first: a rejected field must leave the stored row untouched.
+    let settings: openvhost_conf::WebServerSettings = input.try_into()?;
+    SqliteWebServerSettings::new(db).save(&settings).await?;
+    Ok(())
+}
+
+/// The stored nginx settings, or the documented defaults when the user has
+/// never saved any.
+#[tauri::command]
+#[specta::specta]
+pub async fn web_server_settings(
+    db: tauri::State<'_, Db>,
+) -> Result<WebServerSettingsDto, IpcError> {
+    read_settings(db.inner()).await
+}
+
+/// Validate and store the nginx settings. Does **not** apply them.
+///
+/// Applying is the user's next, explicit step through `plan_config_apply` /
+/// `apply_config` — the same pipeline the sites go through, which is why there
+/// is no settings-only apply command. A second apply path would mean two ways
+/// for the live config to change, only one of which shows a diff first.
+///
+/// It also does not run `nginx -t` before saving. Storing a value that nginx
+/// would reject is recoverable (the row is just a row, and the apply pipeline
+/// validates and rolls back before anything goes live); a pre-save check here
+/// would have to render the CANDIDATE values into a real config and run
+/// `validate_live` against them, because `WebServerAdapter::validate` renders
+/// with *defaults* on purpose and only answers "is the shape valid?" — it would
+/// wave through a combination nginx actually rejects.
+#[tauri::command]
+#[specta::specta]
+pub async fn save_web_server_settings(
+    db: tauri::State<'_, Db>,
+    input: WebServerSettingsDto,
+) -> Result<(), IpcError> {
+    write_settings(db.inner(), input).await
+}
+
+// ---------------------------------------------------------------------------
 // PHP versions (Languages page)
 // ---------------------------------------------------------------------------
 
@@ -1350,8 +1540,8 @@ async fn rescan_into_state(
     let found: Vec<String> = php.iter().map(|rt| rt.major.clone()).collect();
     let new_majors = newly_installed_majors(&before, &found);
 
-    // State write BEFORE the supervisor registration below. `apply_sites` and
-    // `plan_site_apply` read the `RwLock`, not the supervisor's row set, to
+    // State write BEFORE the supervisor registration below. `apply_config` and
+    // `plan_config_apply` read the `RwLock`, not the supervisor's row set, to
     // decide which PHP versions exist — so registering a row first would open
     // a window where `php-fpm-8.4` is visible and startable in the Services
     // panel while the apply pipeline still answers `MissingRuntime` for 8.4,
@@ -1387,7 +1577,7 @@ fn brew_searched_paths() -> Vec<String> {
 /// Deliberately spawns NOTHING — it reads the managed `RwLock` and calls
 /// `find_brew()` (a filesystem check, not a process). It is called on page
 /// mount and after every install, and the discipline that keeps
-/// `plan_site_apply` cheap (Task 4's managed `RwLock`, read then cloned and
+/// `plan_config_apply` cheap (Task 4's managed `RwLock`, read then cloned and
 /// dropped before anything else runs) applies here too. `rescan_php_runtimes`
 /// is the one that actually probes.
 #[tauri::command]
@@ -2574,6 +2764,167 @@ mod list_web_servers_tests {
         assert_eq!(
             nginx.supports_hot_reload,
             openvhost_conf::NginxAdapter.supports_hot_reload()
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod web_server_settings_ipc_tests {
+    use super::*;
+
+    /// A DTO whose every field differs from the default, so a test that
+    /// mutates one field is genuinely checking that field and a dropped
+    /// mapping cannot be masked by a coincidental default.
+    fn valid_dto() -> WebServerSettingsDto {
+        WebServerSettingsDto {
+            worker_connections: 2048,
+            client_max_body_size: "512m".into(),
+            keepalive_timeout: 30,
+            tcp_nodelay: false,
+            fastcgi_connect_timeout: 10,
+            fastcgi_send_timeout: 120,
+            fastcgi_read_timeout: 900,
+            gzip: true,
+            gzip_comp_level: 6,
+            gzip_types: "text/css application/json".into(),
+        }
+    }
+
+    fn expect_validation(e: IpcError) -> (String, String) {
+        match e {
+            IpcError::Validation { field, message } => (field, message),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bad_setting_reaches_the_ui_marked_on_its_own_field() {
+        // The form marks one input; a flattened Core error would mark none.
+        let e: IpcError = openvhost_conf::GzipLevel::parse(99).unwrap_err().into();
+        let (field, _) = expect_validation(e);
+        assert_eq!(field, "gzip_comp_level");
+    }
+
+    #[test]
+    fn a_malformed_gzip_type_names_the_offending_token() {
+        let e: IpcError = openvhost_conf::GzipTypes::parse("text/html; } server {")
+            .unwrap_err()
+            .into();
+        let (field, message) = expect_validation(e);
+        assert_eq!(field, "gzip_types");
+        assert!(message.contains("text/html;"), "got {message}");
+    }
+
+    #[test]
+    fn a_non_field_conf_error_becomes_a_banner_not_a_field_mark() {
+        // Only `InvalidField` knows which input to highlight. Anything else
+        // pinned to some arbitrary field name would mark an input the user
+        // never touched.
+        let e: IpcError = openvhost_conf::ConfError::EmptyUpstream.into();
+        match e {
+            IpcError::Core { message } => assert!(!message.is_empty()),
+            other => panic!("expected Core, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_dto_round_trips_through_the_domain_type() {
+        let dto = valid_dto();
+        let domain: openvhost_conf::WebServerSettings = dto.clone().try_into().unwrap();
+        let back = WebServerSettingsDto::from(domain);
+        assert_eq!(back, dto);
+    }
+
+    /// Every one of the four `Seconds` fields, not just one.
+    ///
+    /// `Seconds::parse` names its field `"seconds"` — a field that exists on
+    /// no form — for all four, so without the per-call-site relabel a bad
+    /// `fastcgi_read_timeout` highlights nothing at all. Testing one field
+    /// would pass while the other three stayed broken, which is exactly how
+    /// this class of bug survives.
+    #[test]
+    fn each_timeout_field_surfaces_its_own_name_not_seconds() {
+        // `0` is outside `Seconds`' `1..=86400` bound.
+        type BreakOne = fn(&mut WebServerSettingsDto);
+        let cases: [(&str, BreakOne); 4] = [
+            ("keepalive_timeout", |d| d.keepalive_timeout = 0),
+            ("fastcgi_connect_timeout", |d| d.fastcgi_connect_timeout = 0),
+            ("fastcgi_send_timeout", |d| d.fastcgi_send_timeout = 0),
+            ("fastcgi_read_timeout", |d| d.fastcgi_read_timeout = 0),
+        ];
+        for (expected, break_it) in cases {
+            let mut dto = valid_dto();
+            break_it(&mut dto);
+            let e = openvhost_conf::WebServerSettings::try_from(dto)
+                .expect_err("an out-of-range timeout must be rejected");
+            let (field, _) = expect_validation(e);
+            assert_eq!(
+                field, expected,
+                "a bad {expected} must mark {expected}, not \"seconds\" — no form has a \
+                 field called \"seconds\", so the user would see nothing highlighted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_absent_row_reads_as_the_documented_defaults() {
+        let db = Db::open_in_memory().await.unwrap();
+        assert_eq!(
+            read_settings(&db).await.unwrap(),
+            WebServerSettingsDto::default()
+        );
+    }
+
+    #[test]
+    fn the_dto_default_is_the_domain_default_and_not_a_second_copy_of_it() {
+        // Hardcoding the numbers here would create a second source of truth
+        // that drifts the first time spec §5's table changes on one side only.
+        assert_eq!(
+            WebServerSettingsDto::default(),
+            WebServerSettingsDto::from(openvhost_conf::WebServerSettings::default())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_saved_setting_reads_back_through_the_dto() {
+        let db = Db::open_in_memory().await.unwrap();
+        write_settings(&db, valid_dto()).await.unwrap();
+        assert_eq!(read_settings(&db).await.unwrap(), valid_dto());
+    }
+
+    /// A rejected field must not take the others down with it.
+    ///
+    /// The save is all-or-nothing: the guard runs before the repository is
+    /// touched, so a form submitted with one bad value leaves every stored
+    /// value exactly as it was. Without this, a user fixing one field could
+    /// silently lose the nine they had already saved.
+    #[tokio::test]
+    async fn a_rejected_field_leaves_every_other_stored_value_untouched() {
+        let db = Db::open_in_memory().await.unwrap();
+        write_settings(&db, valid_dto()).await.unwrap();
+
+        // Every field changed, and one of them invalid.
+        let bad = WebServerSettingsDto {
+            worker_connections: 4096,
+            client_max_body_size: "1g".into(),
+            keepalive_timeout: 45,
+            tcp_nodelay: true,
+            fastcgi_connect_timeout: 20,
+            fastcgi_send_timeout: 30,
+            fastcgi_read_timeout: 40,
+            gzip: false,
+            gzip_comp_level: 99, // rejected: outside 1..=9
+            gzip_types: "text/plain".into(),
+        };
+        let e = write_settings(&db, bad).await.expect_err("99 is not 1..=9");
+        let (field, _) = expect_validation(e);
+        assert_eq!(field, "gzip_comp_level");
+
+        assert_eq!(
+            read_settings(&db).await.unwrap(),
+            valid_dto(),
+            "a rejected field must not clobber the values already stored"
         );
     }
 }
