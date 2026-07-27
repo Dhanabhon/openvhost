@@ -6,6 +6,12 @@
 //! a formula and never a flag. Arguments are passed as a vector rather than
 //! through a shell, which stops command injection — but not flag injection, so
 //! `PhpMajor::parse` enforces the shape AND membership of [`CATALOGUE`].
+//!
+//! SECURITY: [`brew_install_spec`] also requires `brew` to be an absolute
+//! path. An empty or relative leading component in `PATH` is resolved by
+//! `exec` as the current working directory, and brew shells out to `git` and
+//! `curl` — so a relative `brew` path would turn the composed `PATH` into a
+//! PATH-hijack primitive for anyone who controls a file in the CWD.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -74,19 +80,45 @@ pub fn find_brew() -> Option<PathBuf> {
 
 /// The command that installs `major`. Composed here — the formula name is
 /// never accepted from a caller.
-pub fn brew_install_spec(brew: &Path, major: &PhpMajor) -> SpawnSpec {
+///
+/// INVARIANT: `brew` must be an absolute path with a real parent directory.
+/// `Path::new("brew").parent()` is `Some("")`, not `None`, so a naive
+/// `unwrap_or_default()` fallback never fires for a relative or bare-filename
+/// path — the composed `PATH` would then start with an empty (or `.`)
+/// leading component. `exec` resolves an empty/`.` leading `PATH` component
+/// as the current working directory, and brew shells out to `git` and
+/// `curl`, so that would hand execution of `git`/`curl` to whoever controls
+/// a file in the process's CWD. Rejecting non-absolute input here — rather
+/// than trusting callers — is what keeps that primitive from ever reaching
+/// argv.
+pub fn brew_install_spec(brew: &Path, major: &PhpMajor) -> Result<SpawnSpec, CoreError> {
+    if !brew.is_absolute() {
+        return Err(CoreError::Validation {
+            field: "brew_path",
+            reason: format!("{} is not an absolute path", brew.display()),
+        });
+    }
+    let brew_bin = match brew.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => {
+            return Err(CoreError::Validation {
+                field: "brew_path",
+                reason: format!("{} has no parent directory", brew.display()),
+            });
+        }
+    };
+
     // brew shells out to git, curl and friends. The supervisor's env
     // allow-list forwards the parent's PATH, which for an app launched from
     // Finder is the bare system one — so brew's own prefix is prepended
     // explicitly rather than hoping the launch context had it.
-    let brew_bin = brew.parent().map(Path::to_path_buf).unwrap_or_default();
     let mut path = OsString::from(brew_bin);
     if let Some(inherited) = std::env::var_os("PATH") {
         path.push(":");
         path.push(inherited);
     }
 
-    SpawnSpec {
+    Ok(SpawnSpec {
         program: brew.to_path_buf(),
         args: vec![
             OsString::from("install"),
@@ -102,7 +134,7 @@ pub fn brew_install_spec(brew: &Path, major: &PhpMajor) -> SpawnSpec {
             ),
             (OsString::from("PATH"), path),
         ],
-    }
+    })
 }
 
 #[cfg(test)]
@@ -136,7 +168,12 @@ mod tests {
     #[test]
     fn rejects_a_flag_even_though_argv_prevents_command_injection() {
         // argv stops `; rm -rf` but NOT `--build-from-source`, which brew would
-        // happily honour. This is the reason the allowlist exists.
+        // happily honour. None of these contain a `.` separating two digit
+        // runs, so the shape check (layer 1) rejects every one of them before
+        // `CATALOGUE.contains` (layer 2) is ever consulted — this test would
+        // still pass if the catalogue check were deleted. It is the shape
+        // check, not the allowlist, that defeats flag injection: a real brew
+        // flag starts with `-` and can never match `^\d+\.\d+$`.
         for bad in ["--build-from-source", "--HEAD", "-f", "--cask", "nginx"] {
             assert!(PhpMajor::parse(bad).is_err(), "accepted {bad:?}");
         }
@@ -144,7 +181,10 @@ mod tests {
 
     #[test]
     fn rejects_a_well_formed_version_this_build_does_not_offer() {
-        // Shape alone is not enough: policy is the second layer.
+        // Shape alone is not enough: "9.9" and "7.4" both pass the shape
+        // check (digits, one dot, digits), so only the catalogue membership
+        // check (layer 2) can reject them. This is the layer the shape check
+        // cannot provide — it covers well-formed-but-unsupported versions.
         assert!(PhpMajor::parse("9.9").is_err());
         assert!(PhpMajor::parse("7.4").is_err());
     }
@@ -154,7 +194,8 @@ mod tests {
         let spec = brew_install_spec(
             std::path::Path::new("/opt/homebrew/bin/brew"),
             &PhpMajor::parse("8.3").unwrap(),
-        );
+        )
+        .unwrap();
         assert_eq!(
             spec.program,
             std::path::PathBuf::from("/opt/homebrew/bin/brew")
@@ -174,7 +215,8 @@ mod tests {
         let spec = brew_install_spec(
             std::path::Path::new("/opt/homebrew/bin/brew"),
             &PhpMajor::parse("8.3").unwrap(),
-        );
+        )
+        .unwrap();
         let env: Vec<(String, String)> = spec
             .env
             .iter()
@@ -199,7 +241,8 @@ mod tests {
         let spec = brew_install_spec(
             std::path::Path::new("/opt/homebrew/bin/brew"),
             &PhpMajor::parse("8.3").unwrap(),
-        );
+        )
+        .unwrap();
         let path = spec
             .env
             .iter()
@@ -207,5 +250,41 @@ mod tests {
             .map(|(_, v)| v.to_string_lossy().into_owned())
             .expect("PATH must be set explicitly");
         assert!(path.starts_with("/opt/homebrew/bin"), "got {path}");
+    }
+
+    #[test]
+    fn a_relative_brew_path_is_refused_rather_than_putting_the_cwd_on_path() {
+        // `Path::new("brew").parent()` is Some(""), so composing PATH from it
+        // yields ":/usr/bin:/bin" — an empty leading component, which exec
+        // resolves as the working directory. brew shells out to git and curl,
+        // so that is an execution primitive for anyone who can write a file there.
+        for bad in ["brew", "./brew", "bin/brew", ""] {
+            let err =
+                brew_install_spec(std::path::Path::new(bad), &PhpMajor::parse("8.3").unwrap());
+            assert!(err.is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_composed_path_never_starts_with_an_empty_or_relative_component() {
+        let spec = brew_install_spec(
+            std::path::Path::new("/opt/homebrew/bin/brew"),
+            &PhpMajor::parse("8.3").unwrap(),
+        )
+        .unwrap();
+        let path = spec
+            .env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.to_string_lossy().into_owned())
+            .expect("PATH must be set explicitly");
+        assert!(
+            path.starts_with('/'),
+            "PATH starts with a non-absolute component: {path}"
+        );
+        assert!(
+            !path.starts_with(':'),
+            "PATH has an empty leading component: {path}"
+        );
     }
 }
