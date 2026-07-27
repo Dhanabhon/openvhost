@@ -90,10 +90,42 @@ export const commands = {
 	 *  and must stay usable from the CLI.
 	 */
 	applySites: () => typedError<ApplyOutcomeDto, IpcError>(__TAURI_INVOKE("apply_sites")),
+	/**
+	 *  Read-only environment summary for the Languages page: whether Homebrew was
+	 *  found, where it looked, and one row per PHP version (spec §6.1).
+	 * 
+	 *  Deliberately spawns NOTHING — it reads the managed `RwLock` and calls
+	 *  `find_brew()` (a filesystem check, not a process). It is called on page
+	 *  mount and after every install, and the discipline that keeps
+	 *  `plan_site_apply` cheap (Task 4's managed `RwLock`, read then cloned and
+	 *  dropped before anything else runs) applies here too. `rescan_php_runtimes`
+	 *  is the one that actually probes.
+	 */
+	phpEnvironment: () => typedError<PhpEnvironmentDto, IpcError>(__TAURI_INVOKE("php_environment")),
+	/**
+	 *  The explicit, user-initiated re-probe behind Languages' "Check again"
+	 *  button: the user left to install Homebrew (or a PHP version) in a
+	 *  terminal and came back. Unlike `php_environment`, this DOES spawn — once
+	 *  per candidate binary, to read its version — so it is never called
+	 *  implicitly.
+	 */
+	rescanPhpRuntimes: () => typedError<PhpEnvironmentDto, IpcError>(__TAURI_INVOKE("rescan_php_runtimes")),
+	/**
+	 *  Install a PHP major via Homebrew, streaming its output live, then rescan
+	 *  so the freshly installed version (if it appears) gets a supervisor row.
+	 * 
+	 *  Every argument that reaches `brew`'s argv is validated or derived from
+	 *  managed state before this function does anything observable: `major` is
+	 *  parsed and checked against the catalogue allowlist, `brew` is located by
+	 *  absolute path (never `PATH`), and `brew_install_spec` itself refuses a
+	 *  non-absolute `brew` path.
+	 */
+	installPhp: (major: string) => typedError<InstallOutcomeDto, IpcError>(__TAURI_INVOKE("install_php", { major })),
 };
 
 /** Events */
 export const events = {
+	phpInstallLogEvent: makeEvent<PhpInstallLogEvent>("php-install-log-event"),
 	quitRequestedEvent: makeEvent<QuitRequestedEvent>("quit-requested-event"),
 	serviceLogEvent: makeEvent<ServiceLogEvent>("service-log-event"),
 	serviceStateEvent: makeEvent<ServiceStateEvent>("service-state-event"),
@@ -153,6 +185,19 @@ export type HomeUsageDto = {
 };
 
 /**
+ *  The outcome of an `install_php` call. `detected: false` alongside
+ *  `exit_code: Some(0)` is the case that matters most: brew reporting success
+ *  while no `php-fpm` appears afterwards is the silent-failure class this
+ *  project keeps catching, so the DTO carries it explicitly rather than
+ *  leaving the UI to infer it from an empty rescan.
+ */
+export type InstallOutcomeDto = {
+	major: string,
+	exitCode: number | null,
+	detected: boolean,
+};
+
+/**
  *  Serializable command error (spec §7.2). Establishes the pattern:
  *  every command returns `Result<_, IpcError>` and the UI renders failures.
  */
@@ -175,6 +220,51 @@ export type LogLine = {
 	tsMs: number,
 	level: LogLevel,
 	line: string,
+};
+
+/**
+ *  What the Languages page needs to decide which of the three states to show
+ *  (spec §6.1). `brew_found` false means the page must guide, not list.
+ */
+export type PhpEnvironmentDto = {
+	brewFound: boolean,
+	brewSearched: string[],
+	runtimes: PhpRuntimeDto[],
+};
+
+/**
+ *  One line of `brew install`'s output, forwarded live while an install runs.
+ *  Same shape and reasoning as [`ServiceLogEvent`] — see its declaration —
+ *  except `major` names which install this line belongs to, and `stream` is
+ *  a plain "stdout"/"stderr" string rather than `LogLevel`: brew's output has
+ *  no severity for the supervisor's classifier to assign, only a stream.
+ */
+export type PhpInstallLogEvent = {
+	major: string,
+	tsMs: number,
+	stream: string,
+	line: string,
+};
+
+/**
+ *  One row on the Languages page: a catalogue version (installed or not), or
+ *  an installed version outside the catalogue (spec §6.1's "still listed"
+ *  requirement — an install made by hand, or one a later catalogue drops,
+ *  must not vanish from the page while it keeps serving sites).
+ */
+export type PhpRuntimeDto = {
+	major: string,
+	installed: boolean,
+	recommended: boolean,
+	fullVersion: string | null,
+	path: string | null,
+	/**  Where this version's pool listens. `None` until installed. */
+	socketPath: string | null,
+	/**
+	 *  The supervisor id for this version's pool, so the UI can drive
+	 *  start/stop from the row without inventing the id itself.
+	 */
+	serviceId: string | null,
 };
 
 /**

@@ -45,10 +45,14 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::open_site,
             commands::plan_site_apply,
             commands::apply_sites,
+            commands::php_environment,
+            commands::rescan_php_runtimes,
+            commands::install_php,
         ])
         .events(collect_events![
             commands::ServiceStateEvent,
             commands::ServiceLogEvent,
+            commands::PhpInstallLogEvent,
             quit::QuitRequestedEvent
         ])
         // `LogLine`/`ServiceLogEvent` carry `ts_ms: u64` (millisecond epoch
@@ -176,6 +180,15 @@ pub fn run() {
             // to be managed before it is reachable at all, so this is never
             // observed absent by a caller that could actually invoke the command.
             app.manage(commands::ApplyLock::default());
+
+            // Serializes `install_php`: only one brew install can run at a
+            // time. Same unconditional-and-up-front reasoning as `ApplyLock`
+            // above — `install_php` also requires `Db`-adjacent state
+            // (`Arc<Supervisor>`, `Option<StackPaths>`, the runtimes
+            // `RwLock`) to be managed before it is reachable at all, so this
+            // is never observed absent by a caller that could actually
+            // invoke the command.
+            app.manage(commands::InstallLock::default());
 
             // Single-instance lock (design spec §7): reap MUST run only
             // while this is held, otherwise a second live instance would

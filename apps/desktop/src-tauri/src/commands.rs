@@ -64,6 +64,7 @@ pub fn core_info(simulate_error: Option<bool>) -> Result<CoreInfo, IpcError> {
 use std::sync::Arc;
 
 use openvhost_proc::{LogLevel, LogLine, ProcError, ServiceState, ServiceStatus, Supervisor};
+use tauri_specta::Event;
 
 impl From<ProcError> for IpcError {
     fn from(e: ProcError) -> Self {
@@ -1084,6 +1085,453 @@ pub async fn validate_web_server_config(
         ok: report.ok,
         stderr: report.stderr,
     })
+}
+
+// ---------------------------------------------------------------------------
+// PHP versions (Languages page)
+// ---------------------------------------------------------------------------
+
+/// One row on the Languages page: a catalogue version (installed or not), or
+/// an installed version outside the catalogue (spec §6.1's "still listed"
+/// requirement — an install made by hand, or one a later catalogue drops,
+/// must not vanish from the page while it keeps serving sites).
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PhpRuntimeDto {
+    pub major: String,
+    pub installed: bool,
+    pub recommended: bool,
+    pub full_version: Option<String>,
+    pub path: Option<String>,
+    /// Where this version's pool listens. `None` until installed.
+    pub socket_path: Option<String>,
+    /// The supervisor id for this version's pool, so the UI can drive
+    /// start/stop from the row without inventing the id itself.
+    pub service_id: Option<String>,
+}
+
+/// What the Languages page needs to decide which of the three states to show
+/// (spec §6.1). `brew_found` false means the page must guide, not list.
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PhpEnvironmentDto {
+    pub brew_found: bool,
+    pub brew_searched: Vec<String>,
+    pub runtimes: Vec<PhpRuntimeDto>,
+}
+
+/// The outcome of an `install_php` call. `detected: false` alongside
+/// `exit_code: Some(0)` is the case that matters most: brew reporting success
+/// while no `php-fpm` appears afterwards is the silent-failure class this
+/// project keeps catching, so the DTO carries it explicitly rather than
+/// leaving the UI to infer it from an empty rescan.
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallOutcomeDto {
+    pub major: String,
+    pub exit_code: Option<i32>,
+    pub detected: bool,
+}
+
+/// One line of `brew install`'s output, forwarded live while an install runs.
+/// Same shape and reasoning as [`ServiceLogEvent`] — see its declaration —
+/// except `major` names which install this line belongs to, and `stream` is
+/// a plain "stdout"/"stderr" string rather than `LogLevel`: brew's output has
+/// no severity for the supervisor's classifier to assign, only a stream.
+#[derive(Debug, Clone, serde::Serialize, specta::Type, tauri_specta::Event)]
+#[serde(rename_all = "camelCase")]
+pub struct PhpInstallLogEvent {
+    pub major: String,
+    pub ts_ms: u64,
+    pub stream: String,
+    pub line: String,
+}
+
+/// Milliseconds since the epoch, for [`PhpInstallLogEvent::ts_ms`].
+/// `openvhost_proc` has an identical helper, but it is `pub(crate)` there —
+/// this command builds its own event rather than relaying one off the
+/// supervisor's broadcast, so it needs its own clock read.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Build one row per catalogue entry, in catalogue order, plus one row for
+/// every installed runtime that falls outside the catalogue. Pure and
+/// Tauri-free so the row-building logic is testable without a live
+/// `AppHandle` or a real supervisor.
+///
+/// `full_versions` maps a major to the more precise string the page shows
+/// next to it. In production this is built from the same probe that already
+/// produced `installed`'s majors — `openvhost_conf::probe_php_fpm_version`
+/// only ever reports `major.minor`, never a patch level, so today's
+/// production value is identical to `major` for every installed row. Wiring
+/// a true patch-level prober is future work; keeping it a separate parameter
+/// here means that upgrade will not have to touch this function's callers
+/// beyond what they pass in.
+fn php_rows(
+    home: &Path,
+    installed: &[openvhost_core::PhpRuntime],
+    full_versions: &[(&str, &str)],
+) -> Vec<PhpRuntimeDto> {
+    let newest = openvhost_core::CATALOGUE.last().copied();
+    let build = |major: &str, found: Option<&openvhost_core::PhpRuntime>| {
+        let spec = found.map(|rt| crate::stack::php_fpm_spec(home, rt));
+        PhpRuntimeDto {
+            major: major.to_string(),
+            installed: found.is_some(),
+            recommended: Some(major) == newest,
+            full_version: found.and_then(|_| {
+                full_versions
+                    .iter()
+                    .find(|(m, _)| *m == major)
+                    .map(|(_, v)| (*v).to_string())
+            }),
+            path: found.map(|rt| rt.fpm_bin.display().to_string()),
+            socket_path: spec.as_ref().and_then(|s| s.endpoint.clone()),
+            service_id: spec.map(|s| s.id),
+        }
+    };
+
+    let mut rows: Vec<PhpRuntimeDto> = openvhost_core::CATALOGUE
+        .iter()
+        .map(|major| build(major, installed.iter().find(|rt| rt.major == *major)))
+        .collect();
+
+    for rt in installed {
+        if !openvhost_core::CATALOGUE.contains(&rt.major.as_str()) {
+            rows.push(build(&rt.major, Some(rt)));
+        }
+    }
+
+    rows
+}
+
+/// Probe every known Homebrew prefix for installed PHP runtimes.
+///
+/// `openvhost_core::discover_php_in` takes a SYNCHRONOUS probe closure, but
+/// `openvhost_conf::probe_php_fpm_version` is async. Resolved by running the
+/// whole directory walk on `spawn_blocking` and calling the async prober via
+/// `Handle::block_on` from INSIDE that blocking closure: `spawn_blocking`
+/// hands the closure its own blocking-pool thread, not one of the async
+/// worker threads, so blocking there to wait on a future cannot deadlock the
+/// runtime the way calling `block_on` directly inside an async command would.
+///
+/// The other option the task allowed — pre-building a `path -> version` map
+/// by probing candidates asynchronously first, then handing `discover_php_in`
+/// a closure that only reads that map — was passed over because the set of
+/// candidate paths is exactly what `discover_php_in`'s own (private)
+/// directory walk already computes. Re-deriving that candidate list here
+/// first would duplicate discovery logic that already exists and is already
+/// tested, which is the kind of copy-paste drift the project's own
+/// coding-style rules warn against; this approach reuses `discover_php_in`
+/// untouched instead.
+async fn discover_all_php() -> Result<Vec<openvhost_core::PhpRuntime>, IpcError> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let handle = tokio::runtime::Handle::current();
+        let prefixes: Vec<&Path> = openvhost_core::BREW_PREFIXES
+            .iter()
+            .map(Path::new)
+            .collect();
+        openvhost_core::discover_php_in(&prefixes, &|bin| {
+            handle.block_on(openvhost_conf::probe_php_fpm_version(bin))
+        })
+    })
+    .await
+    .map_err(|e| IpcError::Core {
+        message: format!("the PHP discovery task failed to run: {e}"),
+    })
+}
+
+/// Probe for installed PHP runtimes, write the result into the managed
+/// `RwLock`, and register a supervisor row for every major found.
+///
+/// Registering unconditionally for every discovered major (not only "new"
+/// ones) is safe and idempotent: `Supervisor::register` no-ops against a live
+/// entry and otherwise just (re)inserts a `Stopped` row from the freshly
+/// built spec, so a version already registered is left exactly as it was.
+///
+/// Shared by `rescan_php_runtimes` and `install_php` so the two commands
+/// cannot register two different service shapes for the same version.
+async fn rescan_into_state(
+    runtimes: &RwLock<Option<InstalledRuntimes>>,
+    sup: &Supervisor,
+    paths: &StackPaths,
+) -> Result<Vec<openvhost_core::PhpRuntime>, IpcError> {
+    let php = discover_all_php().await?;
+
+    for rt in &php {
+        sup.register(crate::stack::php_fpm_spec(&paths.home, rt));
+    }
+
+    *runtimes.write().map_err(|_| IpcError::Core {
+        message: "runtime list is poisoned".into(),
+    })? = Some(InstalledRuntimes {
+        nginx_bin: paths.nginx_bin.clone(),
+        php: php.clone(),
+    });
+
+    Ok(php)
+}
+
+/// `openvhost_core::BREW_PREFIXES` joined with `bin/brew`, so the UI can say
+/// exactly where Homebrew was looked for.
+fn brew_searched_paths() -> Vec<String> {
+    openvhost_core::BREW_PREFIXES
+        .iter()
+        .map(|prefix| Path::new(prefix).join("bin/brew").display().to_string())
+        .collect()
+}
+
+/// Read-only environment summary for the Languages page: whether Homebrew was
+/// found, where it looked, and one row per PHP version (spec §6.1).
+///
+/// Deliberately spawns NOTHING — it reads the managed `RwLock` and calls
+/// `find_brew()` (a filesystem check, not a process). It is called on page
+/// mount and after every install, and the discipline that keeps
+/// `plan_site_apply` cheap (Task 4's managed `RwLock`, read then cloned and
+/// dropped before anything else runs) applies here too. `rescan_php_runtimes`
+/// is the one that actually probes.
+#[tauri::command]
+#[specta::specta]
+pub async fn php_environment(
+    runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
+    paths: tauri::State<'_, Option<StackPaths>>,
+) -> Result<PhpEnvironmentDto, IpcError> {
+    let p = stack_paths(&paths)?;
+    let installed = runtimes
+        .read()
+        .map_err(|_| IpcError::Core {
+            message: "runtime list is poisoned".into(),
+        })?
+        .as_ref()
+        .map(|r| r.php.clone())
+        .unwrap_or_default();
+    // See `php_rows`'s doc comment: today this is identical to each
+    // runtime's `major`, since the probe never reports a patch level.
+    let full_versions: Vec<(&str, &str)> = installed
+        .iter()
+        .map(|rt| (rt.major.as_str(), rt.major.as_str()))
+        .collect();
+    Ok(PhpEnvironmentDto {
+        brew_found: openvhost_core::find_brew().is_some(),
+        brew_searched: brew_searched_paths(),
+        runtimes: php_rows(&p.home, &installed, &full_versions),
+    })
+}
+
+/// The explicit, user-initiated re-probe behind Languages' "Check again"
+/// button: the user left to install Homebrew (or a PHP version) in a
+/// terminal and came back. Unlike `php_environment`, this DOES spawn — once
+/// per candidate binary, to read its version — so it is never called
+/// implicitly.
+#[tauri::command]
+#[specta::specta]
+pub async fn rescan_php_runtimes(
+    runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
+    paths: tauri::State<'_, Option<StackPaths>>,
+    sup: tauri::State<'_, Arc<Supervisor>>,
+) -> Result<PhpEnvironmentDto, IpcError> {
+    let p = stack_paths(&paths)?;
+    let installed = rescan_into_state(runtimes.inner(), sup.inner(), p).await?;
+    let full_versions: Vec<(&str, &str)> = installed
+        .iter()
+        .map(|rt| (rt.major.as_str(), rt.major.as_str()))
+        .collect();
+    Ok(PhpEnvironmentDto {
+        brew_found: openvhost_core::find_brew().is_some(),
+        brew_searched: brew_searched_paths(),
+        runtimes: php_rows(&p.home, &installed, &full_versions),
+    })
+}
+
+/// Serializes `install_php`: only one brew install runs at a time. The
+/// call site uses `try_lock`, not `lock` — a second press while an install is
+/// running should be refused with an explanation, not silently queued behind
+/// a build that can take twenty minutes. Mirrors `ApplyLock`'s shape.
+#[derive(Default)]
+pub struct InstallLock(pub(crate) tokio::sync::Mutex<()>);
+
+/// Install a PHP major via Homebrew, streaming its output live, then rescan
+/// so the freshly installed version (if it appears) gets a supervisor row.
+///
+/// Every argument that reaches `brew`'s argv is validated or derived from
+/// managed state before this function does anything observable: `major` is
+/// parsed and checked against the catalogue allowlist, `brew` is located by
+/// absolute path (never `PATH`), and `brew_install_spec` itself refuses a
+/// non-absolute `brew` path.
+#[tauri::command]
+#[specta::specta]
+pub async fn install_php(
+    app: tauri::AppHandle,
+    major: String,
+    runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
+    paths: tauri::State<'_, Option<StackPaths>>,
+    sup: tauri::State<'_, Arc<Supervisor>>,
+    lock: tauri::State<'_, InstallLock>,
+) -> Result<InstallOutcomeDto, IpcError> {
+    // Both guard layers, before anything else happens.
+    let major = openvhost_core::PhpMajor::parse(&major)?;
+
+    // One at a time. `try_lock` rather than `lock`: a second press should be
+    // refused with an explanation, not silently queued behind a 20-minute
+    // build.
+    let Ok(_guard) = lock.inner().0.try_lock() else {
+        return Err(IpcError::Core {
+            message: "an install is already running".into(),
+        });
+    };
+
+    let p = stack_paths(&paths)?;
+
+    let before: Vec<String> = runtimes
+        .read()
+        .map_err(|_| IpcError::Core {
+            message: "runtime list is poisoned".into(),
+        })?
+        .as_ref()
+        .map(|r| r.php.iter().map(|rt| rt.major.clone()).collect())
+        .unwrap_or_default();
+
+    if before.iter().any(|m| m == major.as_str()) {
+        return Err(IpcError::Core {
+            message: format!("PHP {} is already installed", major.as_str()),
+        });
+    }
+
+    let brew = openvhost_core::find_brew().ok_or_else(|| IpcError::Core {
+        message: format!(
+            "Homebrew was not found. Looked for bin/brew under: {}",
+            openvhost_core::BREW_PREFIXES.join(", ")
+        ),
+    })?;
+
+    // Returns Result: it refuses a non-absolute brew path, because composing
+    // PATH from one yields an empty leading component and exec resolves that
+    // as the working directory.
+    let spec = openvhost_core::brew_install_spec(&brew, &major)?;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+
+    // Forward brew's output as it arrives, so a long install is visibly
+    // working rather than apparently hung.
+    let emitter = app.clone();
+    let for_event = major.as_str().to_string();
+    let pump = tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            if let openvhost_proc::TaskEvent::Line { stream, text } = ev {
+                let _ = PhpInstallLogEvent {
+                    major: for_event.clone(),
+                    ts_ms: now_ms(),
+                    stream: match stream {
+                        openvhost_proc::TaskStream::Stdout => "stdout".into(),
+                        openvhost_proc::TaskStream::Stderr => "stderr".into(),
+                    },
+                    line: text,
+                }
+                .emit(&emitter);
+            }
+        }
+    });
+
+    let exit_code = openvhost_proc::run_task(openvhost_proc::default_driver(), spec, tx).await?;
+    let _ = pump.await;
+
+    // Rescan even on a non-zero exit: brew can fail late having already
+    // linked the formula, and the truth is on disk either way.
+    let found = rescan_into_state(runtimes.inner(), sup.inner(), p).await?;
+    let detected = found.iter().any(|r| r.major == major.as_str());
+
+    Ok(InstallOutcomeDto {
+        major: major.as_str().to_string(),
+        exit_code,
+        detected,
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod php_ipc_tests {
+    use super::*;
+
+    #[test]
+    fn every_catalogue_entry_is_listed_with_its_installed_state() {
+        let installed = vec![openvhost_core::PhpRuntime {
+            major: "8.3".into(),
+            fpm_bin: PathBuf::from("/opt/homebrew/opt/php@8.3/sbin/php-fpm"),
+        }];
+        let rows = php_rows(Path::new("/tmp/ovh"), &installed, &[("8.3", "8.3.14")]);
+        assert_eq!(rows.len(), openvhost_core::CATALOGUE.len());
+        let three = rows.iter().find(|r| r.major == "8.3").unwrap();
+        assert!(three.installed);
+        assert_eq!(three.full_version.as_deref(), Some("8.3.14"));
+        assert_eq!(three.service_id.as_deref(), Some("php-fpm-8.3"));
+        assert!(
+            three
+                .socket_path
+                .as_deref()
+                .is_some_and(|s| s.ends_with("php-fpm-8.3.sock"))
+        );
+        let one = rows.iter().find(|r| r.major == "8.1").unwrap();
+        assert!(!one.installed);
+        assert!(one.path.is_none());
+        assert!(
+            one.service_id.is_none(),
+            "a version that is not installed has no pool"
+        );
+    }
+
+    #[test]
+    fn exactly_one_catalogue_entry_is_recommended_and_it_is_the_newest() {
+        // A first-time user should not have to know how 8.1 differs from 8.5.
+        let rows = php_rows(Path::new("/tmp/ovh"), &[], &[]);
+        let rec: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.recommended)
+            .map(|r| r.major.as_str())
+            .collect();
+        assert_eq!(rec, vec![*openvhost_core::CATALOGUE.last().unwrap()]);
+    }
+
+    #[test]
+    fn an_installed_version_outside_the_catalogue_is_still_listed() {
+        // Otherwise a version installed by hand — or dropped from a later
+        // catalogue — vanishes from the page while still serving sites.
+        let installed = vec![openvhost_core::PhpRuntime {
+            major: "7.4".into(),
+            fpm_bin: PathBuf::from("/opt/homebrew/opt/php@7.4/sbin/php-fpm"),
+        }];
+        let rows = php_rows(Path::new("/tmp/ovh"), &installed, &[("7.4", "7.4.33")]);
+        assert!(rows.iter().any(|r| r.major == "7.4" && r.installed));
+    }
+
+    #[test]
+    fn a_rejected_version_names_the_field_so_the_ui_can_mark_it() {
+        let e: IpcError = openvhost_core::PhpMajor::parse("--build-from-source")
+            .unwrap_err()
+            .into();
+        match e {
+            IpcError::Validation { field, .. } => assert_eq!(field, "php_version"),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// `brew_searched_paths` is what the UI names as "looked here" — pinned
+    /// against the exact prefixes rather than re-deriving the same join, so
+    /// a typo in the join expression fails a test instead of only ever
+    /// showing up in a manual read of the source.
+    #[test]
+    fn brew_searched_paths_names_bin_brew_under_every_prefix() {
+        let searched = brew_searched_paths();
+        assert_eq!(searched.len(), openvhost_core::BREW_PREFIXES.len());
+        for prefix in openvhost_core::BREW_PREFIXES {
+            assert!(
+                searched.contains(&format!("{prefix}/bin/brew")),
+                "expected {prefix}/bin/brew in {searched:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
