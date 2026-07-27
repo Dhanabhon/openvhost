@@ -17,7 +17,7 @@ exists. This slice makes the other side of that sentence reachable.
 
 Success criterion — a developer can do this on a clean machine:
 
-1. Open **Packages**, see that only PHP 8.5 is installed.
+1. Open **Languages**, see that only PHP 8.5 is installed.
 2. Press **Install** on 8.3 and watch the log until it finishes.
 3. Set a site's PHP version to 8.3, Apply, and have that site served by 8.3 while another
    site is still served by 8.5.
@@ -57,7 +57,7 @@ Homebrew" never live in the same module:
 |---|---|---|---|
 | `openvhost-proc::task` | proc | Run one command to completion, streaming its output | no |
 | `openvhost-core::php` | core | Discover installed versions; build the install `TaskSpec` | yes |
-| Packages page + IPC | desktop | Join the two, then register the new service row | no |
+| Languages page + IPC | desktop | Join the two, then register the new service row | no |
 
 `openvhost-core::php` **executes nothing** — it reads the filesystem and constructs a
 spec. Spawning belongs to `openvhost-proc`, which keeps core `tauri`-free and lets the
@@ -176,7 +176,7 @@ entry that is currently live.
 What follows is emergent rather than written: `render_set` emits one pool per **installed**
 major regardless of whether any site uses it (pinned by the existing test
 `pools_are_rendered_for_installed_majors_nobody_uses`), so a new version immediately makes
-the Sites banner report a pending change, and Apply creates the pool. The Packages row says
+the Sites banner report a pending change, and Apply creates the pool. The Languages row says
 so, with a link to Sites.
 
 **One real change this forces.** `InstalledRuntimes` is currently managed state set once at
@@ -214,10 +214,15 @@ nothing for it.
 
 ## 6. UI
 
-A new **Packages** entry in the rail after Web Server — both answer "what is available to
+A new **Languages** entry in the rail after Web Server — both answer "what is available to
 run". The rail's existing disabled placeholders (Logs, Settings) are untouched.
 
-`/packages` lists one row per catalogue version:
+Named *Languages* rather than *Packages* by owner decision (2026-07-27). It is the honest
+label for what the section holds: PHP today, and other runtimes later. *Packages* would
+promise a general package manager the slice deliberately does not build (§2), and would
+have to be renamed the moment MySQL — a service, not a language — arrived.
+
+`/languages` lists one row per catalogue version:
 
 | Row state | Contents |
 |---|---|
@@ -229,9 +234,17 @@ run". The rail's existing disabled placeholders (Logs, Settings) are untouched.
 A row that has just been installed also says a pool must be created, and links to Sites —
 where the banner will already be showing the pending change.
 
-**`SiteDrawer`'s PHP dropdown** switches from its static list to the discovered versions,
-unioned with the site's current value so an out-of-range stored version stays selectable
-(the behaviour PR #13 established).
+**`SiteDrawer`'s PHP dropdown lists only versions that are actually installed** (owner
+decision, 2026-07-27). Today it offers a hard-coded `['8.4','8.3','8.2','8.1']` with no
+relation to the machine — on the machine this was designed against, not one of those four
+is present, so every option leads to an Apply that is refused. Installing more is the
+Languages page's job, not a dropdown's.
+
+The one exception is the site's **own stored value**, which is prepended and labelled when
+it is not installed. Dropping it would make the `<select>` render blank and silently
+rewrite the site's PHP version to whatever the browser picked instead — the bug PR #13
+fixed. Keeping it is not offering an uninstalled version; it is refusing to change data
+behind the user's back.
 
 ## 7. Testing
 
@@ -303,7 +316,10 @@ so **security-auditor APPROVE is a merge blocker** (CLAUDE.md golden rule 2).
 4. **PHP only.** nginx has one Homebrew version, so a picker adds nothing; MySQL and
    MariaDB would install fine but have no lifecycle yet (no datadir, start/stop or password
    flow), so the buttons would install something unusable.
-5. **A hand-maintained catalogue constant**, accepting that it ages, rather than spawning
+5. **The rail section is called Languages, not Packages** — it holds runtimes, and the
+   slice deliberately is not a package manager (§2). The site editor's PHP dropdown
+   lists only installed versions; installing more belongs on that page.
+6. **A hand-maintained catalogue constant**, accepting that it ages, rather than spawning
    `brew` to enumerate formulae on a path that must stay cheap.
 
 ## 10. Out of scope

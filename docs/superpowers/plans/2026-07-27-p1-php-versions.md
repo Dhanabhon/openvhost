@@ -48,10 +48,10 @@ What this plan does instead: `openvhost-core::php` becomes the single source of 
 - `src-tauri/src/commands.rs` — modify: take the read lock everywhere runtimes are read; add `list_php_runtimes`, `install_php`, their DTOs and the log event.
 - `src/lib/ipc/bindings.ts` — regenerated, committed.
 - `src/lib/ipc/index.ts` — modify: wrappers and type re-exports.
-- `src/lib/packages.svelte.ts` (+ `.test.ts`) — create: the store.
-- `src/lib/components/PackageRow.svelte` (+ `.test.ts`) — create.
-- `src/routes/packages/+page.svelte` — create.
-- `src/lib/components/Rail.svelte` — modify: a Packages nav item.
+- `src/lib/languages.svelte.ts` (+ `.test.ts`) — create: the store.
+- `src/lib/components/LanguageRow.svelte` (+ `.test.ts`) — create.
+- `src/routes/languages/+page.svelte` — create.
+- `src/lib/components/Rail.svelte` — modify: a Languages nav item.
 - `src/lib/sites.derive.ts` (+ `.test.ts`) — modify: `phpVersionOptions` takes the installed list.
 - `src/lib/components/SiteDrawer.svelte` — modify: pass the installed list through.
 
@@ -876,7 +876,7 @@ straight into brew install. The composed argv is pinned by a test."
 
 ## Task 4: Make the installed-runtime set replaceable
 
-`InstalledRuntimes` is managed state set once at startup, and Tauri cannot replace managed state. Until it can be updated, a version installed after launch is invisible to the apply pipeline — the Packages page would appear to work while changing nothing.
+`InstalledRuntimes` is managed state set once at startup, and Tauri cannot replace managed state. Until it can be updated, a version installed after launch is invisible to the apply pipeline — the Languages page would appear to work while changing nothing.
 
 **Files:**
 - Modify: `apps/desktop/src-tauri/src/lib.rs`
@@ -916,7 +916,7 @@ Holding a `std::sync::RwLockReadGuard` across an await point would make the futu
 ```rust
 #[test]
 fn the_runtime_set_can_be_replaced_after_startup() {
-    // The Packages page installs a version at runtime; if this state could not
+    // The Languages page installs a version at runtime; if this state could not
     // be replaced, apply would never learn about it and Install would appear
     // to succeed while changing nothing.
     let state = std::sync::RwLock::new(None::<InstalledRuntimes>);
@@ -1242,19 +1242,19 @@ Dispatch the `security-auditor` subagent over the branch diff. Point it at: whet
 
 ---
 
-## Task 6: The Packages page
+## Task 6: The Languages page
 
 **Files:**
-- Create: `apps/desktop/src/lib/packages.svelte.ts` + `packages.svelte.test.ts`
-- Create: `apps/desktop/src/lib/components/PackageRow.svelte` + `PackageRow.svelte.test.ts`
-- Create: `apps/desktop/src/routes/packages/+page.svelte`
+- Create: `apps/desktop/src/lib/languages.svelte.ts` + `languages.svelte.test.ts`
+- Create: `apps/desktop/src/lib/components/LanguageRow.svelte` + `LanguageRow.svelte.test.ts`
+- Create: `apps/desktop/src/routes/languages/+page.svelte`
 - Modify: `apps/desktop/src/lib/components/Rail.svelte`
 
 **Interfaces:**
 - Consumes: `listPhpRuntimes()`, `installPhp(major)`, `PhpRuntimeDto`, `InstallOutcomeDto`, and the install-log event from Task 5.
 - Produces:
   ```ts
-  export class PackagesStore {
+  export class LanguagesStore {
       rows: PhpRuntimeDto[];
       installing: string;         // '' when idle, otherwise the major
       log: UiLog[];
@@ -1269,13 +1269,13 @@ Dispatch the `security-auditor` subagent over the branch diff. Point it at: whet
 
 ```ts
 it('lists what the backend returns', async () => {
-	const s = new PackagesStore(api({ rows: [row('8.3', true), row('8.4', false)] }));
+	const s = new LanguagesStore(api({ rows: [row('8.3', true), row('8.4', false)] }));
 	await s.refresh();
 	expect(s.rows.map((r) => r.major)).toEqual(['8.3', '8.4']);
 });
 
 it('marks which version is installing and clears it when done', async () => {
-	const s = new PackagesStore(api({ outcome: { major: '8.4', exitCode: 0, detected: true } }));
+	const s = new LanguagesStore(api({ outcome: { major: '8.4', exitCode: 0, detected: true } }));
 	const p = s.install('8.4');
 	expect(s.installing).toBe('8.4');
 	expect(await p).toBe(true);
@@ -1284,7 +1284,7 @@ it('marks which version is installing and clears it when done', async () => {
 
 it('refuses a second install while one is running', async () => {
 	let calls = 0;
-	const s = new PackagesStore({
+	const s = new LanguagesStore({
 		listPhpRuntimes: async () => [],
 		installPhp: async () => {
 			calls += 1;
@@ -1297,7 +1297,7 @@ it('refuses a second install while one is running', async () => {
 });
 
 it('keeps the log and surfaces the error when the install fails', async () => {
-	const s = new PackagesStore({
+	const s = new LanguagesStore({
 		listPhpRuntimes: async () => [],
 		installPhp: async () => {
 			throw { kind: 'core', message: 'brew: no such formula' };
@@ -1314,7 +1314,7 @@ it('re-lists after a successful install rather than assuming the row changed', a
 	// Assuming would show the version as installed even when the rescan did
 	// not find it — the exact case `detected` exists to report.
 	let listCalls = 0;
-	const s = new PackagesStore({
+	const s = new LanguagesStore({
 		listPhpRuntimes: async () => {
 			listCalls += 1;
 			return [row('8.4', listCalls > 1)];
@@ -1331,8 +1331,8 @@ it('re-lists after a successful install rather than assuming the row changed', a
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `pnpm -C apps/desktop test packages.svelte`
-Expected: FAIL — cannot resolve `./packages.svelte`.
+Run: `pnpm -C apps/desktop test languages.svelte`
+Expected: FAIL — cannot resolve `./languages.svelte`.
 
 - [ ] **Step 3: Implement the store**
 
@@ -1340,7 +1340,7 @@ Follow `apps/desktop/src/lib/apply.svelte.ts` for shape: an injected API object,
 
 - [ ] **Step 4: Write the failing component tests**
 
-`PackageRow.svelte.test.ts`, SSR render-to-string in the style of `ApplyDialog.svelte.test.ts`:
+`LanguageRow.svelte.test.ts`, SSR render-to-string in the style of `ApplyDialog.svelte.test.ts`:
 
 ```ts
 it('shows the full version and path when installed', () => {
@@ -1388,16 +1388,16 @@ it('tells the user a pool still has to be created after a successful install', (
 
 - [ ] **Step 5: Run to verify failure**
 
-Run: `pnpm -C apps/desktop test PackageRow`
+Run: `pnpm -C apps/desktop test LanguageRow`
 Expected: FAIL — component does not exist.
 
 - [ ] **Step 6: Build the components and the route**
 
-`PackageRow.svelte` — props `{ row, installing, log, error, outcome, onInstall }`. Reuses `LogPane.svelte` (`{ logs: UiLog[] }`, where `UiLog` has `tsMs`, `level`, `line`) beneath the row that is installing. Never `{@html}` anywhere: brew's output is third-party text.
+`LanguageRow.svelte` — props `{ row, installing, log, error, outcome, onInstall }`. Reuses `LogPane.svelte` (`{ logs: UiLog[] }`, where `UiLog` has `tsMs`, `level`, `line`) beneath the row that is installing. Never `{@html}` anywhere: brew's output is third-party text.
 
-`routes/packages/+page.svelte` — constructs `PackagesStore`, calls `refresh()` on mount, subscribes to the install-log event, and renders a page head in the style of `SitesPanel.svelte`'s.
+`routes/languages/+page.svelte` — constructs `LanguagesStore`, calls `refresh()` on mount, subscribes to the install-log event, and renders a page head in the style of `SitesPanel.svelte`'s.
 
-`Rail.svelte` — a **Packages** nav item after Web Server, matching the existing enabled items (`<a>` with `href={resolve('/packages')}` and `aria-current`), not the `aria-disabled` placeholder style used for Logs and Settings.
+`Rail.svelte` — a **Languages** nav item after Web Server, matching the existing enabled items (`<a>` with `href={resolve('/languages')}` and `aria-current`), not the `aria-disabled` placeholder style used for Logs and Settings.
 
 - [ ] **Step 7: Run the full frontend gate**
 
@@ -1412,7 +1412,7 @@ Expected: PASS, 0 errors / 0 warnings.
 
 ```bash
 git add apps/desktop/src
-git commit -s -m "feat(ui): a Packages page for installing PHP versions
+git commit -s -m "feat(ui): a Languages page for installing PHP versions
 
 Reports the case that matters: brew exiting 0 while the version still
 cannot be found, rather than showing nothing and inviting a retry."
@@ -1498,7 +1498,7 @@ refuse."
 
 ## Definition of Done
 
-- [ ] The Packages page lists every catalogue version plus anything installed outside it, with the installed ones showing their full version and path.
+- [ ] The Languages page lists every catalogue version plus anything installed outside it, with the installed ones showing their full version and path.
 - [ ] Pressing Install streams brew's output live and finishes with the version installed.
 - [ ] A second install cannot start while one is running.
 - [ ] brew exiting 0 without the version appearing is reported in words, not by showing nothing.
