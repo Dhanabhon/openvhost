@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use openvhost_conf::{
     GeneratedFile, NginxAdapter, PhpFpmRuntime, PhpRuntimeAdapter, PhpUpstream, RenderCtx,
-    WebServerAdapter,
+    WebServerAdapter, WebServerSettings,
 };
 
 pub use commit::{ApplyOutcome, ConfigValidator, NginxValidator, apply, commit, rollback};
@@ -124,7 +124,11 @@ pub fn render_set(input: &ApplyInput) -> Result<Vec<GeneratedFile>, ApplyError> 
         }
     }
 
-    let mut out = vec![nginx.generate_main_config(&input.home)?];
+    // TASK 4 replaces this with the settings stored in state.db (via
+    // `settings_repo`), threaded through `ApplyInput`. Until then the
+    // generated main config carries the documented defaults, which is what
+    // this pipeline already produced implicitly.
+    let mut out = vec![nginx.generate_main_config(&input.home, &WebServerSettings::default())?];
 
     let default_upstream = match input.runtimes.php.first() {
         Some(rt) => Some(PhpUpstream::UnixSocket(socket_path(
