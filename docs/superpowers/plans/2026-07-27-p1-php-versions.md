@@ -640,7 +640,10 @@ This is the security core of the slice. Arguments are passed as an argv vector, 
 
   /// The command that installs `major`. Composed here — the formula name is
   /// never accepted from a caller.
-  pub fn brew_install_spec(brew: &std::path::Path, major: &PhpMajor) -> openvhost_proc::SpawnSpec;
+  /// Rejects a non-absolute `brew` path: composing PATH from a relative one
+  /// yields an empty leading component, which exec resolves as the CWD.
+  pub fn brew_install_spec(brew: &std::path::Path, major: &PhpMajor)
+      -> Result<openvhost_proc::SpawnSpec, CoreError>;
   ```
   `openvhost-core` gains a dependency on `openvhost-proc` (it already has one as a dev-dependency; this promotes it to a normal one). `openvhost-proc` depends on neither core nor tauri, so no cycle.
 
