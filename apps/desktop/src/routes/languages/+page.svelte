@@ -101,6 +101,21 @@
 				<p>{store.error}</p>
 			</div>
 		{:else if store.env}
+			<!-- C3 fix: rendered whenever `store.error` is non-empty, INDEPENDENT of
+			     whether the rowlist below renders — not only when `store.env` is
+			     `null`. Before this, a failed rescan (a poisoned lock, a stack-paths
+			     error, a probe spawn failure) set `store.error` and correctly kept
+			     `env`, but nothing rendered it: on a no-brew machine the rowlist
+			     below never mounts at all, so "Check again" — the one control whose
+			     entire purpose is to unstick a user — appeared to do nothing. The
+			     per-row `error` prop below is UNCHANGED and still scoped to
+			     `lastAttempted`, so an install failure keeps its own row-level
+			     message too. -->
+			{#if store.error !== ''}
+				<div class="banner-error" role="alert" data-testid="languages-page-error">
+					{store.error}
+				</div>
+			{/if}
 			<LanguagesEmpty
 				brewFound={store.brewFound}
 				anyInstalled={store.anyInstalled}
@@ -179,6 +194,19 @@
 	}
 	.empty p {
 		margin: 4px 0 0;
+	}
+	/* Same failure palette as routes/+page.svelte's own `.banner-error` (Sites),
+	   but padded rather than margined: THIS one lives inside `.panel`'s own
+	   border/background (that page's sits directly in AppShell), so insetting
+	   it with margin would leave a visible gap between the banner and the
+	   panel's edge that every other child here (`.empty`, `.rowlist`'s rows)
+	   avoids by padding instead. */
+	.banner-error {
+		padding: var(--vh-space-3) var(--vh-space-6);
+		background: var(--vh-fail-tint);
+		color: var(--vh-fail);
+		font-size: var(--vh-text-table);
+		border-bottom: 1px solid var(--vh-border);
 	}
 	.check-again {
 		display: flex;

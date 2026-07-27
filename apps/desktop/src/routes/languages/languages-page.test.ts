@@ -52,7 +52,43 @@ describe('the /languages route', () => {
 	it('renders the panel with no rows and no error on a fresh, unsettled load', () => {
 		const { body } = render(LanguagesPage);
 		expect(body).toContain('data-testid="languages"');
+		expect(body).not.toContain('data-testid="languages-page-error"');
 		expect(body).not.toMatch(/data-testid="lang-row-/);
+	});
+
+	// C3 regression test: before the fix, this exact state — `env` non-null
+	// (an earlier load succeeded) and `error` non-empty (a later rescan
+	// failed), with NEITHER brew nor any installed version — rendered NOTHING
+	// for the error. `store.error !== '' && store.env === null` was false (env
+	// is not null) and the rowlist never mounts (`brewFound || anyInstalled`
+	// is false), so the failure was invisible on the one page whose "Check
+	// again" exists specifically to recover from it.
+	it('shows a failed rescan even though no rows are rendered', () => {
+		languagesStore.env = env(false, []);
+		languagesStore.error = 'runtime list is poisoned';
+		const { body } = render(LanguagesPage);
+		expect(body).toContain('data-testid="languages-page-error"');
+		expect(body).toContain('runtime list is poisoned');
+		expect(body).not.toMatch(/data-testid="lang-row-/);
+	});
+
+	// Same C3 case, but with brew found and a version already installed — the
+	// rowlist DOES render here, so this pins that the panel-level banner is
+	// independent of that, not an accidental side effect of the rowlist being
+	// absent.
+	it('shows a failed rescan alongside an already-populated rowlist too', () => {
+		languagesStore.env = env(true, [row('8.3', true)]);
+		languagesStore.error = 'the PHP discovery task failed to run';
+		const { body } = render(LanguagesPage);
+		expect(body).toContain('data-testid="languages-page-error"');
+		expect(body).toContain('data-testid="lang-row-8.3"');
+	});
+
+	it('shows no error banner once it has been cleared', () => {
+		languagesStore.env = env(true, [row('8.3', true)]);
+		languagesStore.error = '';
+		const { body } = render(LanguagesPage);
+		expect(body).not.toContain('data-testid="languages-page-error"');
 	});
 
 	// C2 regression test: `LanguagesEmpty` renders its own "Check again" button
