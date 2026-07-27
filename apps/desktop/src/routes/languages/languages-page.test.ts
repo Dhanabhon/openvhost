@@ -36,6 +36,17 @@ function env(brewFound: boolean, runtimes: PhpRuntimeDto[]): PhpEnvironmentDto {
 	return { brewFound, brewSearched: ['/opt/homebrew/bin/brew'], runtimes };
 }
 
+/** Pulls out just the header Check again button's own opening tag, so a
+ *  `disabled` assertion can fail for the reason it names rather than
+ *  matching some unrelated part of the page. */
+function checkAgainHeaderButtonTag(body: string): string {
+	const match = body.match(/<button[^>]*data-testid="languages-check-again-header"[^>]*>/);
+	if (!match) {
+		throw new Error('expected the header Check again button to render');
+	}
+	return match[0];
+}
+
 // `languagesStore`/`servicesStore` are module singletons — reset every field
 // this page reads so no test inherits state a previous one left behind.
 beforeEach(() => {
@@ -112,5 +123,46 @@ describe('the /languages route', () => {
 		const { body } = render(LanguagesPage);
 		expect(body).toContain('data-testid="languages-check-again"');
 		expect(body).not.toContain('data-testid="languages-check-again-header"');
+	});
+
+	// A1 audit finding: `rescan_php_runtimes` now takes `InstallLock` with
+	// `.lock().await` (H1's fix, so a rescan can never overwrite a
+	// just-completed install with a stale set) — but that means pressing
+	// Check again during an install now blocks for the whole build (twenty
+	// minutes for a source formula) with no UI feedback, and repeated presses
+	// queue unbounded waiters on that mutex. Both directions are asserted —
+	// a one-directional check here would pass with `disabled` hardcoded
+	// either way.
+	it('disables the header Check again while an install is running', () => {
+		languagesStore.env = env(true, [row('8.4', false)]);
+		languagesStore.installing = '8.4';
+		const { body } = render(LanguagesPage);
+		expect(checkAgainHeaderButtonTag(body)).toContain('disabled');
+	});
+
+	it('leaves the header Check again enabled when no install is running', () => {
+		languagesStore.env = env(true, [row('8.4', false)]);
+		languagesStore.installing = '';
+		const { body } = render(LanguagesPage);
+		expect(checkAgainHeaderButtonTag(body)).not.toContain('disabled');
+	});
+
+	// Same property on the no-brew page's OWN "Check again" button
+	// (`LanguagesEmpty`'s `languages-check-again`), which this page also feeds
+	// `store.installing` into.
+	it('disables the no-brew page Check again while an install is running', () => {
+		languagesStore.env = env(false, []);
+		languagesStore.installing = '8.4';
+		const { body } = render(LanguagesPage);
+		const match = body.match(/<button[^>]*data-testid="languages-check-again"[^>]*>/);
+		expect(match?.[0]).toContain('disabled');
+	});
+
+	it('leaves the no-brew page Check again enabled when no install is running', () => {
+		languagesStore.env = env(false, []);
+		languagesStore.installing = '';
+		const { body } = render(LanguagesPage);
+		const match = body.match(/<button[^>]*data-testid="languages-check-again"[^>]*>/);
+		expect(match?.[0]).not.toContain('disabled');
 	});
 });

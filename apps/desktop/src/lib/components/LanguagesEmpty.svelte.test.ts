@@ -19,6 +19,8 @@ function renderEmpty(props: {
 	brewFound: boolean;
 	anyInstalled?: boolean;
 	brewSearched?: string[];
+	installing?: string;
+	onRescan?: () => void;
 	onOpenBrewSite?: () => void;
 }): string {
 	return render(LanguagesEmpty, {
@@ -26,10 +28,24 @@ function renderEmpty(props: {
 			brewFound: props.brewFound,
 			anyInstalled: props.anyInstalled ?? false,
 			brewSearched: props.brewSearched ?? [],
-			onRescan: () => {},
+			installing: props.installing ?? '',
+			onRescan: props.onRescan ?? (() => {}),
 			onOpenBrewSite: props.onOpenBrewSite ?? (() => {})
 		}
 	}).body;
+}
+
+/** Pulls out just the Check again button's own opening tag, so a `disabled`
+ *  assertion can fail for the reason it names — the brew-install `<pre>`
+ *  block above it is plain text and could never contain the word, but
+ *  scoping to this one element keeps the assertion honest if that ever
+ *  changes. */
+function checkAgainButtonTag(body: string): string {
+	const match = body.match(/<button[^>]*data-testid="languages-check-again"[^>]*>/);
+	if (!match) {
+		throw new Error('expected the Check again button to render');
+	}
+	return match[0];
 }
 
 describe('LanguagesEmpty', () => {
@@ -110,5 +126,21 @@ describe('LanguagesEmpty', () => {
 		});
 		expect(body).toContain('data-testid="open-brew-site"');
 		expect(called).toBe(0); // rendering alone must not invoke it
+	});
+
+	// A1 audit finding: `rescan_php_runtimes` now takes `InstallLock` with
+	// `.lock().await` (H1's fix), so pressing this control during an install
+	// blocks for the whole build with no feedback, and repeated presses queue
+	// unbounded waiters on the mutex. Both directions are asserted — a
+	// one-directional check here would pass with `disabled` hardcoded either
+	// way.
+	it('disables Check again while an install is running', () => {
+		const body = renderEmpty({ brewFound: false, brewSearched: [], installing: '8.3' });
+		expect(checkAgainButtonTag(body)).toContain('disabled');
+	});
+
+	it('leaves Check again enabled when no install is running', () => {
+		const body = renderEmpty({ brewFound: false, brewSearched: [], installing: '' });
+		expect(checkAgainButtonTag(body)).not.toContain('disabled');
 	});
 });

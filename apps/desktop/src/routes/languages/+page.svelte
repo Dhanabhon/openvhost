@@ -151,6 +151,7 @@
 				brewFound={store.brewFound}
 				anyInstalled={store.anyInstalled}
 				brewSearched={store.env.brewSearched}
+				installing={store.installing}
 				onRescan={() => void onRescan()}
 				onOpenBrewSite={() => void openHomebrewSite().catch((e) => store.fail(e))}
 			/>
@@ -164,7 +165,18 @@
 				     yet" and "brew, already installed") so it never sits next to
 				     `LanguagesEmpty`'s own no-brew copy of the same control. -->
 				<div class="check-again">
-					<Button size="sm" testId="languages-check-again-header" onclick={() => void onRescan()}>
+					<!-- A1 audit finding: `rescan_php_runtimes` takes `InstallLock` with
+					     `.lock().await` (H1's fix), so this button now blocks for the
+					     length of a running install with no feedback, and repeated
+					     presses queue unbounded waiters on that mutex. Disabled while
+					     `store.installing !== ''`, same condition `LanguageRow`'s own
+					     Install button already uses. -->
+					<Button
+						size="sm"
+						testId="languages-check-again-header"
+						disabled={store.installing !== ''}
+						onclick={() => void onRescan()}
+					>
 						Check again
 					</Button>
 				</div>

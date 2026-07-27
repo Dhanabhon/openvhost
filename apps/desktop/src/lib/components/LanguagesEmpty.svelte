@@ -18,6 +18,7 @@
 		brewFound,
 		anyInstalled,
 		brewSearched = [],
+		installing = '',
 		onRescan,
 		onOpenBrewSite
 	}: {
@@ -31,6 +32,18 @@
 		 *  the search itself ran, so that case gets its own sentence rather than
 		 *  a blank list. */
 		brewSearched?: string[];
+		/** The major installing anywhere on the page, '' when idle — same prop
+		 *  `LanguageRow` reads to disable its own Install button. A1 audit
+		 *  finding: `rescan_php_runtimes` now takes `InstallLock` with
+		 *  `.lock().await` (H1's fix, so a rescan can never overwrite a
+		 *  just-completed install with a stale set), so pressing this button
+		 *  during an install blocks for the whole build — twenty minutes for a
+		 *  source formula — with no feedback, and repeated presses queue
+		 *  unbounded waiters on the mutex. Disabling the control while
+		 *  `installing !== ''` is the fix; the label is left alone (unlike
+		 *  `LanguageRow`'s Install button, this one has no "Installing…" major
+		 *  of its own to name). */
+		installing?: string;
 		/** Wired to `LanguagesStore.rescan()` by the caller — this component
 		 *  has no IPC import of its own, so it stays testable with a plain fake. */
 		onRescan: () => void;
@@ -91,7 +104,9 @@
 				brew.sh
 			</button> has the full instructions.
 		</p>
-		<Button size="sm" testId="languages-check-again" onclick={onRescan}>Check again</Button>
+		<Button size="sm" testId="languages-check-again" disabled={installing !== ''} onclick={onRescan}
+			>Check again</Button
+		>
 	</div>
 {:else if !anyInstalled}
 	<div class="empty invite" data-testid="languages-no-php">
