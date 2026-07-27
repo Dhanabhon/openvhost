@@ -1332,19 +1332,26 @@ async fn rescan_into_state(
 
     let php = discover_all_php().await?;
     let found: Vec<String> = php.iter().map(|rt| rt.major.clone()).collect();
+    let new_majors = newly_installed_majors(&before, &found);
 
-    for major in newly_installed_majors(&before, &found) {
-        if let Some(rt) = php.iter().find(|rt| rt.major == major) {
-            sup.register(crate::stack::php_fpm_spec(&paths.home, rt));
-        }
-    }
-
+    // State write BEFORE the supervisor registration below. `apply_sites` and
+    // `plan_site_apply` read the `RwLock`, not the supervisor's row set, to
+    // decide which PHP versions exist — so registering a row first would open
+    // a window where `php-fpm-8.4` is visible and startable in the Services
+    // panel while the apply pipeline still answers `MissingRuntime` for 8.4,
+    // because the state write had not landed yet.
     *runtimes.write().map_err(|_| IpcError::Core {
         message: "runtime list is poisoned".into(),
     })? = Some(InstalledRuntimes {
         nginx_bin: paths.nginx_bin.clone(),
         php: php.clone(),
     });
+
+    for major in new_majors {
+        if let Some(rt) = php.iter().find(|rt| rt.major == major) {
+            sup.register(crate::stack::php_fpm_spec(&paths.home, rt));
+        }
+    }
 
     Ok(php)
 }
@@ -1398,14 +1405,31 @@ pub async fn php_environment(
 /// terminal and came back. Unlike `php_environment`, this DOES spawn — once
 /// per candidate binary, to read its version — so it is never called
 /// implicitly.
+///
+/// Takes `InstallLock` — the same lock `install_php` holds for its whole
+/// run — across the entire `rescan_into_state` call. Without it, a rescan is
+/// a read-modify-write over the managed `RwLock` with nothing serializing it
+/// against a concurrent install: the rescan can read the OLD set, block on
+/// probing every candidate binary, and only write its (now stale) result
+/// back AFTER an in-flight install finished and wrote the new one — silently
+/// reverting a completed install. `install_php` still returns
+/// `detected: true` for that install, so the row would say "Installed" while
+/// the apply pipeline no longer knows the version exists.
 #[tauri::command]
 #[specta::specta]
 pub async fn rescan_php_runtimes(
     runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
     paths: tauri::State<'_, Option<StackPaths>>,
     sup: tauri::State<'_, Arc<Supervisor>>,
+    lock: tauri::State<'_, InstallLock>,
 ) -> Result<PhpEnvironmentDto, IpcError> {
     let p = stack_paths(&paths)?;
+    // Blocks until any in-flight install has finished, rather than
+    // `try_lock`-and-refuse like `install_php` does: a rescan is cheap and
+    // idempotent, so waiting behind an install and then reading the
+    // now-current state is correct, not merely tolerable — refusing it
+    // outright would trade a wrong answer for no answer.
+    let _guard = lock.inner().guard.lock().await;
     let installed = rescan_into_state(runtimes.inner(), sup.inner(), p).await?;
     // See `php_rows`'s doc comment: there is no patch-level prober yet, so
     // there is nothing more precise than `major` to hand in here. An empty
@@ -1422,8 +1446,101 @@ pub async fn rescan_php_runtimes(
 /// call site uses `try_lock`, not `lock` — a second press while an install is
 /// running should be refused with an explanation, not silently queued behind
 /// a build that can take twenty minutes. Mirrors `ApplyLock`'s shape.
+///
+/// Also holds the one thing `perform_quit` needs to make the C1 audit finding
+/// stop being true: the in-flight run's `AbortHandle` (see `running`). The
+/// containment `openvhost_proc::run_task` provides — killing brew's whole
+/// process group — is `KillOnDrop`, which only fires when the run's future is
+/// actually DROPPED. Before this, nothing in production ever dropped it:
+/// `install_php` awaited `run_task` inline, so the future lived exactly as
+/// long as the command handler did, and quitting mid-install went straight to
+/// `window.destroy()` and then `process::exit` with no unwinding at all. Now
+/// `install_php` spawns the run so it has a handle to abort, and `perform_quit`
+/// aborts-and-waits on it BEFORE destroying the window — see `quit.rs`.
 #[derive(Default)]
-pub struct InstallLock(pub(crate) tokio::sync::Mutex<()>);
+pub struct InstallLock {
+    pub(crate) guard: tokio::sync::Mutex<()>,
+    running: std::sync::Mutex<Option<RunningInstall>>,
+}
+
+/// The major and abort handle of the one install `install_php` may have in
+/// flight, so `perform_quit` can both abort it and tell the user what major
+/// they are about to lose.
+struct RunningInstall {
+    major: String,
+    abort: tokio::task::AbortHandle,
+}
+
+impl InstallLock {
+    /// `pub(crate)`, not private: the C1 regression test drives this directly
+    /// to reproduce what `install_php` does — spawn a run, record its abort
+    /// handle — without going through the full IPC command.
+    pub(crate) fn set_running(&self, major: String, abort: tokio::task::AbortHandle) {
+        let mut slot = self
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(RunningInstall { major, abort });
+    }
+
+    fn clear_running(&self) {
+        let mut slot = self
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = None;
+    }
+
+    /// The major currently installing, if any — the quit dialog's copy reads
+    /// this through the `pending_php_install` command.
+    pub(crate) fn running_major(&self) -> Option<String> {
+        self.running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|r| r.major.clone())
+    }
+
+    /// A clone of the in-flight run's abort handle, if any. `AbortHandle` is
+    /// cheap to clone (it is a handle, not the task), so `perform_quit` can
+    /// hold its own copy and call `.abort()`/`.is_finished()` on it without
+    /// disturbing whatever `install_php` itself is doing with the run.
+    pub(crate) fn running_abort_handle(&self) -> Option<tokio::task::AbortHandle> {
+        self.running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|r| r.abort.clone())
+    }
+}
+
+/// Clears `InstallLock`'s running slot when dropped, no matter which of
+/// `install_php`'s several return points (normal completion, a `?` on a
+/// failed rescan, an aborted/panicked task) is the one that fires. Mirrors
+/// `openvhost_proc::task::KillOnDrop`'s own reasoning: a fallible sequence of
+/// early returns is exactly the shape where "remember to clear this" rots the
+/// first time a new early return is added, so the guarantee is a `Drop` impl
+/// instead of a set of matching calls scattered through the function body.
+struct RunningInstallGuard<'a> {
+    lock: &'a InstallLock,
+}
+
+impl Drop for RunningInstallGuard<'_> {
+    fn drop(&mut self) {
+        self.lock.clear_running();
+    }
+}
+
+/// The major currently installing, if any — for the quit dialog: a build in
+/// progress is invisible to `pending_service_ids` (it is not a supervised
+/// service), so without this the confirmation would silently discard it.
+#[tauri::command]
+#[specta::specta]
+pub async fn pending_php_install(
+    lock: tauri::State<'_, InstallLock>,
+) -> Result<Option<String>, IpcError> {
+    Ok(lock.inner().running_major())
+}
 
 /// Install a PHP major via Homebrew, streaming its output live, then rescan
 /// so the freshly installed version (if it appears) gets a supervisor row.
@@ -1449,7 +1566,7 @@ pub async fn install_php(
     // One at a time. `try_lock` rather than `lock`: a second press should be
     // refused with an explanation, not silently queued behind a 20-minute
     // build.
-    let Ok(_guard) = lock.inner().0.try_lock() else {
+    let Ok(_guard) = lock.inner().guard.try_lock() else {
         return Err(IpcError::Core {
             message: "an install is already running".into(),
         });
@@ -1506,7 +1623,46 @@ pub async fn install_php(
         }
     });
 
-    let exit_code = openvhost_proc::run_task(openvhost_proc::default_driver(), spec, tx).await?;
+    // Spawned rather than awaited inline — the C1 audit fix. Awaiting
+    // `run_task` directly (as this used to) makes ITS future identical to
+    // this command handler's own future, and Tauri never cancels an
+    // in-flight command: a quit mid-install would go straight from
+    // `window.destroy()` to `process::exit`, and `run_task`'s `KillOnDrop`
+    // containment — the whole reason a one-shot task runner exists instead of
+    // a bare `Command::spawn` — would never fire. Spawning gives an
+    // `AbortHandle`, stashed on `InstallLock` for `perform_quit` to use
+    // BEFORE the window goes away, so aborting here genuinely drops the
+    // future and runs `KillOnDrop` for real.
+    let install_task = tokio::spawn(openvhost_proc::run_task(
+        openvhost_proc::default_driver(),
+        spec,
+        tx,
+    ));
+    lock.inner()
+        .set_running(major.as_str().to_string(), install_task.abort_handle());
+    // Cleared on every return path below via `Drop`, including the two `?`s
+    // still to come — see `RunningInstallGuard`'s doc comment for why that is
+    // a `Drop` impl and not a matching call at each return point.
+    let _running_guard = RunningInstallGuard { lock: lock.inner() };
+
+    let exit_code = match install_task.await {
+        Ok(result) => result?,
+        // Aborted by `perform_quit`: the task's future was genuinely dropped
+        // (so `KillOnDrop` ran and brew's process group is gone), and this
+        // command has nothing left to report but that it did not finish.
+        Err(join_err) if join_err.is_cancelled() => {
+            return Err(IpcError::Proc {
+                message: "the install was aborted because the app is quitting".into(),
+            });
+        }
+        // Any other join failure (a panic inside `run_task`) is not this
+        // command's fault to hide.
+        Err(join_err) => {
+            return Err(IpcError::Proc {
+                message: format!("the install task ended unexpectedly: {join_err}"),
+            });
+        }
+    };
     let _ = pump.await;
 
     // Rescan even on a non-zero exit: brew can fail late having already
@@ -1522,8 +1678,10 @@ pub async fn install_php(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod php_ipc_tests {
+    use tauri::Manager;
+
     use super::*;
 
     #[test]
@@ -1649,6 +1807,64 @@ mod php_ipc_tests {
                 "expected {prefix}/bin/brew in {searched:?}"
             );
         }
+    }
+
+    /// H1 audit finding: `rescan_php_runtimes` must serialize against an
+    /// in-flight `install_php` run rather than reading-modifying-writing the
+    /// managed `RwLock` unguarded. Proven here by holding the SAME
+    /// `InstallLock` guard `install_php` would hold, and asserting the
+    /// spawned rescan cannot complete until that guard is released.
+    ///
+    /// Without the fix, this test does not fail loudly — it is a race the
+    /// old code simply never lost in a single-threaded test, which is exactly
+    /// how the bug survived review. What it proves instead is the mechanism:
+    /// `rescan_php_runtimes` now genuinely blocks on `InstallLock`, which is
+    /// what closes the "Check again races a completed install" window the
+    /// audit describes.
+    #[tokio::test]
+    async fn rescan_blocks_while_an_install_holds_the_lock() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app");
+        app.manage(RwLock::new(None::<InstalledRuntimes>));
+        app.manage(Some(StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: home.path().join("nginx"),
+            nginx_conf: home.path().join("nginx.conf"),
+        }));
+        app.manage(Arc::new(Supervisor::new(openvhost_proc::default_driver())));
+        app.manage(InstallLock::default());
+
+        // Hold the guard the way `install_php`'s `try_lock` would while a
+        // build is running.
+        let lock = app.state::<InstallLock>();
+        let held = lock.inner().guard.lock().await;
+
+        let handle = app.handle().clone();
+        let task = tokio::spawn(async move {
+            rescan_php_runtimes(
+                handle.state::<RwLock<Option<InstalledRuntimes>>>(),
+                handle.state::<Option<StackPaths>>(),
+                handle.state::<Arc<Supervisor>>(),
+                handle.state::<InstallLock>(),
+            )
+            .await
+        });
+
+        // Give the spawned rescan every chance to (wrongly) finish anyway.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !task.is_finished(),
+            "rescan_php_runtimes must not complete while InstallLock is held"
+        );
+
+        drop(held);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("rescan did not unblock after the install lock was released")
+            .expect("rescan task panicked");
+        assert!(result.is_ok(), "got {result:?}");
     }
 }
 

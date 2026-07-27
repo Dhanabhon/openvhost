@@ -274,3 +274,12 @@ export async function onPhpInstallLog(cb: (ev: PhpInstallLogEvent) => void): Pro
 		throw normalizeError(e);
 	}
 }
+
+/**
+ * The major currently installing, if any. Read by the quit dialog: a build in
+ * progress is invisible to the services list (it is not a supervised
+ * service), so without this a quit would silently discard it.
+ */
+export async function pendingPhpInstall(): Promise<string | null> {
+	return unwrap(commands.pendingPhpInstall());
+}

@@ -126,6 +126,16 @@ export const commands = {
 	 *  terminal and came back. Unlike `php_environment`, this DOES spawn — once
 	 *  per candidate binary, to read its version — so it is never called
 	 *  implicitly.
+	 * 
+	 *  Takes `InstallLock` — the same lock `install_php` holds for its whole
+	 *  run — across the entire `rescan_into_state` call. Without it, a rescan is
+	 *  a read-modify-write over the managed `RwLock` with nothing serializing it
+	 *  against a concurrent install: the rescan can read the OLD set, block on
+	 *  probing every candidate binary, and only write its (now stale) result
+	 *  back AFTER an in-flight install finished and wrote the new one — silently
+	 *  reverting a completed install. `install_php` still returns
+	 *  `detected: true` for that install, so the row would say "Installed" while
+	 *  the apply pipeline no longer knows the version exists.
 	 */
 	rescanPhpRuntimes: () => typedError<PhpEnvironmentDto, IpcError>(__TAURI_INVOKE("rescan_php_runtimes")),
 	/**
@@ -139,6 +149,12 @@ export const commands = {
 	 *  non-absolute `brew` path.
 	 */
 	installPhp: (major: string) => typedError<InstallOutcomeDto, IpcError>(__TAURI_INVOKE("install_php", { major })),
+	/**
+	 *  The major currently installing, if any — for the quit dialog: a build in
+	 *  progress is invisible to `pending_service_ids` (it is not a supervised
+	 *  service), so without this the confirmation would silently discard it.
+	 */
+	pendingPhpInstall: () => typedError<string | null, IpcError>(__TAURI_INVOKE("pending_php_install")),
 };
 
 /** Events */

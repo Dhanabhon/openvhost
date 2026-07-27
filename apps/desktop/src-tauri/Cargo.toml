@@ -54,6 +54,12 @@ tauri-specta = { version = "2.0.0-rc.25", features = ["derive", "typescript"] }
 # The `test` feature must be absent from that graph.
 tauri = { version = "2", features = ["test"] }
 tempfile = "3"
+# `test`-only, unix-gated: the C1 regression test in `quit.rs` polls a real
+# spawned child with `kill(pid, 0)`/`SIGKILL` the same way
+# `openvhost-proc`'s own `tests/task_group.rs` does, to prove
+# `abort_pending_install` genuinely drops the run's future rather than
+# merely returning `true`.
+libc = "0.2"
 
 [lints]
 workspace = true
