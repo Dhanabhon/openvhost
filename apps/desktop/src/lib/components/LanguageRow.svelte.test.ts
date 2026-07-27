@@ -167,6 +167,27 @@ describe('LanguageRow', () => {
 		expect(body).toContain('Error: dependency foo failed to build');
 	});
 
+	// The recommended row was the only one with a badge, so it was the only one
+	// whose label had to share a fixed track — and "PHP 8.5" broke across two
+	// lines while every other row looked correct. SSR cannot measure layout, so
+	// these pin the two structural properties that make the wrap impossible.
+	it('gives the version label its own element so it can refuse to wrap', () => {
+		// As a bare text node the label was the only flexible thing in the cell,
+		// so the badge's width came straight out of it.
+		const body = renderRow({ row: r('8.5', false, { recommended: true }) });
+		expect(body).toMatch(/<span[^>]*class="[^"]*\bversion\b[^"]*"[^>]*>\s*PHP 8\.5/);
+	});
+
+	it('renders the badge beside the label rather than inside it', () => {
+		const body = renderRow({ row: r('8.5', false, { recommended: true }) });
+		const label = body.indexOf('PHP 8.5');
+		const badge = body.indexOf('Recommended');
+		expect(label).toBeGreaterThan(-1);
+		expect(badge).toBeGreaterThan(label);
+		// Nothing may reopen the label's span between the two.
+		expect(body.slice(label, badge)).not.toMatch(/<span[^>]*class="[^"]*version/);
+	});
+
 	it('renders nothing extra when there is no outcome at all', () => {
 		const body = renderRow({ row: r('8.4', false) });
 		expect(body).not.toMatch(/exited with code/i);
