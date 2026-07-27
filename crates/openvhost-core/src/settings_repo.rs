@@ -253,11 +253,30 @@ mod tests {
         assert_eq!(repo.get().await.unwrap().keepalive_timeout.get(), 30);
     }
 
+    /// Asserts `result` failed with `CoreError::Validation` naming exactly
+    /// `expected_field`, panicking with the actual value otherwise. Shared by
+    /// the corrupt-row tests below so a failure reports both which field was
+    /// expected and what actually came back, instead of a bare `is_err()`
+    /// that cannot tell "rejected the right field" from "errored for some
+    /// unrelated reason".
+    fn assert_names_field<T: std::fmt::Debug>(result: Result<T, CoreError>, expected_field: &str) {
+        match result {
+            Err(CoreError::Validation { field, .. }) => {
+                assert_eq!(field, expected_field, "wrong field named in error");
+            }
+            other => {
+                panic!("expected CoreError::Validation naming {expected_field:?}, got {other:?}")
+            }
+        }
+    }
+
     #[tokio::test]
-    async fn a_hand_edited_row_that_breaks_a_bound_is_rejected_on_read() {
+    async fn a_corrupt_gzip_comp_level_is_rejected_on_read_and_names_its_field() {
         // state.db is a file on the user's disk. The repo re-validates on read
         // for the same reason SiteRepository does: nothing unparsed may reach a
-        // template, whatever wrote the row.
+        // template, whatever wrote the row. `99` breaks `GzipLevel`'s `1..=9`
+        // bound while still fitting a `u32`, so this exercises the newtype's
+        // own check, not `to_u32` (see the dedicated downcast test below).
         let db = Db::open_in_memory().await.unwrap();
         let repo = SqliteWebServerSettings::new(&db);
         repo.save(&WebServerSettings::default()).await.unwrap();
@@ -265,7 +284,123 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap();
-        assert!(repo.get().await.is_err());
+        assert_names_field(repo.get().await, "gzip_comp_level");
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_worker_connections_is_rejected_on_read_and_names_its_field() {
+        // `99999` breaks `WorkerConnections`' `1..=65535` bound while still
+        // fitting a `u32`, so this is the newtype's own check, not `to_u32`.
+        let db = Db::open_in_memory().await.unwrap();
+        let repo = SqliteWebServerSettings::new(&db);
+        repo.save(&WebServerSettings::default()).await.unwrap();
+        sqlx::query("UPDATE web_server_settings SET worker_connections = 99999 WHERE id = 1")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_names_field(repo.get().await, "worker_connections");
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_gzip_types_is_rejected_on_read_and_names_its_field() {
+        // `not_mime` has no `/`, so `is_mime_shaped` rejects it outright —
+        // this bypasses the repository entirely via raw SQL, the same way
+        // the `client_max_body_size` test above does.
+        let db = Db::open_in_memory().await.unwrap();
+        let repo = SqliteWebServerSettings::new(&db);
+        repo.save(&WebServerSettings::default()).await.unwrap();
+        sqlx::query("UPDATE web_server_settings SET gzip_types = 'not_mime' WHERE id = 1")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_names_field(repo.get().await, "gzip_types");
+    }
+
+    /// `Seconds::parse` takes only the out-of-range value (see its signature
+    /// in `openvhost_conf::settings::value`), so `ConfError::InvalidField`
+    /// always reports `field: "seconds"` regardless of which of the four
+    /// `Seconds`-typed columns produced it — a limitation of the current API,
+    /// not of this test. **Task 5 of the current plan is to have every
+    /// `Seconds` call site pass its own field name through**, so a future
+    /// version of this test can assert per-column names the way
+    /// `worker_connections`/`gzip_comp_level`/`gzip_types`/
+    /// `client_max_body_size` do above. Until then, this is one test over all
+    /// four columns (not four tests pretending to be independent) that
+    /// proves each column is still independently re-validated: a dropped
+    /// `Seconds::parse` call on any one of them fails only that iteration,
+    /// naming the column in the panic message, even though the error itself
+    /// cannot distinguish them yet.
+    #[tokio::test]
+    async fn a_corrupt_seconds_field_is_rejected_on_read_for_every_seconds_column() {
+        let seconds_columns = [
+            "keepalive_timeout",
+            "fastcgi_connect_timeout",
+            "fastcgi_send_timeout",
+            "fastcgi_read_timeout",
+        ];
+        for column in seconds_columns {
+            let db = Db::open_in_memory().await.unwrap();
+            let repo = SqliteWebServerSettings::new(&db);
+            repo.save(&WebServerSettings::default()).await.unwrap();
+            // `99999` breaks `Seconds`' `1..=86400` bound while still fitting
+            // a `u32`. `column` comes from the fixed list above, never from
+            // untrusted input, so asserting it's SQL-safe here is honest —
+            // unlike every value column in this module, which stays
+            // parameter-bound.
+            let sql = format!("UPDATE web_server_settings SET {column} = 99999 WHERE id = 1");
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .execute(db.pool())
+                .await
+                .unwrap();
+
+            match repo.get().await {
+                Err(CoreError::Validation { field, .. }) => {
+                    assert_eq!(
+                        field, "seconds",
+                        "{column}: Seconds::parse always names its field \"seconds\" today"
+                    );
+                }
+                other => panic!("{column}: expected CoreError::Validation, got {other:?}"),
+            }
+        }
+    }
+
+    /// `to_u32` exists specifically to catch an `i64` that cannot become a
+    /// `u32` — negative, or past `u32::MAX` — before it ever reaches a
+    /// newtype's own bound check (see `to_u32`'s doc comment). A value that
+    /// merely breaks `WorkerConnections`' `1..=65535` bound (like the
+    /// `99999` used above) proves the newtype's own check runs, but says
+    /// nothing about `to_u32`: `u32::try_from(99999)` succeeds. `-1` and a
+    /// value past `u32::MAX` force the downcast itself to fail, and the two
+    /// failure modes are told apart by the error's `reason` text — `to_u32`
+    /// always says "does not fit in a u32", never "must be between ..." —
+    /// so a `-1` that got rejected by `WorkerConnections`' bound instead of
+    /// by `to_u32` would fail this assertion rather than passing for the
+    /// wrong reason.
+    #[tokio::test]
+    async fn a_negative_or_oversized_worker_connections_is_rejected_by_the_u32_downcast() {
+        for corrupt_value in [-1_i64, i64::from(u32::MAX) + 1] {
+            let db = Db::open_in_memory().await.unwrap();
+            let repo = SqliteWebServerSettings::new(&db);
+            repo.save(&WebServerSettings::default()).await.unwrap();
+            sqlx::query("UPDATE web_server_settings SET worker_connections = ? WHERE id = 1")
+                .bind(corrupt_value)
+                .execute(db.pool())
+                .await
+                .unwrap();
+
+            match repo.get().await {
+                Err(CoreError::Validation { field, reason }) => {
+                    assert_eq!(field, "worker_connections");
+                    assert!(
+                        reason.contains("does not fit in a u32"),
+                        "{corrupt_value}: expected the to_u32 downcast's reason, got {reason:?} \
+                         — a bound-check failure here would mean to_u32 was bypassed"
+                    );
+                }
+                other => panic!("{corrupt_value}: expected CoreError::Validation, got {other:?}"),
+            }
+        }
     }
 
     /// Every field, not just one, must survive a round trip — the brief's
