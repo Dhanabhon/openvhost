@@ -43,6 +43,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::services_memory,
             commands::home_disk_usage,
             commands::open_site,
+            commands::open_homebrew_site,
             commands::plan_site_apply,
             commands::apply_sites,
             commands::php_environment,

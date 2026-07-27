@@ -18,7 +18,8 @@
 		brewFound,
 		anyInstalled,
 		brewSearched = [],
-		onRescan
+		onRescan,
+		onOpenBrewSite
 	}: {
 		brewFound: boolean;
 		anyInstalled: boolean;
@@ -33,6 +34,13 @@
 		/** Wired to `LanguagesStore.rescan()` by the caller — this component
 		 *  has no IPC import of its own, so it stays testable with a plain fake. */
 		onRescan: () => void;
+		/** Wired to `ipc.openHomebrewSite()` by the caller, same reasoning as
+		 *  `onRescan`. A plain `<a target="_blank">` is inert in this webview:
+		 *  Tauri only handles a new-window request when the app registers
+		 *  `on_new_window`, which it does not, so WebKit is told not to create a
+		 *  window and the click would silently do nothing. This has to be a real
+		 *  control wired to a Rust-side opener command instead. */
+		onOpenBrewSite: () => void;
 	} = $props();
 
 	/**
@@ -74,7 +82,14 @@
 		<p>Install it from a terminal, then come back and check again:</p>
 		<pre class="cmd"><code>{BREW_INSTALL_CMD}</code></pre>
 		<p class="hint">
-			<a href="https://brew.sh" target="_blank" rel="noopener noreferrer">brew.sh</a> has the full instructions.
+			<button
+				type="button"
+				class="link-button"
+				data-testid="open-brew-site"
+				onclick={onOpenBrewSite}
+			>
+				brew.sh
+			</button> has the full instructions.
 		</p>
 		<Button size="sm" testId="languages-check-again" onclick={onRescan}>Check again</Button>
 	</div>
@@ -146,8 +161,19 @@
 	.hint {
 		font-size: var(--vh-text-table);
 	}
-	.hint a {
+	/* Looks and reads like the inline link it replaces (Task 7 review finding):
+	   a plain `<a target="_blank">` is inert in this webview, so this is a real
+	   `<button>` wired to `onOpenBrewSite`, styled to match `.hint a` exactly. */
+	.link-button {
+		display: inline;
+		margin: 0;
+		padding: 0;
+		border: none;
+		background: none;
+		font: inherit;
 		color: var(--vh-link);
+		text-decoration: underline;
+		cursor: pointer;
 	}
 	/* `.empty` centres text, and `.btn` is inline-flex, so plain `text-align:
 	   center` on the parent already centres it — only the top gap is needed. */

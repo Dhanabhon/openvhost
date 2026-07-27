@@ -1,7 +1,13 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { installPhp, onPhpInstallLog, phpEnvironment, rescanPhpRuntimes } from '$lib/ipc';
+	import {
+		installPhp,
+		onPhpInstallLog,
+		openHomebrewSite,
+		phpEnvironment,
+		rescanPhpRuntimes
+	} from '$lib/ipc';
 	import { LanguagesStore } from '$lib/languages.svelte';
 	import { servicesStore } from '$lib/services.shared.svelte';
 	import { runningCount } from '$lib/services.derive';
@@ -106,6 +112,7 @@
 				anyInstalled={store.anyInstalled}
 				brewSearched={store.env.brewSearched}
 				onRescan={() => void store.rescan()}
+				onOpenBrewSite={() => void openHomebrewSite().catch((e) => store.fail(e))}
 			/>
 			{#if store.brewFound || store.anyInstalled}
 				<div class="rowlist">

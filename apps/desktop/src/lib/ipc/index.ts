@@ -156,6 +156,18 @@ export async function openSite(id: string): Promise<void> {
 }
 
 /**
+ * Open Homebrew's install page in the user's browser. Zero parameters, and the URL
+ * is a Rust literal (`commands::open_homebrew_site`) — the webview never supplies one.
+ *
+ * This exists because a plain `<a target="_blank">` is inert in this webview: Tauri
+ * only handles a new-window request when the app registers `on_new_window`, which it
+ * does not, so the click would otherwise silently do nothing.
+ */
+export async function openHomebrewSite(): Promise<void> {
+	await unwrap(commands.openHomebrewSite());
+}
+
+/**
  * What Apply would change against the current sites. Read-only and
  * process-free — safe to call after every site mutation for a pending-changes
  * banner.

@@ -438,6 +438,32 @@ pub async fn open_site(
         })
 }
 
+/// Open Homebrew's install page in the user's browser.
+///
+/// Zero parameters, and the URL is a Rust literal: the webview cannot choose
+/// where this goes. Same reasoning as `open_site` above — granting the
+/// renderer a general "open any URL" primitive is the thing being avoided,
+/// not the act of opening a URL. No capability grant is added to
+/// `capabilities/default.json` for the same reason `open_site` needs none:
+/// this calls the plugin's Rust API, not its JS path, so the ACL (which
+/// gates the JS-to-plugin path) has nothing to do with it.
+///
+/// This exists because a plain `<a target="_blank">` is inert in this
+/// webview: Tauri only handles a new-window request when the app registers
+/// `.on_new_window(...)` on the webview builder, which this app does not, so
+/// WebKit's `WKUIDelegate` is told not to create a window and the click
+/// silently does nothing — no tab, no error, no console warning.
+#[tauri::command]
+#[specta::specta]
+pub async fn open_homebrew_site(app: tauri::AppHandle) -> Result<(), IpcError> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url("https://brew.sh", None::<&str>)
+        .map_err(|e| IpcError::Core {
+            message: e.to_string(),
+        })
+}
+
 /// `http://<domain>:<LISTEN_PORT>`. Extracted so the one thing worth pinning —
 /// that the scheme is fixed and prepended, never taken from the stored value —
 /// is testable without a live `AppHandle` and a real database.

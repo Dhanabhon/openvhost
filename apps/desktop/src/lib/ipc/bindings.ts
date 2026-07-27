@@ -79,6 +79,24 @@ export const commands = {
 	 */
 	openSite: (id: string) => typedError<null, IpcError>(__TAURI_INVOKE("open_site", { id })),
 	/**
+	 *  Open Homebrew's install page in the user's browser.
+	 * 
+	 *  Zero parameters, and the URL is a Rust literal: the webview cannot choose
+	 *  where this goes. Same reasoning as `open_site` above — granting the
+	 *  renderer a general "open any URL" primitive is the thing being avoided,
+	 *  not the act of opening a URL. No capability grant is added to
+	 *  `capabilities/default.json` for the same reason `open_site` needs none:
+	 *  this calls the plugin's Rust API, not its JS path, so the ACL (which
+	 *  gates the JS-to-plugin path) has nothing to do with it.
+	 * 
+	 *  This exists because a plain `<a target="_blank">` is inert in this
+	 *  webview: Tauri only handles a new-window request when the app registers
+	 *  `.on_new_window(...)` on the webview builder, which this app does not, so
+	 *  WebKit's `WKUIDelegate` is told not to create a window and the click
+	 *  silently does nothing — no tab, no error, no console warning.
+	 */
+	openHomebrewSite: () => typedError<null, IpcError>(__TAURI_INVOKE("open_homebrew_site")),
+	/**
 	 *  What Apply would change. Read-only and process-free — the pending-changes
 	 *  banner calls this after every site mutation.
 	 */
