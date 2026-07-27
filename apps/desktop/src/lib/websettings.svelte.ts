@@ -12,6 +12,7 @@ import {
 	NOT_A_NUMBER,
 	type BoolKey,
 	type NumberKey,
+	type SettingKey,
 	type TextKey
 } from './websettings.derive';
 
@@ -51,6 +52,25 @@ function errorMessage(e: unknown): string {
 const REREAD_FAILED =
 	'Saved, but the stored values could not be read back — what you see below may not be exactly what was stored. Reopen this page to check.';
 
+/**
+ * One field of `base` replaced by `local`'s value for the same field.
+ *
+ * Generic over the key, and written as copy-then-assign rather than
+ * `{ ...base, [key]: local[key] }`, because a COMPUTED key of a union type
+ * loses the correlation between the key and its value type — `gzipTypes` and
+ * `gzip` would both widen to `string | number | boolean` and the result would
+ * no longer be a `WebServerSettingsDto`. Same technique as `patch` below.
+ */
+function withField<K extends SettingKey>(
+	base: WebServerSettingsDto,
+	local: WebServerSettingsDto,
+	key: K
+): WebServerSettingsDto {
+	const next = { ...base };
+	next[key] = local[key];
+	return next;
+}
+
 export class WebSettingsStore {
 	/** The form's live values. `null` until the first read settles, and left
 	 * `null` when that read fails, so the form never renders the defaults as if
@@ -69,6 +89,23 @@ export class WebSettingsStore {
 	 * while one is outstanding, and so clearing the server's errors at the start
 	 * of a save does not clear these too. */
 	private localErrors = $state<Record<string, string>>({});
+	/**
+	 * Fields the user changed AFTER the in-flight save took its payload — empty
+	 * whenever no save is in flight.
+	 *
+	 * The Save button is disabled while saving, but the inputs are not (and
+	 * disabling them would rip focus out of the box being typed in), so this
+	 * window is reachable by anyone who keeps editing after clicking Save. The
+	 * follow-up re-read must not carry the stored row over the top of those
+	 * keystrokes: see {@link merge}.
+	 *
+	 * A plain field rather than `$state`: nothing renders off it — what the user
+	 * sees is `values` and `dirty`. An array rather than a `Set` because there
+	 * are ten settings in total, and a `Set` here would have to be `SvelteSet`
+	 * (`svelte/prefer-svelte-reactivity`) — reactive machinery for a list
+	 * nothing subscribes to.
+	 */
+	private pendingEdits: readonly SettingKey[] = [];
 
 	constructor(private api: WebSettingsApi) {}
 
@@ -111,7 +148,10 @@ export class WebSettingsStore {
 		}
 	}
 
-	/** One field, replaced immutably — `this.values` is never mutated in place. */
+	/** One field, replaced immutably — `this.values` is never mutated in place.
+	 *
+	 * An edit made while a save is in flight is also RECORDED, because the
+	 * re-read that save is about to perform would otherwise overwrite it. */
 	private patch<K extends keyof WebServerSettingsDto>(
 		key: K,
 		value: WebServerSettingsDto[K]
@@ -120,6 +160,9 @@ export class WebSettingsStore {
 		const next = { ...this.values };
 		next[key] = value;
 		this.values = next;
+		if (this.saving && !this.pendingEdits.includes(key)) {
+			this.pendingEdits = [...this.pendingEdits, key];
+		}
 	}
 
 	private markLocal(field: string, message: string): void {
@@ -177,12 +220,20 @@ export class WebSettingsStore {
 	 * anything: no `nginx -t` runs here (see `save_web_server_settings`'s own
 	 * doc comment). That check happens inside Apply, which rolls back if it
 	 * fails.
+	 *
+	 * `payload` is a SNAPSHOT: what is sent is what the form held when Save was
+	 * pressed. Anything typed after that is not part of this save, is kept on
+	 * the form by {@link merge}, and leaves the form dirty — which is exactly
+	 * what it is.
 	 */
 	async save(): Promise<boolean> {
 		if (!this.canSave) return false;
 		const payload = this.values;
 		if (payload === null) return false;
 		this.saving = true;
+		// The in-flight window opens here and closes in the `finally` below;
+		// `pendingEdits` is its log of edits this save will not be carrying.
+		this.pendingEdits = [];
 		this.error = '';
 		this.serverErrors = {};
 		try {
@@ -199,21 +250,58 @@ export class WebSettingsStore {
 			return false;
 		} finally {
 			// `finally`, so an early return in the catch cannot leave Save
-			// disabled for the rest of the session.
+			// disabled for the rest of the session. The window's edit log goes
+			// down with the flag that opened it — after this point there is no
+			// re-read left to defend against, and a leftover set would make the
+			// NEXT save ignore the stored answer for those fields.
 			this.saving = false;
+			this.pendingEdits = [];
 		}
 		return true;
 	}
 
 	/** Refresh from storage after a save. Failure is reported but not thrown:
-	 * the save itself already succeeded, and the diff is still worth showing. */
+	 * the save itself already succeeded, and the diff is still worth showing.
+	 *
+	 * Note the order: `saved` takes the stored row unconditionally — it is the
+	 * baseline the dirty flag measures against, and storage is the authority on
+	 * what is stored. Only `values`, which is the user's form, is merged. */
 	private async reread(): Promise<void> {
 		try {
 			const stored = await this.api.webServerSettings();
-			this.values = { ...stored };
 			this.saved = { ...stored };
+			this.values = this.merge(stored);
 		} catch {
 			this.error = REREAD_FAILED;
 		}
+	}
+
+	/**
+	 * The stored row, with every field the user re-edited mid-save left exactly
+	 * as they typed it.
+	 *
+	 * The conflict rule, stated once: **for a field in `pendingEdits`, the local
+	 * edit wins the form and the stored value wins `saved`** — so the two
+	 * disagreeing is not resolved by picking a winner and forgetting, it is
+	 * resolved by rendering the newer of the two (the user's keystrokes, which
+	 * they can still see and correct) and reporting the form as dirty, with Save
+	 * live. Nothing the user typed disappears, and nothing claims to be stored
+	 * that is not.
+	 *
+	 * Every OTHER field still adopts the stored value, which is the entire point
+	 * of the re-read: `gzip_types` is normalised as it is parsed (lowercased,
+	 * re-joined on single spaces), so without it the form would stay dirty
+	 * forever on a value that is already stored. The merge is per-field
+	 * precisely so a stray keystroke in one box does not cost the whole form
+	 * that correction.
+	 */
+	private merge(stored: WebServerSettingsDto): WebServerSettingsDto {
+		const local = this.values;
+		if (local === null) return { ...stored };
+		let merged: WebServerSettingsDto = { ...stored };
+		for (const key of this.pendingEdits) {
+			merged = withField(merged, local, key);
+		}
+		return merged;
 	}
 }

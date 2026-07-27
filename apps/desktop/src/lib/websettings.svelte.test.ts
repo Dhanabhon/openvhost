@@ -325,3 +325,192 @@ describe('saving', () => {
 		expect(s.canSave).toBe(true);
 	});
 });
+
+/**
+ * Typing DURING a save — the window between pressing Save and the diff opening.
+ *
+ * The Save button is disabled while a save is in flight, but the inputs are not,
+ * so this window is reachable by anyone who keeps editing after clicking Save.
+ * It is a real window too: the save is one IPC round trip, the re-read is a
+ * second, and the plan that follows regenerates the whole config set.
+ *
+ * The rule these tests pin: a field the user touched during the window keeps
+ * what they typed and leaves the form DIRTY; every other field still adopts the
+ * stored (normalised) value.
+ */
+describe('editing while a save is in flight', () => {
+	/** A promise the test resolves by hand, so a round trip can be held open
+	 *  while the test types into the form. */
+	function gate(): { held: Promise<void>; release: () => void } {
+		let release = (): void => {};
+		const held = new Promise<void>((resolve) => {
+			release = () => resolve();
+		});
+		return { held, release };
+	}
+
+	/** What `GzipTypes::parse` does to the value on the way in — the reason the
+	 *  re-read exists at all. */
+	function normalise(types: string): string {
+		return types.trim().toLowerCase().split(/\s+/).filter(Boolean).join(' ');
+	}
+
+	/**
+	 * A backend that actually KEEPS what it is given (normalising `gzip_types`
+	 * as the Rust parser does) and holds the save open until the test releases
+	 * it. A mock that discards the write would let a broken merge look right:
+	 * the re-read would return the original row either way.
+	 */
+	function server(): {
+		api: WebSettingsApi;
+		saveGate: ReturnType<typeof gate>;
+		stored: () => WebServerSettingsDto;
+	} {
+		let stored = dto();
+		const saveGate = gate();
+		return {
+			api: {
+				webServerSettings: async () => ({ ...stored }),
+				saveWebServerSettings: async (input) => {
+					await saveGate.held;
+					stored = { ...input, gzipTypes: normalise(input.gzipTypes) };
+				},
+				planConfigApply: async () => emptyPlan
+			},
+			saveGate,
+			stored: () => stored
+		};
+	}
+
+	it('does not lose an edit typed while the save was in flight', async () => {
+		// The reviewer's scenario, exactly: edit A, press Save, edit B before the
+		// round trip lands. Before the merge the re-read replaced `values`
+		// wholesale, B snapped back to the stored 65, `dirty` read false, and the
+		// form presented itself as saved and clean with no error at all.
+		const { api: fake, saveGate } = server();
+		const s = new WebSettingsStore(fake);
+		await s.load();
+
+		s.setNumber('fastcgiReadTimeout', '900');
+		const inFlight = s.save();
+		expect(s.saving).toBe(true);
+		s.setNumber('keepaliveTimeout', '30');
+
+		saveGate.release();
+		expect(await inFlight).toBe(true);
+
+		expect(s.values?.keepaliveTimeout).toBe(30);
+		// And the form says so, rather than claiming to be saved: 30 is on screen
+		// but 65 is what is stored.
+		expect(s.dirty).toBe(true);
+		expect(s.canSave).toBe(true);
+	});
+
+	it('still stores what was on the form when Save was pressed', async () => {
+		// The other half of the same rule: the mid-flight edit is NOT smuggled
+		// into a save the user never asked for.
+		const { api: fake, saveGate, stored } = server();
+		const s = new WebSettingsStore(fake);
+		await s.load();
+
+		s.setNumber('fastcgiReadTimeout', '900');
+		const inFlight = s.save();
+		s.setNumber('keepaliveTimeout', '30');
+		saveGate.release();
+		await inFlight;
+
+		expect(stored().fastcgiReadTimeout).toBe(900);
+		expect(stored().keepaliveTimeout).toBe(65);
+	});
+
+	it('keeps the local edit and reports the form dirty when the stored answer disagrees', async () => {
+		// The conflict case, on the one field the backend rewrites. The user's
+		// keystrokes win the FORM (they are newer, and they are still on screen to
+		// correct), storage wins the baseline — so the disagreement surfaces as
+		// "unsaved changes" instead of one side being silently dropped.
+		const { api: fake, saveGate } = server();
+		const s = new WebSettingsStore(fake);
+		await s.load();
+
+		s.setText('gzipTypes', 'TEXT/HTML  TEXT/CSS');
+		const inFlight = s.save();
+		s.setText('gzipTypes', 'TEXT/HTML TEXT/CSS APPLICATION/JSON');
+		saveGate.release();
+		await inFlight;
+
+		expect(s.values?.gzipTypes).toBe('TEXT/HTML TEXT/CSS APPLICATION/JSON');
+		expect(s.dirty).toBe(true);
+		// Not an error: nothing failed, and a red banner here would send the user
+		// looking for a problem that does not exist.
+		expect(s.error).toBe('');
+	});
+
+	it('still adopts the normalised value for fields the user did NOT touch', async () => {
+		// Guards the over-broad fix — "a pending edit anywhere, so skip the
+		// re-read" — which would leave the form permanently dirty on a gzip_types
+		// value that is already stored, exactly what the re-read exists to avoid.
+		const { api: fake, saveGate } = server();
+		const s = new WebSettingsStore(fake);
+		await s.load();
+
+		s.setText('gzipTypes', '  TEXT/HTML   TEXT/CSS  ');
+		const inFlight = s.save();
+		s.setNumber('keepaliveTimeout', '30');
+		saveGate.release();
+		await inFlight;
+
+		expect(s.values?.gzipTypes).toBe('text/html text/css');
+		expect(s.values?.keepaliveTimeout).toBe(30);
+	});
+
+	it('holds for the whole window, including the plan that follows the re-read', async () => {
+		// The window does not end when the write lands: `planConfigApply`
+		// regenerates the config set, and the form is live for all of it.
+		const { api: fake, saveGate } = server();
+		const planHeld = gate();
+		const planStarted = gate();
+		const s = new WebSettingsStore({
+			...fake,
+			planConfigApply: async () => {
+				planStarted.release();
+				await planHeld.held;
+				return emptyPlan;
+			}
+		});
+		await s.load();
+
+		s.setNumber('fastcgiReadTimeout', '900');
+		const inFlight = s.save();
+		saveGate.release();
+		// The save and the re-read have both settled by the time the plan starts;
+		// this types into a form that still looks live to the user.
+		await planStarted.held;
+		s.setNumber('workerConnections', '2048');
+		planHeld.release();
+		await inFlight;
+
+		expect(s.values?.workerConnections).toBe(2048);
+		expect(s.dirty).toBe(true);
+	});
+
+	it('re-reads normally on the next save, once the window has closed', async () => {
+		// A pending-edit log that outlived its window would make the FOLLOWING
+		// save ignore the stored answer for those fields — the re-read's bug in
+		// mirror image.
+		const { api: fake, saveGate } = server();
+		const s = new WebSettingsStore(fake);
+		await s.load();
+
+		const inFlight = s.save();
+		s.setText('gzipTypes', 'TEXT/HTML');
+		saveGate.release();
+		await inFlight;
+		expect(s.values?.gzipTypes).toBe('TEXT/HTML');
+
+		// Second save: nothing is typed during it, so the normalised value must
+		// come back and the form must go clean.
+		expect(await s.save()).toBe(true);
+		expect(s.values?.gzipTypes).toBe('text/html');
+		expect(s.dirty).toBe(false);
+	});
+});
