@@ -1,21 +1,15 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import {
-		installPhp,
-		onPhpInstallLog,
-		openHomebrewSite,
-		phpEnvironment,
-		rescanPhpRuntimes
-	} from '$lib/ipc';
-	import { LanguagesStore } from '$lib/languages.svelte';
+	import { onPhpInstallLog, openHomebrewSite } from '$lib/ipc';
+	import { languagesStore as store } from '$lib/languages.shared.svelte';
 	import { servicesStore } from '$lib/services.shared.svelte';
 	import { runningCount } from '$lib/services.derive';
 	import AppShell from '$lib/components/AppShell.svelte';
+	import Button from '$lib/components/Button.svelte';
 	import LanguageRow from '$lib/components/LanguageRow.svelte';
 	import LanguagesEmpty from '$lib/components/LanguagesEmpty.svelte';
 
-	const store = new LanguagesStore({ phpEnvironment, rescanPhpRuntimes, installPhp });
 	const running = $derived(runningCount(servicesStore.services));
 
 	/**
@@ -114,6 +108,25 @@
 				onRescan={() => void store.rescan()}
 				onOpenBrewSite={() => void openHomebrewSite().catch((e) => store.fail(e))}
 			/>
+			{#if store.brewFound}
+				<!-- C2 fix: `LanguagesEmpty` only renders its OWN "Check again" button
+				     in the `!brewFound` branch, so once brew is found the rescan
+				     became unreachable from the UI — yet that is exactly what a user
+				     needs after running `brew install php@8.2` in a terminal:
+				     discovering a version this page did not have at launch, without
+				     a relaunch. Shown for every `brewFound` state (both "brew, no PHP
+				     yet" and "brew, already installed") so it never sits next to
+				     `LanguagesEmpty`'s own no-brew copy of the same control. -->
+				<div class="check-again">
+					<Button
+						size="sm"
+						testId="languages-check-again-header"
+						onclick={() => void store.rescan()}
+					>
+						Check again
+					</Button>
+				</div>
+			{/if}
 			{#if store.brewFound || store.anyInstalled}
 				<div class="rowlist">
 					{#each store.env.runtimes as runtime (runtime.major)}
@@ -166,5 +179,11 @@
 	}
 	.empty p {
 		margin: 4px 0 0;
+	}
+	.check-again {
+		display: flex;
+		justify-content: flex-end;
+		padding: var(--vh-space-3) var(--vh-space-4);
+		border-bottom: 1px solid var(--vh-border);
 	}
 </style>
