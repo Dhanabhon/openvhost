@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Validated newtypes for the nginx settings the Web server page edits. Every
-//! value here ends up inside a generated config file, so each one is private
-//! behind a `parse` that is the *only* public constructor — the same
+//! value here ends up inside a generated config file, so each one is `pub`
+//! behind a `parse` that is the *only public* constructor — the same
 //! parse-don't-validate shape as `openvhost_core::site::model` (see that
 //! module's docs for the rationale).
 //!
@@ -12,8 +12,23 @@
 //! whitespace and validates each token as a MIME type shape, one at a time,
 //! so a single hostile token is rejected by name rather than the whole field
 //! being trusted as an opaque string.
+//!
+//! There is exactly one way to build a value here without going through
+//! `parse`: [`unchecked_defaults`], which builds a whole
+//! [`super::WebServerSettings`] from literals in one place, for
+//! `Default::default` alone. It is `pub(super)` — visible only to the
+//! `settings` module that declares `mod value;` — not `pub(crate)`. A
+//! sibling module elsewhere in this crate (such as the template renderer in
+//! `crate::webserver`) has no path to it and cannot construct an
+//! out-of-range value.
 
 use crate::error::ConfError;
+
+/// Development-appropriate default `gzip_types` list — a handful of common
+/// compressible text formats, not nginx's own (empty) default. See
+/// [`unchecked_defaults`] and [`super::WebServerSettings::default`] for why a
+/// development-appropriate default is safe to choose here.
+const DEFAULT_GZIP_TYPES: &str = "text/plain text/css application/json application/javascript application/xml image/svg+xml font/woff2";
 
 /// Longest a single `gzip_types` token may be, in bytes. Real MIME types
 /// (`application/vnd.openxmlformats-officedocument.wordprocessingml.document`
@@ -58,12 +73,6 @@ impl WorkerConnections {
     pub fn get(&self) -> u32 {
         self.0
     }
-    /// `Default`-only escape hatch: `Default` cannot fail, so it cannot go
-    /// through `parse`. `pub(crate)` so nothing outside this module can use
-    /// it to bypass `parse` — that is the actual validation boundary.
-    pub(crate) fn new_unchecked(v: u32) -> Self {
-        Self(v)
-    }
 }
 
 /// A duration in seconds used by nginx's `keepalive_timeout` and the
@@ -92,10 +101,6 @@ impl Seconds {
     pub fn get(&self) -> u32 {
         self.0
     }
-    /// `Default`-only escape hatch — see [`WorkerConnections::new_unchecked`].
-    pub(crate) fn new_unchecked(v: u32) -> Self {
-        Self(v)
-    }
 }
 
 /// Nginx `gzip_comp_level`: the zlib compression level, `1..=9` (nginx's own
@@ -119,10 +124,6 @@ impl GzipLevel {
     /// The validated compression level.
     pub fn get(&self) -> u32 {
         self.0
-    }
-    /// `Default`-only escape hatch — see [`WorkerConnections::new_unchecked`].
-    pub(crate) fn new_unchecked(v: u32) -> Self {
-        Self(v)
     }
 }
 
@@ -161,10 +162,6 @@ impl BodySize {
     /// The validated value as a `&str`, exactly as nginx expects it.
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-    /// `Default`-only escape hatch — see [`WorkerConnections::new_unchecked`].
-    pub(crate) fn new_unchecked(s: &str) -> Self {
-        Self(s.to_string())
     }
 }
 
@@ -237,12 +234,6 @@ impl GzipTypes {
     pub fn as_directive(&self) -> String {
         self.0.join(" ")
     }
-    /// `Default`-only escape hatch — see [`WorkerConnections::new_unchecked`].
-    /// Splits on whitespace the same way `parse` does, so `as_directive`
-    /// behaves identically whichever constructor built the value.
-    pub(crate) fn new_unchecked(s: &str) -> Self {
-        Self(s.split_whitespace().map(str::to_string).collect())
-    }
 }
 
 /// A boolean nginx directive value (`on` / `off`), e.g. `tcp_nodelay` and
@@ -263,6 +254,41 @@ impl OnOff {
     /// Whether this is `on`.
     pub fn is_on(&self) -> bool {
         self.0
+    }
+}
+
+/// The one bypass of `parse` in this crate. `Default` cannot fail, so
+/// [`super::WebServerSettings::default`] cannot go through `parse` for any
+/// of its fields — it calls this instead of performing one type-level
+/// bypass per field. Every constant below is a raw literal from spec §5,
+/// built directly (each newtype's inner field is private to this file, so
+/// only code in this module can construct one without going through
+/// `parse`); [`super::WebServerSettings::default`] is the only call site.
+///
+/// `pub(super)`: visible to `settings` — the module that defines
+/// `WebServerSettings` and needs this to implement `Default` — and to
+/// nothing else. That is the boundary the compiler actually enforces: a
+/// sibling module in this crate (`crate::webserver`, which is where the
+/// template renderer lives) cannot see this function, cannot call it, and
+/// has no way to build an out-of-range value. `every_default_would_survive_
+/// its_own_parser` is what keeps these constants honest.
+pub(super) fn unchecked_defaults() -> super::WebServerSettings {
+    super::WebServerSettings {
+        worker_connections: WorkerConnections(1024),
+        client_max_body_size: BodySize("256m".to_string()),
+        keepalive_timeout: Seconds(65),
+        tcp_nodelay: OnOff(true),
+        fastcgi_connect_timeout: Seconds(60),
+        fastcgi_send_timeout: Seconds(300),
+        fastcgi_read_timeout: Seconds(300),
+        gzip: OnOff(false),
+        gzip_comp_level: GzipLevel(1),
+        gzip_types: GzipTypes(
+            DEFAULT_GZIP_TYPES
+                .split_whitespace()
+                .map(str::to_string)
+                .collect(),
+        ),
     }
 }
 

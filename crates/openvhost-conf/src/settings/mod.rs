@@ -10,12 +10,6 @@ mod value;
 
 pub use value::{BodySize, GzipLevel, GzipTypes, OnOff, Seconds, WorkerConnections};
 
-/// Development-appropriate default `gzip_types` list — a handful of common
-/// compressible text formats, not nginx's own (empty) default. See
-/// [`WebServerSettings::default`] for why a development-appropriate default
-/// is safe to choose here.
-const DEFAULT_GZIP_TYPES: &str = "text/plain text/css application/json application/javascript application/xml image/svg+xml font/woff2";
-
 /// The nginx settings the Web server page can edit. Every field is a
 /// validated newtype from [`value`], so nothing unparsed can reach the
 /// generated config that Task 3 renders from this struct.
@@ -39,23 +33,15 @@ impl Default for WebServerSettings {
     /// before it lands — without that, nginx's values would be the only
     /// defensible defaults.
     ///
-    /// Built from `new_unchecked` rather than `parse`, because `Default`
-    /// cannot fail and threading a fallible constructor through it would hide
-    /// which value is real behind error handling that can never fire. Every
-    /// constant here is inside the bounds its own `parse` enforces, and
-    /// `every_default_would_survive_its_own_parser` is what keeps that true.
+    /// Built from [`value::unchecked_defaults`] rather than `parse`, because
+    /// `Default` cannot fail and threading a fallible constructor through it
+    /// would hide which value is real behind error handling that can never
+    /// fire. That function is the single, narrowly-scoped bypass of `parse`
+    /// in this crate — see its doc comment for why one function beats one
+    /// bypass per field. Every constant it uses is inside the bounds its own
+    /// `parse` enforces, and `every_default_would_survive_its_own_parser` is
+    /// what keeps that true.
     fn default() -> Self {
-        Self {
-            worker_connections: WorkerConnections::new_unchecked(1024),
-            client_max_body_size: BodySize::new_unchecked("256m"),
-            keepalive_timeout: Seconds::new_unchecked(65),
-            tcp_nodelay: OnOff::new(true),
-            fastcgi_connect_timeout: Seconds::new_unchecked(60),
-            fastcgi_send_timeout: Seconds::new_unchecked(300),
-            fastcgi_read_timeout: Seconds::new_unchecked(300),
-            gzip: OnOff::new(false),
-            gzip_comp_level: GzipLevel::new_unchecked(1),
-            gzip_types: GzipTypes::new_unchecked(DEFAULT_GZIP_TYPES),
-        }
+        value::unchecked_defaults()
     }
 }
