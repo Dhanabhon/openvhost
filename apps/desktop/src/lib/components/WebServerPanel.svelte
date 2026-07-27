@@ -39,8 +39,12 @@
 		<!-- `<h2>`, not `<h1>`: the route already renders the page's `<h1>` (sr-only), the way
 		     routes/services/+page.svelte does. -->
 		<h2>Web server</h2>
+		<!-- No longer "Read-only": the settings form below this panel edits how
+		     nginx behaves. This line now describes what the panel itself shows,
+		     and the form carries its own description of what saving does. -->
 		<p class="sub">
-			Read-only — the binary OpenVHost runs, the config it reads, and whether that config is valid.
+			The binary OpenVHost runs, the config it reads, whether that config is valid — and the
+			settings that shape it.
 		</p>
 	</div>
 </div>

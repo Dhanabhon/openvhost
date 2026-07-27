@@ -197,6 +197,23 @@ describe('the /web-server route', () => {
 		servicesStore.services = [svc('nginx', 'running'), svc('php-fpm', 'stopped')];
 		expect(titlebarCount(render(WebServerPage).body)).toBe('1');
 	});
+
+	// The page is a control now, not only an inspector. `onMount` does not run
+	// under SSR, so the form renders in its not-yet-loaded state — which is
+	// exactly what proves it is MOUNTED rather than waiting on a value that
+	// never arrives in this harness.
+	it('renders the settings form beneath the inspector', () => {
+		const { body } = render(WebServerPage);
+		expect(body).toContain('data-testid="web-server-settings"');
+		expect(body).toContain('data-testid="settings-unloaded"');
+	});
+
+	it('no longer calls itself read-only', () => {
+		const visible = render(WebServerPage)
+			.body.replace(/<[^>]*>/g, ' ')
+			.replace(/\s+/g, ' ');
+		expect(visible).not.toMatch(/read-only/i);
+	});
 });
 
 describe('the titlebar running count', () => {

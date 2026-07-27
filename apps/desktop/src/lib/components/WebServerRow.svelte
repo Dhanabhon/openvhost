@@ -187,16 +187,19 @@
 			{#if !report.ok}
 				<!-- Says the rewrite out loud. `site::apply` (openvhost-core's
 				     `site/apply/mod.rs`) regenerates `<home>/config/generated/nginx/nginx.conf`
-				     from the user's sites every time Apply runs — so a hand edit here holds only
+				     from the user's sites AND the stored web-server settings every time Apply
+				     runs — so a hand edit here holds only
 				     until the next Apply and then vanishes with no notice. This sentence is the
 				     only place the product tells anyone to edit that file, so it is the place
-				     that has to be honest about it, and it names the escape hatch
+				     that has to be honest about it. It no longer says "this page is read-only"
+				     either — the settings form below this panel edits how that file is
+				     generated, so the claim now belongs to this VIEW, not to the page. and it names the escape hatch
 				     (`config/custom/`) rather than leaving the reader with nowhere safe to put a
 				     customisation. -->
 				<p class="next">
-					Edit the file on disk, then validate again — this page is read-only. Apply regenerates
-					this file from your sites, so hand edits are lost on the next Apply. Add custom directives
-					under <code>config/custom/</code> instead.
+					Edit the file on disk, then validate again — this view shows it, it does not edit it.
+					Apply regenerates this file from your sites and the settings below, so hand edits are lost
+					on the next Apply. Add custom directives under <code>config/custom/</code> instead.
 				</p>
 			{/if}
 		</div>
