@@ -17,6 +17,13 @@ pub struct BrewStack {
 
 /// Probe the standard Homebrew prefixes (Apple Silicon, then Intel). NEVER
 /// resolves via PATH — a ServBay install shadows `nginx`/`php-fpm` there.
+///
+/// This duplicates the prefix list also kept in `openvhost-core::php::BREW_PREFIXES`
+/// (and its own `find_brew_binaries`/`find_brew`). It stays separate rather than
+/// becoming a shared definition on purpose: `openvhost-core` depends on
+/// `openvhost-conf`, not the reverse, and this crate's validator has no business
+/// knowing Homebrew's layout beyond what it needs to run `nginx -t` / `php-fpm -t`.
+/// Two definitions with a stated reason beat inverting the dependency graph.
 pub fn find_brew_binaries() -> Option<BrewStack> {
     for prefix in [Path::new("/opt/homebrew"), Path::new("/usr/local")] {
         let nginx = prefix.join("opt/nginx/bin/nginx");

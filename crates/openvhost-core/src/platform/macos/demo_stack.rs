@@ -23,7 +23,8 @@ pub struct BrewStack {
 
 /// Probe the standard Homebrew prefixes (Apple Silicon first, then Intel).
 pub fn find_brew_binaries() -> Option<BrewStack> {
-    find_brew_binaries_in(&[Path::new("/opt/homebrew"), Path::new("/usr/local")])
+    let prefixes: Vec<&Path> = crate::php::BREW_PREFIXES.iter().map(Path::new).collect();
+    find_brew_binaries_in(&prefixes)
 }
 
 /// Pure prober: first prefix holding BOTH binaries wins.
