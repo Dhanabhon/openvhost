@@ -83,7 +83,7 @@ Pure values, no IO, no database. This is where the injection boundary is, so it 
 **Interfaces:**
 - Consumes: `ConfError::InvalidField { field: &'static str, value: String, reason: &'static str }` — read `crates/openvhost-conf/src/error.rs` and match its real field types before writing.
 - Produces:
-  ```rust
+```rust
   pub struct WorkerConnections(u32);   // 1..=65535
   pub struct Seconds(u32);             // 1..=86400
   pub struct GzipLevel(u32);           // 1..=9
@@ -198,7 +198,7 @@ accepts."
 **Interfaces:**
 - Consumes: `openvhost_conf::WebServerSettings` and its newtypes (Task 1); `Db`, `now_ms` from `crate::db`; `CoreError`.
 - Produces:
-  ```rust
+```rust
   pub trait WebServerSettingsRepository: Send + Sync {
       /// The stored settings, or the defaults when no row exists. Does NOT write.
       fn get(&self) -> impl std::future::Future<Output = Result<WebServerSettings, CoreError>> + Send;
@@ -207,7 +207,7 @@ accepts."
   }
   pub struct SqliteWebServerSettings<'a>(&'a SqlitePool);
   impl<'a> SqliteWebServerSettings<'a> { pub fn new(db: &'a Db) -> Self; }
-  ```
+```
   Follow `crates/openvhost-core/src/site/repo.rs` for the trait shape — it uses RPITIT rather than `async_trait`, and re-validates rows through the newtypes on read so a hand-edited `state.db` cannot feed an unvalidated value downstream. Do the same here.
 
 - [ ] **Step 1: Write the migration**
@@ -574,7 +574,7 @@ git commit -s -m "feat(core): settings feed render_set, so the existing pipeline
 **Interfaces:**
 - Consumes: `WebServerSettingsRepository` (Task 2); the changed `ApplyInput` (Task 4).
 - Produces:
-  ```rust
+```rust
   /// `#[serde(rename_all = "camelCase")]` like every other DTO here, so the
   /// TypeScript side is `fastcgiReadTimeout`, `clientMaxBodySize` and so on —
   /// the names Task 6's tests use.
@@ -592,7 +592,7 @@ git commit -s -m "feat(core): settings feed render_set, so the existing pipeline
   }
   #[tauri::command] pub async fn web_server_settings(...) -> Result<WebServerSettingsDto, IpcError>;
   #[tauri::command] pub async fn save_web_server_settings(input: WebServerSettingsDto, ...) -> Result<(), IpcError>;
-  ```
+```
   Renames: `plan_site_apply` → `plan_config_apply`, `apply_sites` → `apply_config`. DTOs and behaviour unchanged.
   TS: `webServerSettings()`, `saveWebServerSettings(input)`, `planConfigApply()`, `applyConfig()`.
 
@@ -704,7 +704,7 @@ the next reader about what an apply includes."
 **Interfaces:**
 - Consumes: `webServerSettings()`, `saveWebServerSettings(dto)`, `planConfigApply()`, `applyConfig()`, `WebServerSettingsDto`.
 - Produces:
-  ```ts
+```ts
   export class WebSettingsStore {
       values: WebServerSettingsDto | null;
       fieldErrors: Record<string, string>;
@@ -714,7 +714,7 @@ the next reader about what an apply includes."
       load(): Promise<void>;
       save(): Promise<boolean>;   // saves, then plans; true when the diff is ready
   }
-  ```
+```
 
 - [ ] **Step 1: Write the failing store tests**
 
