@@ -109,9 +109,10 @@
 	/* Ported from docs/design/mock.css (.page-head, .page-head .sub, .page-head h1 — applied to
 	   the `<h2>` this panel renders instead, .panel, .rowlist, .empty, .empty .title), the same
 	   recipes SitesPanel.svelte and ServicesPanel.svelte already use, so a third page reads as
-	   part of the same product rather than a new dialect. `.page-head` has no action button
-	   here: this page is read-only, and this codebase does not render a control for something
-	   that isn't wired (see Rail.svelte's Logs/Settings placeholders). */
+	   part of the same product rather than a new dialect. `.page-head` still has no action
+	   button: the settings form below edits nginx's config and each row now carries its own
+	   Start/Stop, so there is nothing left for a page-head button to do that isn't already
+	   wired somewhere on the page. */
 	.page-head {
 		display: flex;
 		align-items: center;

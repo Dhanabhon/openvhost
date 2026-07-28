@@ -19,6 +19,8 @@
 	import { ApplyStore } from '$lib/apply.svelte';
 	import { runningCount } from '$lib/services.derive';
 	import { servicesStore } from '$lib/services.shared.svelte';
+	import { reloadAfterApply } from '$lib/webserver-apply';
+	import { loadSitesOrFail } from '$lib/webserver-sites';
 	import { statusFor, stoppedPoolsFor } from '$lib/webservers.derive';
 	import { webServersStore as store } from '$lib/webservers.svelte';
 	import { WebSettingsStore } from '$lib/websettings.svelte';
@@ -95,11 +97,34 @@
 		// state.db only — spawns nothing, so it is cheap enough to fire with the
 		// rest. A failure leaves `sites` empty, which suppresses the pool warning
 		// rather than blanking the page: a missing hint is a smaller harm than a
-		// page that will not render, and the row's own state is unaffected.
-		void listSites()
-			.then((s) => (sites = s))
-			.catch(() => {});
+		// page that will not render, and the row's own state is unaffected. But
+		// swallowing it silently made a real 502 undiagnosable — nothing on this
+		// page renders a claim about `sites` at all, so there was no channel to
+		// surface it on that would not misreport it as a `list_web_servers`
+		// failure (`store.error`, rendered above, is documented as exactly that
+		// call failing). `servicesStore.fail` is the established channel for a
+		// read failing outside its own store's api calls (see
+		// `routes/+layout.svelte`, `routes/services/+page.svelte`,
+		// `routes/languages/+page.svelte` for the same pattern) — it renders on
+		// AppShell's banner on every route, including this one, without this
+		// page claiming its own list failed.
+		void loadSitesOrFail(listSites, (e) => servicesStore.fail(e)).then((s) => (sites = s));
 	});
+
+	/**
+	 * Apply, then — only on success — re-read the web-server list. `run()`
+	 * already re-plans the pending count; it has no idea `configExists` on
+	 * this page's own rows is downstream of the same apply. Without this, a
+	 * fresh install's first Apply writes nginx.conf and Start still shows
+	 * "No config generated yet" on the row that just got one — see
+	 * `reloadAfterApply`'s own doc comment.
+	 */
+	async function onApply(): Promise<void> {
+		await reloadAfterApply(
+			() => applyStore.run(),
+			() => store.load()
+		);
+	}
 </script>
 
 <AppShell runningCount={running} active="web-server">
@@ -159,7 +184,7 @@
 			applying={applyStore.applying}
 			error={applyStore.error}
 			outcome={applyStore.outcome}
-			onApply={() => void applyStore.run()}
+			onApply={() => void onApply()}
 			onClose={() => (applyDialogOpen = false)}
 		/>
 	{/if}
