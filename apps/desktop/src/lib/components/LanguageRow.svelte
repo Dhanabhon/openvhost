@@ -4,6 +4,7 @@
 	import type { UiLog } from '../languages.svelte';
 	import Button from './Button.svelte';
 	import LogPane from './LogPane.svelte';
+	import StatusPill from './StatusPill.svelte';
 
 	let {
 		row,
@@ -73,17 +74,13 @@
 		{/if}
 	</div>
 
-	<!-- The duplication fix this line undoes if it drifts back: `row.fullVersion`
-	     is `None` for every row in production today (no patch-level prober
-	     exists yet — see `PhpRuntimeDto::full_version`'s own doc comment on the
-	     Rust side), and it is ALSO `None` for a row that is not installed at
-	     all (`php_rows` only sets it when `found.is_some()`). Falling back to
-	     `row.major` here would print "8.3" a second time right next to the
-	     "PHP 8.3" heading, implying a patch level was fetched when it was not —
-	     the exact thing the Rust-side fix (`the_patch_level_is_absent_rather_
-	     than_a_repeat_of_the_major`) removed, reappearing one layer up. An em
-	     dash is the honest "unknown", same as the path/socket columns below. -->
-	<div class="meta mono">{row.fullVersion ?? '—'}</div>
+	<!-- Renders nothing when the state is unknown, the same `{#if}` guard
+	     WebServerRow uses: an absent snapshot is not a state to name. -->
+	<div class="pill-cell">
+		{#if serviceState}
+			<StatusPill kind={serviceState.kind} testId="lang-pill-{row.major}" />
+		{/if}
+	</div>
 
 	<!-- `title` so the full value stays reachable when the cell ellipsizes, same
 	     reasoning as ServiceRow.svelte's endpoint column. -->
@@ -217,7 +214,12 @@
 		   8px gap and the ~106px Recommended badge without either wrapping. At
 		   120px the badge's width was taken out of the label. The path and
 		   socket columns already ellipsize, so the space comes from there. */
-		grid-template-columns: minmax(190px, 0.6fr) 90px minmax(180px, 1.4fr) minmax(180px, 1.4fr) auto;
+		grid-template-columns:
+			minmax(190px, 0.6fr) 120px minmax(180px, 1.4fr) minmax(180px, 1.4fr)
+			auto;
+	}
+	.pill-cell {
+		min-width: 0;
 	}
 	.primary {
 		font-weight: 600;

@@ -53,34 +53,20 @@ function renderRow(props: {
 }
 
 describe('LanguageRow', () => {
-	it('shows the version, path and socket when installed', () => {
+	// `fullVersion` is asserted separately, in 'the pool status pill' describe
+	// block below — it no longer has a cell of its own, only the
+	// install-success message.
+	it('shows the path and socket when installed', () => {
 		const body = renderRow({
 			row: r('8.3', true, {
-				fullVersion: '8.3.14',
 				path: '/opt/homebrew/opt/php@8.3/sbin/php-fpm',
 				socketPath: '/Users/x/.openvhost/run/php-fpm-8.3.sock',
 				serviceId: 'php-fpm-8.3'
 			})
 		});
-		expect(body).toContain('8.3.14');
 		expect(body).toContain('/opt/homebrew/opt/php@8.3');
 		expect(body).toContain('php-fpm-8.3.sock');
 		expect(body).not.toContain('data-testid="install-8.3"');
-	});
-
-	// The "one line" branch-review-fix-report.md finding: `fullVersion` is
-	// `null` for every row in production (no patch-level prober exists yet), so
-	// falling back to `row.major` in the version column printed the major a
-	// SECOND time right next to the "PHP 8.3" heading — implying a patch level
-	// had been fetched when it had not. An em dash is the honest "unknown".
-	it('shows an em dash rather than repeating the major when the patch level is unknown', () => {
-		const body = renderRow({ row: r('8.3', true, { fullVersion: null }) });
-		// The version column is the FIRST `meta mono` cell (path/socket follow with
-		// their own extra classes) — matched by class rather than an exact literal
-		// string so a scoped-style hash suffix on the class attribute cannot break
-		// this assertion for reasons unrelated to what it is pinning.
-		const versionCell = body.match(/<div class="meta mono[^"]*">([^<]*)<\/div>/);
-		expect(versionCell?.[1]).toBe('—');
 	});
 
 	it('offers start and stop for an installed version', () => {
@@ -287,5 +273,61 @@ describe('a failed pool', () => {
 		});
 		expect(out).toContain('brew exited with code 1');
 		expect(out).toContain('pool is broken');
+	});
+});
+
+describe('the pool status pill', () => {
+	const installed = r('8.4', true, { serviceId: 'php-fpm-8.4' });
+
+	it('names the state for a pool the supervisor knows about', () => {
+		const out = renderRow({ row: installed, serviceState: { kind: 'running' } });
+		expect(out).toContain('data-testid="lang-pill-8.4"');
+		expect(out).toContain('running');
+	});
+
+	it('renders nothing while the state is unknown', () => {
+		// Same rule the control follows: an absent snapshot is not a state.
+		const out = renderRow({ row: installed, serviceState: null });
+		expect(out).not.toContain('data-testid="lang-pill-8.4"');
+	});
+
+	it('drops the full-version column that never had anything to show', () => {
+		// It rendered an em dash on EVERY row, installed or not, because no
+		// patch-level prober exists. To a reader that is not absent data, it is
+		// data that failed to load.
+		//
+		// COUNTING the cells, not pattern-matching one of them. Two things make
+		// the obvious assertions wrong here:
+		//
+		//  - `not.toContain('—')` would fail for reasons unrelated to this
+		//    column, because the path and socket cells render an em dash too
+		//    when their values are null.
+		//  - the deleted test's `/<div class="meta mono[^"]*">/` regex is not
+		//    specific to the version cell either. It looks like it is, because
+		//    path and socket carry a `title` attribute after their class — but
+		//    that attribute is `title={row.path ?? undefined}`, and Svelte OMITS
+		//    an attribute whose value is `undefined`. With a null path the cell
+		//    renders `<div class="meta mono path">` and the regex matches it.
+		//
+		// The count is unambiguous under every fixture: three `meta mono` cells
+		// before (version, path, socket), two after. It is also the finding the
+		// deleted test recorded: falling back to `row.major` in the version cell
+		// printed the major a SECOND time right next to the "PHP 8.3" heading,
+		// implying a patch level had been fetched when none had — which is why
+		// this column had nothing worth showing in the first place.
+		const out = renderRow({ row: { ...installed, fullVersion: null }, serviceState: null });
+		const cells = out.match(/<div class="meta mono/g) ?? [];
+		expect(cells).toHaveLength(2);
+	});
+
+	it('still names the full version in the install-success message', () => {
+		// The FIELD stays; only the column goes. This message is where it is
+		// genuinely useful and degrades honestly to the major.
+		const out = renderRow({
+			row: { ...installed, fullVersion: '8.4.13' },
+			serviceState: null,
+			outcome: { major: '8.4', exitCode: 0, detected: true }
+		});
+		expect(out).toContain('8.4.13');
 	});
 });
