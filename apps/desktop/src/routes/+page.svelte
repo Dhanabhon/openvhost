@@ -6,6 +6,7 @@
 	import ApplyDialog from '$lib/components/ApplyDialog.svelte';
 	import ApplyErrorBanner from '$lib/components/ApplyErrorBanner.svelte';
 	import PendingChangesBanner from '$lib/components/PendingChangesBanner.svelte';
+	import ScaffoldNoticeBanner from '$lib/components/ScaffoldNoticeBanner.svelte';
 	import SiteDrawer from '$lib/components/SiteDrawer.svelte';
 	import SitesPanel from '$lib/components/SitesPanel.svelte';
 	import {
@@ -192,6 +193,14 @@
 				>.</span
 			>
 		</div>
+	{/if}
+	{#if store.lastScaffold}
+		<ScaffoldNoticeBanner
+			siteName={store.lastScaffold.siteName}
+			docroot={store.lastScaffold.docroot}
+			outcome={store.lastScaffold.outcome}
+			onDismiss={() => store.dismissScaffold()}
+		/>
 	{/if}
 	<PendingChangesBanner count={applyStore.pendingCount} onReview={() => (applyDialogOpen = true)} />
 	<SitesPanel
