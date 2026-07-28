@@ -1355,7 +1355,20 @@ async fn write_settings(
     let settings: openvhost_conf::WebServerSettings = input.try_into()?;
 
     if let Some(checker) = checker {
-        match checker.check(&settings).await? {
+        let verdict = match checker.check(&settings).await {
+            Ok(v) => v,
+            // The binary recorded at launch will not run — nginx was removed
+            // or moved since. That is the SAME situation as `checker: None`,
+            // so it degrades the same way rather than making the page
+            // unsavable: with no runnable nginx there is no apply to trap.
+            // A TIMEOUT is deliberately not included: that means nginx exists
+            // and hung, which is a real failure and must not pass as checked.
+            Err(openvhost_conf::ConfError::ValidatorSpawn { .. }) => {
+                return Ok(SqliteWebServerSettings::new(db).save(&settings).await?);
+            }
+            Err(e) => return Err(e.into()),
+        };
+        match verdict {
             openvhost_conf::SettingsCheck::Accepted { .. } => {}
             openvhost_conf::SettingsCheck::Rejected { field, stderr } => {
                 let message = rejection_message(&stderr);
@@ -3156,6 +3169,67 @@ mod web_server_settings_ipc_tests {
         let db = Db::open_in_memory().await.unwrap();
         write_settings(&db, valid_dto(), None).await.unwrap();
         assert_eq!(read_settings(&db).await.unwrap(), valid_dto());
+    }
+
+    /// A checker whose binary cannot be spawned, and one that hangs. The two
+    /// must NOT behave the same way.
+    struct FailingChecker(openvhost_conf::ConfError);
+
+    #[async_trait::async_trait]
+    impl SettingsChecker for FailingChecker {
+        async fn check(
+            &self,
+            _: &openvhost_conf::WebServerSettings,
+        ) -> Result<openvhost_conf::SettingsCheck, openvhost_conf::ConfError> {
+            Err(match &self.0 {
+                openvhost_conf::ConfError::ValidatorTimeout { bin, secs } => {
+                    openvhost_conf::ConfError::ValidatorTimeout {
+                        bin: bin.clone(),
+                        secs: *secs,
+                    }
+                }
+                _ => openvhost_conf::ConfError::ValidatorSpawn {
+                    bin: "nginx".into(),
+                    source: std::io::Error::from(std::io::ErrorKind::NotFound),
+                },
+            })
+        }
+    }
+
+    /// nginx removed since launch: the recorded binary will not spawn. That is
+    /// the no-nginx case arriving late, so the save must still go through —
+    /// otherwise uninstalling nginx silently makes this page unsavable.
+    #[tokio::test]
+    async fn a_validator_that_cannot_be_spawned_does_not_block_the_save() {
+        let db = Db::open_in_memory().await.unwrap();
+        let checker = FailingChecker(openvhost_conf::ConfError::ValidatorSpawn {
+            bin: "nginx".into(),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        });
+        write_settings(&db, valid_dto(), Some(&checker))
+            .await
+            .unwrap();
+        assert_eq!(read_settings(&db).await.unwrap(), valid_dto());
+    }
+
+    /// A validator that HUNG is not a validator that is absent. Treating a
+    /// timeout as "unchecked, carry on" would store the very values the check
+    /// exists to keep out, on the machines where nginx is present.
+    #[tokio::test]
+    async fn a_validator_that_times_out_fails_the_save() {
+        let db = Db::open_in_memory().await.unwrap();
+        let checker = FailingChecker(openvhost_conf::ConfError::ValidatorTimeout {
+            bin: "nginx".into(),
+            secs: 5,
+        });
+        write_settings(&db, valid_dto(), Some(&checker))
+            .await
+            .expect_err("a hung validator must not pass as checked");
+        assert_eq!(
+            read_settings(&db).await.unwrap(),
+            WebServerSettingsDto::default(),
+            "nothing may be stored when the check never completed"
+        );
     }
 
     /// The newtype guard runs FIRST: an out-of-range value costs no process
