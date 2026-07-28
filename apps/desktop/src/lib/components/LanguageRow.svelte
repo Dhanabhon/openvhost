@@ -57,7 +57,7 @@
 	 *  both: `1` (or any other non-zero code) and `null` (no code at all) are both
 	 *  "not a clean exit". Checked before `notFound`/`justInstalled` in the
 	 *  markup below — those only make sense once `exitCode === 0`. */
-	const failed = $derived(rowOutcome !== null && rowOutcome.exitCode !== 0);
+	const installFailed = $derived(rowOutcome !== null && rowOutcome.exitCode !== 0);
 </script>
 
 <div class="row lang-row" data-testid="lang-row-{row.major}">
@@ -153,7 +153,7 @@
 	<p class="error" role="alert" style="white-space: pre-wrap">{error}</p>
 {/if}
 
-{#if failed}
+{#if installFailed}
 	<!-- C1 fix: brew's own non-zero exit (or a signal kill, `exitCode === null`)
 	     used to render NOTHING — no error (nothing threw), no `notFound` (that
 	     branch requires `exitCode === 0`), and by then the log had already been
@@ -172,6 +172,20 @@
 		Homebrew reported success installing PHP {row.major}, but the version was not found afterwards.
 		Check the log above for what brew actually did.
 	</p>
+{/if}
+
+{#if serviceState?.kind === 'failed'}
+	<!-- The supervisor's captured stderr is the only thing that explains why a
+	     start did not take. Verbatim — a php-fpm startup error names the pool
+	     file and the directive that broke, and summarising it would throw away
+	     the part that fixes the problem. Same treatment WebServerRow gives a
+	     failed nginx. -->
+	<p class="error" role="alert" data-testid="pool-failed-{row.serviceId}">
+		PHP {row.major}'s pool failed{#if serviceState.exit !== null}&nbsp;(exit {serviceState.exit}){/if}.
+	</p>
+	{#if serviceState.stderrTail.length > 0}
+		<pre class="pool-stderr">{serviceState.stderrTail.join('\n')}</pre>
+	{/if}
 {/if}
 
 {#if justInstalled}
@@ -251,6 +265,19 @@
 		padding: var(--vh-space-3);
 		margin: 0 var(--vh-space-4) var(--vh-space-3);
 		font-size: var(--vh-text-table);
+	}
+	.pool-stderr {
+		margin: 0 var(--vh-space-4) var(--vh-space-3);
+		padding: var(--vh-space-2) var(--vh-space-3);
+		background: var(--vh-log-bg);
+		border: 1px solid var(--vh-border);
+		border-radius: var(--vh-radius-control);
+		color: var(--vh-text);
+		font-size: var(--vh-text-log);
+		line-height: 1.6;
+		overflow: auto;
+		max-height: 320px;
+		white-space: pre-wrap;
 	}
 	.warn {
 		color: var(--vh-fail);

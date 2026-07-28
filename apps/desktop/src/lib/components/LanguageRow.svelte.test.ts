@@ -245,3 +245,47 @@ describe('the pool control', () => {
 		expect(out).toContain('data-testid="install-8.4"');
 	});
 });
+
+describe('a failed pool', () => {
+	const installed = r('8.4', true, { serviceId: 'php-fpm-8.4' });
+
+	it("shows php-fpm's own words, not just a Retry button", () => {
+		// Asserting on CONTENT, not on the presence of a block: an empty <pre>
+		// would satisfy a weaker assertion and tell the user nothing about why
+		// their pool did not start.
+		const out = renderRow({
+			row: installed,
+			serviceState: {
+				kind: 'failed',
+				exit: 78,
+				stderrTail: ['[08-Jul-2026 10:00:00] ERROR: unable to bind listening socket']
+			}
+		});
+		expect(out).toContain('unable to bind listening socket');
+		expect(out).toContain('data-testid="pool-failed-php-fpm-8.4"');
+	});
+
+	it('says a failure happened even when php-fpm said nothing', () => {
+		// A pool killed by a signal has an empty tail. Rendering only the <pre>
+		// would leave a failed row looking identical to a healthy one.
+		const out = renderRow({
+			row: installed,
+			serviceState: { kind: 'failed', exit: null, stderrTail: [] }
+		});
+		expect(out).toContain('data-testid="pool-failed-php-fpm-8.4"');
+		expect(out).toContain('PHP 8.4');
+	});
+
+	it('keeps a brew install failure and a pool failure apart', () => {
+		// The two render in different places and mean different things. A row
+		// showing both must show each in its own block, not one in place of the
+		// other.
+		const out = renderRow({
+			row: installed,
+			serviceState: { kind: 'failed', exit: 78, stderrTail: ['pool is broken'] },
+			outcome: { major: '8.4', exitCode: 1, detected: false }
+		});
+		expect(out).toContain('brew exited with code 1');
+		expect(out).toContain('pool is broken');
+	});
+});
