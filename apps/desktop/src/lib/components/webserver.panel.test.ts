@@ -21,7 +21,8 @@ const nginx: WebServerDto = {
 	binaryPath: '/opt/homebrew/opt/nginx/bin/nginx',
 	version: '1.27.3',
 	supportsHotReload: true,
-	configPath: '/x/.openvhost/conf/nginx.conf'
+	configPath: '/x/.openvhost/conf/nginx.conf',
+	configExists: true
 };
 const apache: WebServerDto = {
 	id: 'apache',
@@ -31,7 +32,8 @@ const apache: WebServerDto = {
 	binaryPath: null,
 	version: null,
 	supportsHotReload: false,
-	configPath: null
+	configPath: null,
+	configExists: false
 };
 
 /** A supervisor snapshot entry. Takes the whole `ServiceState` rather than a bare
@@ -55,6 +57,8 @@ function html(props: Record<string, unknown>): string {
 			validating: {},
 			onShowConfig: () => {},
 			onValidate: () => {},
+			onStart: () => {},
+			onStop: () => {},
 			...props
 		}
 	}).body;
@@ -278,5 +282,117 @@ describe('a read error next to previously-read content', () => {
 		);
 		expect(t).toContain('cannot read /x/.openvhost/conf/nginx.conf: No such file');
 		expect(t).toContain('test is successful');
+	});
+});
+
+describe('the service control', () => {
+	it('renders nothing at all before the services snapshot arrives', () => {
+		// An empty services array is what the very first frame of every visit
+		// looks like. Neither a Start nor a Stop may appear.
+		const out = html({ servers: [nginx], services: [] });
+		expect(out).not.toContain('data-testid="ws-start-nginx"');
+		expect(out).not.toContain('data-testid="ws-stop-nginx"');
+	});
+
+	it('offers Start when nginx is stopped and a config exists', () => {
+		const out = html({ servers: [nginx], services: [svc('nginx', { kind: 'stopped' })] });
+		expect(out).toContain('data-testid="ws-start-nginx"');
+		// Asserting the REASON is absent, not that the word "disabled" is absent
+		// anywhere in the panel: this is a whole-panel string, and any other
+		// control acquiring a `disabled` attribute later would fail this case for
+		// a reason that has nothing to do with Start.
+		expect(out).not.toContain('ws-start-reason-nginx');
+	});
+
+	it('disables Start and says why when no config has been generated', () => {
+		const out = html({
+			servers: [{ ...nginx, configExists: false }],
+			services: [svc('nginx', { kind: 'stopped' })]
+		});
+		expect(out).toContain('data-testid="ws-start-nginx"');
+		expect(out).toContain('disabled');
+		expect(out).toContain('ws-start-reason-nginx');
+		expect(out).toContain('No config generated yet');
+	});
+
+	it('offers Start with no reason when config existence could not be determined', () => {
+		// `configExists: null` is what the backend reports when its own stat
+		// could not be performed — NOT the same fact as "confirmed absent". Start
+		// stays enabled and, critically, the reason line does not render: naming
+		// NO_CONFIG_REASON here would tell the user to re-Apply for a problem
+		// (a permission error, say) that Apply cannot fix.
+		const out = html({
+			servers: [{ ...nginx, configExists: null }],
+			services: [svc('nginx', { kind: 'stopped' })]
+		});
+		expect(out).toContain('data-testid="ws-start-nginx"');
+		// The same reason-absence assertion the enabled case above makes: a whole-
+		// panel string, so this is about Start specifically, not about "disabled"
+		// never appearing anywhere in the markup.
+		expect(out).not.toContain('ws-start-reason-nginx');
+	});
+
+	it('offers Stop while running', () => {
+		const out = html({ servers: [nginx], services: [svc('nginx', { kind: 'running' })] });
+		expect(out).toContain('data-testid="ws-stop-nginx"');
+		expect(out).not.toContain('data-testid="ws-start-nginx"');
+	});
+
+	it('gives Apache no service control, since it supervises nothing', () => {
+		const out = html({ servers: [apache], services: [] });
+		expect(out).not.toContain('ws-start-apache');
+		expect(out).not.toContain('ws-stop-apache');
+	});
+});
+
+describe('the pool warning', () => {
+	it('warns that a site will 502 when its pool is down', () => {
+		const out = html({
+			servers: [nginx],
+			services: [svc('nginx', { kind: 'running' }), svc('php-fpm-8.4', { kind: 'stopped' })],
+			stoppedPools: ['8.4']
+		});
+		expect(out).toContain('data-testid="ws-pool-warning"');
+		expect(out).toContain('502');
+		expect(out).toContain('8.4');
+	});
+});
+
+describe('a failed nginx', () => {
+	it("shows nginx's own words, not just a failed pill", () => {
+		// The whole point. Asserting on the CONTENT, not on the presence of a
+		// block: an empty <pre> would satisfy a weaker assertion and tell the
+		// user nothing about why their web server did not start.
+		const out = html({
+			servers: [nginx],
+			services: [
+				svc('nginx', {
+					kind: 'failed',
+					exit: 1,
+					stderrTail: ['nginx: [emerg] bind() to 0.0.0.0:8080 failed (48: Address already in use)']
+				})
+			]
+		});
+		expect(out).toContain('Address already in use');
+		expect(out).toContain('data-testid="ws-failed-nginx"');
+	});
+
+	it('offers Retry rather than Start after a failure', () => {
+		const out = html({
+			servers: [nginx],
+			services: [svc('nginx', { kind: 'failed', exit: 1, stderrTail: ['boom'] })]
+		});
+		expect(out).toContain('data-testid="ws-retry-nginx"');
+	});
+
+	it('says a failure happened even when nginx said nothing', () => {
+		// A service killed by a signal has an empty tail. Rendering only the
+		// <pre> would leave a failed row that looks identical to a healthy one.
+		const out = html({
+			servers: [nginx],
+			services: [svc('nginx', { kind: 'failed', exit: null, stderrTail: [] })]
+		});
+		expect(out).toContain('data-testid="ws-failed-nginx"');
+		expect(out).toContain('nginx failed');
 	});
 });

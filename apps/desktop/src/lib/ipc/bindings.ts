@@ -442,6 +442,32 @@ export type WebServerDto = {
 	version: string | null,
 	supportsHotReload: boolean,
 	configPath: string | null,
+	/**
+	 *  Whether a file exists at `config_path` right now — a TRI-STATE, because
+	 *  a filesystem stat has three honest outcomes, not two.
+	 * 
+	 *  `Some(true)`: confirmed present. `Some(false)`: confirmed absent — and
+	 *  on a fresh install this is the common case, because `provision_home`
+	 *  seeds directories and the welcome page but writes no config (pinned by
+	 *  `provisioning_no_longer_writes_any_config`). `None`: the stat could not
+	 *  be performed at all (permission denied on a parent directory, a
+	 *  dangling symlink from an interrupted atomic write, ...) — this is
+	 *  EXISTENCE UNKNOWN, and it must never collapse into `Some(false)`.
+	 *  Doing so would tell the user "no config generated yet — apply your
+	 *  changes first" when the real cause has nothing to do with Apply and
+	 *  re-running it cannot fix it.
+	 * 
+	 *  EXISTENCE, NOT VALIDITY, in every non-`None` case. nginx is registered
+	 *  to spawn with `-c <config_path>`, so a confirmed-missing file means
+	 *  Start exits immediately, and the page disables Start on `Some(false)`
+	 *  and says why, rather than letting the user find out by pressing it. On
+	 *  `None` the page instead leaves Start enabled with no claim about the
+	 *  cause — see `startStopFor` — because nginx's own stderr on a genuine
+	 *  failure names the real problem, which this DTO cannot. A config that
+	 *  exists can still be refused by nginx; that case is the row's stderr
+	 *  block, not this flag.
+	 */
+	configExists: boolean | null,
 };
 
 /**

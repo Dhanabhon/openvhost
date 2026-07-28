@@ -1,7 +1,6 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <script lang="ts">
 	import type { ServiceStatus, ValidationReportDto, WebServerDto } from '$lib/ipc';
-	import { statusFor } from '$lib/webservers.derive';
 	import WebServerRow from './WebServerRow.svelte';
 
 	// PURELY PRESENTATIONAL: every piece of state arrives as a prop and every action
@@ -16,8 +15,11 @@
 		configError,
 		reports,
 		validating,
+		stoppedPools = [],
 		onShowConfig,
-		onValidate
+		onValidate,
+		onStart,
+		onStop
 	}: {
 		servers: readonly WebServerDto[];
 		/** The SHARED supervisor snapshot. Status is correlated by `serviceId` rather
@@ -29,8 +31,16 @@
 		configError: Record<string, string>;
 		reports: Record<string, ValidationReportDto>;
 		validating: Record<string, boolean>;
+		/** PHP majors an enabled site needs whose pool is not running, while nginx
+		 * IS running (see `stoppedPoolsFor`). Panel-level, not per-row: it can name
+		 * more than one version at once and belongs above every row, not on nginx's
+		 * own — the per-row `ws-failed-*` block is about nginx failing to start,
+		 * not about a pool a different service owns. */
+		stoppedPools?: readonly string[];
 		onShowConfig: (id: string) => void;
 		onValidate: (id: string) => void;
+		onStart: (serviceId: string) => void;
+		onStop: (serviceId: string) => void;
 	} = $props();
 </script>
 
@@ -65,19 +75,30 @@
 			</p>
 		</div>
 	{:else}
+		{#if stoppedPools.length > 0}
+			<p class="pool-warning" role="status" data-testid="ws-pool-warning">
+				nginx is running, but {stoppedPools.length === 1 ? 'the pool' : 'the pools'} your sites need
+				{stoppedPools.length === 1 ? 'is' : 'are'} not: PHP {stoppedPools.join(', ')}. A PHP site
+				will answer 502 until {stoppedPools.length === 1 ? 'it starts' : 'they start'}. Start
+				{stoppedPools.length === 1 ? 'it' : 'them'} on the Languages page.
+			</p>
+		{/if}
 		<div class="rowlist">
 			{#each servers as server (server.id)}
 				<!-- The per-id maps are indexed HERE so each row receives only its own slice.
-				     `statusFor` returns the state KIND the pill takes, or null. -->
+				     The whole state is passed, not just its kind — `failed` carries the
+				     `stderrTail` the row renders, and a kind alone cannot express it. -->
 				<WebServerRow
 					{server}
-					statusKind={statusFor(services, server.serviceId)}
+					serviceState={services.find((s) => s.id === server.serviceId)?.state ?? null}
 					configText={configText[server.id]}
 					configError={configError[server.id] ?? ''}
 					report={reports[server.id] ?? null}
 					validating={validating[server.id] === true}
 					{onShowConfig}
 					{onValidate}
+					{onStart}
+					{onStop}
 				/>
 			{/each}
 		</div>
@@ -88,9 +109,10 @@
 	/* Ported from docs/design/mock.css (.page-head, .page-head .sub, .page-head h1 — applied to
 	   the `<h2>` this panel renders instead, .panel, .rowlist, .empty, .empty .title), the same
 	   recipes SitesPanel.svelte and ServicesPanel.svelte already use, so a third page reads as
-	   part of the same product rather than a new dialect. `.page-head` has no action button
-	   here: this page is read-only, and this codebase does not render a control for something
-	   that isn't wired (see Rail.svelte's Logs/Settings placeholders). */
+	   part of the same product rather than a new dialect. `.page-head` still has no action
+	   button: the settings form below edits nginx's config and each row now carries its own
+	   Start/Stop, so there is nothing left for a page-head button to do that isn't already
+	   wired somewhere on the page. */
 	.page-head {
 		display: flex;
 		align-items: center;
@@ -119,6 +141,13 @@
 	.rowlist {
 		display: flex;
 		flex-direction: column;
+	}
+	.pool-warning {
+		margin: 0;
+		padding: var(--vh-space-3) var(--vh-space-4);
+		border-bottom: 1px solid var(--vh-border);
+		color: var(--vh-text-2);
+		font-size: var(--vh-text-table);
 	}
 	.empty {
 		padding: var(--vh-space-8) var(--vh-space-6);

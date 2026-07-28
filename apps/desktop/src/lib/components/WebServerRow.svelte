@@ -1,9 +1,8 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <script lang="ts">
-	import type { ValidationReportDto, WebServerDto } from '$lib/ipc';
-	import type { StateKind } from '$lib/services.derive';
+	import type { ServiceStatus, ValidationReportDto, WebServerDto } from '$lib/ipc';
 	import { WEB_SERVERS, type WebServerKind } from '$lib/sites.derive';
-	import { hotReloadLabel } from '$lib/webservers.derive';
+	import { hotReloadLabel, startStopFor } from '$lib/webservers.derive';
 	import Button from './Button.svelte';
 	import StatusPill from './StatusPill.svelte';
 	import WebServerIcon from './WebServerIcon.svelte';
@@ -13,26 +12,45 @@
 	// neighbour's config text nor a neighbour's error.
 	let {
 		server,
-		statusKind,
+		serviceState,
 		configText,
 		configError,
 		report,
 		validating,
 		onShowConfig,
-		onValidate
+		onValidate,
+		onStart,
+		onStop
 	}: {
 		server: WebServerDto;
-		/** From `statusFor()`; `null` for a brand with no supervised service (Apache)
-		 * or before the first supervisor snapshot arrives — then no pill renders,
-		 * rather than a pill making up a state. */
-		statusKind: StateKind | null;
+		/** The whole supervised state, not just its kind: `failed` carries the
+		 *  `stderrTail` this row renders, and a kind alone cannot express it.
+		 *  `null` when the brand is unsupervised OR the snapshot has not
+		 *  arrived — both render no control (see `startStopFor`). */
+		serviceState: ServiceStatus['state'] | null;
 		configText?: string;
 		configError: string;
 		report: ValidationReportDto | null;
 		validating: boolean;
 		onShowConfig: (id: string) => void;
 		onValidate: (id: string) => void;
+		onStart: (serviceId: string) => void;
+		onStop: (serviceId: string) => void;
 	} = $props();
+
+	// Derived locally so the existing pill (`{#if statusKind}`) and the
+	// `startStopFor` call below keep the same meaning after `serviceState`
+	// replaced the bare kind: only this line needed to change.
+	const statusKind = $derived(serviceState?.kind ?? null);
+
+	// `server.serviceId` is null for a brand OpenVHost does not supervise
+	// (Apache), which is a different "no control" from "state not yet known" —
+	// both render nothing, but only one of them can ever change.
+	const control = $derived(
+		server.serviceId === null
+			? { kind: 'none' as const }
+			: startStopFor(statusKind, server.configExists)
+	);
 
 	/** Shown for any fact the backend could not fill in — never an empty gap the
 	 * reader cannot interpret. Reachable for `version` whenever the probe fails;
@@ -89,6 +107,32 @@
 		<div class="grow"></div>
 		{#if server.supported}
 			<div class="row-actions">
+				{#if control.kind === 'start'}
+					<Button
+						variant="quiet"
+						size="sm"
+						testId="ws-start-{server.id}"
+						ariaLabel="Start {server.displayName}"
+						disabled={control.disabled}
+						onclick={() => onStart(server.serviceId ?? '')}>Start</Button
+					>
+				{:else if control.kind === 'retry'}
+					<Button
+						variant="quiet"
+						size="sm"
+						testId="ws-retry-{server.id}"
+						ariaLabel="Retry {server.displayName}"
+						onclick={() => onStart(server.serviceId ?? '')}>Retry</Button
+					>
+				{:else if control.kind === 'stop'}
+					<Button
+						variant="quiet"
+						size="sm"
+						testId="ws-stop-{server.id}"
+						ariaLabel="Stop {server.displayName}"
+						onclick={() => onStop(server.serviceId ?? '')}>Stop</Button
+					>
+				{/if}
 				<Button
 					variant="quiet"
 					size="sm"
@@ -113,6 +157,12 @@
 			</div>
 		{/if}
 	</div>
+
+	{#if control.kind === 'start' && control.disabled}
+		<!-- The disabled button alone is a dead end: it says "not now" without
+		     saying when. This names the action that produces a config. -->
+		<p class="unavailable" data-testid="ws-start-reason-{server.id}">{control.reason}</p>
+	{/if}
 
 	{#if server.supported}
 		<dl class="facts">
@@ -201,6 +251,22 @@
 					Apply regenerates this file from your sites and the settings below, so hand edits are lost
 					on the next Apply. Add custom directives under <code>config/custom/</code> instead.
 				</p>
+			{/if}
+		</div>
+	{/if}
+
+	{#if serviceState?.kind === 'failed'}
+		<!-- Same recipe as ServiceRow.svelte's `fail-detail`, and for the same
+		     reason: the supervisor's captured stderr is the only thing that
+		     explains why a start did not take. Verbatim — an nginx [emerg] line
+		     names the file and line number, and summarising it would throw away
+		     the part that fixes the problem. -->
+		<div class="report report-fail" role="status" data-testid="ws-failed-{server.id}">
+			<p class="headline">
+				{server.displayName} failed{#if serviceState.exit !== null}&nbsp;(exit {serviceState.exit}){/if}
+			</p>
+			{#if serviceState.stderrTail.length > 0}
+				<pre>{serviceState.stderrTail.join('\n')}</pre>
 			{/if}
 		</div>
 	{/if}

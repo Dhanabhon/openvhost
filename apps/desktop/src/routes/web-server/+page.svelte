@@ -8,16 +8,39 @@
 	import PendingChangesBanner from '$lib/components/PendingChangesBanner.svelte';
 	import WebServerPanel from '$lib/components/WebServerPanel.svelte';
 	import WebServerSettingsForm from '$lib/components/WebServerSettingsForm.svelte';
-	import { applyConfig, planConfigApply, saveWebServerSettings, webServerSettings } from '$lib/ipc';
+	import {
+		applyConfig,
+		listSites,
+		planConfigApply,
+		saveWebServerSettings,
+		webServerSettings
+	} from '$lib/ipc';
+	import type { SiteDto } from '$lib/ipc';
 	import { ApplyStore } from '$lib/apply.svelte';
 	import { runningCount } from '$lib/services.derive';
 	import { servicesStore } from '$lib/services.shared.svelte';
+	import { reloadAfterApply } from '$lib/webserver-apply';
+	import { loadSitesOrFail } from '$lib/webserver-sites';
+	import { statusFor, stoppedPoolsFor } from '$lib/webservers.derive';
 	import { webServersStore as store } from '$lib/webservers.svelte';
 	import { WebSettingsStore } from '$lib/websettings.svelte';
 
 	// The titlebar's "N running" belongs to every route and comes from the shared
 	// supervisor state the layout subscribes to — never a literal.
 	const running = $derived(runningCount(servicesStore.services));
+
+	// Read-only, and only to answer "which php-fpm pools do the sites need".
+	// Deliberately NOT a SitesStore: that carries create/update/delete/open, and
+	// this page must not be able to change a site just to render one warning line.
+	let sites = $state<SiteDto[]>([]);
+
+	const stoppedPools = $derived(
+		stoppedPoolsFor(
+			sites,
+			servicesStore.services,
+			statusFor(servicesStore.services, 'nginx') === 'running'
+		)
+	);
 
 	// Same pair the Sites page wires, for the same pipeline: the settings and the
 	// sites are ONE config set, so this page reaches `plan_config_apply` /
@@ -71,7 +94,37 @@
 		// both are cheap enough to fire alongside the list.
 		void settings.load();
 		void applyStore.refresh();
+		// state.db only — spawns nothing, so it is cheap enough to fire with the
+		// rest. A failure leaves `sites` empty, which suppresses the pool warning
+		// rather than blanking the page: a missing hint is a smaller harm than a
+		// page that will not render, and the row's own state is unaffected. But
+		// swallowing it silently made a real 502 undiagnosable — nothing on this
+		// page renders a claim about `sites` at all, so there was no channel to
+		// surface it on that would not misreport it as a `list_web_servers`
+		// failure (`store.error`, rendered above, is documented as exactly that
+		// call failing). `servicesStore.fail` is the established channel for a
+		// read failing outside its own store's api calls (see
+		// `routes/+layout.svelte`, `routes/services/+page.svelte`,
+		// `routes/languages/+page.svelte` for the same pattern) — it renders on
+		// AppShell's banner on every route, including this one, without this
+		// page claiming its own list failed.
+		void loadSitesOrFail(listSites, (e) => servicesStore.fail(e)).then((s) => (sites = s));
 	});
+
+	/**
+	 * Apply, then — only on success — re-read the web-server list. `run()`
+	 * already re-plans the pending count; it has no idea `configExists` on
+	 * this page's own rows is downstream of the same apply. Without this, a
+	 * fresh install's first Apply writes nginx.conf and Start still shows
+	 * "No config generated yet" on the row that just got one — see
+	 * `reloadAfterApply`'s own doc comment.
+	 */
+	async function onApply(): Promise<void> {
+		await reloadAfterApply(
+			() => applyStore.run(),
+			() => store.load()
+		);
+	}
 </script>
 
 <AppShell runningCount={running} active="web-server">
@@ -104,8 +157,11 @@
 		configError={store.configError}
 		reports={store.reports}
 		validating={store.validating}
+		{stoppedPools}
 		onShowConfig={(id) => void store.showConfig(id)}
 		onValidate={(id) => void store.validate(id)}
+		onStart={(id) => void servicesStore.start(id)}
+		onStop={(id) => void servicesStore.stop(id)}
 	/>
 	<WebServerSettingsForm
 		values={settings.values}
@@ -128,7 +184,7 @@
 			applying={applyStore.applying}
 			error={applyStore.error}
 			outcome={applyStore.outcome}
-			onApply={() => void applyStore.run()}
+			onApply={() => void onApply()}
 			onClose={() => (applyDialogOpen = false)}
 		/>
 	{/if}
