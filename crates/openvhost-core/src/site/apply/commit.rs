@@ -38,68 +38,25 @@ impl ConfigValidator for NginxValidator {
     }
 }
 
-/// Write via a temp file in the SAME directory, then rename: a rename is
-/// atomic only within one filesystem, which is the whole reason the temp file
-/// cannot go in `/tmp` — a target under the user's home may live on a
-/// different filesystem than the system temp directory. The temp name does
-/// not end in `.conf` so `plan()`'s owned-file scan never mistakes a
-/// leftover for a real site config.
-///
-/// A5: the actual suffix is `uuid::Uuid::new_v4().simple()` — see
-/// `atomic_write`. It is injected here, rather than generated inline, so a
-/// test can pin a known suffix and pre-plant a symlink at the exact temp
-/// path `atomic_write` would otherwise pick unpredictably; production code
-/// never calls this with anything but a fresh random suffix.
+/// Thin wrapper over the crate-shared hardened atomic write (see
+/// `crate::atomicfile`), mapping its error type into `ApplyError::Io`. Kept
+/// under the original name so the pre-planted-symlink regression test below
+/// — the only remaining caller now that `atomic_write` calls
+/// `crate::atomicfile::write_atomic` directly — compiles unchanged.
+/// `#[cfg(test)]` because that is its only caller: without it, a plain
+/// `cargo build`/`clippy` (which does not compile `#[cfg(test)]` code) sees
+/// no non-test caller and flags this as dead code.
+#[cfg(test)]
 fn atomic_write_with_suffix(path: &Path, contents: &str, suffix: &str) -> Result<(), ApplyError> {
-    let parent = path.parent().unwrap_or(Path::new("."));
-    std::fs::create_dir_all(parent).map_err(|source| ApplyError::Io {
-        op: "create_dir_all",
-        path: parent.to_path_buf(),
-        source,
-    })?;
-    let tmp = parent.join(format!(
-        ".{}.{suffix}.tmp",
-        path.file_name().unwrap_or_default().to_string_lossy()
-    ));
-    // `create_new` opens (and fails on) the path ITSELF rather than whatever
-    // it might point to: POSIX guarantees `O_CREAT|O_EXCL` fails with EEXIST
-    // on a pre-existing symlink regardless of its target, so a pre-planted
-    // `.<name>.<suffix>.tmp` symlink can never be written through — unlike
-    // the old `std::fs::write`, which follows symlinks and would have made
-    // that an arbitrary-file-overwrite primitive. The random suffix on top
-    // means the name cannot be pre-planted in the first place, and keeps two
-    // concurrent applies from colliding on the same temp path.
-    use std::io::Write as _;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .map_err(|source| ApplyError::Io {
-            op: "create",
-            path: tmp.clone(),
-            source,
-        })?;
-    f.write_all(contents.as_bytes())
-        .map_err(|source| ApplyError::Io {
-            op: "write",
-            path: tmp.clone(),
-            source,
-        })?;
-    drop(f);
-    std::fs::rename(&tmp, path).map_err(|source| {
-        // Best-effort: the rename error is the one worth propagating, and if
-        // this cleanup also fails there is nothing useful left to report.
-        let _ = std::fs::remove_file(&tmp);
-        ApplyError::Io {
-            op: "rename",
-            path: path.to_path_buf(),
-            source,
-        }
-    })
+    Ok(crate::atomicfile::write_atomic_with_suffix(
+        path, contents, suffix,
+    )?)
 }
 
+/// Thin wrapper over `crate::atomicfile::write_atomic` — see
+/// `atomic_write_with_suffix`.
 fn atomic_write(path: &Path, contents: &str) -> Result<(), ApplyError> {
-    atomic_write_with_suffix(path, contents, &uuid::Uuid::new_v4().simple().to_string())
+    Ok(crate::atomicfile::write_atomic(path, contents)?)
 }
 
 fn remove_if_exists(path: &Path) -> Result<(), ApplyError> {
