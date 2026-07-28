@@ -56,8 +56,12 @@
 		     note on the name cell) and the domain is the row's identifying detail. -->
 		<div class="meta mono" title={site.domain}>{site.domain}</div>
 	</div>
-	<div class="mono num">
-		PHP {site.phpVersion}
+	<!-- The version is its own element so it can carry `white-space: nowrap`. As a
+	     bare text node it was the only flexible thing in this fixed track, so the
+	     badge's width came out of it and "PHP 8.4" broke across two lines — on
+	     exactly the rows the warning matters for. -->
+	<div class="mono num php-cell">
+		<span class="version">PHP {site.phpVersion}</span>
 		{#if phpMissing}
 			<!-- Same `.badge`-adjacent vocabulary as `ApplyDialog`'s diff badges, but this
 			     one is a warning rather than a diff kind, so it gets `role="status"` and
@@ -217,9 +221,21 @@
 	   Reuses the failure palette (`--vh-fail`/`--vh-fail-tint`) that `.row-error` and
 	   the page-level banners already use for this exact semantic, rather than
 	   inventing a second "something is wrong" colour. */
+	.php-cell {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		min-width: 0;
+	}
+	.php-cell .version {
+		white-space: nowrap;
+	}
 	.php-missing {
 		display: inline-block;
-		margin-left: 6px;
+		/* Never absorb a shortfall by squashing — an unreadable sliver of a
+		   warning is worse than an overflowing one. */
+		flex-shrink: 0;
+		white-space: nowrap;
 		padding: 1px 6px;
 		border-radius: var(--vh-radius-pill);
 		font-size: var(--vh-text-caption);
@@ -229,7 +245,14 @@
 		border: 1px solid color-mix(in oklab, var(--vh-fail) 35%, transparent);
 	}
 	.site-row {
-		grid-template-columns: minmax(220px, 1.4fr) 110px 90px 120px auto;
+		/* PHP track raised 110px -> 168px so "PHP 8.4" plus the 6px gap plus the
+		   ~100px "not installed" badge fit without wrapping. It stays a FIXED
+		   track rather than content-sized for the same reason the pill track
+		   below does: every row is its own grid, so only fixed widths keep the
+		   columns aligned down the list. The cost is dead space on rows without
+		   the badge, which is the cheaper of the two — a misaligned list reads
+		   as broken, a slightly airy one does not. */
+		grid-template-columns: minmax(220px, 1.4fr) 168px 90px 120px auto;
 	}
 	/* `justify-content` + symmetric padding: the pill is a GRID ITEM in a fixed
 	   120px track, and a grid item's default `justify-self: stretch` widens this

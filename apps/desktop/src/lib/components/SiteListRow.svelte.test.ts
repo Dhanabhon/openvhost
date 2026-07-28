@@ -138,4 +138,19 @@ describe('SiteListRow actions', () => {
 		const knownEmpty = rowHtml(site(true, '8.4'), { installed: [] });
 		expect(knownEmpty).toContain('data-testid="php-missing"');
 	});
+	// Same defect as LanguageRow's Recommended badge: the version was a bare text
+	// node in a fixed track, so adding a badge beside it took the width out of the
+	// label and "PHP 8.4" wrapped — on exactly the rows the warning is for.
+	it('gives the version label its own element so it can refuse to wrap', () => {
+		const body = rowHtml(site(true, '8.4'), { installed: ['8.5'] });
+		expect(body).toMatch(/<span[^>]*class="[^"]*\bversion\b[^"]*"[^>]*>\s*PHP 8\.4/);
+	});
+
+	it('renders the not-installed badge after the label, not inside it', () => {
+		const body = rowHtml(site(true, '8.4'), { installed: ['8.5'] });
+		const label = body.indexOf('PHP 8.4');
+		const badge = body.indexOf('data-testid="php-missing"');
+		expect(label).toBeGreaterThan(-1);
+		expect(badge).toBeGreaterThan(label);
+	});
 });

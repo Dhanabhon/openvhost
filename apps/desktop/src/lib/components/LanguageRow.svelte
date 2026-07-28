@@ -55,8 +55,13 @@
 </script>
 
 <div class="row lang-row" data-testid="lang-row-{row.major}">
+	<!-- The label is its own element rather than a bare text node so it can carry
+	     `white-space: nowrap`. As a bare node it was the only flexible thing in
+	     this cell, so the badge's width came straight out of it and "PHP 8.5"
+	     broke across two lines — on the recommended row only, which is why every
+	     other row looked fine. -->
 	<div class="primary">
-		PHP {row.major}
+		<span class="version">PHP {row.major}</span>
 		{#if row.recommended}
 			<span class="badge recommended">Recommended</span>
 		{/if}
@@ -180,17 +185,30 @@
 		background: color-mix(in oklab, var(--vh-text) 3%, var(--vh-surface));
 	}
 	.lang-row {
-		grid-template-columns: minmax(120px, 0.6fr) 90px minmax(200px, 1.4fr) minmax(200px, 1.4fr) auto;
+		/* First column min raised 120px -> 190px: it has to hold "PHP 8.5", an
+		   8px gap and the ~106px Recommended badge without either wrapping. At
+		   120px the badge's width was taken out of the label. The path and
+		   socket columns already ellipsize, so the space comes from there. */
+		grid-template-columns: minmax(190px, 0.6fr) 90px minmax(180px, 1.4fr) minmax(180px, 1.4fr) auto;
 	}
 	.primary {
 		font-weight: 600;
 		display: flex;
 		align-items: center;
 		gap: 8px;
+		min-width: 0;
+	}
+	.primary .version {
+		white-space: nowrap;
 	}
 	.badge.recommended {
 		display: inline-flex;
 		align-items: center;
+		/* Never absorb the shortfall by squashing: if this cell is ever too
+		   narrow the badge keeps its size and the row scrolls, rather than the
+		   badge silently collapsing into an unreadable sliver. */
+		flex-shrink: 0;
+		white-space: nowrap;
 		padding: 1px 8px;
 		border-radius: var(--vh-radius-pill);
 		font-size: var(--vh-text-caption);
