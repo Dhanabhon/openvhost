@@ -21,9 +21,9 @@ pub(crate) struct AtomicWriteError {
 /// leftover for a real site config.
 ///
 /// A5: the actual suffix is `uuid::Uuid::new_v4().simple()` — see
-/// `atomic_write`. It is injected here, rather than generated inline, so a
+/// `write_atomic`. It is injected here, rather than generated inline, so a
 /// test can pin a known suffix and pre-plant a symlink at the exact temp
-/// path `atomic_write` would otherwise pick unpredictably; production code
+/// path `write_atomic` would otherwise pick unpredictably; production code
 /// never calls this with anything but a fresh random suffix.
 pub(crate) fn write_atomic_with_suffix(
     path: &Path,
