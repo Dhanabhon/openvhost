@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, expect, it } from 'vitest';
-import { statusFor, hotReloadLabel, startStopFor } from './webservers.derive';
-import type { ServiceStatus } from '$lib/ipc';
+import { statusFor, hotReloadLabel, startStopFor, stoppedPoolsFor } from './webservers.derive';
+import type { ServiceStatus, SiteDto } from '$lib/ipc';
 // NOTE: `ServiceState` is NOT exported from `$lib/ipc` (only `ServiceStateEvent`
 // and `ServiceStatus`), and `StatusPill` takes `kind: StateKind` rather than a
 // state object — so `statusFor` returns the kind STRING, indexed off the
@@ -103,5 +103,57 @@ describe('startStopFor', () => {
 		// whether the user may stop it.
 		expect(startStopFor('running', false)).toEqual({ kind: 'stop' });
 		expect(startStopFor('starting', false)).toEqual({ kind: 'stop' });
+	});
+});
+
+describe('stoppedPoolsFor', () => {
+	const site = (phpVersion: string, enabled = true): SiteDto => ({
+		id: `s-${phpVersion}-${enabled}`,
+		name: 'x',
+		domain: 'x.localhost',
+		docroot: '/x',
+		webServer: 'nginx',
+		phpVersion,
+		enabled,
+		createdAt: 0,
+		updatedAt: 0
+	});
+
+	it('names a pool an enabled site needs that is not running', () => {
+		// The 502 this exists to prevent: nginx up, pool down, site dead, and
+		// nothing on screen connecting the three.
+		expect(stoppedPoolsFor([site('8.4')], [svc('php-fpm-8.4', 'stopped')], true)).toEqual(['8.4']);
+	});
+
+	it('stays quiet when the pool is running', () => {
+		expect(stoppedPoolsFor([site('8.4')], [svc('php-fpm-8.4', 'running')], true)).toEqual([]);
+	});
+
+	it('ignores disabled sites', () => {
+		// Warning about a pool nothing is serving would train the user to
+		// ignore this line, and then it fails when it matters.
+		expect(stoppedPoolsFor([site('8.4', false)], [svc('php-fpm-8.4', 'stopped')], true)).toEqual(
+			[]
+		);
+	});
+
+	it('stays quiet while nginx itself is stopped', () => {
+		// The user has not asked to serve anything yet. A pool warning here is
+		// noise about a problem they do not have.
+		expect(stoppedPoolsFor([site('8.4')], [svc('php-fpm-8.4', 'stopped')], false)).toEqual([]);
+	});
+
+	it('names a pool that is missing from the snapshot entirely', () => {
+		// A PHP major with no registered service is not running by definition —
+		// this is the never-installed case, and it is the one most likely to
+		// bite a new user.
+		expect(stoppedPoolsFor([site('8.4')], [], true)).toEqual(['8.4']);
+	});
+
+	it('names each version once, in order, however many sites share it', () => {
+		expect(stoppedPoolsFor([site('8.4'), site('8.3'), site('8.4')], [], true)).toEqual([
+			'8.3',
+			'8.4'
+		]);
 	});
 });

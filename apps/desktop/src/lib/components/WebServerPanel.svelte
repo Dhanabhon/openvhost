@@ -15,6 +15,7 @@
 		configError,
 		reports,
 		validating,
+		stoppedPools = [],
 		onShowConfig,
 		onValidate,
 		onStart,
@@ -30,6 +31,12 @@
 		configError: Record<string, string>;
 		reports: Record<string, ValidationReportDto>;
 		validating: Record<string, boolean>;
+		/** PHP majors an enabled site needs whose pool is not running, while nginx
+		 * IS running (see `stoppedPoolsFor`). Panel-level, not per-row: it can name
+		 * more than one version at once and belongs above every row, not on nginx's
+		 * own — the per-row `ws-failed-*` block is about nginx failing to start,
+		 * not about a pool a different service owns. */
+		stoppedPools?: readonly string[];
 		onShowConfig: (id: string) => void;
 		onValidate: (id: string) => void;
 		onStart: (serviceId: string) => void;
@@ -68,6 +75,14 @@
 			</p>
 		</div>
 	{:else}
+		{#if stoppedPools.length > 0}
+			<p class="pool-warning" role="status" data-testid="ws-pool-warning">
+				nginx is running, but {stoppedPools.length === 1 ? 'the pool' : 'the pools'} your sites need
+				{stoppedPools.length === 1 ? 'is' : 'are'} not: PHP {stoppedPools.join(', ')}. A PHP site
+				will answer 502 until {stoppedPools.length === 1 ? 'it starts' : 'they start'}. Start
+				{stoppedPools.length === 1 ? 'it' : 'them'} on the Languages page.
+			</p>
+		{/if}
 		<div class="rowlist">
 			{#each servers as server (server.id)}
 				<!-- The per-id maps are indexed HERE so each row receives only its own slice.
@@ -125,6 +140,13 @@
 	.rowlist {
 		display: flex;
 		flex-direction: column;
+	}
+	.pool-warning {
+		margin: 0;
+		padding: var(--vh-space-3) var(--vh-space-4);
+		border-bottom: 1px solid var(--vh-border);
+		color: var(--vh-text-2);
+		font-size: var(--vh-text-table);
 	}
 	.empty {
 		padding: var(--vh-space-8) var(--vh-space-6);

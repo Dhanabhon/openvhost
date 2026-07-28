@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import type { ServiceStatus } from '$lib/ipc';
+import type { ServiceStatus, SiteDto } from '$lib/ipc';
 
 /**
  * The supervised state-kind a row shows, or `null` when the row has no
@@ -85,4 +85,38 @@ export function startStopFor(
 		return { kind: 'start', disabled: false, reason: '' };
 	}
 	return { kind: 'stop' };
+}
+
+/**
+ * The PHP majors an enabled site needs whose php-fpm pool is not running.
+ *
+ * A PHP site needs nginx AND a pool. Starting nginx alone leaves the site
+ * answering 502 with nothing on screen connecting the two — the page names the
+ * gap instead of letting the user find it in a browser.
+ *
+ * Only while nginx is RUNNING: with nginx stopped the user has not asked to
+ * serve anything, and a pool warning would be noise about a problem they do not
+ * have. Only ENABLED sites: a disabled site's pool is genuinely not needed, and
+ * warning about it teaches the user to ignore this line.
+ *
+ * A major missing from the snapshot counts as not running. That is the
+ * never-installed case, which is the one most likely to bite a new user, and
+ * treating "absent" as "fine" would hide exactly that.
+ *
+ * `site.phpVersion` is already `major.minor` (e.g. `8.4`), the same selector
+ * `PhpVersion::parse` validates in `crates/openvhost-core/src/site/model.rs`
+ * and the same value `php_fpm_spec` (`apps/desktop/src-tauri/src/stack.rs:79`)
+ * builds its `php-fpm-<major>` service id from — no extraction needed.
+ */
+export function stoppedPoolsFor(
+	sites: readonly SiteDto[],
+	services: readonly ServiceStatus[],
+	nginxRunning: boolean
+): string[] {
+	if (!nginxRunning) return [];
+	const needed = new Set(sites.filter((s) => s.enabled).map((s) => s.phpVersion));
+	const down = [...needed].filter(
+		(major) => services.find((s) => s.id === `php-fpm-${major}`)?.state.kind !== 'running'
+	);
+	return down.sort();
 }

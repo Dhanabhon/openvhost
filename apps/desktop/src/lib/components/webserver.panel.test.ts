@@ -345,6 +345,19 @@ describe('the service control', () => {
 	});
 });
 
+describe('the pool warning', () => {
+	it('warns that a site will 502 when its pool is down', () => {
+		const out = html({
+			servers: [nginx],
+			services: [svc('nginx', { kind: 'running' }), svc('php-fpm-8.4', { kind: 'stopped' })],
+			stoppedPools: ['8.4']
+		});
+		expect(out).toContain('data-testid="ws-pool-warning"');
+		expect(out).toContain('502');
+		expect(out).toContain('8.4');
+	});
+});
+
 describe('a failed nginx', () => {
 	it("shows nginx's own words, not just a failed pill", () => {
 		// The whole point. Asserting on the CONTENT, not on the presence of a
