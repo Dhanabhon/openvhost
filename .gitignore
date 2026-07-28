@@ -12,6 +12,12 @@ apps/desktop/src-tauri/gen/
 # Skills installed per-machine by whoever is working here. Not project-owned:
 # they carry their own compiled artefacts (__pycache__), they differ per person,
 # and committing one would ship someone's local tooling to everyone who clones.
-.claude/skills/
+#
+# `**/` and not a bare `.claude/skills/`: a pattern with an interior slash is
+# ANCHORED to the directory holding this file, so the bare form covered the repo
+# root and nothing else. A skill dropped in apps/desktop/ or crates/ would have
+# been committed. Verified with `git check-ignore` before and after this change,
+# not assumed from the docs.
+**/.claude/skills/
 # The isolated worktrees this repo's agent workflow creates live under here too.
-.claude/worktrees/
+**/.claude/worktrees/
