@@ -45,3 +45,38 @@ describe(':focus-visible', () => {
 		expect(focusVisibleBlock()).not.toMatch(/border-radius/);
 	});
 });
+
+describe('a focused quiet button', () => {
+	// `.btn-quiet` is the only variant with a visible border of its own, so the
+	// global ring's 2px offset stacked THREE concentric edges on it — border,
+	// gap, ring — and read as a doubled frame. Reported twice on the quit
+	// dialog's Cancel button. An earlier attempt widened the gap, which
+	// separated the two frames rather than removing one.
+	const button = readFileSync(new URL('../components/Button.svelte', import.meta.url), 'utf8');
+
+	/** The body of `.btn-quiet:focus-visible`, without its braces. */
+	function quietFocusBlock(): string {
+		const m = button.match(/\.btn-quiet:focus-visible\s*\{([^}]*)\}/);
+		if (!m) throw new Error('no `.btn-quiet:focus-visible` rule found in Button.svelte');
+		return m[1];
+	}
+
+	it('closes the gap, so the ring and the border form one band', () => {
+		// Any non-zero offset here puts the page background back between the
+		// button's own border and the ring — which is the doubled frame.
+		expect(quietFocusBlock()).toMatch(/outline-offset:\s*0/);
+	});
+
+	it("recolours its own border to the ring's colour", () => {
+		// With the gap closed, a grey border against a green ring would still read
+		// as two bands. Matching the colour is what makes them one.
+		expect(quietFocusBlock()).toMatch(/border-color:\s*var\(--vh-focus-ring\)/);
+	});
+
+	it('leaves the primary button on the global ring', () => {
+		// A green ring flush against a green fill would lose the contrast the 2px
+		// gap gives it against the page. Primary has no border to double up with,
+		// so it has nothing to fix.
+		expect(button).not.toMatch(/\.btn-primary:focus-visible/);
+	});
+});

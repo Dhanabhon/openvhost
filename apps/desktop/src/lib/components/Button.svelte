@@ -97,6 +97,29 @@
 	.btn-quiet:hover {
 		background: color-mix(in oklab, var(--vh-text) 6%, transparent);
 	}
+	/* The global `:focus-visible` in tokens.css puts a 2px ring 2px outside the
+	   control. On a button with no border of its own that reads as one focus
+	   indicator, which is what it is. On `.btn-quiet` — the only variant with a
+	   VISIBLE border — it stacks three concentric edges: the grey 1px border,
+	   the 2px gap, then the green ring. That reads as a doubled frame, and it
+	   was reported twice on the quit dialog's Cancel button.
+
+	   An earlier attempt moved the global offset from 1px to 2px. That treated
+	   the symptom: it separated the two frames rather than removing one, so
+	   there were still two.
+
+	   Closing the gap and letting the border carry the ring's colour merges
+	   them into a single 3px band whose radius matches the button. Only colour
+	   and offset change — the border is still 1px, so nothing reflows and the
+	   button does not move when focused.
+
+	   NOT applied to `.btn-primary`: its border is already transparent, so it
+	   has no doubling to fix, and a green ring flush against a green fill would
+	   lose the contrast the 2px gap currently gives it against the page. */
+	.btn-quiet:focus-visible {
+		border-color: var(--vh-focus-ring);
+		outline-offset: 0;
+	}
 	.btn:disabled {
 		color: var(--vh-text-disabled);
 		border-color: var(--vh-border);
