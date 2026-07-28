@@ -17,7 +17,9 @@
 		reports,
 		validating,
 		onShowConfig,
-		onValidate
+		onValidate,
+		onStart,
+		onStop
 	}: {
 		servers: readonly WebServerDto[];
 		/** The SHARED supervisor snapshot. Status is correlated by `serviceId` rather
@@ -31,6 +33,8 @@
 		validating: Record<string, boolean>;
 		onShowConfig: (id: string) => void;
 		onValidate: (id: string) => void;
+		onStart: (serviceId: string) => void;
+		onStop: (serviceId: string) => void;
 	} = $props();
 </script>
 
@@ -78,6 +82,8 @@
 					validating={validating[server.id] === true}
 					{onShowConfig}
 					{onValidate}
+					{onStart}
+					{onStop}
 				/>
 			{/each}
 		</div>

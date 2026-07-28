@@ -57,6 +57,8 @@ function html(props: Record<string, unknown>): string {
 			validating: {},
 			onShowConfig: () => {},
 			onValidate: () => {},
+			onStart: () => {},
+			onStop: () => {},
 			...props
 		}
 	}).body;
@@ -280,5 +282,48 @@ describe('a read error next to previously-read content', () => {
 		);
 		expect(t).toContain('cannot read /x/.openvhost/conf/nginx.conf: No such file');
 		expect(t).toContain('test is successful');
+	});
+});
+
+describe('the service control', () => {
+	it('renders nothing at all before the services snapshot arrives', () => {
+		// An empty services array is what the very first frame of every visit
+		// looks like. Neither a Start nor a Stop may appear.
+		const out = html({ servers: [nginx], services: [] });
+		expect(out).not.toContain('data-testid="ws-start-nginx"');
+		expect(out).not.toContain('data-testid="ws-stop-nginx"');
+	});
+
+	it('offers Start when nginx is stopped and a config exists', () => {
+		const out = html({ servers: [nginx], services: [svc('nginx', { kind: 'stopped' })] });
+		expect(out).toContain('data-testid="ws-start-nginx"');
+		// Asserting the REASON is absent, not that the word "disabled" is absent
+		// anywhere in the panel: this is a whole-panel string, and any other
+		// control acquiring a `disabled` attribute later would fail this case for
+		// a reason that has nothing to do with Start.
+		expect(out).not.toContain('ws-start-reason-nginx');
+	});
+
+	it('disables Start and says why when no config has been generated', () => {
+		const out = html({
+			servers: [{ ...nginx, configExists: false }],
+			services: [svc('nginx', { kind: 'stopped' })]
+		});
+		expect(out).toContain('data-testid="ws-start-nginx"');
+		expect(out).toContain('disabled');
+		expect(out).toContain('ws-start-reason-nginx');
+		expect(out).toContain('No config generated yet');
+	});
+
+	it('offers Stop while running', () => {
+		const out = html({ servers: [nginx], services: [svc('nginx', { kind: 'running' })] });
+		expect(out).toContain('data-testid="ws-stop-nginx"');
+		expect(out).not.toContain('data-testid="ws-start-nginx"');
+	});
+
+	it('gives Apache no service control, since it supervises nothing', () => {
+		const out = html({ servers: [apache], services: [] });
+		expect(out).not.toContain('ws-start-apache');
+		expect(out).not.toContain('ws-stop-apache');
 	});
 });

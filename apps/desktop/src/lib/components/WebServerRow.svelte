@@ -3,7 +3,7 @@
 	import type { ValidationReportDto, WebServerDto } from '$lib/ipc';
 	import type { StateKind } from '$lib/services.derive';
 	import { WEB_SERVERS, type WebServerKind } from '$lib/sites.derive';
-	import { hotReloadLabel } from '$lib/webservers.derive';
+	import { hotReloadLabel, startStopFor } from '$lib/webservers.derive';
 	import Button from './Button.svelte';
 	import StatusPill from './StatusPill.svelte';
 	import WebServerIcon from './WebServerIcon.svelte';
@@ -19,7 +19,9 @@
 		report,
 		validating,
 		onShowConfig,
-		onValidate
+		onValidate,
+		onStart,
+		onStop
 	}: {
 		server: WebServerDto;
 		/** From `statusFor()`; `null` for a brand with no supervised service (Apache)
@@ -32,7 +34,18 @@
 		validating: boolean;
 		onShowConfig: (id: string) => void;
 		onValidate: (id: string) => void;
+		onStart: (serviceId: string) => void;
+		onStop: (serviceId: string) => void;
 	} = $props();
+
+	// `server.serviceId` is null for a brand OpenVHost does not supervise
+	// (Apache), which is a different "no control" from "state not yet known" —
+	// both render nothing, but only one of them can ever change.
+	const control = $derived(
+		server.serviceId === null
+			? { kind: 'none' as const }
+			: startStopFor(statusKind, server.configExists)
+	);
 
 	/** Shown for any fact the backend could not fill in — never an empty gap the
 	 * reader cannot interpret. Reachable for `version` whenever the probe fails;
@@ -89,6 +102,32 @@
 		<div class="grow"></div>
 		{#if server.supported}
 			<div class="row-actions">
+				{#if control.kind === 'start'}
+					<Button
+						variant="quiet"
+						size="sm"
+						testId="ws-start-{server.id}"
+						ariaLabel="Start {server.displayName}"
+						disabled={control.disabled}
+						onclick={() => onStart(server.serviceId ?? '')}>Start</Button
+					>
+				{:else if control.kind === 'retry'}
+					<Button
+						variant="quiet"
+						size="sm"
+						testId="ws-retry-{server.id}"
+						ariaLabel="Retry {server.displayName}"
+						onclick={() => onStart(server.serviceId ?? '')}>Retry</Button
+					>
+				{:else if control.kind === 'stop'}
+					<Button
+						variant="quiet"
+						size="sm"
+						testId="ws-stop-{server.id}"
+						ariaLabel="Stop {server.displayName}"
+						onclick={() => onStop(server.serviceId ?? '')}>Stop</Button
+					>
+				{/if}
 				<Button
 					variant="quiet"
 					size="sm"
@@ -113,6 +152,12 @@
 			</div>
 		{/if}
 	</div>
+
+	{#if control.kind === 'start' && control.disabled}
+		<!-- The disabled button alone is a dead end: it says "not now" without
+		     saying when. This names the action that produces a config. -->
+		<p class="unavailable" data-testid="ws-start-reason-{server.id}">{control.reason}</p>
+	{/if}
 
 	{#if server.supported}
 		<dl class="facts">

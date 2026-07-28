@@ -106,6 +106,8 @@
 		validating={store.validating}
 		onShowConfig={(id) => void store.showConfig(id)}
 		onValidate={(id) => void store.validate(id)}
+		onStart={(id) => void servicesStore.start(id)}
+		onStop={(id) => void servicesStore.stop(id)}
 	/>
 	<WebServerSettingsForm
 		values={settings.values}
