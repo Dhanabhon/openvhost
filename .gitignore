@@ -9,3 +9,9 @@ apps/desktop/src-tauri/gen/
 .superpowers/
 .remember/
 .claude/settings.local.json
+# Skills installed per-machine by whoever is working here. Not project-owned:
+# they carry their own compiled artefacts (__pycache__), they differ per person,
+# and committing one would ship someone's local tooling to everyone who clones.
+.claude/skills/
+# The isolated worktrees this repo's agent workflow creates live under here too.
+.claude/worktrees/
