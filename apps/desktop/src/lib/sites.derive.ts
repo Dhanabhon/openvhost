@@ -142,7 +142,7 @@ export function phpVersionMissing(
  *
  * Deliberately RE-DERIVED here rather than carried over IPC as a structured
  * error field (see task-9-report.md, "which option and why", for the full
- * tradeoff): `phpEnvironment()` and `plan_site_apply()`/`apply_sites()` all read
+ * tradeoff): `phpEnvironment()` and `plan_config_apply()`/`apply_config()` all read
  * the same cached `RwLock<Option<InstalledRuntimes>>` in `commands.rs`, so this
  * and the backend's own check are already looking at the same source of truth
  * — they can only disagree in the same narrow window (a rescan landing between

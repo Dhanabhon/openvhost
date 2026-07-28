@@ -9,10 +9,19 @@ pid "{{ pid_path }}";
 error_log "{{ error_log }}" warn;
 error_log stderr notice;
 
-events {}
+events {
+    worker_connections {{ worker_connections }};
+}
 
 http {
     access_log "{{ access_log }}";
+    client_max_body_size {{ client_max_body_size }};
+    keepalive_timeout {{ keepalive_timeout }};
+    tcp_nodelay {{ tcp_nodelay }};
+    fastcgi_connect_timeout {{ fastcgi_connect_timeout }};
+    fastcgi_send_timeout {{ fastcgi_send_timeout }};
+    fastcgi_read_timeout {{ fastcgi_read_timeout }};
+    gzip {{ gzip }};{{ gzip_extra }}
     types {
         text/html                             html htm;
         text/css                              css;

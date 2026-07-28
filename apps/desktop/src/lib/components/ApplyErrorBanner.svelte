@@ -5,13 +5,17 @@
 
 	let {
 		error,
-		missing,
-		onEditSite
+		// Both default to "there is no site-shaped remedy to offer": the Web
+		// server page renders this same banner for the same shared pipeline, and
+		// it has no site list to derive a remedy from and no drawer to open. The
+		// Sites page passes both.
+		missing = null,
+		onEditSite = () => {}
 	}: {
 		/**
-		 * `applyStore.error` verbatim — a failed `plan_site_apply` (e.g.
+		 * `applyStore.error` verbatim — a failed `plan_config_apply` (e.g.
 		 * `MissingRuntime`/`NotAPlainFile`, which fail the whole call) or a
-		 * failed `apply_sites` once the dialog is closed with changes still
+		 * failed `apply_config` once the dialog is closed with changes still
 		 * pending. Rendered as-is, never parsed: see `missing` below for why
 		 * the "is this a missing runtime?" question is answered separately.
 		 */
@@ -24,15 +28,16 @@
 		 * task-9-report.md for the full reasoning). `null` here means "no PHP
 		 * remedy fits", not "nothing failed" — `error` is shown either way.
 		 */
-		missing: SiteDto | null;
+		missing?: SiteDto | null;
 		/** Opens `missing`'s site in the editor drawer — mirrors `SiteListRow`'s
-		 * own `onEdit`, so a page wiring one already has the other. */
-		onEditSite: (site: SiteDto) => void;
+		 * own `onEdit`, so a page wiring one already has the other. Only ever
+		 * called from the `missing !== null` branch, hence the no-op default. */
+		onEditSite?: (site: SiteDto) => void;
 	} = $props();
 </script>
 
 <div class="banner-error" role="alert" data-testid="apply-plan-error">
-	<strong>Couldn't apply site changes</strong>
+	<strong>Couldn't apply the pending changes</strong>
 	<!-- pre-wrap: `ValidationFailed`'s nginx stderr is multi-line and would run
 	     off-screen as a single line otherwise (the ServiceRow lesson, also
 	     applied in ApplyDialog.svelte's own copy of this same error). -->

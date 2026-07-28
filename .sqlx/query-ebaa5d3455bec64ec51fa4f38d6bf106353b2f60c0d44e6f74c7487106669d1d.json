@@ -1,0 +1,134 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT worker_connections, client_max_body_size, keepalive_timeout, tcp_nodelay, fastcgi_connect_timeout, fastcgi_send_timeout, fastcgi_read_timeout, gzip, gzip_comp_level, gzip_types FROM web_server_settings WHERE id = 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "worker_connections",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "web_server_settings",
+            "name": "worker_connections"
+          }
+        }
+      },
+      {
+        "name": "client_max_body_size",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "web_server_settings",
+            "name": "client_max_body_size"
+          }
+        }
+      },
+      {
+        "name": "keepalive_timeout",
+        "ordinal": 2,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "web_server_settings",
+            "name": "keepalive_timeout"
+          }
+        }
+      },
+      {
+        "name": "tcp_nodelay",
+        "ordinal": 3,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "web_server_settings",
+            "name": "tcp_nodelay"
+          }
+        }
+      },
+      {
+        "name": "fastcgi_connect_timeout",
+        "ordinal": 4,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "web_server_settings",
+            "name": "fastcgi_connect_timeout"
+          }
+        }
+      },
+      {
+        "name": "fastcgi_send_timeout",
+        "ordinal": 5,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "web_server_settings",
+            "name": "fastcgi_send_timeout"
+          }
+        }
+      },
+      {
+        "name": "fastcgi_read_timeout",
+        "ordinal": 6,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "web_server_settings",
+            "name": "fastcgi_read_timeout"
+          }
+        }
+      },
+      {
+        "name": "gzip",
+        "ordinal": 7,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "web_server_settings",
+            "name": "gzip"
+          }
+        }
+      },
+      {
+        "name": "gzip_comp_level",
+        "ordinal": 8,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "web_server_settings",
+            "name": "gzip_comp_level"
+          }
+        }
+      },
+      {
+        "name": "gzip_types",
+        "ordinal": 9,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "web_server_settings",
+            "name": "gzip_types"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "ebaa5d3455bec64ec51fa4f38d6bf106353b2f60c0d44e6f74c7487106669d1d"
+}

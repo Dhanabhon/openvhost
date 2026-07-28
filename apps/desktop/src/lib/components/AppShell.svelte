@@ -90,4 +90,25 @@
 		min-height: 0;
 		overflow: auto;
 	}
+	/* Beyond mock.css, and the fix for a bug that hit every page at once.
+
+	   `.content` is a COLUMN FLEX container, so everything a route renders into it is a
+	   flex item with the default `flex-shrink: 1`. A flex item is normally protected from
+	   shrinking below its own content by its automatic minimum size — but that protection
+	   is switched off for any item whose `overflow` is not `visible`, and every panel in
+	   this app sets `overflow: hidden` so its rounded corners clip the rows inside it
+	   (SitesPanel, ServicesPanel, WebServerPanel, WebServerSettingsForm). Those panels are
+	   therefore shrinkable all the way to zero, and once a page is taller than the window
+	   the browser shrinks them and clips their content instead of scrolling it.
+
+	   It showed up as the nginx card's "Version 1.31.3" sliced in half by the card's own
+	   bottom edge. It was latent on the other pages for as long as they happened to fit;
+	   the Web server page simply became the first one tall enough to expose it.
+
+	   `flex-shrink: 0` makes every child keep its natural height, which is what turns the
+	   excess into scrolling — the job `.content`'s `overflow: auto` was already there to
+	   do and never got the chance. */
+	.content > :global(*) {
+		flex-shrink: 0;
+	}
 </style>

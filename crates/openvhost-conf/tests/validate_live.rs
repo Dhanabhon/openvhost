@@ -8,7 +8,8 @@
 #![allow(clippy::unwrap_used)]
 
 use openvhost_conf::{
-    NginxAdapter, PhpFpmRuntime, PhpRuntimeAdapter, PhpUpstream, RenderCtx, WebServerAdapter,
+    BodySize, GzipLevel, GzipTypes, NginxAdapter, OnOff, PhpFpmRuntime, PhpRuntimeAdapter,
+    PhpUpstream, RenderCtx, Seconds, WebServerAdapter, WebServerSettings, WorkerConnections,
     find_brew_binaries, probe_nginx_version, validate_live,
 };
 
@@ -36,6 +37,30 @@ fn temp_home_ctx() -> (tempfile::TempDir, RenderCtx) {
     (base, ctx)
 }
 
+/// Write the main + site config generated from `settings` into `ctx.home`,
+/// create the directories `nginx -t` needs, and return the main config's path.
+///
+/// `NginxAdapter::validate` cannot serve this: it renders with
+/// `WebServerSettings::default()` on purpose (it answers "is the SHAPE
+/// valid?"), so a non-default settings value never reaches a real nginx
+/// through it. In production those values reach nginx through the apply
+/// pipeline's `validate_live` on the installed file, which is what this
+/// mirrors.
+fn materialize_with(ctx: &RenderCtx, settings: &WebServerSettings) -> std::path::PathBuf {
+    let main = NginxAdapter
+        .generate_main_config(&ctx.home, settings)
+        .unwrap();
+    let site = NginxAdapter.generate_site_config(ctx).unwrap();
+    for f in [&main, &site] {
+        std::fs::create_dir_all(f.path.parent().unwrap()).unwrap();
+        std::fs::write(&f.path, &f.contents).unwrap();
+    }
+    for d in ["run", "run/nginx", "logs"] {
+        std::fs::create_dir_all(ctx.home.join(d)).unwrap();
+    }
+    main.path
+}
+
 #[tokio::test]
 async fn generated_stack_passes_native_validators() {
     let Some(brew) = find_brew_binaries() else {
@@ -57,7 +82,9 @@ async fn generated_stack_passes_native_validators() {
     // A zero-match `include` glob also passes plain `-t` silently, so `-t`
     // alone can't prove the main->site include seam actually expanded. `-T`
     // test-and-dumps the fully resolved config to stdout instead.
-    let main = NginxAdapter.generate_main_config(&ctx.home).unwrap();
+    let main = NginxAdapter
+        .generate_main_config(&ctx.home, &WebServerSettings::default())
+        .unwrap();
     let err_log = ctx.home.join("logs/nginx.error.log");
     let dump = tokio::process::Command::new(&brew.nginx)
         .arg("-e")
@@ -122,7 +149,9 @@ async fn both_probes_pass_real_nginx_in_the_assembled_environment() {
          anything about the environment:\n{}",
         generated.stderr
     );
-    let main = NginxAdapter.generate_main_config(&ctx.home).unwrap();
+    let main = NginxAdapter
+        .generate_main_config(&ctx.home, &WebServerSettings::default())
+        .unwrap();
     let err_log = ctx.home.join("logs/nginx.error.log");
 
     let live = validate_live(&brew.nginx, &main.path, &err_log)
@@ -142,5 +171,226 @@ async fn both_probes_pass_real_nginx_in_the_assembled_environment() {
         version.is_some(),
         "real `nginx -v` produced no parseable banner under the assembled probe \
          environment, so every row would read `Version: Unknown`"
+    );
+}
+
+/// The settings the Web server page edits are rendered as directives at
+/// specific scopes, and only a REAL nginx can say whether that placement is
+/// legal. Every unit test in `webserver.rs` asserts on the string this crate
+/// produced — none of them can tell a valid config from one nginx refuses,
+/// which is the entire failure this layer exists to prevent: the newtypes
+/// guarantee the VALUES are well formed, the template decides where they GO.
+///
+/// Non-default across the board (including gzip on with a custom type list and
+/// a 900s read timeout), because the default set is the one path most likely to
+/// be exercised by accident elsewhere.
+#[tokio::test]
+async fn non_default_settings_pass_real_nginx() {
+    let Some(brew) = find_brew_binaries() else {
+        eprintln!("SKIP non_default_settings_pass_real_nginx: brew nginx not found");
+        return;
+    };
+    let (_home, ctx) = temp_home_ctx();
+    let settings = WebServerSettings {
+        worker_connections: WorkerConnections::parse(4096).unwrap(),
+        client_max_body_size: BodySize::parse("512m").unwrap(),
+        keepalive_timeout: Seconds::parse(15).unwrap(),
+        tcp_nodelay: OnOff::new(false),
+        fastcgi_connect_timeout: Seconds::parse(900).unwrap(),
+        fastcgi_send_timeout: Seconds::parse(900).unwrap(),
+        fastcgi_read_timeout: Seconds::parse(900).unwrap(),
+        gzip: OnOff::new(true),
+        gzip_comp_level: GzipLevel::parse(9).unwrap(),
+        gzip_types: GzipTypes::parse("text/x-component application/vnd.ms-fontobject").unwrap(),
+    };
+    let main_path = materialize_with(&ctx, &settings);
+    let err_log = ctx.home.join("logs/nginx.error.log");
+
+    let report = validate_live(&brew.nginx, &main_path, &err_log)
+        .await
+        .unwrap();
+    assert!(
+        report.ok,
+        "real `nginx -t` REJECTED a config built from settings every newtype \
+         accepted — the values parse but the template places them wrongly:\n{}",
+        report.stderr
+    );
+
+    // `-t` accepts a directive at a legal-but-wrong scope as readily as at the
+    // right one only when both are legal; it does NOT prove the values landed.
+    // Dump the resolved config and read them back.
+    let dump = tokio::process::Command::new(&brew.nginx)
+        .arg("-e")
+        .arg(&err_log)
+        .arg("-T")
+        .arg("-c")
+        .arg(&main_path)
+        .output()
+        .await
+        .unwrap();
+    assert!(dump.status.success());
+    let out = String::from_utf8_lossy(&dump.stdout);
+    for expected in [
+        "worker_connections 4096;",
+        "client_max_body_size 512m;",
+        "keepalive_timeout 15;",
+        "tcp_nodelay off;",
+        "fastcgi_read_timeout 900;",
+        "gzip on;",
+        "gzip_comp_level 9;",
+        "gzip_types text/x-component application/vnd.ms-fontobject;",
+    ] {
+        assert!(
+            out.contains(expected),
+            "nginx's own dump of the resolved config is missing {expected:?}:\n{out}"
+        );
+    }
+}
+
+/// The FULL DOCUMENTED MAXIMUM of `gzip_types`: [`GzipTypes::MAX_TOKENS`]
+/// tokens of exactly [`GzipTypes::MAX_TOKEN_LEN`] bytes each. Every value here
+/// is one this crate's own parser accepts and therefore one a user can save
+/// from the Web server page.
+///
+/// This is the case the unit tests structurally cannot cover. The token cap
+/// used to be 128 bytes on the theory that it only had to stop a smuggled
+/// payload, and every unit test agreed with itself about that number — but
+/// nginx's gzip filter hashes the type list into a bucket of
+/// `ngx_cacheline_size` (64) that no directive resizes, which fits 46 bytes
+/// per type and no more. Anything longer makes nginx reject THE WHOLE
+/// CONFIGURATION:
+///
+/// ```text
+/// nginx: [emerg] could not build test_types_hash, you should increase test_types_hash_bucket_size: 64
+/// ```
+///
+/// and `save_web_server_settings` does not run `nginx -t`, so the value lands
+/// in `state.db` silently and every later apply — including one for an
+/// unrelated site edited on the Sites page — fails validation and rolls back
+/// with an error naming nothing the user touched. Only a real nginx can say
+/// where that boundary is, so only a real nginx can keep the constant honest.
+#[tokio::test]
+async fn the_documented_gzip_types_maximum_loads_in_real_nginx() {
+    // Deliberately FAILS rather than skipping, like
+    // `both_probes_pass_real_nginx_in_the_assembled_environment` above and for
+    // the same reason: this is the ONLY check that the token cap is a number
+    // nginx can load. GitHub CI is disabled on this repo and local gates are
+    // the merge gate, so a skip here reads as a pass for the one fact this
+    // test exists to establish.
+    let Some(brew) = find_brew_binaries() else {
+        panic!(
+            "Homebrew nginx not found, so the gzip_types maximum could not be checked against \
+             a real nginx. This test must not skip: it is the only proof that \
+             GzipTypes::MAX_TOKEN_LEN is a length nginx's fixed test_types bucket accepts. \
+             Install it (brew install nginx) and re-run."
+        );
+    };
+    let (_home, ctx) = temp_home_ctx();
+
+    // Unique, MIME-shaped, each exactly MAX_TOKEN_LEN bytes.
+    let list = (0..GzipTypes::MAX_TOKENS)
+        .map(|i| {
+            let suffix = format!("{i:04}");
+            let filler = "a".repeat(GzipTypes::MAX_TOKEN_LEN - "text/".len() - suffix.len());
+            format!("text/{filler}{suffix}")
+        })
+        .collect::<Vec<_>>();
+    for t in &list {
+        assert_eq!(t.len(), GzipTypes::MAX_TOKEN_LEN);
+    }
+    let joined = list.join(" ");
+
+    let settings = WebServerSettings {
+        gzip: OnOff::new(true),
+        gzip_types: GzipTypes::parse(&joined).unwrap(),
+        ..WebServerSettings::default()
+    };
+    let main_path = materialize_with(&ctx, &settings);
+    let err_log = ctx.home.join("logs/nginx.error.log");
+
+    let report = validate_live(&brew.nginx, &main_path, &err_log)
+        .await
+        .unwrap();
+    assert!(
+        report.ok,
+        "real `nginx -t` REJECTED the documented maximum of gzip_types \
+         ({} tokens x {} bytes) — a value the Web server page accepts, saves \
+         without validation, and then makes every later apply fail:\n{}",
+        GzipTypes::MAX_TOKENS,
+        GzipTypes::MAX_TOKEN_LEN,
+        report.stderr
+    );
+}
+
+/// The largest `client_max_body_size` values [`BodySize`] accepts, each loaded
+/// by a real nginx. Shape alone (`^\d+[kKmMgG]?$`) does not decide this:
+/// nginx multiplies digits by unit into an `off_t` and refuses the config with
+/// `"client_max_body_size" directive invalid value` past `i64::MAX`, so the
+/// four boundaries the parser enforces are only meaningful if nginx agrees
+/// with them exactly.
+#[tokio::test]
+async fn the_largest_body_sizes_we_accept_load_in_real_nginx() {
+    // Fails rather than skips, for the same reason as the case above: these
+    // numbers are claims about another program's arithmetic.
+    let Some(brew) = find_brew_binaries() else {
+        panic!(
+            "Homebrew nginx not found, so the client_max_body_size boundaries could not be \
+             checked against a real nginx. This test must not skip: it is the only proof \
+             that BodySize's upper bound matches ngx_conf_set_off_slot. Install it \
+             (brew install nginx) and re-run."
+        );
+    };
+    for value in [
+        "9223372036854775807",
+        "8589934591g",
+        "8796093022207m",
+        "9007199254740991k",
+    ] {
+        let (_home, ctx) = temp_home_ctx();
+        let settings = WebServerSettings {
+            client_max_body_size: BodySize::parse(value).unwrap(),
+            ..WebServerSettings::default()
+        };
+        let main_path = materialize_with(&ctx, &settings);
+        let err_log = ctx.home.join("logs/nginx.error.log");
+        let report = validate_live(&brew.nginx, &main_path, &err_log)
+            .await
+            .unwrap();
+        assert!(
+            report.ok,
+            "real `nginx -t` REJECTED client_max_body_size {value:?}, which \
+             `BodySize::parse` accepts — the parser's upper bound is above \
+             nginx's:\n{}",
+            report.stderr
+        );
+    }
+}
+
+/// An empty `gzip_types` list is a legitimate setting ("compress nothing
+/// beyond nginx's built-in text/html"). This is the case that turns into a
+/// bare `gzip_types;` if the renderer emits the directive unconditionally —
+/// a syntax error only a real nginx reports.
+#[tokio::test]
+async fn an_empty_gzip_types_list_still_passes_real_nginx() {
+    let Some(brew) = find_brew_binaries() else {
+        eprintln!("SKIP an_empty_gzip_types_list_still_passes_real_nginx: brew nginx not found");
+        return;
+    };
+    let (_home, ctx) = temp_home_ctx();
+    let settings = WebServerSettings {
+        gzip: OnOff::new(true),
+        gzip_types: GzipTypes::parse("   ").unwrap(),
+        ..WebServerSettings::default()
+    };
+    let main_path = materialize_with(&ctx, &settings);
+    let err_log = ctx.home.join("logs/nginx.error.log");
+    let report = validate_live(&brew.nginx, &main_path, &err_log)
+        .await
+        .unwrap();
+    assert!(
+        report.ok,
+        "an empty gzip_types list must render as NO directive; a bare \
+         `gzip_types;` is what nginx is rejecting here:\n{}",
+        report.stderr
     );
 }

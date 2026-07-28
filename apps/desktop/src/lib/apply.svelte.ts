@@ -4,8 +4,8 @@
 import type { ApplyOutcomeDto, ApplyPlanDto, FileChangeDto } from './ipc';
 
 export interface ApplyApi {
-	planSiteApply(): Promise<ApplyPlanDto>;
-	applySites(): Promise<ApplyOutcomeDto>;
+	planConfigApply(): Promise<ApplyPlanDto>;
+	applyConfig(): Promise<ApplyOutcomeDto>;
 }
 
 function errorMessage(e: unknown): string {
@@ -31,7 +31,7 @@ export class ApplyStore {
 	async refresh(): Promise<void> {
 		this.error = '';
 		try {
-			this.changes = (await this.api.planSiteApply()).changes;
+			this.changes = (await this.api.planConfigApply()).changes;
 		} catch (e) {
 			this.error = errorMessage(e);
 			this.changes = [];
@@ -50,7 +50,7 @@ export class ApplyStore {
 		this.applying = true;
 		this.error = '';
 		try {
-			this.outcome = await this.api.applySites();
+			this.outcome = await this.api.applyConfig();
 		} catch (e) {
 			this.error = errorMessage(e);
 			return false;

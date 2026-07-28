@@ -23,7 +23,7 @@
 	/**
 	 * `needsAttention` did not exist when this dialog's shape was first sketched:
 	 * a later security/reliability review found that Apply could stop a service
-	 * and fail to bring it back while `apply_sites` still resolved successfully.
+	 * and fail to bring it back while `apply_config` still resolved successfully.
 	 * A non-empty list means the apply did NOT fully succeed, so it is rendered
 	 * INSTEAD of the plain success message, never alongside it — presenting both
 	 * would bury the thing the user has to act on under a headline that says
@@ -106,7 +106,7 @@
 		{#if error !== ''}
 			<!-- pre-wrap: nginx's stderr is multi-line and ran off-screen when it was
 			     rendered as a single line (the ServiceRow lesson). This also carries a
-			     failed `plan_site_apply` (MissingRuntime / NotAPlainFile): that error
+			     failed `plan_config_apply` (MissingRuntime / NotAPlainFile): that error
 			     arrives with `changes` empty, and without this the dialog would show an
 			     empty file list and nothing explaining why. -->
 			<!-- `white-space: pre-wrap` is ALSO set inline here, duplicating the scoped

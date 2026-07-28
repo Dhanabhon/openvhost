@@ -44,8 +44,10 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::home_disk_usage,
             commands::open_site,
             commands::open_homebrew_site,
-            commands::plan_site_apply,
-            commands::apply_sites,
+            commands::plan_config_apply,
+            commands::apply_config,
+            commands::web_server_settings,
+            commands::save_web_server_settings,
             commands::php_environment,
             commands::rescan_php_runtimes,
             commands::install_php,
@@ -174,11 +176,11 @@ pub fn run() {
             // the confirmation instead of failing loudly.
             app.manage(quit::UiReady::default());
 
-            // A2: serializes `apply_sites` end to end (plan -> commit -> validate
+            // A2: serializes `apply_config` end to end (plan -> commit -> validate
             // -> restart) so two overlapping Apply calls cannot interleave their
             // commit/rollback or their stop/start of the same services. Managed
             // unconditionally and up front, same reasoning as `UiReady` above —
-            // `apply_sites` also requires `Db`/`Arc<Supervisor>`/`Option<StackPaths>`
+            // `apply_config` also requires `Db`/`Arc<Supervisor>`/`Option<StackPaths>`
             // to be managed before it is reachable at all, so this is never
             // observed absent by a caller that could actually invoke the command.
             app.manage(commands::ApplyLock::default());

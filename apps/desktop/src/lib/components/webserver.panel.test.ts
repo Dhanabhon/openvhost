@@ -188,7 +188,11 @@ describe('the disclosure and Validate controls', () => {
 describe('the failed-validation next step', () => {
 	it('warns that Apply regenerates the file from the sites', () => {
 		const t = text(html({ reports: { nginx: { ok: false, stderr: 'nginx: [emerg] boom' } } }));
-		expect(t).toContain('this page is read-only');
+		// Not "this page is read-only" any more: the settings form below this
+		// panel edits exactly how that file is generated. The claim belongs to
+		// the config VIEW, which still cannot be typed into.
+		expect(t).toContain('it does not edit it');
+		expect(t).not.toContain('this page is read-only');
 		expect(t.toLowerCase()).toContain('regenerates this file from your sites');
 		expect(t).toContain('config/custom/');
 	});

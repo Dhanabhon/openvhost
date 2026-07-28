@@ -15,7 +15,7 @@ use std::os::unix::process::CommandExt;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-use openvhost_conf::probe_php_fpm_version;
+use openvhost_conf::{WebServerSettings, probe_php_fpm_version};
 use openvhost_core::platform::macos::demo_stack::{find_brew_binaries, provision_home};
 use openvhost_core::site::apply::LISTEN_PORT;
 use openvhost_core::{
@@ -169,6 +169,9 @@ async fn site_apply_serves_a_real_site_end_to_end() {
                 fpm_bin: brew.php_fpm.clone(),
             }],
         },
+        // The defaults, deliberately: this test proves the pipeline serves a
+        // real request end to end, not that any particular setting renders.
+        settings: WebServerSettings::default(),
     };
 
     let site_plan = plan(&input).unwrap_or_else(|e| panic!("plan() failed: {e}"));

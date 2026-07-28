@@ -9,13 +9,13 @@
 	import SiteDrawer from '$lib/components/SiteDrawer.svelte';
 	import SitesPanel from '$lib/components/SitesPanel.svelte';
 	import {
-		applySites,
+		applyConfig,
 		createSite,
 		deleteSite,
 		listSites,
 		openSite,
 		phpEnvironment,
-		planSiteApply,
+		planConfigApply,
 		updateSite,
 		type PhpEnvironmentDto,
 		type SiteDto,
@@ -28,7 +28,7 @@
 	import { SitesStore } from '$lib/sites.svelte';
 
 	const store = new SitesStore({ listSites, createSite, updateSite, deleteSite, openSite });
-	const applyStore = new ApplyStore({ planSiteApply, applySites });
+	const applyStore = new ApplyStore({ planConfigApply, applyConfig });
 	// The titlebar's "N running" belongs to every route, so it reads the shared
 	// supervisor state that `routes/+layout.svelte` subscribes to — this page used to
 	// pass a hardcoded 0, which announced "0 running" even with services up.
@@ -143,10 +143,10 @@
 	{/if}
 	{#if applyStore.error !== '' && !applyDialogOpen}
 		<!-- `applyStore.error` covers two distinct failures with one string: a
-		     failed `plan_site_apply` (MissingRuntime / NotAPlainFile — fails the
+		     failed `plan_config_apply` (MissingRuntime / NotAPlainFile — fails the
 		     WHOLE call, not just an empty change list) surfaces here with the
 		     dialog unreachable (no pending count means no "Review and apply"
-		     button), and a failed `apply_sites` surfaces here too once the user
+		     button), and a failed `apply_config` surfaces here too once the user
 		     closes the dialog with the count still pending. Without this banner
 		     the first case in particular would leave the user with no way to
 		     learn why Apply never appears at all. The heading stays generic
@@ -158,7 +158,7 @@
 		     reach or read behind a blurred backdrop.
 
 		     `missingRuntimeSite` — see its derivation above — is what turns this
-		     from a dead end into a way out: this is exactly the plan_site_apply
+		     from a dead end into a way out: this is exactly the plan_config_apply
 		     failure a machine that lost a PHP version hits, and until now this
 		     banner named the problem and offered nothing to press. -->
 		<ApplyErrorBanner error={applyStore.error} missing={missingRuntimeSite} onEditSite={onEdit} />

@@ -19,9 +19,19 @@ source of truth for architecture, roadmap, and agent ownership.
 5. Both OSes green in CI or it doesn't merge.
 6. Never bundle service binaries into the installer — runtime download
    with SHA-256 verification only (license + security).
-7. License is GPL-3.0-or-later (plan §1.3): SPDX headers on new files,
-   DCO sign-off, license-gate must pass for any new dependency, never
-   link native MySQL/MariaDB client libs (separate processes only).
+7. **DEFERRED until after v1.0.0 ships — do not act on this rule or raise
+   licensing as a consideration in the meantime** (owner decision,
+   2026-07-28). It was costing deliberation on nearly every slice while the
+   shape of the product is still moving, and any call made now would be
+   re-made later. Keep adding SPDX headers and `git commit -s` sign-off —
+   both are habit, cost nothing, and stripping them would be pure churn —
+   but skip the license-gate on new dependencies and do not weigh licence
+   implications when choosing an approach. Revisit the whole rule at 1.0.0.
+   *(Original: License is GPL-3.0-or-later (plan §1.3): SPDX headers on new
+   files, DCO sign-off, license-gate must pass for any new dependency,
+   never link native MySQL/MariaDB client libs — separate processes only.
+   Note rule 6 still stands on its own: runtime download with SHA-256
+   verification is a security requirement independently of licensing.)*
 8. Anything listed in plan §7 (Open Questions) needs a human decision —
    stop and ask.
 

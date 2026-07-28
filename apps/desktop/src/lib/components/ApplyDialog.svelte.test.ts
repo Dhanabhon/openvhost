@@ -170,7 +170,7 @@ describe('ApplyDialog', () => {
 			error: 'nginx is missing',
 			outcome: { applied: 1, restarted: ['nginx'], notStarted: [], needsAttention: [] }
 		});
-		// applySites() can succeed and then the automatic re-plan inside run() can
+		// applyConfig() can succeed and then the automatic re-plan inside run() can
 		// throw. Showing "Applied." next to that error would contradict it.
 		expect(body).not.toContain('data-testid="apply-success"');
 		expect(body).toContain('data-testid="apply-error"');
@@ -210,7 +210,7 @@ describe('ApplyDialog', () => {
 		expect(body).toContain('&lt;/script');
 	});
 
-	// A failed `plan_site_apply` (MissingRuntime / NotAPlainFile) can leave the
+	// A failed `plan_config_apply` (MissingRuntime / NotAPlainFile) can leave the
 	// dialog with an empty change list and nothing else to show — the error is the
 	// only thing telling the user why. Rendered even with zero changes.
 	it('shows the plan error even when there are no changes to display', () => {

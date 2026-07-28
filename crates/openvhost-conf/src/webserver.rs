@@ -10,12 +10,22 @@ use async_trait::async_trait;
 use crate::ctx::{PhpUpstream, RenderCtx, to_config_path};
 use crate::engine::render;
 use crate::error::ConfError;
+use crate::settings::WebServerSettings;
 use crate::{GeneratedFile, ValidationReport};
 
 #[async_trait]
 pub trait WebServerAdapter: Send + Sync {
     fn id(&self) -> &'static str;
-    fn generate_main_config(&self, home: &Path) -> Result<GeneratedFile, ConfError>;
+    /// The main config. `settings` supplies every tunable the Web server page
+    /// edits; each one is written explicitly, even at its default value, so
+    /// the generated file states what it means rather than leaving the reader
+    /// to know nginx's own fallbacks (the same call already made for
+    /// `clear_env` and `security.limit_extensions` in the php-fpm pool).
+    fn generate_main_config(
+        &self,
+        home: &Path,
+        settings: &WebServerSettings,
+    ) -> Result<GeneratedFile, ConfError>;
     fn generate_site_config(&self, ctx: &RenderCtx) -> Result<GeneratedFile, ConfError>;
     fn generate_default_site_config(
         &self,
@@ -59,6 +69,32 @@ impl NginxAdapter {
         })
     }
 
+    /// The gzip lines that only mean anything once gzip is on, composed in
+    /// Rust rather than with a Tera `{% if %}` — the same rule the platform
+    /// branch follows: decisions live in Rust, the template only interpolates.
+    ///
+    /// An empty `gzip_types` list yields NO `gzip_types` directive at all,
+    /// rather than a bare `gzip_types;` (which nginx rejects outright). An
+    /// empty list is a legitimate setting meaning "compress nothing beyond
+    /// nginx's built-in `text/html`", and omitting the directive is exactly
+    /// how nginx itself expresses that.
+    ///
+    /// Each line carries its own LEADING newline and the template appends this
+    /// directly after `gzip on|off;` — so the empty case adds no blank line at
+    /// all. Toggling gzip then shows up in the apply diff as exactly the lines
+    /// that changed, instead of dragging a phantom blank line along with them.
+    fn gzip_extra(settings: &WebServerSettings) -> String {
+        if !settings.gzip.is_on() {
+            return String::new();
+        }
+        let mut out = format!("\n    gzip_comp_level {};", settings.gzip_comp_level.get());
+        let types = settings.gzip_types.as_directive();
+        if !types.is_empty() {
+            out.push_str(&format!("\n    gzip_types {types};"));
+        }
+        out
+    }
+
     /// The PHP `location` block, or an empty string when no PHP runtime is
     /// installed — a `fastcgi_pass` with no pool behind it only produces 502s.
     fn php_location(
@@ -82,7 +118,11 @@ impl WebServerAdapter for NginxAdapter {
         "nginx"
     }
 
-    fn generate_main_config(&self, home: &Path) -> Result<GeneratedFile, ConfError> {
+    fn generate_main_config(
+        &self,
+        home: &Path,
+        settings: &WebServerSettings,
+    ) -> Result<GeneratedFile, ConfError> {
         let home_str = to_config_path(home)?;
         let mut tc = tera::Context::new();
         tc.insert(
@@ -101,6 +141,25 @@ impl WebServerAdapter for NginxAdapter {
             "custom_sites_glob",
             &format!("{home_str}/config/custom/sites/*.conf"),
         );
+        // Scope is load-bearing and is fixed by the template, not here:
+        // `worker_connections` is only legal inside `events`, and the
+        // `fastcgi_*` timeouts sit at `http` scope deliberately so they apply
+        // to every site rather than being repeated per server block.
+        tc.insert("worker_connections", &settings.worker_connections.get());
+        tc.insert(
+            "client_max_body_size",
+            settings.client_max_body_size.as_str(),
+        );
+        tc.insert("keepalive_timeout", &settings.keepalive_timeout.get());
+        tc.insert("tcp_nodelay", settings.tcp_nodelay.as_str());
+        tc.insert(
+            "fastcgi_connect_timeout",
+            &settings.fastcgi_connect_timeout.get(),
+        );
+        tc.insert("fastcgi_send_timeout", &settings.fastcgi_send_timeout.get());
+        tc.insert("fastcgi_read_timeout", &settings.fastcgi_read_timeout.get());
+        tc.insert("gzip", settings.gzip.as_str());
+        tc.insert("gzip_extra", &Self::gzip_extra(settings));
         let contents = render("nginx/main.conf", &tc)?;
         Ok(GeneratedFile {
             path: Self::gen_dir(home).join("nginx.conf"),
@@ -183,7 +242,11 @@ impl WebServerAdapter for NginxAdapter {
     async fn validate(&self, bin: &Path, ctx: &RenderCtx) -> Result<ValidationReport, ConfError> {
         // Materialize main + site into ctx.home, pre-create the dirs `nginx -t`
         // needs (run/, run/nginx/, logs/ — NOT www/), then run the validator.
-        let main = self.generate_main_config(&ctx.home)?;
+        // Defaults, not the user's stored settings: this call answers "is the
+        // generated SHAPE valid?", and the user's values reach a real
+        // `nginx -t` through the apply pipeline's `validate_live` on the
+        // installed file.
+        let main = self.generate_main_config(&ctx.home, &WebServerSettings::default())?;
         let site = self.generate_site_config(ctx)?;
         crate::validate::materialize(&[main.clone(), site])?;
         for d in ["run", "run/nginx", "logs"] {
@@ -223,7 +286,44 @@ impl WebServerAdapter for NginxAdapter {
 mod tests {
     use super::*;
     use crate::PhpUpstream;
+    use crate::settings::{BodySize, GzipLevel, GzipTypes, OnOff, Seconds, WorkerConnections};
     use std::path::PathBuf;
+
+    /// Render the main config for the default settings — the shape most tests
+    /// want.
+    fn main_conf() -> String {
+        NginxAdapter
+            .generate_main_config(Path::new("/tmp/ovh"), &WebServerSettings::default())
+            .unwrap()
+            .contents
+    }
+
+    /// The block path a directive sits inside, e.g. `["http"]`, walking the
+    /// generated file line by line.
+    ///
+    /// Scope, not mere presence, is what this file gets wrong in the way that
+    /// matters: `worker_connections` is legal only inside `events`, and a test
+    /// that greps the whole string would pass just as happily with it sitting
+    /// in `http`, where nginx refuses to start. Returns `None` when the
+    /// directive is absent.
+    fn scope_of(contents: &str, directive: &str) -> Option<Vec<String>> {
+        let mut stack: Vec<String> = Vec::new();
+        for line in contents.lines() {
+            let t = line.trim();
+            if t.starts_with('#') {
+                continue;
+            }
+            if t.split_whitespace().next() == Some(directive) && t.ends_with(';') {
+                return Some(stack);
+            }
+            if let Some(name) = t.strip_suffix('{') {
+                stack.push(name.trim().to_string());
+            } else if t == "}" {
+                stack.pop();
+            }
+        }
+        None
+    }
 
     fn unix_ctx() -> RenderCtx {
         RenderCtx::new(
@@ -240,7 +340,9 @@ mod tests {
 
     #[test]
     fn main_config_is_banner_quoted_and_includes() {
-        let f = NginxAdapter.generate_main_config(&unix_ctx().home).unwrap();
+        let f = NginxAdapter
+            .generate_main_config(&unix_ctx().home, &WebServerSettings::default())
+            .unwrap();
         assert_eq!(
             f.path,
             PathBuf::from("/tmp/ovh/config/generated/nginx/nginx.conf")
@@ -301,17 +403,18 @@ mod tests {
 
     #[test]
     fn generation_is_deterministic() {
-        let a = NginxAdapter.generate_main_config(&unix_ctx().home).unwrap();
-        let b = NginxAdapter.generate_main_config(&unix_ctx().home).unwrap();
+        let a = NginxAdapter
+            .generate_main_config(&unix_ctx().home, &WebServerSettings::default())
+            .unwrap();
+        let b = NginxAdapter
+            .generate_main_config(&unix_ctx().home, &WebServerSettings::default())
+            .unwrap();
         assert_eq!(a, b);
     }
 
     #[test]
     fn main_config_declares_mime_types() {
-        let f = NginxAdapter
-            .generate_main_config(std::path::Path::new("/tmp/ovh"))
-            .unwrap();
-        let c = &f.contents;
+        let c = &main_conf();
         // Without a types block nginx labels every response octet-stream and
         // browsers refuse to apply the stylesheet.
         assert!(c.contains("text/css                              css;"));
@@ -466,5 +569,205 @@ mod tests {
             .is_err(),
             "a site whose server_name is {stem:?} would collide with the catch-all"
         );
+    }
+
+    #[test]
+    fn worker_connections_lands_inside_the_events_block() {
+        // Scope matters: nginx rejects worker_connections anywhere else.
+        let c = main_conf();
+        assert_eq!(
+            scope_of(&c, "worker_connections").as_deref(),
+            Some(["events".to_string()].as_slice()),
+            "worker_connections must sit inside `events`, got:\n{c}"
+        );
+    }
+
+    #[test]
+    fn every_http_scoped_directive_sits_directly_inside_http() {
+        // Not "appears somewhere in the file": `fastcgi_read_timeout` nested
+        // one block deeper (inside `types`, say) or hoisted to the top level
+        // is a different config, and only its SCOPE distinguishes the two.
+        let c = main_conf();
+        for directive in [
+            "client_max_body_size",
+            "keepalive_timeout",
+            "tcp_nodelay",
+            "fastcgi_connect_timeout",
+            "fastcgi_send_timeout",
+            "fastcgi_read_timeout",
+            "gzip",
+        ] {
+            assert_eq!(
+                scope_of(&c, directive).as_deref(),
+                Some(["http".to_string()].as_slice()),
+                "{directive} must sit directly inside `http`, got:\n{c}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_http_level_settings_are_all_rendered() {
+        let c = main_conf();
+        assert!(c.contains("client_max_body_size 256m;"));
+        assert!(c.contains("keepalive_timeout 65;"));
+        assert!(c.contains("tcp_nodelay on;"));
+        assert!(c.contains("fastcgi_connect_timeout 60;"));
+        assert!(c.contains("fastcgi_send_timeout 300;"));
+        assert!(c.contains("fastcgi_read_timeout 300;"));
+        assert!(c.contains("gzip off;"));
+        assert!(c.contains("worker_connections 1024;"));
+    }
+
+    #[test]
+    fn a_changed_setting_changes_the_output() {
+        // Guards the whole point of the slice: if the template ignored the
+        // struct and kept its literals, every other test here would still pass.
+        let s = WebServerSettings {
+            fastcgi_read_timeout: Seconds::parse(900).unwrap(),
+            ..WebServerSettings::default()
+        };
+        let c = NginxAdapter
+            .generate_main_config(Path::new("/tmp/ovh"), &s)
+            .unwrap()
+            .contents;
+        assert!(c.contains("fastcgi_read_timeout 900;"));
+        assert!(!c.contains("fastcgi_read_timeout 300;"));
+    }
+
+    #[test]
+    fn every_setting_is_reachable_from_the_struct() {
+        // `a_changed_setting_changes_the_output` proves ONE field is wired.
+        // A field the template forgot would still render its default here and
+        // pass every literal assertion above, so change all of them at once
+        // and require the output to differ field by field.
+        let s = WebServerSettings {
+            worker_connections: WorkerConnections::parse(2048).unwrap(),
+            client_max_body_size: BodySize::parse("7m").unwrap(),
+            keepalive_timeout: Seconds::parse(11).unwrap(),
+            tcp_nodelay: OnOff::new(false),
+            fastcgi_connect_timeout: Seconds::parse(22).unwrap(),
+            fastcgi_send_timeout: Seconds::parse(33).unwrap(),
+            fastcgi_read_timeout: Seconds::parse(44).unwrap(),
+            gzip: OnOff::new(true),
+            gzip_comp_level: GzipLevel::parse(6).unwrap(),
+            gzip_types: GzipTypes::parse("text/x-component").unwrap(),
+        };
+        let c = NginxAdapter
+            .generate_main_config(Path::new("/tmp/ovh"), &s)
+            .unwrap()
+            .contents;
+        for expected in [
+            "worker_connections 2048;",
+            "client_max_body_size 7m;",
+            "keepalive_timeout 11;",
+            "tcp_nodelay off;",
+            "fastcgi_connect_timeout 22;",
+            "fastcgi_send_timeout 33;",
+            "fastcgi_read_timeout 44;",
+            "gzip on;",
+            "gzip_comp_level 6;",
+            "gzip_types text/x-component;",
+        ] {
+            assert!(c.contains(expected), "missing {expected:?} in:\n{c}");
+        }
+    }
+
+    #[test]
+    fn gzip_directives_appear_only_when_gzip_is_on() {
+        let off = main_conf();
+        assert!(off.contains("gzip off;"));
+        assert!(
+            !off.contains("gzip_types"),
+            "no point listing types with gzip off"
+        );
+        assert!(!off.contains("gzip_comp_level"));
+        // No phantom blank line where the gzip extras would have gone: toggling
+        // gzip must diff as exactly the lines that changed.
+        assert!(
+            off.contains("    gzip off;\n    types {"),
+            "gzip off left a stray blank line behind:\n{off}"
+        );
+
+        let s = WebServerSettings {
+            gzip: OnOff::new(true),
+            ..WebServerSettings::default()
+        };
+        let on = NginxAdapter
+            .generate_main_config(Path::new("/tmp/ovh"), &s)
+            .unwrap()
+            .contents;
+        assert!(on.contains("gzip on;"));
+        assert!(on.contains("gzip_comp_level 1;"));
+        assert!(on.contains("gzip_types text/plain"));
+        assert_eq!(
+            scope_of(&on, "gzip_comp_level").as_deref(),
+            Some(["http".to_string()].as_slice())
+        );
+        assert_eq!(
+            scope_of(&on, "gzip_types").as_deref(),
+            Some(["http".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn an_empty_gzip_types_list_emits_no_gzip_types_directive_at_all() {
+        // A blank input parses to an EMPTY list on purpose — "compress nothing
+        // beyond nginx's built-in text/html". The honest rendering of that is
+        // no directive; a bare `gzip_types;` is a syntax error nginx refuses
+        // to start on, which would turn a legitimate setting into a config the
+        // user cannot apply.
+        let s = WebServerSettings {
+            gzip: OnOff::new(true),
+            gzip_types: GzipTypes::parse("   ").unwrap(),
+            ..WebServerSettings::default()
+        };
+        let c = NginxAdapter
+            .generate_main_config(Path::new("/tmp/ovh"), &s)
+            .unwrap()
+            .contents;
+        assert!(c.contains("gzip on;"));
+        assert!(c.contains("gzip_comp_level 1;"));
+        assert!(
+            !c.contains("gzip_types"),
+            "an empty list must omit the directive, not emit a bare one:\n{c}"
+        );
+    }
+
+    #[test]
+    fn generation_stays_deterministic_for_non_default_settings() {
+        let s = WebServerSettings {
+            gzip: OnOff::new(true),
+            gzip_types: GzipTypes::parse("text/plain application/json").unwrap(),
+            ..WebServerSettings::default()
+        };
+        let a = NginxAdapter
+            .generate_main_config(Path::new("/tmp/ovh"), &s)
+            .unwrap();
+        let b = NginxAdapter
+            .generate_main_config(Path::new("/tmp/ovh"), &s)
+            .unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn every_rendered_setting_line_is_terminated() {
+        // A directive missing its `;` swallows the following line into itself:
+        // nginx either rejects the file or, worse, reads something other than
+        // what the template meant.
+        let s = WebServerSettings {
+            gzip: OnOff::new(true),
+            ..WebServerSettings::default()
+        };
+        let c = NginxAdapter
+            .generate_main_config(Path::new("/tmp/ovh"), &s)
+            .unwrap()
+            .contents;
+        for line in c.lines() {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') || t.ends_with('{') || t == "}" {
+                continue;
+            }
+            assert!(t.ends_with(';'), "unterminated directive line: {line:?}");
+        }
     }
 }
