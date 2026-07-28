@@ -3,7 +3,7 @@
 // domains resolve without touching the hosts file, which is why this slice
 // needs no privileged helper. Custom TLDs are a later slice.
 
-import type { SiteDto } from './ipc';
+import type { ScaffoldOutcomeDto, SiteDto } from './ipc';
 
 const LOCALHOST_SUFFIX = '.localhost';
 
@@ -160,4 +160,82 @@ export function findMissingRuntimeSite(
 		(s) => s.enabled && s.webServer === 'nginx' && phpVersionMissing(s, installed)
 	);
 	return found ?? null;
+}
+
+/**
+ * Live preview of the docroot the create-folder checkbox will produce.
+ * `null` = not previewable yet (blank parent or no name typed).
+ *
+ * Normalization MUST match Rust's `scaffold_path` (`crates/openvhost-core/src/site/scaffold.rs`):
+ * `parent.trim_end_matches('/')` joined with `/${name}`. Spec D7 accepts this TS/Rust
+ * duplication the same way the drawer's charset filters are accepted — a typing
+ * affordance, not the authority. The truth is the returned `SiteDto.docroot`: Rust
+ * re-validates the join as a `Docroot` (over-length, say) and can refuse a path this
+ * preview happily shows.
+ */
+export function scaffoldPreview(parent: string, name: string): string | null {
+	if (parent.trim() === '' || name === '') return null;
+	return `${parent.replace(/\/+$/, '')}/${name}`;
+}
+
+/**
+ * A renderable `{ tone, role, text }` for the outcome of create-with-folder —
+ * consumed exclusively by `ScaffoldNoticeBanner.svelte` (no copy strings live in
+ * that template; this is the one place authoring them, so translation/extraction
+ * has a single seam later).
+ *
+ * Named `ScaffoldNoticeCopy` rather than `ScaffoldNotice` as sketched in the design
+ * doc (spec D7): `SitesStore` already exports a `ScaffoldNotice` interface — the
+ * STATE this helper reads (`{ siteName; docroot; outcome }`) — and reusing that
+ * name for this unrelated return shape would read as the same type across two
+ * modules when it isn't.
+ */
+export type ScaffoldNoticeCopy = { tone: 'ok' | 'warn'; role: 'status' | 'alert'; text: string };
+
+/**
+ * Copy + tone for the scaffold-outcome notice banner. Exhaustive over
+ * `ScaffoldOutcomeDto` — deliberately NO `default:` case, so a fourth variant
+ * fails typecheck instead of silently rendering nothing (spec D7).
+ *
+ * `warn`, never `fail`: `save()` in `sites.svelte.ts` only ever assigns
+ * `lastScaffold` after the site itself has already been created — the folder step
+ * running here is strictly downstream of that success. Rendering this as the same
+ * fail-red as `ErrorBanner`/`ApplyErrorBanner` would tell the user their site did
+ * NOT save, which is false; `ScaffoldNoticeBanner.svelte` maps `warn` to this app's
+ * "starting/pending" amber, not its "failed" red, for exactly that reason.
+ */
+export function scaffoldNotice(
+	siteName: string,
+	docroot: string,
+	outcome: ScaffoldOutcomeDto
+): ScaffoldNoticeCopy {
+	switch (outcome.kind) {
+		case 'created':
+			return {
+				tone: 'ok',
+				role: 'status',
+				text: `Folder ready — added a starter page at ${docroot}/index.html.`
+			};
+		case 'keptExisting':
+			return {
+				tone: 'ok',
+				role: 'status',
+				text: `Folder ready — using your existing ${outcome.existing} in ${docroot}.`
+			};
+		case 'failed':
+			return {
+				tone: 'warn',
+				role: 'alert',
+				text: `${siteName} was saved, but its folder couldn't be set up: ${outcome.reason}`
+			};
+		default: {
+			// Standard exhaustiveness idiom (no `assertNever`-style helper exists yet
+			// in this codebase — checked). `outcome` only narrows to `never` here if
+			// every `kind` above has been handled; a fourth `ScaffoldOutcomeDto`
+			// variant added later fails THIS assignment at compile time rather than
+			// falling through silently.
+			const unreachable: never = outcome;
+			return unreachable;
+		}
+	}
 }

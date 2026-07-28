@@ -6,6 +6,7 @@
 	import ApplyDialog from '$lib/components/ApplyDialog.svelte';
 	import ApplyErrorBanner from '$lib/components/ApplyErrorBanner.svelte';
 	import PendingChangesBanner from '$lib/components/PendingChangesBanner.svelte';
+	import ScaffoldNoticeBanner from '$lib/components/ScaffoldNoticeBanner.svelte';
 	import SiteDrawer from '$lib/components/SiteDrawer.svelte';
 	import SitesPanel from '$lib/components/SitesPanel.svelte';
 	import {
@@ -112,8 +113,12 @@
 	// pending-changes banner would otherwise show a stale count (or none) after a
 	// save, a delete, or a row toggle. `refresh()` is cheap by design (see
 	// `ApplyStore`'s own doc comment) — it is fine to call after every mutation.
-	async function onSave(id: string | null, input: SiteInput): Promise<boolean> {
-		const ok = await store.save(id, input);
+	async function onSave(
+		id: string | null,
+		input: SiteInput,
+		createFolder: boolean
+	): Promise<boolean> {
+		const ok = await store.save(id, input, createFolder);
 		if (ok) await applyStore.refresh();
 		return ok;
 	}
@@ -188,6 +193,14 @@
 				>.</span
 			>
 		</div>
+	{/if}
+	{#if store.lastScaffold}
+		<ScaffoldNoticeBanner
+			siteName={store.lastScaffold.siteName}
+			docroot={store.lastScaffold.docroot}
+			outcome={store.lastScaffold.outcome}
+			onDismiss={() => store.dismissScaffold()}
+		/>
 	{/if}
 	<PendingChangesBanner count={applyStore.pendingCount} onReview={() => (applyDialogOpen = true)} />
 	<SitesPanel

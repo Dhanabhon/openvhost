@@ -5,6 +5,7 @@
 //! MUST NEVER depend on tauri: consumed by both the desktop app and the
 //! openvhost CLI. Current slice: home-directory resolution + CoreInfo.
 
+mod atomicfile;
 pub mod db;
 mod error;
 mod home;

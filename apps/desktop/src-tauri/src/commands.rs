@@ -15,6 +15,10 @@ use openvhost_core::{
     PhpVersion, Site, SiteId, SiteName, SiteRepository, SqliteSiteRepository,
     SqliteWebServerSettings, WebServer, WebServerSettingsRepository,
 };
+// Not re-exported at the crate root like the flat types above: `scaffold`'s
+// home is the `site` submodule (Tasks 2-3), and it stays that way rather than
+// growing `lib.rs`'s re-export list for a type only this one command needs.
+use openvhost_core::site::scaffold::{ScaffoldOutcome, ScaffoldStep, scaffold, scaffold_path};
 
 use crate::stack::StackPaths;
 
@@ -381,6 +385,72 @@ impl TryFrom<SiteInput> for NewSite {
     }
 }
 
+/// Scaffold outcome crossing IPC. Mirrors `openvhost_core::site::scaffold`'s
+/// `ScaffoldOutcome` — the core crate stays serde/specta-free by design, so
+/// this DTO is the serialization layer, the same seam as `Site` → `SiteDto`.
+/// `kind` is the discriminator the UI switches on exhaustively.
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ScaffoldOutcomeDto {
+    Created,
+    KeptExisting {
+        existing: String,
+    },
+    Failed {
+        step: ScaffoldStepDto,
+        reason: String,
+    },
+}
+
+impl From<ScaffoldOutcome> for ScaffoldOutcomeDto {
+    fn from(o: ScaffoldOutcome) -> Self {
+        match o {
+            ScaffoldOutcome::Created => ScaffoldOutcomeDto::Created,
+            ScaffoldOutcome::KeptExisting { existing } => {
+                ScaffoldOutcomeDto::KeptExisting { existing }
+            }
+            ScaffoldOutcome::Failed { step, reason } => ScaffoldOutcomeDto::Failed {
+                step: step.into(),
+                reason,
+            },
+        }
+    }
+}
+
+/// Which step of a [`ScaffoldOutcomeDto::Failed`] failed. Mirrors
+/// `openvhost_core::site::scaffold::ScaffoldStep`; never parse English out of
+/// `reason` in the UI — this is the stable discriminator for that.
+#[derive(Debug, Clone, Copy, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub enum ScaffoldStepDto {
+    CreateDir,
+    Inspect,
+    WritePlaceholder,
+}
+
+impl From<ScaffoldStep> for ScaffoldStepDto {
+    fn from(s: ScaffoldStep) -> Self {
+        match s {
+            ScaffoldStep::CreateDir => ScaffoldStepDto::CreateDir,
+            ScaffoldStep::Inspect => ScaffoldStepDto::Inspect,
+            ScaffoldStep::WritePlaceholder => ScaffoldStepDto::WritePlaceholder,
+        }
+    }
+}
+
+/// The result of `create_site`: the persisted site, plus what scaffolding did
+/// — if it was requested at all.
+///
+/// `scaffold: None` means "not requested" (the caller passed
+/// `create_folder: false`) — it is NOT a fourth outcome alongside
+/// `Created`/`KeptExisting`/`Failed`, and the UI must not conflate the two.
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateSiteResult {
+    pub site: SiteDto,
+    pub scaffold: Option<ScaffoldOutcomeDto>,
+}
+
 // These commands build a repository per call from the managed `Db` (cheap —
 // cloning a pool handle) rather than managing a second type. If `state.db`
 // failed to open at startup, `Db` is not managed and Tauri's State extraction
@@ -392,12 +462,36 @@ pub async fn list_sites(db: tauri::State<'_, Db>) -> Result<Vec<SiteDto>, IpcErr
     Ok(repo.list().await?.into_iter().map(SiteDto::from).collect())
 }
 
+/// Create a site, optionally scaffolding its docroot folder and a starter
+/// page (spec: docs/superpowers/specs/2026-07-29-p1-site-scaffold-design.md,
+/// D2).
+///
+/// Order is load-bearing: ingress guard → join (if `create_folder`) → DB
+/// insert → THEN scaffold. Scaffolding runs only once `repo.create` has
+/// actually returned `Ok` — a UNIQUE violation on `name`/`domain` returns
+/// `Err` from the `?` below and this function stops right there, before the
+/// `scaffold` line is ever reached, so a rejected create can never leave a
+/// folder behind.
 #[tauri::command]
 #[specta::specta]
-pub async fn create_site(db: tauri::State<'_, Db>, input: SiteInput) -> Result<SiteDto, IpcError> {
-    let new: NewSite = input.try_into()?;
+pub async fn create_site(
+    db: tauri::State<'_, Db>,
+    input: SiteInput,
+    create_folder: bool,
+) -> Result<CreateSiteResult, IpcError> {
+    let mut new: NewSite = input.try_into()?;
+    if create_folder {
+        // Re-parse of the JOINED path: over-length or bad-charset joins fail
+        // here as a docroot field error, before any row or folder exists.
+        new.docroot = scaffold_path(&new.docroot, &new.name)?;
+    }
     let repo = SqliteSiteRepository::new(db.inner());
-    Ok(SiteDto::from(repo.create(new).await?))
+    let site = repo.create(new).await?;
+    let scaffold = create_folder.then(|| scaffold(&site.docroot, &site.name, &site.domain));
+    Ok(CreateSiteResult {
+        site: SiteDto::from(site),
+        scaffold: scaffold.map(Into::into),
+    })
 }
 
 #[tauri::command]
@@ -2311,6 +2405,8 @@ mod php_ipc_tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod site_ipc_tests {
+    use tauri::Manager;
+
     use super::*;
 
     fn valid_input() -> SiteInput {
@@ -2440,6 +2536,195 @@ mod site_ipc_tests {
         assert_eq!(dto.created_at, 111);
         assert_eq!(dto.updated_at, 222);
         assert!(dto.enabled);
+    }
+
+    /// Every `ScaffoldOutcome` variant must survive the DTO mirror with its
+    /// payload intact — same reasoning as `dto_round_trips_a_site` above, for
+    /// the mirror `create_site` added alongside `SiteDto`.
+    #[test]
+    fn scaffold_outcome_dto_round_trips_every_variant() {
+        assert!(matches!(
+            ScaffoldOutcomeDto::from(ScaffoldOutcome::Created),
+            ScaffoldOutcomeDto::Created
+        ));
+
+        let kept = ScaffoldOutcomeDto::from(ScaffoldOutcome::KeptExisting {
+            existing: "index.php".to_string(),
+        });
+        match kept {
+            ScaffoldOutcomeDto::KeptExisting { existing } => assert_eq!(existing, "index.php"),
+            other => panic!("expected KeptExisting, got {other:?}"),
+        }
+
+        let failed = ScaffoldOutcomeDto::from(ScaffoldOutcome::Failed {
+            step: ScaffoldStep::WritePlaceholder,
+            reason: "disk full".to_string(),
+        });
+        match failed {
+            ScaffoldOutcomeDto::Failed { step, reason } => {
+                assert!(matches!(step, ScaffoldStepDto::WritePlaceholder));
+                assert_eq!(reason, "disk full");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scaffold_step_dto_round_trips_every_variant() {
+        assert!(matches!(
+            ScaffoldStepDto::from(ScaffoldStep::CreateDir),
+            ScaffoldStepDto::CreateDir
+        ));
+        assert!(matches!(
+            ScaffoldStepDto::from(ScaffoldStep::Inspect),
+            ScaffoldStepDto::Inspect
+        ));
+        assert!(matches!(
+            ScaffoldStepDto::from(ScaffoldStep::WritePlaceholder),
+            ScaffoldStepDto::WritePlaceholder
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // `create_site` end to end, against a real (in-memory) `Db` — the same
+    // `tauri::test::mock_builder`/`app.state()` harness `list_web_servers_*`
+    // and `rescan_blocks_while_an_install_holds_the_lock` already use below in
+    // this file (see the Cargo.toml comment on the `tauri "test"` feature:
+    // `tauri::test::mock_builder` is the ONLY way to obtain a `tauri::State`
+    // outside the framework itself). This is what makes it possible to pin
+    // `create_site`'s two properties that a `SiteInput`/`NewSite`-only test
+    // cannot reach: the actual insert-before-scaffold ORDER, and the actual
+    // bytes written to `state.db` for the docroot column.
+    // -----------------------------------------------------------------------
+
+    /// Joined-docroot storage: `input.docroot` is the PARENT the user picked,
+    /// and the column actually written — echoed back on `result.site.docroot`
+    /// — must be that parent JOINED with the site's name, because that is the
+    /// literal directory `scaffold` went on to create. A test that only
+    /// checked `scaffold_path` in isolation (already covered in
+    /// `site/scaffold.rs`) would miss a `create_site` that forgot to route the
+    /// join's output back into `new.docroot` before the insert.
+    #[tokio::test]
+    async fn create_site_stores_the_joined_docroot_and_scaffolds_it_when_requested() {
+        let parent_dir = tempfile::tempdir().unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(Db::open_in_memory().await.unwrap());
+
+        let input = SiteInput {
+            docroot: parent_dir.path().to_str().unwrap().to_string(),
+            ..valid_input()
+        };
+        let result = create_site(app.state(), input, true).await.unwrap();
+
+        let joined = parent_dir.path().join("myshop");
+        assert_eq!(
+            result.site.docroot,
+            joined.to_str().unwrap(),
+            "the stored docroot must be the JOINED path, not the raw parent the \
+             caller picked"
+        );
+        assert!(
+            joined.is_dir(),
+            "scaffold must have created the docroot itself"
+        );
+        assert!(
+            joined.join("index.html").exists(),
+            "scaffold must have written the placeholder page"
+        );
+        assert!(
+            matches!(result.scaffold, Some(ScaffoldOutcomeDto::Created)),
+            "expected Some(Created), got {:?}",
+            result.scaffold
+        );
+    }
+
+    /// Insert-before-scaffold ordering (spec D2): a UNIQUE violation on `name`
+    /// must leave NO folder behind for the rejected site. This is provable
+    /// from the source without running anything — `repo.create(new).await?`
+    /// diverges out of `create_site` on `Err` before the `scaffold` line is
+    /// ever reached — but it is exactly the kind of invariant worth pinning
+    /// with a real failing insert rather than trusting the reading alone.
+    #[tokio::test]
+    async fn a_unique_violation_leaves_no_folder_behind_for_the_rejected_site() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(Db::open_in_memory().await.unwrap());
+
+        let first_root = tempfile::tempdir().unwrap();
+        create_site(
+            app.state(),
+            SiteInput {
+                docroot: first_root.path().to_str().unwrap().to_string(),
+                ..valid_input()
+            },
+            true,
+        )
+        .await
+        .unwrap();
+
+        // Same NAME as the first (`valid_input()`'s "myshop") but a different
+        // domain, so `name` is the ONLY constraint this violates — `sites`
+        // also has a UNIQUE index on `domain`, and leaving that unchanged too
+        // would let sqlite report either column depending on index-check
+        // order, making the `field` assertion below flaky about which one.
+        let second_root = tempfile::tempdir().unwrap();
+        let err = create_site(
+            app.state(),
+            SiteInput {
+                docroot: second_root.path().to_str().unwrap().to_string(),
+                domain: "myshop-again.localhost".into(),
+                ..valid_input()
+            },
+            true,
+        )
+        .await
+        .unwrap_err();
+        match err {
+            IpcError::Validation { field, .. } => assert_eq!(field, "name"),
+            other => panic!("expected Validation on name, got {other:?}"),
+        }
+
+        let rejected_docroot = second_root.path().join("myshop");
+        assert!(
+            !rejected_docroot.exists(),
+            "a rejected create must leave NO folder behind at {} — scaffold must \
+             never run for a site that was never actually inserted",
+            rejected_docroot.display()
+        );
+    }
+
+    /// The other half of "`scaffold: None` means not requested": with
+    /// `create_folder: false`, the RAW docroot is stored untouched (no join)
+    /// and nothing is ever written to disk — even one that does not exist at
+    /// all, which would otherwise be exactly the case a stray join or an
+    /// unconditional scaffold call would surface on.
+    #[tokio::test]
+    async fn create_site_stores_the_raw_docroot_and_skips_scaffolding_when_not_requested() {
+        let parent_dir = tempfile::tempdir().unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(Db::open_in_memory().await.unwrap());
+
+        let docroot = parent_dir.path().join("never-created");
+        let input = SiteInput {
+            docroot: docroot.to_str().unwrap().to_string(),
+            ..valid_input()
+        };
+        let result = create_site(app.state(), input, false).await.unwrap();
+
+        assert_eq!(result.site.docroot, docroot.to_str().unwrap());
+        assert!(
+            result.scaffold.is_none(),
+            "scaffold must not run when not requested"
+        );
+        assert!(
+            !docroot.exists(),
+            "no folder may appear when create_folder is false"
+        );
     }
 
     #[test]

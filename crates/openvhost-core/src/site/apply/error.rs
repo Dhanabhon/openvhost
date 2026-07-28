@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use openvhost_conf::ConfError;
 
 use crate::CoreError;
+use crate::atomicfile::AtomicWriteError;
 
 /// Two different true statements depending on whether ANY PHP runtime was
 /// detected at all.
@@ -93,6 +94,19 @@ pub enum ApplyError {
     },
     #[error(transparent)]
     Core(#[from] CoreError),
+}
+
+/// Maps the crate-shared hardened atomic write's error (`crate::atomicfile`)
+/// into the pipeline's own `Io` variant; a manual impl rather than
+/// `#[from]` because the fields are remapped, not wrapped as-is.
+impl From<AtomicWriteError> for ApplyError {
+    fn from(e: AtomicWriteError) -> Self {
+        ApplyError::Io {
+            op: e.op,
+            path: e.path,
+            source: e.source,
+        }
+    }
 }
 
 /// What a rollback managed to do. Rollback continues past a failure — restoring

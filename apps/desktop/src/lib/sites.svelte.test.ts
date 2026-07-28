@@ -2,7 +2,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { SitesStore } from './sites.svelte';
 import type { SitesApi } from './sites.svelte';
-import type { SiteDto, SiteInput } from './ipc';
+import type { CreateSiteResult, ScaffoldOutcomeDto, SiteDto, SiteInput } from './ipc';
 
 const dto = (id: string, name: string): SiteDto => ({
 	id,
@@ -25,6 +25,14 @@ const input: SiteInput = {
 	enabled: true
 };
 
+/** `scaffold: null` (not requested/not applicable) unless a case says otherwise —
+ *  same default the api() mock below uses for every test that isn't specifically
+ *  about scaffolding. */
+const createResult = (scaffold: ScaffoldOutcomeDto | null = null): CreateSiteResult => ({
+	site: dto('a', 'shop'),
+	scaffold
+});
+
 // `as unknown as SitesApi` (not `as never`): callers keep a `const a = api()`
 // reference to assert `a.createSite`/etc. were called, which needs a type
 // with those members — `never` would satisfy the `SitesStore` constructor
@@ -32,7 +40,7 @@ const input: SiteInput = {
 function api(overrides: Partial<Record<string, unknown>> = {}): SitesApi {
 	return {
 		listSites: vi.fn(async () => [dto('a', 'shop')]),
-		createSite: vi.fn(async () => dto('a', 'shop')),
+		createSite: vi.fn(async () => createResult()),
 		updateSite: vi.fn(async () => dto('a', 'shop')),
 		deleteSite: vi.fn(async () => true),
 		openSite: vi.fn(async () => undefined),
@@ -47,18 +55,18 @@ describe('SitesStore', () => {
 		expect(store.sites.map((s) => s.name)).toEqual(['shop']);
 	});
 
-	it('save(null, input) creates then refetches', async () => {
+	it('save(null, input, false) creates then refetches', async () => {
 		const a = api();
 		const store = new SitesStore(a);
-		expect(await store.save(null, input)).toBe(true);
-		expect(a.createSite).toHaveBeenCalledWith(input);
+		expect(await store.save(null, input, false)).toBe(true);
+		expect(a.createSite).toHaveBeenCalledWith(input, false);
 		expect(a.listSites).toHaveBeenCalled();
 	});
 
-	it('save(id, input) updates then refetches', async () => {
+	it('save(id, input, false) updates then refetches', async () => {
 		const a = api();
 		const store = new SitesStore(a);
-		expect(await store.save('a', input)).toBe(true);
+		expect(await store.save('a', input, false)).toBe(true);
 		expect(a.updateSite).toHaveBeenCalledWith('a', input);
 	});
 
@@ -69,7 +77,7 @@ describe('SitesStore', () => {
 			})
 		});
 		const store = new SitesStore(a);
-		expect(await store.save(null, input)).toBe(false);
+		expect(await store.save(null, input, false)).toBe(false);
 		expect(store.fieldErrors.domain).toBe('already taken');
 		expect(store.error).toBeNull();
 	});
@@ -81,7 +89,7 @@ describe('SitesStore', () => {
 			})
 		});
 		const store = new SitesStore(a);
-		expect(await store.save(null, input)).toBe(false);
+		expect(await store.save(null, input, false)).toBe(false);
 		expect(store.fieldErrors.domain).toBe('already taken');
 		store.clearErrors();
 		expect(store.fieldErrors).toEqual({});
@@ -104,6 +112,52 @@ describe('SitesStore', () => {
 		const store = new SitesStore(a);
 		expect(await store.remove('a')).toBe(true);
 		expect(a.listSites).toHaveBeenCalled();
+	});
+});
+
+describe('SitesStore.lastScaffold', () => {
+	const outcome: ScaffoldOutcomeDto = { kind: 'created' };
+
+	it('passes createFolder through to the api and stores the scaffold outcome', async () => {
+		const a = api({ createSite: vi.fn(async () => createResult(outcome)) });
+		const store = new SitesStore(a);
+		expect(await store.save(null, input, true)).toBe(true);
+		expect(a.createSite).toHaveBeenCalledWith(input, true);
+		expect(store.lastScaffold).toEqual({
+			siteName: input.name,
+			docroot: '/srv/www/shop',
+			outcome
+		});
+	});
+
+	it('leaves lastScaffold null when scaffold was not requested', async () => {
+		// The default api() mock already resolves `{ scaffold: null }` — the
+		// honest shape `create_folder: false` produces on the Rust side.
+		const a = api();
+		const store = new SitesStore(a);
+		expect(await store.save(null, input, false)).toBe(true);
+		expect(a.createSite).toHaveBeenCalledWith(input, false);
+		expect(store.lastScaffold).toBeNull();
+	});
+
+	it('dismissScaffold clears the notice', async () => {
+		const a = api({ createSite: vi.fn(async () => createResult(outcome)) });
+		const store = new SitesStore(a);
+		await store.save(null, input, true);
+		expect(store.lastScaffold).not.toBeNull();
+		store.dismissScaffold();
+		expect(store.lastScaffold).toBeNull();
+	});
+
+	it('reset clears a stale scaffold notice', async () => {
+		const a = api({ createSite: vi.fn(async () => createResult(outcome)) });
+		const store = new SitesStore(a);
+		await store.save(null, input, true);
+		expect(store.lastScaffold).not.toBeNull();
+		// `clearErrors()` is the public entry point onto the store's shared
+		// private `reset()` — the same one `load()`/`save()`/`remove()` call.
+		store.clearErrors();
+		expect(store.lastScaffold).toBeNull();
 	});
 });
 

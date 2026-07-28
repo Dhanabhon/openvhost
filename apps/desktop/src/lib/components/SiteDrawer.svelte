@@ -85,6 +85,7 @@
 		splitDomain,
 		defaultPhpVersion,
 		phpVersionOptions,
+		scaffoldPreview,
 		WEB_SERVERS,
 		type WebServerKind
 	} from '$lib/sites.derive';
@@ -107,7 +108,7 @@
 		 * `phpVersionOptions`/`defaultPhpVersion` in `$lib/sites.derive` for why this
 		 * replaced a hardcoded list. */
 		installed: readonly string[];
-		onSave: (id: string | null, input: SiteInput) => Promise<boolean>;
+		onSave: (id: string | null, input: SiteInput, createFolder: boolean) => Promise<boolean>;
 		onDelete: (id: string) => Promise<boolean>;
 		onClose: () => void;
 	} = $props();
@@ -128,6 +129,11 @@
 	let name = $state(untrack(() => site?.name ?? ''));
 	let subdomain = $state(untrack(() => (site ? splitDomain(site.domain) : '')));
 	let docroot = $state(untrack(() => site?.docroot ?? ''));
+	// NOT seeded from `site` like the fields above: the checkbox this backs only ever
+	// renders in create mode (see the Project-folder field below), so an existing site
+	// has nothing to read here — always starting unchecked is the spec's explicit
+	// decision, not a stand-in default.
+	let createFolder = $state(false);
 	let webServer = $state<WebServerKind>(untrack(() => initialWebServer(site)));
 	let phpVersion = $state(untrack(() => site?.phpVersion ?? defaultPhpVersion(installed) ?? ''));
 	let enabled = $state(untrack(() => site?.enabled ?? true));
@@ -350,7 +356,16 @@
 	);
 
 	const rootDescribedBy = $derived(
-		[fieldErrors.docroot ? 'f-root-error' : null, pickerError ? 'f-root-picker-error' : null]
+		[
+			fieldErrors.docroot ? 'f-root-error' : null,
+			pickerError ? 'f-root-picker-error' : null,
+			// Mirrors the create-folder preview's own render gate below EXACTLY
+			// (`{#if site === null}` wrapping `{#if createFolder}`) — 'f-root-preview' must
+			// join this list only in the one case that paragraph is actually on the page.
+			// Last, per the same error-first ordering the other four fields use: it is a
+			// live description of what Save will do, not an error.
+			site === null && createFolder ? 'f-root-preview' : null
+		]
 			.filter((id): id is string => id !== null)
 			.join(' ') || undefined
 	);
@@ -377,7 +392,10 @@
 				phpVersion,
 				enabled
 			};
-			const ok = await onSave(site?.id ?? null, input);
+			// `createFolder` unconditionally: in edit mode the checkbox above never renders,
+			// so this state can only ever be its `false` default there — no need to gate the
+			// call on `site === null` a second time here.
+			const ok = await onSave(site?.id ?? null, input, createFolder);
 			if (ok) onClose();
 		} finally {
 			submitting = false;
@@ -507,6 +525,27 @@
 					Browse
 				</button>
 			</div>
+			{#if site === null}
+				<!-- Create mode only — an existing site's folder already exists (that is what
+				     "edit" means), so there is nothing to scaffold and this control would be a
+				     lie. Same wrapping-label convention as the Enabled checkbox below
+				     (`.checkbox-field`), not a new pattern. -->
+				<label class="checkbox-field">
+					<input id="f-root-create" type="checkbox" bind:checked={createFolder} />
+					Create a site folder inside this folder
+				</label>
+				{#if createFolder}
+					<!-- Live preview of exactly what Save will do to the path above — kept in sync
+					     with `rootDescribedBy` (this paragraph's id joins that list, last, only
+					     while both this renders and the checkbox is on). The fallback copy covers
+					     BOTH reasons `scaffoldPreview` can return null (blank parent or no name
+					     yet). -->
+					<p class="hint mono" id="f-root-preview">
+						{scaffoldPreview(docroot, name) ??
+							'Pick a folder and enter a name to see the final path'}
+					</p>
+				{/if}
+			{/if}
 			{#if fieldErrors.docroot}
 				<p class="field-error" id="f-root-error">{fieldErrors.docroot}</p>
 			{/if}

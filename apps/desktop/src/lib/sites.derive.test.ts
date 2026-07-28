@@ -7,9 +7,11 @@ import {
 	findMissingRuntimeSite,
 	phpVersionMissing,
 	phpVersionOptions,
+	scaffoldNotice,
+	scaffoldPreview,
 	splitDomain
 } from './sites.derive';
-import type { SiteDto } from './ipc';
+import type { ScaffoldOutcomeDto, SiteDto } from './ipc';
 
 const site = (overrides: Partial<SiteDto> = {}): SiteDto => ({
 	id: 'a1',
@@ -143,4 +145,49 @@ describe('findMissingRuntimeSite', () => {
 	it('is null when every servable site has an installed version', () => {
 		expect(findMissingRuntimeSite([site({ phpVersion: '8.5' })], ['8.5'])).toBeNull();
 	});
+});
+
+describe('scaffoldNotice', () => {
+	// Exhaustive over ScaffoldOutcomeDto's three variants (spec D7) — one test per
+	// variant, each asserting the tone/role pairing the banner's `role`/`data-tone`
+	// attributes render from, plus the substrings the copy must contain.
+	it('created: ok/status, names the starter-page path', () => {
+		const outcome: ScaffoldOutcomeDto = { kind: 'created' };
+		const notice = scaffoldNotice('hello', '/srv/www/hello', outcome);
+		expect(notice.tone).toBe('ok');
+		expect(notice.role).toBe('status');
+		expect(notice.text).toContain('/srv/www/hello/index.html');
+	});
+
+	it('keptExisting: ok/status, names the file it kept', () => {
+		const outcome: ScaffoldOutcomeDto = { kind: 'keptExisting', existing: 'index.php' };
+		const notice = scaffoldNotice('hello', '/srv/www/hello', outcome);
+		expect(notice.tone).toBe('ok');
+		expect(notice.role).toBe('status');
+		expect(notice.text).toContain('index.php');
+		expect(notice.text).toContain('/srv/www/hello');
+	});
+
+	it('failed: warn/alert (NOT the fail-red tone), names the site and the reason', () => {
+		const outcome: ScaffoldOutcomeDto = {
+			kind: 'failed',
+			step: 'createDir',
+			reason: 'Permission denied (os error 13)'
+		};
+		const notice = scaffoldNotice('hello', '/srv/www/hello', outcome);
+		expect(notice.tone).toBe('warn');
+		expect(notice.role).toBe('alert');
+		expect(notice.text).toContain('hello');
+		expect(notice.text).toContain('Permission denied (os error 13)');
+	});
+});
+
+describe('scaffoldPreview', () => {
+	it('joins parent and name', () =>
+		expect(scaffoldPreview('/Users/x/Downloads', 'my-site')).toBe('/Users/x/Downloads/my-site'));
+	it('normalizes trailing slashes', () =>
+		expect(scaffoldPreview('/Users/x/Downloads//', 'my-site')).toBe('/Users/x/Downloads/my-site'));
+	it('handles the root parent', () => expect(scaffoldPreview('/', 'a')).toBe('/a'));
+	it('returns null while name is empty', () => expect(scaffoldPreview('/x', '')).toBeNull());
+	it('returns null while parent is blank', () => expect(scaffoldPreview('  ', 'a')).toBeNull());
 });

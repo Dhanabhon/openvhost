@@ -5,6 +5,7 @@ import type {
 	ApplyOutcomeDto,
 	ApplyPlanDto,
 	CoreInfo,
+	CreateSiteResult,
 	FileChangeDto,
 	HomeUsageDto,
 	InstallOutcomeDto,
@@ -13,6 +14,8 @@ import type {
 	PhpEnvironmentDto,
 	PhpInstallLogEvent,
 	PhpRuntimeDto,
+	ScaffoldOutcomeDto,
+	ScaffoldStepDto,
 	ServiceLogEvent,
 	ServiceProblemDto,
 	ServicesMemoryDto,
@@ -29,6 +32,7 @@ export type {
 	ApplyOutcomeDto,
 	ApplyPlanDto,
 	CoreInfo,
+	CreateSiteResult,
 	FileChangeDto,
 	HomeUsageDto,
 	InstallOutcomeDto,
@@ -37,6 +41,8 @@ export type {
 	PhpEnvironmentDto,
 	PhpInstallLogEvent,
 	PhpRuntimeDto,
+	ScaffoldOutcomeDto,
+	ScaffoldStepDto,
 	ServiceLogEvent,
 	ServiceProblemDto,
 	ServicesMemoryDto,
@@ -139,8 +145,17 @@ export async function onServiceLog(cb: (ev: ServiceLogEvent) => void): Promise<(
 export async function listSites(): Promise<SiteDto[]> {
 	return unwrap(commands.listSites());
 }
-export async function createSite(input: SiteInput): Promise<SiteDto> {
-	return unwrap(commands.createSite(input));
+/**
+ * Create a site. `createFolder: true` also scaffolds the docroot folder and a
+ * starter page on disk — see `CreateSiteResult.scaffold` (`null` means it was
+ * not requested at all, never a fourth outcome alongside the scaffold enum's
+ * own three).
+ */
+export async function createSite(
+	input: SiteInput,
+	createFolder: boolean
+): Promise<CreateSiteResult> {
+	return unwrap(commands.createSite(input, createFolder));
 }
 export async function updateSite(id: string, input: SiteInput): Promise<SiteDto> {
 	return unwrap(commands.updateSite(id, input));
