@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Turn a picked parent folder into a site's docroot and, later, a starter
-//! page (spec: docs/superpowers/specs/2026-07-29-p1-site-scaffold-design.md).
+//! Turn a picked parent folder into a site's docroot and a starter page
+//! (spec: docs/superpowers/specs/2026-07-29-p1-site-scaffold-design.md).
 //!
-//! This file currently holds only the pure pieces: [`scaffold_path`] (the
-//! parent+name join, re-validated as a `Docroot` before anything touches the
-//! filesystem) and the [`ScaffoldOutcome`]/[`ScaffoldStep`] shapes that the
-//! filesystem-touching `scaffold()` (a later slice) reports through. Kept
-//! serde/specta-free by design — the app layer mirrors these as DTOs.
+//! Holds [`scaffold_path`] (the parent+name join, re-validated as a
+//! `Docroot` before anything touches the filesystem), the
+//! [`ScaffoldOutcome`]/[`ScaffoldStep`] shapes that [`scaffold`] reports
+//! through, and `scaffold` itself: creating the docroot directory and, unless
+//! an `index.*` entry point already exists there, writing an escaped
+//! placeholder `index.html`. Kept serde/specta-free by design — the app
+//! layer mirrors `ScaffoldOutcome` as a DTO.
 
 use crate::error::CoreError;
-use crate::site::model::{Docroot, SiteName};
+use crate::site::model::{Docroot, Domain, SiteName};
 
 /// Pure join of the picked parent folder and the site name, re-validated as a
 /// `Docroot` so the over-length case fails before anything is created.
@@ -54,17 +56,124 @@ pub enum ScaffoldStep {
     WritePlaceholder,
 }
 
+const PLACEHOLDER_HTML: &str = include_str!("placeholder.html");
+
+/// Create the docroot folder and starter page. Infallible by design: every
+/// failure is data (`ScaffoldOutcome::Failed`), because the caller has already
+/// persisted the site row and must not roll it back over a filesystem problem.
+pub fn scaffold(docroot: &Docroot, name: &SiteName, domain: &Domain) -> ScaffoldOutcome {
+    let dir = docroot.as_path();
+    match std::fs::create_dir(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // lstat, no follow: a file or symlink squatting on the docroot is
+            // refused rather than written into.
+            match std::fs::symlink_metadata(dir) {
+                Ok(md) if md.is_dir() => {}
+                Ok(_) => {
+                    return ScaffoldOutcome::Failed {
+                        step: ScaffoldStep::CreateDir,
+                        reason: format!("{} already exists and is not a folder", dir.display()),
+                    };
+                }
+                Err(e) => {
+                    return ScaffoldOutcome::Failed {
+                        step: ScaffoldStep::CreateDir,
+                        reason: format!("{}: {e}", dir.display()),
+                    };
+                }
+            }
+        }
+        Err(e) => {
+            return ScaffoldOutcome::Failed {
+                step: ScaffoldStep::CreateDir,
+                reason: format!("{}: {e}", dir.display()),
+            };
+        }
+    }
+
+    match existing_index(dir) {
+        Ok(Some(existing)) => return ScaffoldOutcome::KeptExisting { existing },
+        Ok(None) => {}
+        Err(e) => {
+            return ScaffoldOutcome::Failed {
+                step: ScaffoldStep::Inspect,
+                reason: format!("{}: {e}", dir.display()),
+            };
+        }
+    }
+
+    let html = render_placeholder(name, domain, docroot);
+    match crate::atomicfile::write_atomic(&dir.join("index.html"), &html) {
+        Ok(()) => ScaffoldOutcome::Created,
+        Err(e) => ScaffoldOutcome::Failed {
+            step: ScaffoldStep::WritePlaceholder,
+            reason: format!("{}: {}", e.path.display(), e.source),
+        },
+    }
+}
+
+/// Any non-directory entry whose file stem is `index` (ASCII case-insensitive)
+/// blocks generation: covers index.html / index.htm / index.php / INDEX.HTML,
+/// identically on case-insensitive (APFS default) and case-sensitive volumes.
+fn existing_index(dir: &std::path::Path) -> std::io::Result<Option<String>> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            continue;
+        }
+        let fname = entry.file_name();
+        let Some(fname) = fname.to_str() else {
+            continue;
+        };
+        if std::path::Path::new(fname)
+            .file_stem()
+            .is_some_and(|s| s.eq_ignore_ascii_case("index"))
+        {
+            return Ok(Some(fname.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+/// Escaping lives HERE, unconditionally, for all three values — the newtypes
+/// are charset guards, not encoders, and Docroot legally contains & < > '.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn render_placeholder(name: &SiteName, domain: &Domain, docroot: &Docroot) -> String {
+    PLACEHOLDER_HTML
+        .replace("{{name}}", &html_escape(name.as_str()))
+        .replace("{{domain}}", &html_escape(domain.as_str()))
+        .replace("{{docroot}}", &html_escape(docroot.as_str()))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::site::model::{Docroot, SiteName};
+    use crate::site::model::{Docroot, Domain, SiteName};
 
     fn d(s: &str) -> Docroot {
         Docroot::parse(s).unwrap()
     }
     fn n(s: &str) -> SiteName {
         SiteName::parse(s).unwrap()
+    }
+    fn dom(s: &str) -> Domain {
+        Domain::parse(s).unwrap()
     }
 
     #[test]
@@ -110,5 +219,181 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn scaffold_creates_dir_and_placeholder() {
+        let parent_dir = tempfile::tempdir().unwrap();
+        let parent = d(parent_dir.path().to_str().unwrap());
+        let docroot = scaffold_path(&parent, &n("my-site")).unwrap();
+        let name = n("my-site");
+        let domain = dom("my-site.localhost");
+
+        let outcome = scaffold(&docroot, &name, &domain);
+        assert_eq!(outcome, ScaffoldOutcome::Created);
+
+        assert!(docroot.as_path().is_dir());
+        let contents = std::fs::read_to_string(docroot.as_path().join("index.html")).unwrap();
+        assert!(
+            contents.contains("my-site"),
+            "missing site name: {contents}"
+        );
+        assert!(
+            contents.contains("my-site.localhost"),
+            "missing domain: {contents}"
+        );
+        assert!(
+            contents.contains(docroot.as_str()),
+            "missing docroot path: {contents}"
+        );
+    }
+
+    #[test]
+    fn scaffold_second_run_keeps_existing() {
+        let parent_dir = tempfile::tempdir().unwrap();
+        let parent = d(parent_dir.path().to_str().unwrap());
+        let docroot = scaffold_path(&parent, &n("my-site")).unwrap();
+        let name = n("my-site");
+        let domain = dom("my-site.localhost");
+
+        assert_eq!(scaffold(&docroot, &name, &domain), ScaffoldOutcome::Created);
+
+        let index = docroot.as_path().join("index.html");
+        let before_contents = std::fs::read_to_string(&index).unwrap();
+        let before_mtime = std::fs::metadata(&index).unwrap().modified().unwrap();
+
+        let second = scaffold(&docroot, &name, &domain);
+        assert_eq!(
+            second,
+            ScaffoldOutcome::KeptExisting {
+                existing: "index.html".to_string()
+            }
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&index).unwrap(),
+            before_contents,
+            "content must be untouched by a second run"
+        );
+        assert_eq!(
+            std::fs::metadata(&index).unwrap().modified().unwrap(),
+            before_mtime,
+            "mtime must be untouched by a second run"
+        );
+    }
+
+    #[test]
+    fn scaffold_keeps_existing_index_php() {
+        let parent_dir = tempfile::tempdir().unwrap();
+        let parent = d(parent_dir.path().to_str().unwrap());
+        let docroot = scaffold_path(&parent, &n("my-site")).unwrap();
+        std::fs::create_dir(docroot.as_path()).unwrap();
+        std::fs::write(docroot.as_path().join("index.php"), "<?php echo 'hi'; ?>").unwrap();
+
+        let outcome = scaffold(&docroot, &n("my-site"), &dom("my-site.localhost"));
+        assert_eq!(
+            outcome,
+            ScaffoldOutcome::KeptExisting {
+                existing: "index.php".to_string()
+            }
+        );
+        assert!(!docroot.as_path().join("index.html").exists());
+    }
+
+    #[test]
+    fn scaffold_keeps_existing_uppercase_index() {
+        let parent_dir = tempfile::tempdir().unwrap();
+        let parent = d(parent_dir.path().to_str().unwrap());
+        let docroot = scaffold_path(&parent, &n("my-site")).unwrap();
+        std::fs::create_dir(docroot.as_path()).unwrap();
+        std::fs::write(docroot.as_path().join("INDEX.HTML"), "already here").unwrap();
+
+        let outcome = scaffold(&docroot, &n("my-site"), &dom("my-site.localhost"));
+        assert_eq!(
+            outcome,
+            ScaffoldOutcome::KeptExisting {
+                existing: "INDEX.HTML".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn scaffold_ignores_directory_named_index() {
+        let parent_dir = tempfile::tempdir().unwrap();
+        let parent = d(parent_dir.path().to_str().unwrap());
+        let docroot = scaffold_path(&parent, &n("my-site")).unwrap();
+        std::fs::create_dir(docroot.as_path()).unwrap();
+        std::fs::create_dir(docroot.as_path().join("index")).unwrap();
+
+        let outcome = scaffold(&docroot, &n("my-site"), &dom("my-site.localhost"));
+        assert_eq!(outcome, ScaffoldOutcome::Created);
+        assert!(docroot.as_path().join("index.html").exists());
+    }
+
+    #[test]
+    fn scaffold_fails_when_parent_missing() {
+        let parent_dir = tempfile::tempdir().unwrap();
+        let missing = parent_dir.path().join("does-not-exist/my-site");
+        let docroot = d(missing.to_str().unwrap());
+
+        let outcome = scaffold(&docroot, &n("my-site"), &dom("my-site.localhost"));
+        match outcome {
+            ScaffoldOutcome::Failed { step, .. } => assert_eq!(step, ScaffoldStep::CreateDir),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scaffold_fails_when_target_is_a_file() {
+        let parent_dir = tempfile::tempdir().unwrap();
+        let parent = d(parent_dir.path().to_str().unwrap());
+        let docroot = scaffold_path(&parent, &n("my-site")).unwrap();
+        std::fs::write(docroot.as_path(), "just a file").unwrap();
+
+        let outcome = scaffold(&docroot, &n("my-site"), &dom("my-site.localhost"));
+        match outcome {
+            ScaffoldOutcome::Failed { step, reason } => {
+                assert_eq!(step, ScaffoldStep::CreateDir);
+                assert!(reason.contains("not a folder"), "reason was: {reason}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scaffold_fails_when_target_is_a_symlink() {
+        let parent_dir = tempfile::tempdir().unwrap();
+        let parent = d(parent_dir.path().to_str().unwrap());
+        let docroot = scaffold_path(&parent, &n("my-site")).unwrap();
+
+        let real_dir = parent_dir.path().join("real-dir");
+        std::fs::create_dir(&real_dir).unwrap();
+        std::os::unix::fs::symlink(&real_dir, docroot.as_path()).unwrap();
+
+        let outcome = scaffold(&docroot, &n("my-site"), &dom("my-site.localhost"));
+        match outcome {
+            ScaffoldOutcome::Failed { step, .. } => assert_eq!(step, ScaffoldStep::CreateDir),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn placeholder_html_escapes_interpolations() {
+        let parent_dir = tempfile::tempdir().unwrap();
+        let docroot = d(parent_dir.path().join("<b>&'x").to_str().unwrap());
+
+        let outcome = scaffold(&docroot, &n("my-site"), &dom("my-site.localhost"));
+        assert_eq!(outcome, ScaffoldOutcome::Created);
+
+        let html = std::fs::read_to_string(docroot.as_path().join("index.html")).unwrap();
+        assert!(
+            html.contains("&lt;b&gt;&amp;&#39;x"),
+            "escaped docroot missing: {html}"
+        );
+        assert!(
+            !html.contains("<b>"),
+            "raw unescaped docroot leaked: {html}"
+        );
     }
 }
