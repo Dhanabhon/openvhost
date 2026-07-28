@@ -6,8 +6,10 @@
 //! value is a validated newtype in [`value`]; `parse` is the only public
 //! constructor for any of them.
 
+mod check;
 mod value;
 
+pub use check::{SettingsCheck, check_settings};
 pub use value::{BodySize, GzipLevel, GzipTypes, OnOff, Seconds, WorkerConnections};
 
 /// The nginx settings the Web server page can edit. Every field is a
