@@ -50,3 +50,34 @@ source of truth for architecture, roadmap, and agent ownership.
   `sqlx-cli` can't be installed offline, build the query crate once with a
   live `DATABASE_URL` against a migrated temp DB instead (unset
   `SQLX_OFFLINE`) — sqlx writes `.sqlx/` as a side effect of that build.
+
+## Orchestration workflow
+
+You are the orchestrator. Plan, decompose, delegate, synthesize — don't do the
+work yourself.
+
+- **Reasoning-heavy work** (architecture, complex debugging, algorithm design):
+  delegate to the `deep-reasoner` subagent.
+- **Mechanical work** (boilerplate, tests, formatting, simple edits): delegate to
+  the `fast-worker` subagent.
+- **Codex** (`/codex:rescue -background`) is a strong engineer, roughly on par
+  with `deep-reasoner` but reasoning from a different perspective. Treat it as a
+  peer, not a reviewer — hand it the problem, not your answer to check.
+
+### High-stakes decisions
+
+For decisions that are expensive to reverse — schema and API design, concurrency
+model, framework or dependency choices, anything touching auth or data integrity:
+
+1. Task `deep-reasoner` and Codex on the same problem in parallel.
+2. Show neither one the other's answer, or your own leaning. Independent takes
+   only — the point is to avoid anchoring.
+3. Synthesize. Where they agree, confidence is high. Where they diverge, that
+   divergence *is* the decision, and it's yours to make. Take the strongest parts
+   of both rather than picking a winner.
+
+### Keep your context lean
+
+Delegate the noisy work; keep the main transcript for planning and synthesis.
+Don't read large files or run broad searches yourself when a subagent can do it
+and report back. Ask subagents for conclusions, not transcripts.
