@@ -80,3 +80,121 @@ describe('a focused quiet button', () => {
 		expect(button).not.toMatch(/\.btn-primary:focus-visible/);
 	});
 });
+
+describe('focused, invalid form controls', () => {
+	// The other three controls with a visible border of their own: `.input` in
+	// `WebServerSettingsForm.svelte` and `SiteDrawer.svelte`, and `.trigger` in
+	// `Select.svelte` (its `role="combobox"` stand-in for a native `<select>`).
+	// Same doubled-frame bug as `.btn-quiet`, fixed the same way — plus a hard
+	// requirement `.btn-quiet` never had: an INVALID control must read red even
+	// while focused, never the focus ring's colour.
+	//
+	// Each file's own rules live beside the selector they modify (a global
+	// `.input:focus-visible` in tokens.css would tie with the component's own
+	// scoped `.input` rule at identical specificity and lose to load order —
+	// see this task's report), which is exactly the setup that let the three
+	// copies drift from each other unnoticed. Comparing their rule BODIES
+	// against each other, not just against a fixed expectation, is what makes
+	// that drift a test failure instead of a future bug report.
+	const files: Record<string, string> = {
+		WebServerSettingsForm: readFileSync(
+			new URL('../components/WebServerSettingsForm.svelte', import.meta.url),
+			'utf8'
+		),
+		SiteDrawer: readFileSync(new URL('../components/SiteDrawer.svelte', import.meta.url), 'utf8'),
+		Select: readFileSync(new URL('../components/Select.svelte', import.meta.url), 'utf8')
+	};
+
+	/** Selector each file uses for its bordered control: `.input` for the two
+	 * forms, `.trigger` for `Select`'s combobox button. */
+	const selectors: Record<string, string> = {
+		WebServerSettingsForm: '.input',
+		SiteDrawer: '.input',
+		Select: '.trigger'
+	};
+
+	/** The body (no braces) of `<selector>:focus-visible`, escaping the selector's
+	 * leading dot for the regex. */
+	function focusBlock(css: string, selector: string): string {
+		const escaped = selector.replace('.', '\\.');
+		const re = new RegExp(`${escaped}:focus-visible\\s*\\{([^}]*)\\}`);
+		const m = css.match(re);
+		if (!m) throw new Error(`no \`${selector}:focus-visible\` rule found`);
+		return m[1];
+	}
+
+	/** The body of `<selector>[aria-invalid='true']:focus-visible` — the rule
+	 * that must win over the plain one above when both apply, per "red wins". */
+	function invalidFocusBlock(css: string, selector: string): string {
+		const escaped = selector.replace('.', '\\.');
+		const re = new RegExp(`${escaped}\\[aria-invalid='true'\\]:focus-visible\\s*\\{([^}]*)\\}`);
+		const m = css.match(re);
+		if (!m) throw new Error(`no \`${selector}[aria-invalid='true']:focus-visible\` rule found`);
+		return m[1];
+	}
+
+	/** Normalises whitespace so the comparison is about declarations, not
+	 * incidental formatting. */
+	function normalise(block: string): string {
+		return block
+			.split(';')
+			.map((decl) => decl.trim())
+			.filter((decl) => decl !== '')
+			.sort()
+			.join(';');
+	}
+
+	const names = Object.keys(files);
+
+	it('closes the gap and recolours the border on every one of the three controls', () => {
+		for (const name of names) {
+			const block = focusBlock(files[name], selectors[name]);
+			expect(block, name).toMatch(/outline-offset:\s*0/);
+			expect(block, name).toMatch(/border-color:\s*var\(--vh-focus-ring\)/);
+		}
+	});
+
+	it('turns the whole band red — border AND outline — when an invalid control is focused', () => {
+		for (const name of names) {
+			const block = invalidFocusBlock(files[name], selectors[name]);
+			expect(block, name).toMatch(/border-color:\s*var\(--vh-fail\)/);
+			expect(block, name).toMatch(/outline-color:\s*var\(--vh-fail\)/);
+			// Red wins: the ring's colour token must not appear here at all, or the
+			// two could be blended/overridden by a later rule reintroducing it.
+			expect(block, name).not.toMatch(/--vh-focus-ring/);
+		}
+	});
+
+	it('keeps the ordinary focus rule identical across all three controls', () => {
+		const [first, ...rest] = names.map((name) =>
+			normalise(focusBlock(files[name], selectors[name]))
+		);
+		for (const block of rest) expect(block).toBe(first);
+	});
+
+	it('keeps the invalid-focus rule identical across all three controls', () => {
+		const [first, ...rest] = names.map((name) =>
+			normalise(invalidFocusBlock(files[name], selectors[name]))
+		);
+		for (const block of rest) expect(block).toBe(first);
+	});
+
+	it('gives SiteDrawer the same base invalid marker WebServerSettingsForm has', () => {
+		// The gap this task closes: SiteDrawer set `aria-invalid` on its fields
+		// but had no CSS rule for it at all, so an invalid-but-idle field there
+		// was indistinguishable from a valid one except for the message
+		// underneath — worse than either "always grey" or "always red" once the
+		// focus rule could turn it red.
+		const re = /\.input\[aria-invalid='true'\]\s*\{([^}]*)\}/;
+		const m = files.SiteDrawer.match(re);
+		expect(m, 'SiteDrawer must have a base `.input[aria-invalid="true"]` rule').not.toBeNull();
+		expect(m?.[1]).toMatch(/border-color:\s*var\(--vh-fail\)/);
+	});
+
+	it('gives Select the same base invalid marker the two forms have', () => {
+		const re = /\.trigger\[aria-invalid='true'\]\s*\{([^}]*)\}/;
+		const m = files.Select.match(re);
+		expect(m, 'Select must have a base `.trigger[aria-invalid="true"]` rule').not.toBeNull();
+		expect(m?.[1]).toMatch(/border-color:\s*var\(--vh-fail\)/);
+	});
+});

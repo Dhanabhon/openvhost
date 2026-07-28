@@ -806,6 +806,49 @@
 	.input:hover {
 		border-color: color-mix(in oklab, var(--vh-text) 40%, transparent);
 	}
+	/* An invalid field is never marked by colour alone — the message below it
+	   carries the same information (brand guidelines §4.2). Copied from
+	   `WebServerSettingsForm.svelte`'s identical rule: this file sets
+	   `aria-invalid` on its name/domain/docroot fields (above) but, until
+	   now, had no CSS rule for it at all, so an invalid field here read as
+	   grey — indistinguishable from a valid one except for the message
+	   underneath. Both forms must mark errors the same way. */
+	.input[aria-invalid='true'] {
+		border-color: var(--vh-fail);
+	}
+	/* The global `:focus-visible` in tokens.css (`outline: 2px solid
+	   var(--vh-focus-ring)` at a 2px offset) stays the single source for the
+	   ring itself — its size and its ordinary colour, for every focusable
+	   control in the app. `.input` has a visible 1px border of its own,
+	   though, so that same offset stacks three concentric edges on it —
+	   border, gap, ring — the doubled frame `.btn-quiet` in Button.svelte was
+	   fixed for. Closing the gap and letting the border carry the ring's
+	   colour merges them into one 3px band; this rule is a fact about THIS
+	   control's own border, which the global rule — written once for every
+	   focusable element — has no way to know. It does not move where the
+	   ring is drawn or what it is coloured in the ordinary case.
+
+	   `focus-ring.test.ts` asserts this rule (and the invalid-focus rule
+	   below it) are IDENTICAL, byte for byte, to the matching rules in
+	   `WebServerSettingsForm.svelte`'s `.input` and `Select.svelte`'s
+	   `.trigger` — the three controls this same doubling affects. A future
+	   edit to one that misses the others fails that test instead of
+	   quietly drifting apart. */
+	.input:focus-visible {
+		border-color: var(--vh-focus-ring);
+		outline-offset: 0;
+	}
+	/* Red wins: an invalid field stays the failure colour even while
+	   focused, never the focus ring's colour. Both the border AND the
+	   outline are set to `--vh-fail` so the whole band is red, not a red
+	   border beside a green ring. Focus is still signalled — the band
+	   GROWS from a 1px border to a 3px band — so this does not cost the
+	   keyboard user anything, it just refuses to let the ring repaint an
+	   error green. */
+	.input[aria-invalid='true']:focus-visible {
+		border-color: var(--vh-fail);
+		outline-color: var(--vh-fail);
+	}
 	.input.mono {
 		font-family: var(--vh-font-mono);
 		font-size: var(--vh-text-table);

@@ -451,6 +451,38 @@
 	.input[aria-invalid='true'] {
 		border-color: var(--vh-fail);
 	}
+	/* The global `:focus-visible` in tokens.css (`outline: 2px solid
+	   var(--vh-focus-ring)` at a 2px offset) stays the single source for the
+	   ring itself — its size and its ordinary colour, for every focusable
+	   control in the app. `.input` has a visible 1px border of its own,
+	   though, so that same offset stacks three concentric edges on it —
+	   border, gap, ring — the doubled frame `.btn-quiet` in Button.svelte was
+	   fixed for. Closing the gap and letting the border carry the ring's
+	   colour merges them into one 3px band; this rule is a fact about THIS
+	   control's own border, which the global rule — written once for every
+	   focusable element — has no way to know. It does not move where the
+	   ring is drawn or what it is coloured in the ordinary case.
+
+	   `focus-ring.test.ts` asserts this rule (and the invalid-focus rule
+	   below it) are IDENTICAL, byte for byte, to the matching rules in
+	   `SiteDrawer.svelte`'s `.input` and `Select.svelte`'s `.trigger` — the
+	   three controls this same doubling affects. A future edit to one that
+	   misses the others fails that test instead of quietly drifting apart. */
+	.input:focus-visible {
+		border-color: var(--vh-focus-ring);
+		outline-offset: 0;
+	}
+	/* Red wins: an invalid field stays the failure colour even while
+	   focused, never the focus ring's colour. Both the border AND the
+	   outline are set to `--vh-fail` so the whole band is red, not a red
+	   border beside a green ring. Focus is still signalled — the band
+	   GROWS from a 1px border to a 3px band — so this does not cost the
+	   keyboard user anything, it just refuses to let the ring repaint an
+	   error green. */
+	.input[aria-invalid='true']:focus-visible {
+		border-color: var(--vh-fail);
+		outline-color: var(--vh-fail);
+	}
 	.input.mono,
 	.input.num {
 		font-family: var(--vh-font-mono);
@@ -553,10 +585,14 @@
 		background: color-mix(in oklab, var(--vh-ink) 8%, transparent);
 		border-color: var(--vh-border);
 	}
-	/* No `:focus-visible` rule anywhere in this file: tokens.css sets one ring
-	   for the whole app (`outline: 2px solid var(--vh-focus-ring)` at a 2px
-	   offset), and a second one here is how the two drift apart — this project
-	   has already fixed a focus ring once. */
+	/* No `:focus-visible` rule for `.switch`: it has no border of its own to
+	   double up with, so the global ring in tokens.css already reads as one
+	   clean indicator on it — nothing here to fix. (`.input` above DOES carry
+	   a per-control rule now; that is not the same thing as a second ring for
+	   the whole app. tokens.css still sets the ring's size and colour exactly
+	   once — the rule on `.input` only stops that one control's own border
+	   from doubling it, which is a fact about `.input`'s border that the
+	   global rule, written once for every focusable element, cannot know.) */
 
 	.settings-foot {
 		display: flex;
