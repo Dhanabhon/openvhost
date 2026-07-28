@@ -14,5 +14,6 @@
 pub mod apply;
 pub mod model;
 pub mod repo;
+pub mod scaffold;
 
 pub use model::{Docroot, Domain, NewSite, PhpVersion, Site, SiteId, SiteName, WebServer};
