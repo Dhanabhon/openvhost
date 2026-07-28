@@ -2,14 +2,22 @@
 // Sites panel state. Mutations refetch the list (there is no site event
 // stream), and a per-field validation error is surfaced separately from a
 // general error so the form can mark the offending input.
-import type { IpcError, SiteDto, SiteInput } from './ipc';
+import type { CreateSiteResult, IpcError, ScaffoldOutcomeDto, SiteDto, SiteInput } from './ipc';
 
 export interface SitesApi {
 	listSites(): Promise<SiteDto[]>;
-	createSite(input: SiteInput): Promise<SiteDto>;
+	createSite(input: SiteInput, createFolder: boolean): Promise<CreateSiteResult>;
 	updateSite(id: string, input: SiteInput): Promise<SiteDto>;
 	deleteSite(id: string): Promise<boolean>;
 	openSite(id: string): Promise<void>;
+}
+
+/** The notice `lastScaffold` renders: what create-with-folder actually did,
+ *  and which site/docroot it did it to. */
+export interface ScaffoldNotice {
+	siteName: string;
+	docroot: string;
+	outcome: ScaffoldOutcomeDto;
 }
 
 function isValidation(e: unknown): e is { kind: 'validation'; field: string; message: string } {
@@ -48,19 +56,29 @@ export class SitesStore {
 	 * only copy of a re-entrancy guard, because deleting it leaves no test failing.
 	 */
 	busy = $state<Record<string, boolean>>({});
+	/** Outcome of the most recent create-with-folder, for the notice banner.
+	 *  `null` means nothing to show — either scaffolding was never requested,
+	 *  or the notice was dismissed/reset. */
+	lastScaffold = $state<ScaffoldNotice | null>(null);
 
 	constructor(private api: SitesApi) {}
 
-	/** Clear both error channels before a new attempt. */
+	/** Clear both error channels and any stale scaffold notice before a new attempt. */
 	private reset(): void {
 		this.error = null;
 		this.fieldErrors = {};
+		this.lastScaffold = null;
 	}
 
 	/** Clear both error channels. Call when opening a fresh drawer session so a
 	 *  previous attempt's per-field error can't render on a new/blank form. */
 	clearErrors(): void {
 		this.reset();
+	}
+
+	/** Dismiss the create-with-folder notice without touching anything else. */
+	dismissScaffold(): void {
+		this.lastScaffold = null;
 	}
 
 	async load(): Promise<void> {
@@ -72,12 +90,31 @@ export class SitesStore {
 		}
 	}
 
-	/** `id === null` creates, otherwise updates. Returns true on success. */
-	async save(id: string | null, input: SiteInput): Promise<boolean> {
+	/**
+	 * `id === null` creates, otherwise updates. Returns true on success.
+	 *
+	 * `createFolder` only matters on the create branch; the edit branch never
+	 * scaffolds. `scaffoldNotice` is resolved before `load()` runs but assigned
+	 * to `this.lastScaffold` only AFTER it returns — `load()` calls the shared
+	 * `reset()` too, which would otherwise wipe the very notice this call just
+	 * produced before it ever rendered.
+	 */
+	async save(id: string | null, input: SiteInput, createFolder: boolean): Promise<boolean> {
 		this.reset();
+		let scaffoldNotice: ScaffoldNotice | null = null;
 		try {
-			if (id === null) await this.api.createSite(input);
-			else await this.api.updateSite(id, input);
+			if (id === null) {
+				const result = await this.api.createSite(input, createFolder);
+				if (result.scaffold !== null) {
+					scaffoldNotice = {
+						siteName: input.name,
+						docroot: result.site.docroot,
+						outcome: result.scaffold
+					};
+				}
+			} else {
+				await this.api.updateSite(id, input);
+			}
 		} catch (e) {
 			if (isValidation(e)) {
 				this.fieldErrors = { [e.field]: e.message };
@@ -87,6 +124,7 @@ export class SitesStore {
 			return false;
 		}
 		await this.load();
+		this.lastScaffold = scaffoldNotice;
 		return true;
 	}
 

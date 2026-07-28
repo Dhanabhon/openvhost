@@ -11,7 +11,19 @@ export const commands = {
 	stopService: (id: string) => typedError<null, IpcError>(__TAURI_INVOKE("stop_service", { id })),
 	serviceLogTail: (id: string, n: number) => typedError<LogLine[], IpcError>(__TAURI_INVOKE("service_log_tail", { id, n })),
 	listSites: () => typedError<SiteDto[], IpcError>(__TAURI_INVOKE("list_sites")),
-	createSite: (input: SiteInput) => typedError<SiteDto, IpcError>(__TAURI_INVOKE("create_site", { input })),
+	/**
+	 *  Create a site, optionally scaffolding its docroot folder and a starter
+	 *  page (spec: docs/superpowers/specs/2026-07-29-p1-site-scaffold-design.md,
+	 *  D2).
+	 * 
+	 *  Order is load-bearing: ingress guard → join (if `create_folder`) → DB
+	 *  insert → THEN scaffold. Scaffolding runs only once `repo.create` has
+	 *  actually returned `Ok` — a UNIQUE violation on `name`/`domain` returns
+	 *  `Err` from the `?` below and this function stops right there, before the
+	 *  `scaffold` line is ever reached, so a rejected create can never leave a
+	 *  folder behind.
+	 */
+	createSite: (input: SiteInput, createFolder: boolean) => typedError<CreateSiteResult, IpcError>(__TAURI_INVOKE("create_site", { input, createFolder })),
 	updateSite: (id: string, input: SiteInput) => typedError<SiteDto, IpcError>(__TAURI_INVOKE("update_site", { id, input })),
 	deleteSite: (id: string) => typedError<boolean, IpcError>(__TAURI_INVOKE("delete_site", { id })),
 	listWebServers: () => typedError<WebServerDto[], IpcError>(__TAURI_INVOKE("list_web_servers")),
@@ -231,6 +243,19 @@ export type CoreInfo = {
 	openvhostHome: string,
 };
 
+/**
+ *  The result of `create_site`: the persisted site, plus what scaffolding did
+ *  — if it was requested at all.
+ * 
+ *  `scaffold: None` means "not requested" (the caller passed
+ *  `create_folder: false`) — it is NOT a fourth outcome alongside
+ *  `Created`/`KeptExisting`/`Failed`, and the UI must not conflate the two.
+ */
+export type CreateSiteResult = {
+	site: SiteDto,
+	scaffold: ScaffoldOutcomeDto | null,
+};
+
 export type FileChangeDto = {
 	path: string,
 	/**  "added" | "modified" | "removed" */
@@ -343,6 +368,21 @@ export type PhpRuntimeDto = {
  *  answers with the `confirm_quit` command, or does nothing if the user cancels.
  */
 export type QuitRequestedEvent = Record<string, never>;
+
+/**
+ *  Scaffold outcome crossing IPC. Mirrors `openvhost_core::site::scaffold`'s
+ *  `ScaffoldOutcome` — the core crate stays serde/specta-free by design, so
+ *  this DTO is the serialization layer, the same seam as `Site` → `SiteDto`.
+ *  `kind` is the discriminator the UI switches on exhaustively.
+ */
+export type ScaffoldOutcomeDto = { kind: "created" } | { kind: "keptExisting"; existing: string } | { kind: "failed"; step: ScaffoldStepDto; reason: string };
+
+/**
+ *  Which step of a [`ScaffoldOutcomeDto::Failed`] failed. Mirrors
+ *  `openvhost_core::site::scaffold::ScaffoldStep`; never parse English out of
+ *  `reason` in the UI — this is the stable discriminator for that.
+ */
+export type ScaffoldStepDto = "createDir" | "inspect" | "writePlaceholder";
 
 export type ServiceLogEvent = {
 	id: string,
