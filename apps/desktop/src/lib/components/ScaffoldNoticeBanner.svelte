@@ -65,6 +65,11 @@
 	.scaffold-notice p {
 		flex: 1;
 		margin: 0;
+		/* Docroot (up to 1023 bytes, no spaces) and OS error text are unbreakable
+		   tokens — without these two, flex's default min-width: auto refuses to
+		   shrink below the longest one and pushes Dismiss out of view. */
+		min-width: 0;
+		overflow-wrap: anywhere;
 	}
 	.scaffold-notice[data-tone='ok'] {
 		border: 1px solid color-mix(in oklab, var(--vh-run) 35%, transparent);

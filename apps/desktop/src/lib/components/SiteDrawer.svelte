@@ -539,9 +539,10 @@
 					     with `rootDescribedBy` (this paragraph's id joins that list, last, only
 					     while both this renders and the checkbox is on). The fallback copy covers
 					     BOTH reasons `scaffoldPreview` can return null (blank parent or no name
-					     yet), not just the name half its wording names. -->
+					     yet). -->
 					<p class="hint mono" id="f-root-preview">
-						{scaffoldPreview(docroot, name) ?? 'Enter a name to see the final path'}
+						{scaffoldPreview(docroot, name) ??
+							'Pick a folder and enter a name to see the final path'}
 					</p>
 				{/if}
 			{/if}
