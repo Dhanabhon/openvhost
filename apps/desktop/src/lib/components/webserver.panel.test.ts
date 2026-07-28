@@ -344,3 +344,42 @@ describe('the service control', () => {
 		expect(out).not.toContain('ws-stop-apache');
 	});
 });
+
+describe('a failed nginx', () => {
+	it("shows nginx's own words, not just a failed pill", () => {
+		// The whole point. Asserting on the CONTENT, not on the presence of a
+		// block: an empty <pre> would satisfy a weaker assertion and tell the
+		// user nothing about why their web server did not start.
+		const out = html({
+			servers: [nginx],
+			services: [
+				svc('nginx', {
+					kind: 'failed',
+					exit: 1,
+					stderrTail: ['nginx: [emerg] bind() to 0.0.0.0:8080 failed (48: Address already in use)']
+				})
+			]
+		});
+		expect(out).toContain('Address already in use');
+		expect(out).toContain('data-testid="ws-failed-nginx"');
+	});
+
+	it('offers Retry rather than Start after a failure', () => {
+		const out = html({
+			servers: [nginx],
+			services: [svc('nginx', { kind: 'failed', exit: 1, stderrTail: ['boom'] })]
+		});
+		expect(out).toContain('data-testid="ws-retry-nginx"');
+	});
+
+	it('says a failure happened even when nginx said nothing', () => {
+		// A service killed by a signal has an empty tail. Rendering only the
+		// <pre> would leave a failed row that looks identical to a healthy one.
+		const out = html({
+			servers: [nginx],
+			services: [svc('nginx', { kind: 'failed', exit: null, stderrTail: [] })]
+		});
+		expect(out).toContain('data-testid="ws-failed-nginx"');
+		expect(out).toContain('nginx failed');
+	});
+});

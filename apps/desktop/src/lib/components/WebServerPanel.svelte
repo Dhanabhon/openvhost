@@ -1,7 +1,6 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <script lang="ts">
 	import type { ServiceStatus, ValidationReportDto, WebServerDto } from '$lib/ipc';
-	import { statusFor } from '$lib/webservers.derive';
 	import WebServerRow from './WebServerRow.svelte';
 
 	// PURELY PRESENTATIONAL: every piece of state arrives as a prop and every action
@@ -72,10 +71,11 @@
 		<div class="rowlist">
 			{#each servers as server (server.id)}
 				<!-- The per-id maps are indexed HERE so each row receives only its own slice.
-				     `statusFor` returns the state KIND the pill takes, or null. -->
+				     The whole state is passed, not just its kind — `failed` carries the
+				     `stderrTail` the row renders, and a kind alone cannot express it. -->
 				<WebServerRow
 					{server}
-					statusKind={statusFor(services, server.serviceId)}
+					serviceState={services.find((s) => s.id === server.serviceId)?.state ?? null}
 					configText={configText[server.id]}
 					configError={configError[server.id] ?? ''}
 					report={reports[server.id] ?? null}
