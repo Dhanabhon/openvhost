@@ -161,3 +161,19 @@ export function findMissingRuntimeSite(
 	);
 	return found ?? null;
 }
+
+/**
+ * Live preview of the docroot the create-folder checkbox will produce.
+ * `null` = not previewable yet (blank parent or no name typed).
+ *
+ * Normalization MUST match Rust's `scaffold_path` (`crates/openvhost-core/src/site/scaffold.rs`):
+ * `parent.trim_end_matches('/')` joined with `/${name}`. Spec D7 accepts this TS/Rust
+ * duplication the same way the drawer's charset filters are accepted — a typing
+ * affordance, not the authority. The truth is the returned `SiteDto.docroot`: Rust
+ * re-validates the join as a `Docroot` (over-length, say) and can refuse a path this
+ * preview happily shows.
+ */
+export function scaffoldPreview(parent: string, name: string): string | null {
+	if (parent.trim() === '' || name === '') return null;
+	return `${parent.replace(/\/+$/, '')}/${name}`;
+}

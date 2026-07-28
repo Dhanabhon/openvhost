@@ -392,3 +392,19 @@ describe('SiteDrawer name field', () => {
 		expect(filterNameInput('ab_cd', 3)).toEqual({ value: 'abcd', caret: 2 });
 	});
 });
+
+describe('SiteDrawer create-folder checkbox', () => {
+	// WHAT THIS FILE CANNOT COVER (see header): SSR renders only the checkbox's initial,
+	// unchecked state — there is no DOM here to click it, so the live preview
+	// appearing/updating, and its id joining `rootDescribedBy`, once checked are asserted
+	// manually instead (task report's click-list), same convention as the header comment.
+	it('create mode renders the create-folder checkbox unchecked', () => {
+		const input = tagWith(drawerHtml(null), 'id="f-root-create"');
+		expect(input).toContain('type="checkbox"');
+		expect(input).not.toContain('checked');
+	});
+
+	it('edit mode renders no create-folder control at all', () => {
+		expect(drawerHtml(site('8.3'))).not.toContain('f-root-create');
+	});
+});

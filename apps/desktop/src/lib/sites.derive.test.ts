@@ -7,6 +7,7 @@ import {
 	findMissingRuntimeSite,
 	phpVersionMissing,
 	phpVersionOptions,
+	scaffoldPreview,
 	splitDomain
 } from './sites.derive';
 import type { SiteDto } from './ipc';
@@ -143,4 +144,14 @@ describe('findMissingRuntimeSite', () => {
 	it('is null when every servable site has an installed version', () => {
 		expect(findMissingRuntimeSite([site({ phpVersion: '8.5' })], ['8.5'])).toBeNull();
 	});
+});
+
+describe('scaffoldPreview', () => {
+	it('joins parent and name', () =>
+		expect(scaffoldPreview('/Users/x/Downloads', 'my-site')).toBe('/Users/x/Downloads/my-site'));
+	it('normalizes trailing slashes', () =>
+		expect(scaffoldPreview('/Users/x/Downloads//', 'my-site')).toBe('/Users/x/Downloads/my-site'));
+	it('handles the root parent', () => expect(scaffoldPreview('/', 'a')).toBe('/a'));
+	it('returns null while name is empty', () => expect(scaffoldPreview('/x', '')).toBeNull());
+	it('returns null while parent is blank', () => expect(scaffoldPreview('  ', 'a')).toBeNull());
 });

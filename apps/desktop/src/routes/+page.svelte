@@ -112,12 +112,12 @@
 	// pending-changes banner would otherwise show a stale count (or none) after a
 	// save, a delete, or a row toggle. `refresh()` is cheap by design (see
 	// `ApplyStore`'s own doc comment) — it is fine to call after every mutation.
-	async function onSave(id: string | null, input: SiteInput): Promise<boolean> {
-		// `false`: SiteDrawer has no "create folder" affordance yet (a later
-		// slice adds the checkbox this value will come from) — this keeps
-		// today's behaviour identical to before `SitesStore.save` grew the
-		// parameter.
-		const ok = await store.save(id, input, false);
+	async function onSave(
+		id: string | null,
+		input: SiteInput,
+		createFolder: boolean
+	): Promise<boolean> {
+		const ok = await store.save(id, input, createFolder);
 		if (ok) await applyStore.refresh();
 		return ok;
 	}
