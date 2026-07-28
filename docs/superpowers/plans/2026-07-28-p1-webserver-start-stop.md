@@ -171,7 +171,11 @@ Then `pnpm -C apps/desktop check` will fail on the two fixtures in `webserver.pa
 
 - [ ] **Step 6: Prove the test is not vacuous**
 
-Change `list_web_servers` to hardcode `true` instead of stat-ing. Confirm `the_nginx_row_reports_whether_its_config_is_actually_there` still passes (it tests `web_server_rows`, not the command) — **this is expected, and it is the point of the next line.** Then confirm the honest gap: there is no test covering the *command's* stat. Write it down in your report as a known gap rather than pretending the unit test covers it. Restore the stat.
+Change `list_web_servers` to hardcode `true` instead of stat-ing. `the_nginx_row_reports_whether_its_config_is_actually_there` will still pass, because it tests `web_server_rows` and not the command — so nothing currently covers the stat itself, which is the half that talks to the filesystem.
+
+Close that: write a test that exercises the real stat against a `tempfile::TempDir` — create the file, assert true; remove it, assert false. If `list_web_servers`' `tauri::State` parameter makes it untestable directly, extract the stat into a small free function (`async fn nginx_config_exists(conf: &Path) -> bool`) and test that instead, then have the command call it.
+
+Restore the stat and confirm both tests pass. If you conclude the test genuinely cannot be written, say exactly what blocked it in your report — do not record it as accepted.
 
 - [ ] **Step 7: Run all gates and commit**
 
