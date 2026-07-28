@@ -18,6 +18,10 @@ tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 serde.workspace = true
 serde_json = "1"
+# The settings pre-check is injected as a trait object so the save path is
+# testable without nginx installed; already in the tree via openvhost-conf and
+# openvhost-core, so this adds no new crate to Cargo.lock.
+async-trait = "0.1"
 thiserror.workspace = true
 # `fs` on top of the workspace features: `read_web_server_config` reads the live
 # config with `tokio::fs` rather than blocking a worker thread. `tauri` happens to

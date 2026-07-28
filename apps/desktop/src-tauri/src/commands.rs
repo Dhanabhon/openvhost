@@ -1279,9 +1279,99 @@ async fn read_settings(db: &Db) -> Result<WebServerSettingsDto, IpcError> {
     Ok(WebServerSettingsDto::from(repo.get().await?))
 }
 
-async fn write_settings(db: &Db, input: WebServerSettingsDto) -> Result<(), IpcError> {
-    // Guard first: a rejected field must leave the stored row untouched.
+/// Asks nginx whether a candidate settings struct is acceptable.
+///
+/// A trait rather than a direct call so the save path's behaviour — that a
+/// rejection names a field and writes nothing — is testable without nginx
+/// installed. The production implementation is [`NginxSettingsChecker`].
+#[async_trait::async_trait]
+pub trait SettingsChecker: Send + Sync {
+    async fn check(
+        &self,
+        settings: &openvhost_conf::WebServerSettings,
+    ) -> Result<openvhost_conf::SettingsCheck, openvhost_conf::ConfError>;
+}
+
+/// The real check: `nginx -t` over a candidate render (`check_settings`).
+pub struct NginxSettingsChecker {
+    pub bin: PathBuf,
+    /// Where the throwaway candidate config is written — inside the app's own
+    /// home, never `/tmp`.
+    pub scratch_root: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl SettingsChecker for NginxSettingsChecker {
+    async fn check(
+        &self,
+        settings: &openvhost_conf::WebServerSettings,
+    ) -> Result<openvhost_conf::SettingsCheck, openvhost_conf::ConfError> {
+        openvhost_conf::check_settings(&self.bin, &self.scratch_root, settings).await
+    }
+}
+
+/// The part of nginx's stderr worth putting beside a form field.
+///
+/// nginx's `[emerg]` line ends with ` in <path>:<line>`, where the path is a
+/// throwaway directory the user has never seen and the line number belongs to
+/// a file they cannot open. The field marking already says WHERE, so that tail
+/// is dropped and the reason kept. Anything unrecognised is passed through
+/// whole rather than swallowed — a message we failed to parse is still the
+/// only diagnostic there is.
+fn rejection_message(stderr: &str) -> String {
+    let Some(line) = stderr.lines().find(|l| l.contains("[emerg]")) else {
+        return stderr.trim().to_string();
+    };
+    let reason = line.split("[emerg]").nth(1).unwrap_or(line).trim();
+    let trimmed = match reason.rfind(" in ") {
+        Some(i) if reason[i..].ends_with(char::is_numeric) => &reason[..i],
+        _ => reason,
+    };
+    format!("nginx rejected this value: {trimmed}")
+}
+
+/// Validate, ASK NGINX, then store.
+///
+/// The nginx step is what stops a value that passes the newtypes but that
+/// nginx refuses from being written. Such a value is not a one-off failure:
+/// `render_set` regenerates `nginx.conf` from the stored settings on every
+/// plan, so once stored it makes EVERY later apply fail validation and roll
+/// back — including one triggered from the Sites page, where the error names
+/// an nginx internal and points at no field. See `openvhost_conf::settings`'s
+/// check module for why `WebServerAdapter::validate` cannot serve this.
+///
+/// `checker` is `None` when nginx is not installed. The save then proceeds
+/// unchecked, deliberately: the Web server page stays editable on a machine
+/// that has not installed nginx yet (the Languages page guides that), and with
+/// no nginx there is no apply to trap. The guarantee is "checked whenever
+/// nginx is present", which is exactly when it can matter.
+async fn write_settings(
+    db: &Db,
+    input: WebServerSettingsDto,
+    checker: Option<&dyn SettingsChecker>,
+) -> Result<(), IpcError> {
+    // Cheap, precise guard first: these errors name their own field exactly,
+    // and cost no process spawn.
     let settings: openvhost_conf::WebServerSettings = input.try_into()?;
+
+    if let Some(checker) = checker {
+        match checker.check(&settings).await? {
+            openvhost_conf::SettingsCheck::Accepted { .. } => {}
+            openvhost_conf::SettingsCheck::Rejected { field, stderr } => {
+                let message = rejection_message(&stderr);
+                // A rejection nginx could not be traced to one field is a
+                // banner, NOT a silent pass: either way nothing is stored.
+                return Err(match field {
+                    Some(field) => IpcError::Validation {
+                        field: field.to_string(),
+                        message,
+                    },
+                    None => IpcError::Core { message },
+                });
+            }
+        }
+    }
+
     SqliteWebServerSettings::new(db).save(&settings).await?;
     Ok(())
 }
@@ -1303,20 +1393,31 @@ pub async fn web_server_settings(
 /// is no settings-only apply command. A second apply path would mean two ways
 /// for the live config to change, only one of which shows a diff first.
 ///
-/// It also does not run `nginx -t` before saving. Storing a value that nginx
-/// would reject is recoverable (the row is just a row, and the apply pipeline
-/// validates and rolls back before anything goes live); a pre-save check here
-/// would have to render the CANDIDATE values into a real config and run
-/// `validate_live` against them, because `WebServerAdapter::validate` renders
-/// with *defaults* on purpose and only answers "is the shape valid?" — it would
-/// wave through a combination nginx actually rejects.
+/// It DOES run `nginx -t` first, over a candidate render of the submitted
+/// values (`write_settings`). That check renders the user's own values, which
+/// is why it cannot be `WebServerAdapter::validate` — that call renders with
+/// *defaults* on purpose, answers "is the shape valid?", and would wave
+/// through a combination nginx rejects. Measured cost of the spawn is well
+/// under a frame, against a failure that otherwise surfaces at an unrelated
+/// later apply.
 #[tauri::command]
 #[specta::specta]
 pub async fn save_web_server_settings(
     db: tauri::State<'_, Db>,
+    paths: tauri::State<'_, Option<StackPaths>>,
     input: WebServerSettingsDto,
 ) -> Result<(), IpcError> {
-    write_settings(db.inner(), input).await
+    // No stack (nginx not installed) => no checker; see `write_settings`.
+    let checker = paths.inner().as_ref().map(|p| NginxSettingsChecker {
+        bin: p.nginx_bin.clone(),
+        scratch_root: p.home.join("run"),
+    });
+    write_settings(
+        db.inner(),
+        input,
+        checker.as_ref().map(|c| c as &dyn SettingsChecker),
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -2889,7 +2990,7 @@ mod web_server_settings_ipc_tests {
     #[tokio::test]
     async fn a_saved_setting_reads_back_through_the_dto() {
         let db = Db::open_in_memory().await.unwrap();
-        write_settings(&db, valid_dto()).await.unwrap();
+        write_settings(&db, valid_dto(), None).await.unwrap();
         assert_eq!(read_settings(&db).await.unwrap(), valid_dto());
     }
 
@@ -2902,7 +3003,7 @@ mod web_server_settings_ipc_tests {
     #[tokio::test]
     async fn a_rejected_field_leaves_every_other_stored_value_untouched() {
         let db = Db::open_in_memory().await.unwrap();
-        write_settings(&db, valid_dto()).await.unwrap();
+        write_settings(&db, valid_dto(), None).await.unwrap();
 
         // Every field changed, and one of them invalid.
         let bad = WebServerSettingsDto {
@@ -2917,7 +3018,9 @@ mod web_server_settings_ipc_tests {
             gzip_comp_level: 99, // rejected: outside 1..=9
             gzip_types: "text/plain".into(),
         };
-        let e = write_settings(&db, bad).await.expect_err("99 is not 1..=9");
+        let e = write_settings(&db, bad, None)
+            .await
+            .expect_err("99 is not 1..=9");
         let (field, _) = expect_validation(e);
         assert_eq!(field, "gzip_comp_level");
 
@@ -2925,6 +3028,178 @@ mod web_server_settings_ipc_tests {
             read_settings(&db).await.unwrap(),
             valid_dto(),
             "a rejected field must not clobber the values already stored"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The nginx pre-check on the save path
+    // -----------------------------------------------------------------------
+
+    /// A checker with a canned verdict that records whether it was consulted.
+    struct FakeChecker {
+        verdict: openvhost_conf::SettingsCheck,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeChecker {
+        fn new(verdict: openvhost_conf::SettingsCheck) -> Self {
+            Self {
+                verdict,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn accepting() -> Self {
+            Self::new(openvhost_conf::SettingsCheck::Accepted {
+                stderr: String::new(),
+            })
+        }
+        fn rejecting(field: Option<&'static str>, stderr: &str) -> Self {
+            Self::new(openvhost_conf::SettingsCheck::Rejected {
+                field,
+                stderr: stderr.to_string(),
+            })
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SettingsChecker for FakeChecker {
+        async fn check(
+            &self,
+            _: &openvhost_conf::WebServerSettings,
+        ) -> Result<openvhost_conf::SettingsCheck, openvhost_conf::ConfError> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(self.verdict.clone())
+        }
+    }
+
+    /// The point of the whole change: a value nginx refuses is refused HERE,
+    /// on the field the user just edited, and never reaches the row.
+    ///
+    /// Without this, the value stores fine and instead breaks the NEXT
+    /// `apply_config` — including one started from the Sites page, where the
+    /// error names an nginx internal and marks no field at all.
+    #[tokio::test]
+    async fn an_nginx_rejection_marks_the_field_and_stores_nothing() {
+        let db = Db::open_in_memory().await.unwrap();
+        write_settings(&db, valid_dto(), None).await.unwrap();
+
+        let checker = FakeChecker::rejecting(
+            Some("gzip_comp_level"),
+            "nginx: [emerg] value must be between 1 and 9 in /h/run/x/nginx.conf:17\n",
+        );
+        let mut submitted = valid_dto();
+        submitted.gzip_comp_level = 9;
+        let e = write_settings(&db, submitted, Some(&checker))
+            .await
+            .expect_err("nginx rejected this render");
+
+        let (field, message) = expect_validation(e);
+        assert_eq!(field, "gzip_comp_level");
+        assert!(
+            message.contains("value must be between 1 and 9"),
+            "nginx's reason must survive to the user, got {message:?}"
+        );
+        assert!(
+            !message.contains("/h/run/x/nginx.conf"),
+            "the throwaway path is a file the user cannot open; it must not be shown: {message:?}"
+        );
+        assert_eq!(
+            read_settings(&db).await.unwrap(),
+            valid_dto(),
+            "a value nginx refused must not be stored"
+        );
+    }
+
+    /// A rejection that maps to no field is a banner — and still stores
+    /// nothing. Falling through to the save "because we could not tell which
+    /// field it was" would store exactly the values this check exists to keep
+    /// out.
+    #[tokio::test]
+    async fn an_untraceable_rejection_is_a_banner_and_still_stores_nothing() {
+        let db = Db::open_in_memory().await.unwrap();
+        let checker = FakeChecker::rejecting(None, "nginx: [emerg] something structural\n");
+        let e = write_settings(&db, valid_dto(), Some(&checker))
+            .await
+            .expect_err("a rejection with no field is still a rejection");
+        match e {
+            IpcError::Core { message } => assert!(message.contains("something structural")),
+            other => panic!("expected a banner, got {other:?}"),
+        }
+        assert_eq!(
+            read_settings(&db).await.unwrap(),
+            WebServerSettingsDto::default(),
+            "nothing was ever stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_accepted_check_stores_the_settings() {
+        let db = Db::open_in_memory().await.unwrap();
+        let checker = FakeChecker::accepting();
+        write_settings(&db, valid_dto(), Some(&checker))
+            .await
+            .unwrap();
+        assert_eq!(checker.calls(), 1, "nginx must actually have been asked");
+        assert_eq!(read_settings(&db).await.unwrap(), valid_dto());
+    }
+
+    /// With nginx not installed there is no checker — and the page must still
+    /// save. Blocking the save would make the Web server settings uneditable
+    /// on a fresh machine, for a check that cannot matter there: with no
+    /// nginx there is no apply to break.
+    #[tokio::test]
+    async fn settings_still_save_when_nginx_is_not_installed() {
+        let db = Db::open_in_memory().await.unwrap();
+        write_settings(&db, valid_dto(), None).await.unwrap();
+        assert_eq!(read_settings(&db).await.unwrap(), valid_dto());
+    }
+
+    /// The newtype guard runs FIRST: an out-of-range value costs no process
+    /// spawn, and reports the precise reason the newtype knows rather than
+    /// whatever nginx would have said about the rendered line.
+    #[tokio::test]
+    async fn a_value_the_newtypes_reject_never_reaches_nginx() {
+        let db = Db::open_in_memory().await.unwrap();
+        let checker = FakeChecker::accepting();
+        let mut bad = valid_dto();
+        bad.gzip_comp_level = 99; // outside 1..=9
+        let e = write_settings(&db, bad, Some(&checker))
+            .await
+            .expect_err("99 is not 1..=9");
+        assert_eq!(expect_validation(e).0, "gzip_comp_level");
+        assert_eq!(
+            checker.calls(),
+            0,
+            "the cheap guard must reject before spawning a validator"
+        );
+    }
+
+    #[test]
+    fn a_rejection_message_keeps_the_reason_and_drops_the_throwaway_path() {
+        assert_eq!(
+            rejection_message("nginx: [emerg] value must be between 1 and 9 in /h/nginx.conf:17\n"),
+            "nginx rejected this value: value must be between 1 and 9"
+        );
+        assert_eq!(
+            rejection_message(
+                "nginx: [emerg] \"client_max_body_size\" directive invalid value in /h/x.conf:7"
+            ),
+            "nginx rejected this value: \"client_max_body_size\" directive invalid value"
+        );
+    }
+
+    /// An unparseable stderr must be passed through, not swallowed: a message
+    /// we failed to parse is still the only diagnostic the user has.
+    #[test]
+    fn a_rejection_message_we_cannot_parse_is_shown_whole() {
+        assert_eq!(rejection_message("total nonsense\n"), "total nonsense");
+        assert_eq!(
+            rejection_message("nginx: [emerg] no line reference here"),
+            "nginx rejected this value: no line reference here"
         );
     }
 }
