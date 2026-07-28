@@ -146,13 +146,54 @@ cannot be used to inflate the generated config. One bad token rejects the whole 
 naming the token — never a silent drop, which would leave the user with compression quietly
 not covering what they asked for.
 
+### 6.1 The save path asks nginx too (added after the PR #30 audit)
+
+The table above is per-field diligence, not a structural guarantee. The audit on PR #30 named
+why that matters: `render_set` regenerates `nginx.conf` from the **stored** settings on every
+plan. A value that passes its newtype but that nginx refuses is therefore not a one-off — once
+stored, *every* later `apply_config` fails validation and rolls back, including one started
+from the Sites page, where the error names an nginx internal and marks no field. It fails safe
+and it fails forever, until the user guesses which field to change.
+
+Two such values were found and fixed per-field in PR #30 (a `gzip_types` token over 46 bytes,
+a `client_max_body_size` that overflows nginx's size parser). The next field whose validity
+depends on an nginx internal has the same shape, so the save path now runs the check itself:
+`openvhost_conf::check_settings` renders the **candidate** values into a throwaway home and
+runs `validate_live` (`nginx -t`) against them.
+
+It is deliberately **not** `WebServerAdapter::validate` — that call renders with *defaults* on
+purpose, answers "is the shape valid?", and would wave through a combination nginx rejects.
+
+Decisions behind it:
+
+- **On save, not behind a "Check" button.** Measured cost of the spawn is under 10ms — well
+  inside a frame, so there is no latency case for making it opt-in. And the failure is one the
+  user has no reason to suspect, so an affordance they must remember to press leaves the trap
+  set.
+- **Rollback-on-apply was not enough.** It is safe, but safety was never the defect: the
+  *diagnostic* is, and it appears at an unrelated time on an unrelated page.
+- **Field, not just a banner.** nginx names the offending directive for some failures and only
+  a line number for others, so the field is resolved by **line number against the config we
+  rendered**, not by matching nginx's prose. A rejection on a line the user cannot edit
+  (`include`, `error_log`) yields a banner rather than a wrongly-marked field — and still
+  stores nothing.
+- **No nginx installed ⇒ save proceeds unchecked.** The page must stay editable on a fresh
+  machine, and with no nginx there is no apply to trap.
+
+Scope: this validates the settings **alone**, into a home whose `include` globs match nothing.
+The apply pipeline's own `nginx -t` over the full config set is unchanged and still
+authoritative for anything involving sites. Note also that `gzip_comp_level` and `gzip_types`
+are only rendered while gzip is on — so they are checked exactly when they are live, which is
+also exactly when they could break an apply.
+
 ## 7. Error surface
 
 | Condition | What the user sees |
 |---|---|
 | A field fails `parse` | that field marked, with the rule stated in words |
 | A gzip type is malformed | the offending token named, the form rejected |
-| `nginx -t` rejects the result | the existing rollback, with nginx's own stderr |
+| `nginx -t` rejects the **candidate** on save | that field marked, with nginx's reason (§6.1) |
+| `nginx -t` rejects the result at apply | the existing rollback, with nginx's own stderr |
 | Settings row missing (fresh install) | the defaults, not an error — first read seeds them |
 
 ## 8. UI

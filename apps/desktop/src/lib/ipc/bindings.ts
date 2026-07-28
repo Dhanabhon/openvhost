@@ -127,13 +127,13 @@ export const commands = {
 	 *  is no settings-only apply command. A second apply path would mean two ways
 	 *  for the live config to change, only one of which shows a diff first.
 	 * 
-	 *  It also does not run `nginx -t` before saving. Storing a value that nginx
-	 *  would reject is recoverable (the row is just a row, and the apply pipeline
-	 *  validates and rolls back before anything goes live); a pre-save check here
-	 *  would have to render the CANDIDATE values into a real config and run
-	 *  `validate_live` against them, because `WebServerAdapter::validate` renders
-	 *  with *defaults* on purpose and only answers "is the shape valid?" — it would
-	 *  wave through a combination nginx actually rejects.
+	 *  It DOES run `nginx -t` first, over a candidate render of the submitted
+	 *  values (`write_settings`). That check renders the user's own values, which
+	 *  is why it cannot be `WebServerAdapter::validate` — that call renders with
+	 *  *defaults* on purpose, answers "is the shape valid?", and would wave
+	 *  through a combination nginx rejects. Measured cost of the spawn is well
+	 *  under a frame, against a failure that otherwise surfaces at an unrelated
+	 *  later apply.
 	 */
 	saveWebServerSettings: (input: WebServerSettingsDto) => typedError<null, IpcError>(__TAURI_INVOKE("save_web_server_settings", { input })),
 	/**

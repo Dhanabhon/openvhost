@@ -87,8 +87,14 @@ fn field_for_rejection(rendered: &str, stderr: &str) -> Option<&'static str> {
         .and_then(error_line_number)?;
     // nginx counts from 1.
     let line = rendered.lines().nth(line_no.checked_sub(1)?)?;
-    let directive = line.trim().split([' ', '\t', ';']).find(|t| !t.is_empty())?;
-    EDITABLE_DIRECTIVES.iter().copied().find(|d| *d == directive)
+    let directive = line
+        .trim()
+        .split([' ', '\t', ';'])
+        .find(|t| !t.is_empty())?;
+    EDITABLE_DIRECTIVES
+        .iter()
+        .copied()
+        .find(|d| *d == directive)
 }
 
 /// The `:<line>` nginx appends to an `[emerg]` message.
@@ -375,7 +381,11 @@ mod tests {
         // `to` is a value nginx refuses.
         let cases = [
             // nginx reports this one WITHOUT naming the directive.
-            ("gzip_comp_level 1;", "gzip_comp_level 99;", "gzip_comp_level"),
+            (
+                "gzip_comp_level 1;",
+                "gzip_comp_level 99;",
+                "gzip_comp_level",
+            ),
             // ...and this one WITH the directive named.
             (
                 "client_max_body_size 256m;",
@@ -402,7 +412,10 @@ mod tests {
             let report = crate::inspect::validate_live(&brew.nginx, &main.path, &err_log)
                 .await
                 .unwrap();
-            assert!(!report.ok, "nginx accepted `{to}`; this test proves nothing");
+            assert!(
+                !report.ok,
+                "nginx accepted `{to}`; this test proves nothing"
+            );
             assert_eq!(
                 field_for_rejection(&corrupted, &report.stderr),
                 Some(expected),
@@ -429,12 +442,16 @@ mod tests {
             .generate_main_config(Path::new("/tmp/ovh"), &settings)
             .unwrap()
             .contents;
-        let line_no = 1 + rendered
+        let Some(idx) = rendered
             .lines()
             .position(|l| l.trim().starts_with("gzip_comp_level "))
-            .expect("the main config renders gzip_comp_level while gzip is on");
+        else {
+            panic!("the main config renders gzip_comp_level while gzip is on")
+        };
+        let line_no = idx + 1;
 
-        let msg = format!("nginx: [emerg] value must be between 1 and 9 in /h/nginx.conf:{line_no}");
+        let msg =
+            format!("nginx: [emerg] value must be between 1 and 9 in /h/nginx.conf:{line_no}");
         let bin = root.path().join("fake-nginx");
         std::fs::write(&bin, format!("#!/bin/sh\necho '{msg}' >&2\nexit 1\n")).unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
