@@ -7,7 +7,7 @@
 import { describe, expect, it } from 'vitest';
 import { render } from 'svelte/server';
 import LanguageRow from './LanguageRow.svelte';
-import type { InstallOutcomeDto, PhpRuntimeDto } from '$lib/ipc';
+import type { InstallOutcomeDto, PhpRuntimeDto, ServiceStatus } from '$lib/ipc';
 import type { UiLog } from '$lib/languages.svelte';
 
 /** One row, with sensible installed-shape defaults so most tests only need to
@@ -31,7 +31,7 @@ function r(
 
 function renderRow(props: {
 	row: PhpRuntimeDto;
-	running?: boolean;
+	serviceState?: ServiceStatus['state'] | null;
 	installing?: string;
 	log?: UiLog[];
 	error?: string;
@@ -40,7 +40,7 @@ function renderRow(props: {
 	return render(LanguageRow, {
 		props: {
 			row: props.row,
-			running: props.running ?? false,
+			serviceState: props.serviceState ?? null,
 			installing: props.installing ?? '',
 			log: props.log ?? [],
 			error: props.error ?? '',
@@ -53,39 +53,28 @@ function renderRow(props: {
 }
 
 describe('LanguageRow', () => {
-	it('shows the version, path and socket when installed', () => {
+	// `fullVersion` is asserted separately, in 'the pool status pill' describe
+	// block below — it no longer has a cell of its own, only the
+	// install-success message.
+	it('shows the path and socket when installed', () => {
 		const body = renderRow({
 			row: r('8.3', true, {
-				fullVersion: '8.3.14',
 				path: '/opt/homebrew/opt/php@8.3/sbin/php-fpm',
 				socketPath: '/Users/x/.openvhost/run/php-fpm-8.3.sock',
 				serviceId: 'php-fpm-8.3'
 			})
 		});
-		expect(body).toContain('8.3.14');
 		expect(body).toContain('/opt/homebrew/opt/php@8.3');
 		expect(body).toContain('php-fpm-8.3.sock');
 		expect(body).not.toContain('data-testid="install-8.3"');
 	});
 
-	// The "one line" branch-review-fix-report.md finding: `fullVersion` is
-	// `null` for every row in production (no patch-level prober exists yet), so
-	// falling back to `row.major` in the version column printed the major a
-	// SECOND time right next to the "PHP 8.3" heading — implying a patch level
-	// had been fetched when it had not. An em dash is the honest "unknown".
-	it('shows an em dash rather than repeating the major when the patch level is unknown', () => {
-		const body = renderRow({ row: r('8.3', true, { fullVersion: null }) });
-		// The version column is the FIRST `meta mono` cell (path/socket follow with
-		// their own extra classes) — matched by class rather than an exact literal
-		// string so a scoped-style hash suffix on the class attribute cannot break
-		// this assertion for reasons unrelated to what it is pinning.
-		const versionCell = body.match(/<div class="meta mono[^"]*">([^<]*)<\/div>/);
-		expect(versionCell?.[1]).toBe('—');
-	});
-
 	it('offers start and stop for an installed version', () => {
 		// The install-to-running flow otherwise spans three pages.
-		const body = renderRow({ row: r('8.3', true, { serviceId: 'php-fpm-8.3' }), running: false });
+		const body = renderRow({
+			row: r('8.3', true, { serviceId: 'php-fpm-8.3' }),
+			serviceState: { kind: 'stopped' }
+		});
 		expect(body).toContain('data-testid="start-php-fpm-8.3"');
 	});
 
@@ -192,5 +181,153 @@ describe('LanguageRow', () => {
 		const body = renderRow({ row: r('8.4', false) });
 		expect(body).not.toMatch(/exited with code/i);
 		expect(body).not.toMatch(/killed/i);
+	});
+});
+
+describe('the pool control', () => {
+	const installed = r('8.4', true, { serviceId: 'php-fpm-8.4' });
+	const notInstalled = r('8.4', false);
+
+	it('offers Start when the pool is stopped', () => {
+		const out = renderRow({ row: installed, serviceState: { kind: 'stopped' } });
+		expect(out).toContain('data-testid="start-php-fpm-8.4"');
+		expect(out).not.toContain('data-testid="retry-php-fpm-8.4"');
+	});
+
+	it('offers Stop while running or still starting', () => {
+		// `starting` gets Stop, not nothing: a start that hangs has to be
+		// interruptible or the only way out is quitting the app.
+		for (const kind of ['running', 'starting'] as const) {
+			const out = renderRow({ row: installed, serviceState: { kind } });
+			expect(out, kind).toContain('data-testid="stop-php-fpm-8.4"');
+		}
+	});
+
+	it('offers Retry after a failure, not another Start', () => {
+		// The whole point. `failed` used to collapse onto `stopped`, so the row
+		// showed a Start button identical to the one the user had just pressed.
+		const out = renderRow({
+			row: installed,
+			serviceState: { kind: 'failed', exit: 1, stderrTail: ['boom'] }
+		});
+		expect(out).toContain('data-testid="retry-php-fpm-8.4"');
+		expect(out).not.toContain('data-testid="start-php-fpm-8.4"');
+	});
+
+	it('renders no control at all while the state is unknown', () => {
+		// `null` is the first frame of every visit. A Start button here asserts
+		// the pool is stopped before the supervisor has answered.
+		const out = renderRow({ row: installed, serviceState: null });
+		expect(out).not.toContain('data-testid="start-php-fpm-8.4"');
+		expect(out).not.toContain('data-testid="stop-php-fpm-8.4"');
+		expect(out).not.toContain('data-testid="retry-php-fpm-8.4"');
+	});
+
+	it('still offers Install first when PHP is not installed', () => {
+		// Spec §5.1: the not-installed branch outranks every service-state
+		// branch. Reversing them would replace Install with nothing on exactly
+		// the rows a new user needs it.
+		const out = renderRow({ row: notInstalled, serviceState: null });
+		expect(out).toContain('data-testid="install-8.4"');
+	});
+});
+
+describe('a failed pool', () => {
+	const installed = r('8.4', true, { serviceId: 'php-fpm-8.4' });
+
+	it("shows php-fpm's own words, not just a Retry button", () => {
+		// Asserting on CONTENT, not on the presence of a block: an empty <pre>
+		// would satisfy a weaker assertion and tell the user nothing about why
+		// their pool did not start.
+		const out = renderRow({
+			row: installed,
+			serviceState: {
+				kind: 'failed',
+				exit: 78,
+				stderrTail: ['[08-Jul-2026 10:00:00] ERROR: unable to bind listening socket']
+			}
+		});
+		expect(out).toContain('unable to bind listening socket');
+		expect(out).toContain('data-testid="pool-failed-php-fpm-8.4"');
+	});
+
+	it('says a failure happened even when php-fpm said nothing', () => {
+		// A pool killed by a signal has an empty tail. Rendering only the <pre>
+		// would leave a failed row looking identical to a healthy one.
+		const out = renderRow({
+			row: installed,
+			serviceState: { kind: 'failed', exit: null, stderrTail: [] }
+		});
+		expect(out).toContain('data-testid="pool-failed-php-fpm-8.4"');
+		expect(out).toContain('PHP 8.4');
+	});
+
+	it('keeps a brew install failure and a pool failure apart', () => {
+		// The two render in different places and mean different things. A row
+		// showing both must show each in its own block, not one in place of the
+		// other.
+		const out = renderRow({
+			row: installed,
+			serviceState: { kind: 'failed', exit: 78, stderrTail: ['pool is broken'] },
+			outcome: { major: '8.4', exitCode: 1, detected: false }
+		});
+		expect(out).toContain('brew exited with code 1');
+		expect(out).toContain('pool is broken');
+	});
+});
+
+describe('the pool status pill', () => {
+	const installed = r('8.4', true, { serviceId: 'php-fpm-8.4' });
+
+	it('names the state for a pool the supervisor knows about', () => {
+		const out = renderRow({ row: installed, serviceState: { kind: 'running' } });
+		expect(out).toContain('data-testid="lang-pill-8.4"');
+		expect(out).toContain('running');
+	});
+
+	it('renders nothing while the state is unknown', () => {
+		// Same rule the control follows: an absent snapshot is not a state.
+		const out = renderRow({ row: installed, serviceState: null });
+		expect(out).not.toContain('data-testid="lang-pill-8.4"');
+	});
+
+	it('drops the full-version column that never had anything to show', () => {
+		// It rendered an em dash on EVERY row, installed or not, because no
+		// patch-level prober exists. To a reader that is not absent data, it is
+		// data that failed to load.
+		//
+		// COUNTING the cells, not pattern-matching one of them. Two things make
+		// the obvious assertions wrong here:
+		//
+		//  - `not.toContain('—')` would fail for reasons unrelated to this
+		//    column, because the path and socket cells render an em dash too
+		//    when their values are null.
+		//  - the deleted test's `/<div class="meta mono[^"]*">/` regex is not
+		//    specific to the version cell either. It looks like it is, because
+		//    path and socket carry a `title` attribute after their class — but
+		//    that attribute is `title={row.path ?? undefined}`, and Svelte OMITS
+		//    an attribute whose value is `undefined`. With a null path the cell
+		//    renders `<div class="meta mono path">` and the regex matches it.
+		//
+		// The count is unambiguous under every fixture: three `meta mono` cells
+		// before (version, path, socket), two after. It is also the finding the
+		// deleted test recorded: falling back to `row.major` in the version cell
+		// printed the major a SECOND time right next to the "PHP 8.3" heading,
+		// implying a patch level had been fetched when none had — which is why
+		// this column had nothing worth showing in the first place.
+		const out = renderRow({ row: { ...installed, fullVersion: null }, serviceState: null });
+		const cells = out.match(/<div class="meta mono/g) ?? [];
+		expect(cells).toHaveLength(2);
+	});
+
+	it('still names the full version in the install-success message', () => {
+		// The FIELD stays; only the column goes. This message is where it is
+		// genuinely useful and degrades honestly to the major.
+		const out = renderRow({
+			row: { ...installed, fullVersion: '8.4.13' },
+			serviceState: null,
+			outcome: { major: '8.4', exitCode: 0, detected: true }
+		});
+		expect(out).toContain('8.4.13');
 	});
 });

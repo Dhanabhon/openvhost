@@ -60,18 +60,6 @@
 		await servicesStore.reload();
 	}
 
-	/**
-	 * Reads running state from the shared services store rather than keeping a
-	 * second copy — two sources for one fact is how they disagree. `null`
-	 * covers a row with no pool yet (not installed, or installed but never
-	 * started so the supervisor has no entry for it).
-	 */
-	function isRunning(serviceId: string | null): boolean {
-		if (serviceId === null) return false;
-		const svc = servicesStore.services.find((s) => s.id === serviceId);
-		return svc !== undefined && svc.state.kind !== 'stopped' && svc.state.kind !== 'failed';
-	}
-
 	onMount(() => {
 		let unlisten: (() => void) | null = null;
 		let disposed = false;
@@ -186,7 +174,9 @@
 					{#each store.env.runtimes as runtime (runtime.major)}
 						<LanguageRow
 							row={runtime}
-							running={isRunning(runtime.serviceId)}
+							serviceState={runtime.serviceId === null
+								? null
+								: (servicesStore.services.find((s) => s.id === runtime.serviceId)?.state ?? null)}
 							installing={store.installing}
 							log={store.logFor(runtime.major)}
 							error={runtime.major === lastAttempted ? store.error : ''}

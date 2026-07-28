@@ -13,7 +13,7 @@ import { render } from 'svelte/server';
 import LanguagesPage from './+page.svelte';
 import { languagesStore } from '$lib/languages.shared.svelte';
 import { servicesStore } from '$lib/services.shared.svelte';
-import type { PhpEnvironmentDto, PhpRuntimeDto } from '$lib/ipc';
+import type { PhpEnvironmentDto, PhpRuntimeDto, ServiceStatus } from '$lib/ipc';
 
 function row(
 	major: string,
@@ -34,6 +34,10 @@ function row(
 
 function env(brewFound: boolean, runtimes: PhpRuntimeDto[]): PhpEnvironmentDto {
 	return { brewFound, brewSearched: ['/opt/homebrew/bin/brew'], runtimes };
+}
+
+function svc(id: string, state: ServiceStatus['state']): ServiceStatus {
+	return { id, displayName: id, endpoint: null, pid: null, state };
 }
 
 /** Pulls out just the header Check again button's own opening tag, so a
@@ -164,5 +168,48 @@ describe('the /languages route', () => {
 		const { body } = render(LanguagesPage);
 		const match = body.match(/<button[^>]*data-testid="languages-check-again"[^>]*>/);
 		expect(match?.[0]).not.toContain('disabled');
+	});
+
+	// Pins the page's own `serviceState` lookup (the `runtime.serviceId === null
+	// ? null : servicesStore.services.find(...)?.state ?? null` glue in
+	// +page.svelte) — nothing else exercises it, since LanguageRow's own tests
+	// hand it `serviceState` directly and every other test here leaves
+	// `servicesStore.services` empty. A runtime whose `serviceId` MATCHES an
+	// entry in the shared snapshot must get that entry's state: seeding a
+	// `failed` pool and asserting the row renders the failed surface is only
+	// reachable through a correct `find`, not a hardcoded fallback.
+	it('renders a matching runtime with its pool state from the shared services snapshot', () => {
+		languagesStore.env = env(true, [row('8.4', true)]);
+		servicesStore.services = [
+			svc('php-fpm-8.4', { kind: 'failed', exit: 78, stderrTail: ['pool is broken'] })
+		];
+		const { body } = render(LanguagesPage);
+		expect(body).toContain('data-testid="pool-failed-php-fpm-8.4"');
+		expect(body).toContain('data-testid="retry-php-fpm-8.4"');
+	});
+
+	// Same lookup, the "no match" side: a runtime's `serviceId` that is not in
+	// the snapshot at all (e.g. the supervisor hasn't reported it yet) must
+	// render as `null` — no pill, no Start/Stop/Retry control — rather than
+	// falling back to some default state.
+	it('renders no pill and no control for a runtime whose serviceId matches nothing in the snapshot', () => {
+		languagesStore.env = env(true, [row('8.4', true)]);
+		servicesStore.services = [svc('some-other-service', { kind: 'running' })];
+		const { body } = render(LanguagesPage);
+		expect(body).not.toContain('data-testid="lang-pill-8.4"');
+		expect(body).not.toContain('data-testid="start-php-fpm-8.4"');
+		expect(body).not.toContain('data-testid="stop-php-fpm-8.4"');
+		expect(body).not.toContain('data-testid="retry-php-fpm-8.4"');
+	});
+
+	// The guard's other branch: a not-installed runtime has `serviceId: null`,
+	// so the lookup must short-circuit to `null` without ever touching
+	// `servicesStore.services` — and the row still renders Install.
+	it('renders Install for a not-installed runtime regardless of the services snapshot', () => {
+		languagesStore.env = env(true, [row('8.4', false)]);
+		servicesStore.services = [svc('unrelated', { kind: 'running' })];
+		const { body } = render(LanguagesPage);
+		expect(body).toContain('data-testid="install-8.4"');
+		expect(body).not.toContain('data-testid="lang-pill-8.4"');
 	});
 });

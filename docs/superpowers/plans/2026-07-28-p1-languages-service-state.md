@@ -422,14 +422,24 @@ describe('the pool status pill', () => {
 		// patch-level prober exists. To a reader that is not absent data, it is
 		// data that failed to load.
 		//
-		// Asserting on the CELL, not on the em dash: the path and socket cells
-		// render `'—'` too when their values are null, so `not.toContain('—')`
-		// would fail for reasons that have nothing to do with this column, and
-		// would pass or fail on which fixture happened to be used. This is the
-		// same regex the test being deleted used — the version cell was the only
-		// `meta mono` with no third class; path and socket add their own.
+		// COUNTING the cells, not pattern-matching one of them. Two things make
+		// the obvious assertions wrong here:
+		//
+		//  - `not.toContain('—')` would fail for reasons unrelated to this
+		//    column, because the path and socket cells render an em dash too
+		//    when their values are null.
+		//  - the deleted test's `/<div class="meta mono[^"]*">/` regex is not
+		//    specific to the version cell either. It looks like it is, because
+		//    path and socket carry a `title` attribute after their class — but
+		//    that attribute is `title={row.path ?? undefined}`, and Svelte OMITS
+		//    an attribute whose value is `undefined`. With a null path the cell
+		//    renders `<div class="meta mono path">` and the regex matches it.
+		//
+		// The count is unambiguous under every fixture: three `meta mono` cells
+		// before (version, path, socket), two after.
 		const out = renderRow({ row: { ...installed, fullVersion: null }, serviceState: null });
-		expect(out).not.toMatch(/<div class="meta mono[^"]*">/);
+		const cells = out.match(/<div class="meta mono/g) ?? [];
+		expect(cells).toHaveLength(2);
 	});
 
 	it('still names the full version in the install-success message', () => {

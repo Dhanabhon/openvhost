@@ -1,13 +1,14 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <script lang="ts">
-	import type { InstallOutcomeDto, PhpRuntimeDto } from '../ipc';
+	import type { InstallOutcomeDto, PhpRuntimeDto, ServiceStatus } from '../ipc';
 	import type { UiLog } from '../languages.svelte';
 	import Button from './Button.svelte';
 	import LogPane from './LogPane.svelte';
+	import StatusPill from './StatusPill.svelte';
 
 	let {
 		row,
-		running = false,
+		serviceState,
 		installing = '',
 		log = [],
 		error = '',
@@ -17,9 +18,15 @@
 		onStop
 	}: {
 		row: PhpRuntimeDto;
-		/** Whether this row's `serviceId` is currently running — read from the
-		 *  shared services store by the caller, never tracked a second time here. */
-		running?: boolean;
+		/** The whole supervised state, not just whether it is running: `failed`
+		 *  carries the `stderrTail` this row renders, and a boolean cannot express
+		 *  it. Read from the shared services store by the caller, never tracked a
+		 *  second time here.
+		 *
+		 *  `null` means the snapshot has not arrived yet, OR this row has no pool
+		 *  at all. Both render no service control — but the not-installed row is
+		 *  caught earlier by the `!row.installed` branch, which renders Install. */
+		serviceState: ServiceStatus['state'] | null;
 		/** The major installing anywhere on the page, '' when idle. Disables
 		 *  every install button, not just this row's — only one install can run
 		 *  at a time (`LanguagesStore.install`'s own re-entrancy guard). */
@@ -51,7 +58,7 @@
 	 *  both: `1` (or any other non-zero code) and `null` (no code at all) are both
 	 *  "not a clean exit". Checked before `notFound`/`justInstalled` in the
 	 *  markup below — those only make sense once `exitCode === 0`. */
-	const failed = $derived(rowOutcome !== null && rowOutcome.exitCode !== 0);
+	const installFailed = $derived(rowOutcome !== null && rowOutcome.exitCode !== 0);
 </script>
 
 <div class="row lang-row" data-testid="lang-row-{row.major}">
@@ -67,17 +74,13 @@
 		{/if}
 	</div>
 
-	<!-- The duplication fix this line undoes if it drifts back: `row.fullVersion`
-	     is `None` for every row in production today (no patch-level prober
-	     exists yet — see `PhpRuntimeDto::full_version`'s own doc comment on the
-	     Rust side), and it is ALSO `None` for a row that is not installed at
-	     all (`php_rows` only sets it when `found.is_some()`). Falling back to
-	     `row.major` here would print "8.3" a second time right next to the
-	     "PHP 8.3" heading, implying a patch level was fetched when it was not —
-	     the exact thing the Rust-side fix (`the_patch_level_is_absent_rather_
-	     than_a_repeat_of_the_major`) removed, reappearing one layer up. An em
-	     dash is the honest "unknown", same as the path/socket columns below. -->
-	<div class="meta mono">{row.fullVersion ?? '—'}</div>
+	<!-- Renders nothing when the state is unknown, the same `{#if}` guard
+	     WebServerRow uses: an absent snapshot is not a state to name. -->
+	<div class="pill-cell">
+		{#if serviceState}
+			<StatusPill kind={serviceState.kind} testId="lang-pill-{row.major}" />
+		{/if}
+	</div>
 
 	<!-- `title` so the full value stays reachable when the cell ellipsizes, same
 	     reasoning as ServiceRow.svelte's endpoint column. -->
@@ -100,22 +103,30 @@
 			>
 				{isInstalling ? 'Installing…' : 'Install'}
 			</Button>
-		{:else if row.serviceId}
-			{#if running}
+		{:else if row.serviceId && serviceState !== null}
+			{#if serviceState.kind === 'failed'}
 				<Button
 					variant="quiet"
 					size="sm"
-					testId="stop-{row.serviceId}"
-					ariaLabel="Stop PHP {row.major}"
-					onclick={() => onStop(row.serviceId ?? '')}>Stop</Button
+					testId="retry-{row.serviceId}"
+					ariaLabel="Retry PHP {row.major}"
+					onclick={() => onStart(row.serviceId ?? '')}>Retry</Button
 				>
-			{:else}
+			{:else if serviceState.kind === 'stopped'}
 				<Button
 					variant="quiet"
 					size="sm"
 					testId="start-{row.serviceId}"
 					ariaLabel="Start PHP {row.major}"
 					onclick={() => onStart(row.serviceId ?? '')}>Start</Button
+				>
+			{:else}
+				<Button
+					variant="quiet"
+					size="sm"
+					testId="stop-{row.serviceId}"
+					ariaLabel="Stop PHP {row.major}"
+					onclick={() => onStop(row.serviceId ?? '')}>Stop</Button
 				>
 			{/if}
 		{/if}
@@ -139,7 +150,7 @@
 	<p class="error" role="alert" style="white-space: pre-wrap">{error}</p>
 {/if}
 
-{#if failed}
+{#if installFailed}
 	<!-- C1 fix: brew's own non-zero exit (or a signal kill, `exitCode === null`)
 	     used to render NOTHING — no error (nothing threw), no `notFound` (that
 	     branch requires `exitCode === 0`), and by then the log had already been
@@ -158,6 +169,20 @@
 		Homebrew reported success installing PHP {row.major}, but the version was not found afterwards.
 		Check the log above for what brew actually did.
 	</p>
+{/if}
+
+{#if serviceState?.kind === 'failed'}
+	<!-- The supervisor's captured stderr is the only thing that explains why a
+	     start did not take. Verbatim — a php-fpm startup error names the pool
+	     file and the directive that broke, and summarising it would throw away
+	     the part that fixes the problem. Same treatment WebServerRow gives a
+	     failed nginx. -->
+	<p class="error" role="alert" data-testid="pool-failed-{row.serviceId}">
+		PHP {row.major}'s pool failed{#if serviceState.exit !== null}&nbsp;(exit {serviceState.exit}){/if}.
+	</p>
+	{#if serviceState.stderrTail.length > 0}
+		<pre class="pool-stderr">{serviceState.stderrTail.join('\n')}</pre>
+	{/if}
 {/if}
 
 {#if justInstalled}
@@ -189,7 +214,12 @@
 		   8px gap and the ~106px Recommended badge without either wrapping. At
 		   120px the badge's width was taken out of the label. The path and
 		   socket columns already ellipsize, so the space comes from there. */
-		grid-template-columns: minmax(190px, 0.6fr) 90px minmax(180px, 1.4fr) minmax(180px, 1.4fr) auto;
+		grid-template-columns:
+			minmax(190px, 0.6fr) 120px minmax(180px, 1.4fr) minmax(180px, 1.4fr)
+			auto;
+	}
+	.pill-cell {
+		min-width: 0;
 	}
 	.primary {
 		font-weight: 600;
@@ -237,6 +267,19 @@
 		padding: var(--vh-space-3);
 		margin: 0 var(--vh-space-4) var(--vh-space-3);
 		font-size: var(--vh-text-table);
+	}
+	.pool-stderr {
+		margin: 0 var(--vh-space-4) var(--vh-space-3);
+		padding: var(--vh-space-2) var(--vh-space-3);
+		background: var(--vh-log-bg);
+		border: 1px solid var(--vh-border);
+		border-radius: var(--vh-radius-control);
+		color: var(--vh-text);
+		font-size: var(--vh-text-log);
+		line-height: 1.6;
+		overflow: auto;
+		max-height: 320px;
+		white-space: pre-wrap;
 	}
 	.warn {
 		color: var(--vh-fail);
