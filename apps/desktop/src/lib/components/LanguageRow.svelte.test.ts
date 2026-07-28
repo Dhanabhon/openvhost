@@ -7,7 +7,7 @@
 import { describe, expect, it } from 'vitest';
 import { render } from 'svelte/server';
 import LanguageRow from './LanguageRow.svelte';
-import type { InstallOutcomeDto, PhpRuntimeDto } from '$lib/ipc';
+import type { InstallOutcomeDto, PhpRuntimeDto, ServiceStatus } from '$lib/ipc';
 import type { UiLog } from '$lib/languages.svelte';
 
 /** One row, with sensible installed-shape defaults so most tests only need to
@@ -31,7 +31,7 @@ function r(
 
 function renderRow(props: {
 	row: PhpRuntimeDto;
-	running?: boolean;
+	serviceState?: ServiceStatus['state'] | null;
 	installing?: string;
 	log?: UiLog[];
 	error?: string;
@@ -40,7 +40,7 @@ function renderRow(props: {
 	return render(LanguageRow, {
 		props: {
 			row: props.row,
-			running: props.running ?? false,
+			serviceState: props.serviceState ?? null,
 			installing: props.installing ?? '',
 			log: props.log ?? [],
 			error: props.error ?? '',
@@ -85,7 +85,10 @@ describe('LanguageRow', () => {
 
 	it('offers start and stop for an installed version', () => {
 		// The install-to-running flow otherwise spans three pages.
-		const body = renderRow({ row: r('8.3', true, { serviceId: 'php-fpm-8.3' }), running: false });
+		const body = renderRow({
+			row: r('8.3', true, { serviceId: 'php-fpm-8.3' }),
+			serviceState: { kind: 'stopped' }
+		});
 		expect(body).toContain('data-testid="start-php-fpm-8.3"');
 	});
 
@@ -192,5 +195,53 @@ describe('LanguageRow', () => {
 		const body = renderRow({ row: r('8.4', false) });
 		expect(body).not.toMatch(/exited with code/i);
 		expect(body).not.toMatch(/killed/i);
+	});
+});
+
+describe('the pool control', () => {
+	const installed = r('8.4', true, { serviceId: 'php-fpm-8.4' });
+	const notInstalled = r('8.4', false);
+
+	it('offers Start when the pool is stopped', () => {
+		const out = renderRow({ row: installed, serviceState: { kind: 'stopped' } });
+		expect(out).toContain('data-testid="start-php-fpm-8.4"');
+		expect(out).not.toContain('data-testid="retry-php-fpm-8.4"');
+	});
+
+	it('offers Stop while running or still starting', () => {
+		// `starting` gets Stop, not nothing: a start that hangs has to be
+		// interruptible or the only way out is quitting the app.
+		for (const kind of ['running', 'starting'] as const) {
+			const out = renderRow({ row: installed, serviceState: { kind } });
+			expect(out, kind).toContain('data-testid="stop-php-fpm-8.4"');
+		}
+	});
+
+	it('offers Retry after a failure, not another Start', () => {
+		// The whole point. `failed` used to collapse onto `stopped`, so the row
+		// showed a Start button identical to the one the user had just pressed.
+		const out = renderRow({
+			row: installed,
+			serviceState: { kind: 'failed', exit: 1, stderrTail: ['boom'] }
+		});
+		expect(out).toContain('data-testid="retry-php-fpm-8.4"');
+		expect(out).not.toContain('data-testid="start-php-fpm-8.4"');
+	});
+
+	it('renders no control at all while the state is unknown', () => {
+		// `null` is the first frame of every visit. A Start button here asserts
+		// the pool is stopped before the supervisor has answered.
+		const out = renderRow({ row: installed, serviceState: null });
+		expect(out).not.toContain('data-testid="start-php-fpm-8.4"');
+		expect(out).not.toContain('data-testid="stop-php-fpm-8.4"');
+		expect(out).not.toContain('data-testid="retry-php-fpm-8.4"');
+	});
+
+	it('still offers Install first when PHP is not installed', () => {
+		// Spec §5.1: the not-installed branch outranks every service-state
+		// branch. Reversing them would replace Install with nothing on exactly
+		// the rows a new user needs it.
+		const out = renderRow({ row: notInstalled, serviceState: null });
+		expect(out).toContain('data-testid="install-8.4"');
 	});
 });

@@ -1,13 +1,13 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <script lang="ts">
-	import type { InstallOutcomeDto, PhpRuntimeDto } from '../ipc';
+	import type { InstallOutcomeDto, PhpRuntimeDto, ServiceStatus } from '../ipc';
 	import type { UiLog } from '../languages.svelte';
 	import Button from './Button.svelte';
 	import LogPane from './LogPane.svelte';
 
 	let {
 		row,
-		running = false,
+		serviceState,
 		installing = '',
 		log = [],
 		error = '',
@@ -17,9 +17,15 @@
 		onStop
 	}: {
 		row: PhpRuntimeDto;
-		/** Whether this row's `serviceId` is currently running — read from the
-		 *  shared services store by the caller, never tracked a second time here. */
-		running?: boolean;
+		/** The whole supervised state, not just whether it is running: `failed`
+		 *  carries the `stderrTail` this row renders, and a boolean cannot express
+		 *  it. Read from the shared services store by the caller, never tracked a
+		 *  second time here.
+		 *
+		 *  `null` means the snapshot has not arrived yet, OR this row has no pool
+		 *  at all. Both render no service control — but the not-installed row is
+		 *  caught earlier by the `!row.installed` branch, which renders Install. */
+		serviceState: ServiceStatus['state'] | null;
 		/** The major installing anywhere on the page, '' when idle. Disables
 		 *  every install button, not just this row's — only one install can run
 		 *  at a time (`LanguagesStore.install`'s own re-entrancy guard). */
@@ -100,22 +106,30 @@
 			>
 				{isInstalling ? 'Installing…' : 'Install'}
 			</Button>
-		{:else if row.serviceId}
-			{#if running}
+		{:else if row.serviceId && serviceState !== null}
+			{#if serviceState.kind === 'failed'}
 				<Button
 					variant="quiet"
 					size="sm"
-					testId="stop-{row.serviceId}"
-					ariaLabel="Stop PHP {row.major}"
-					onclick={() => onStop(row.serviceId ?? '')}>Stop</Button
+					testId="retry-{row.serviceId}"
+					ariaLabel="Retry PHP {row.major}"
+					onclick={() => onStart(row.serviceId ?? '')}>Retry</Button
 				>
-			{:else}
+			{:else if serviceState.kind === 'stopped'}
 				<Button
 					variant="quiet"
 					size="sm"
 					testId="start-{row.serviceId}"
 					ariaLabel="Start PHP {row.major}"
 					onclick={() => onStart(row.serviceId ?? '')}>Start</Button
+				>
+			{:else}
+				<Button
+					variant="quiet"
+					size="sm"
+					testId="stop-{row.serviceId}"
+					ariaLabel="Stop PHP {row.major}"
+					onclick={() => onStop(row.serviceId ?? '')}>Stop</Button
 				>
 			{/if}
 		{/if}
