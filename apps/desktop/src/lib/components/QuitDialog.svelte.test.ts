@@ -40,6 +40,40 @@ function text(markup: string): string {
 		.trim();
 }
 
+describe('where focus lands when the dialog opens', () => {
+	// The dialog focuses ITSELF on mount rather than the Cancel button. Focusing a
+	// control put a focus ring on a button the user had never navigated to —
+	// whether `:focus-visible` matches a script-focused element is a browser
+	// heuristic, so the ring came and went depending on how the dialog was
+	// reached. Reported three times before the cause was found.
+	//
+	// SSR cannot verify where focus actually goes — see this file's header. What
+	// it CAN pin is the thing that makes it possible: the container is focusable
+	// at all. `dialog?.focus()` on an element without `tabindex` silently does
+	// nothing and focus stays on `<body>`, which would leave the dialog unfocused
+	// AND untrapped with no error anywhere.
+	it('makes the container focusable, without putting it in the tab order', () => {
+		const m = html({});
+		expect(m).toContain('tabindex="-1"');
+	});
+
+	it('still puts Cancel before the destructive button in DOM order', () => {
+		// This became load-bearing with the focus change. The old code focused the
+		// first button EXPLICITLY, so it landed on Cancel however the markup was
+		// ordered. Focus now starts on the container and reaches a control by
+		// ordinary Tab, so "the safe choice comes first" is enforced by DOM order
+		// alone — swapping the two buttons would put a stray Enter one keypress
+		// from quitting, with nothing else to catch it.
+		//
+		// `lastIndexOf` for the confirm label: "Quit" also appears in the dialog's
+		// own title ("Quit OpenVHost?"), which precedes both buttons. Matching the
+		// first occurrence would compare against the heading and pass regardless of
+		// the buttons' order.
+		const t = text(html({ pending: [] }));
+		expect(t.indexOf('Cancel')).toBeLessThan(t.lastIndexOf('Quit'));
+	});
+});
+
 describe('QuitDialog', () => {
 	it('is a labelled modal dialog', () => {
 		const m = html({});

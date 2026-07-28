@@ -37,12 +37,31 @@
 	let dialog = $state<HTMLElement | null>(null);
 
 	onMount(() => {
-		// Focus the SAFE choice, not the destructive one: a stray Enter or Space
-		// arriving right after the dialog opens must not quit the app. Cancel is
-		// first in DOM order, and queried rather than bound because `Button` exposes
-		// no element ref — `bind:this` on a wrapping <span> would hand back an
-		// unfocusable node and `.focus()` would silently no-op onto <body>.
-		dialog?.querySelector<HTMLElement>('button')?.focus();
+		// Focus the DIALOG, not a button inside it.
+		//
+		// This used to focus Cancel, reasoning that a stray Enter or Space right
+		// after the dialog opens must not quit the app. That safety property is
+		// preserved and improved here — the container is not a button, so a stray
+		// Enter or Space activates nothing at all.
+		//
+		// What focusing Cancel also did was put a focus ring on a button the user
+		// had never navigated to. Whether `:focus-visible` matches an element
+		// focused by script is a browser heuristic — Chromium, for one, carries it
+		// over from whatever was focused before — so the ring appeared or not
+		// depending on how the user reached the dialog, which is worse than either
+		// outcome consistently. Reported three times; restyling the ring never
+		// addressed it, because the ring was not the problem. Putting focus on a
+		// control was.
+		//
+		// Focusing the container sidesteps the heuristic entirely rather than
+		// betting on it: no button is focused, so no button can be ringed.
+		//
+		// Focusing the container is the ordinary modal pattern and is better for
+		// screen readers too: this element carries `aria-labelledby`/`aria-describedby`,
+		// so landing on it announces the title and the body rather than just the
+		// word "Cancel". Tab from here moves to Cancel and rings it properly,
+		// because that IS keyboard navigation.
+		dialog?.focus();
 	});
 
 	/**
@@ -67,7 +86,18 @@
 		if (els.length === 0) return;
 		const first = els[0];
 		const last = els[els.length - 1];
-		if (e.shiftKey && document.activeElement === first) {
+		// Focus starts on the dialog CONTAINER now, not on a button, so Shift+Tab
+		// from that starting position matched neither branch below and the browser
+		// moved focus backwards — out of a dialog that claims `aria-modal="true"`.
+		// Only reachable as the very first key pressed, which is exactly when a
+		// keyboard user is most likely to press it.
+		//
+		// Plain Tab from the container needs no branch: it is already heading INTO
+		// the dialog, and letting the browser do it is what puts focus on Cancel.
+		if (e.shiftKey && document.activeElement === dialog) {
+			e.preventDefault();
+			last.focus();
+		} else if (e.shiftKey && document.activeElement === first) {
 			e.preventDefault();
 			last.focus();
 		} else if (!e.shiftKey && document.activeElement === last) {
@@ -94,6 +124,7 @@
 	aria-describedby="quit-body"
 	bind:this={dialog}
 	data-testid="quit-dialog"
+	tabindex="-1"
 >
 	<h2 id="quit-title">Quit OpenVHost?</h2>
 	<p id="quit-body" class="body">
@@ -138,6 +169,17 @@
 		background: var(--vh-scrim);
 		backdrop-filter: blur(2px);
 		z-index: var(--vh-z-dialog-backdrop);
+	}
+	/* The container takes focus on open (see `onMount`), and the global
+	   `:focus-visible` in tokens.css would then draw a ring around the whole
+	   dialog — trading a ring on one button for a much larger one. Suppressed
+	   here and ONLY here: this element is `tabindex="-1"`, so it is not reachable
+	   by keyboard and has no focus state a user needs to see. Every control
+	   inside it keeps the global ring, which is what a keyboard user actually
+	   navigates between. */
+	.quit-dialog:focus,
+	.quit-dialog:focus-visible {
+		outline: none;
 	}
 	.quit-dialog {
 		position: fixed;
