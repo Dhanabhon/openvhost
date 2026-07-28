@@ -21,7 +21,8 @@ const nginx: WebServerDto = {
 	binaryPath: '/opt/homebrew/opt/nginx/bin/nginx',
 	version: '1.27.3',
 	supportsHotReload: true,
-	configPath: '/x/.openvhost/conf/nginx.conf'
+	configPath: '/x/.openvhost/conf/nginx.conf',
+	configExists: true
 };
 const apache: WebServerDto = {
 	id: 'apache',
@@ -31,7 +32,8 @@ const apache: WebServerDto = {
 	binaryPath: null,
 	version: null,
 	supportsHotReload: false,
-	configPath: null
+	configPath: null,
+	configExists: false
 };
 
 /** A supervisor snapshot entry. Takes the whole `ServiceState` rather than a bare

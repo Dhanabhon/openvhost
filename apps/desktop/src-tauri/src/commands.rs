@@ -1001,6 +1001,17 @@ pub struct WebServerDto {
     pub version: Option<String>,
     pub supports_hot_reload: bool,
     pub config_path: Option<String>,
+    /// Whether a file exists at `config_path` right now.
+    ///
+    /// EXISTENCE, NOT VALIDITY. nginx is registered to spawn with
+    /// `-c <config_path>`, so a missing file means Start exits immediately —
+    /// and on a fresh install the file is genuinely absent, because
+    /// `provision_home` seeds directories and the welcome page but writes no
+    /// config (pinned by `provisioning_no_longer_writes_any_config`). The page
+    /// disables Start on this and says why, rather than letting the user find
+    /// out by pressing it. A config that exists can still be refused by nginx;
+    /// that case is the row's stderr block, not this flag.
+    pub config_exists: bool,
 }
 
 impl WebServerDto {
@@ -1016,6 +1027,7 @@ impl WebServerDto {
             version: None,
             supports_hot_reload: false,
             config_path: None,
+            config_exists: false,
         }
     }
 }
@@ -1070,7 +1082,11 @@ fn stack_paths<'a>(
 /// live version probe: everything process- or state-dependent arrives as an
 /// argument. A test can therefore pin that Apache is LISTED, not merely
 /// constructible.
-fn web_server_rows(p: &StackPaths, version: Option<String>) -> Vec<WebServerDto> {
+fn web_server_rows(
+    p: &StackPaths,
+    version: Option<String>,
+    config_exists: bool,
+) -> Vec<WebServerDto> {
     vec![
         WebServerDto {
             id: "nginx".into(),
@@ -1081,6 +1097,7 @@ fn web_server_rows(p: &StackPaths, version: Option<String>) -> Vec<WebServerDto>
             version,
             supports_hot_reload: openvhost_conf::NginxAdapter.supports_hot_reload(),
             config_path: Some(p.nginx_conf.display().to_string()),
+            config_exists,
         },
         WebServerDto::apache(),
     ]
@@ -1099,7 +1116,13 @@ pub async fn list_web_servers(
     // — see `openvhost_conf::probe_nginx_version`'s own doc comment.
     let err_log = p.home.join("logs/nginx.error.log");
     let version = openvhost_conf::probe_nginx_version(&p.nginx_bin, &err_log).await;
-    Ok(web_server_rows(p, version))
+    // `tokio::fs`, not `Path::exists()`: a sync stat pins a tokio WORKER, and an
+    // OPENVHOST_HOME on a stalled network mount would take the supervisor event
+    // pump down with it — the same hazard `read_web_server_config` documents
+    // below. `unwrap_or(false)` because a stat that ERRORS is not evidence the
+    // file is there, and the row must not claim it is.
+    let config_exists = tokio::fs::try_exists(&p.nginx_conf).await.unwrap_or(false);
+    Ok(web_server_rows(p, version, config_exists))
 }
 
 #[tauri::command]
@@ -2475,7 +2498,7 @@ mod web_server_ipc_tests {
     #[test]
     fn rows_list_apache_and_report_nginx_from_the_given_paths() {
         let p = sample_paths();
-        let listed = web_server_rows(&p, Some("1.27.3".into()));
+        let listed = web_server_rows(&p, Some("1.27.3".into()), true);
 
         let nginx = listed
             .iter()
@@ -2677,7 +2700,7 @@ mod apply_ipc_tests {
 // has no supported web-server stack yet (`stack::macos_stack` is the only
 // builder), so there is nothing here a Windows run would be covering.
 #[cfg(all(test, unix))]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod list_web_servers_tests {
     use std::path::{Path, PathBuf};
 
@@ -2764,6 +2787,90 @@ mod list_web_servers_tests {
         assert_eq!(
             nginx.supports_hot_reload,
             openvhost_conf::NginxAdapter.supports_hot_reload()
+        );
+    }
+
+    #[test]
+    fn the_nginx_row_reports_whether_its_config_is_actually_there() {
+        // The page disables Start on this fact, so a row that claims a config
+        // exists when it does not sends the user at a service that will exit
+        // immediately — and one that claims the opposite hides a working button.
+        let p = StackPaths {
+            home: PathBuf::from("/x/.openvhost"),
+            nginx_bin: PathBuf::from("/opt/homebrew/opt/nginx/bin/nginx"),
+            nginx_conf: PathBuf::from("/x/.openvhost/config/generated/nginx/nginx.conf"),
+        };
+
+        let present = web_server_rows(&p, None, true);
+        let nginx = present
+            .iter()
+            .find(|r| r.id == "nginx")
+            .expect("an nginx row");
+        assert!(nginx.config_exists, "true must reach the nginx row");
+
+        let absent = web_server_rows(&p, None, false);
+        let nginx = absent
+            .iter()
+            .find(|r| r.id == "nginx")
+            .expect("an nginx row");
+        assert!(!nginx.config_exists, "false must reach the nginx row");
+    }
+
+    #[test]
+    fn apache_never_claims_a_config() {
+        // Apache is unsupported and has no config path at all. Reporting `true`
+        // here would be the row asserting something about a file it cannot name.
+        let apache = WebServerDto::apache();
+        assert_eq!(apache.config_path, None);
+        assert!(!apache.config_exists);
+    }
+
+    /// Closes the gap `the_nginx_row_reports_whether_its_config_is_actually_there`
+    /// leaves open: that test drives `web_server_rows`, which only ever MOVES a
+    /// bool around — nothing there touches the filesystem. This one drives
+    /// `list_web_servers` itself, so the real `tokio::fs::try_exists` stat against
+    /// `p.nginx_conf` is what is under test. Proven non-vacuous by hand: hardcoding
+    /// `let config_exists = true;` in `list_web_servers` leaves
+    /// `the_nginx_row_reports_whether_its_config_is_actually_there` green (it never
+    /// calls the command) while this test catches it, because the "removed" half
+    /// of the assertion below would then fail.
+    #[tokio::test]
+    async fn list_web_servers_reports_the_real_state_of_the_config_file_on_disk() {
+        let home = tempfile::tempdir().unwrap();
+        let argv = home.path().join("argv.txt");
+        let bin = fake_nginx(home.path(), &argv, "1.27.3");
+        let conf = home.path().join("conf/nginx.conf");
+
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(Some(StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: bin,
+            nginx_conf: conf.clone(),
+        }));
+
+        std::fs::create_dir_all(conf.parent().unwrap()).unwrap();
+        std::fs::write(&conf, "# placeholder\n").unwrap();
+        let rows = list_web_servers(app.state()).await.unwrap();
+        let nginx = rows
+            .iter()
+            .find(|r| r.id == "nginx")
+            .unwrap_or_else(|| panic!("nginx must be listed, got {rows:?}"));
+        assert!(
+            nginx.config_exists,
+            "the file is there; the row must say so"
+        );
+
+        std::fs::remove_file(&conf).unwrap();
+        let rows = list_web_servers(app.state()).await.unwrap();
+        let nginx = rows
+            .iter()
+            .find(|r| r.id == "nginx")
+            .unwrap_or_else(|| panic!("nginx must be listed, got {rows:?}"));
+        assert!(
+            !nginx.config_exists,
+            "the file is gone; the row must not claim otherwise"
         );
     }
 }

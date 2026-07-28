@@ -442,6 +442,19 @@ export type WebServerDto = {
 	version: string | null,
 	supportsHotReload: boolean,
 	configPath: string | null,
+	/**
+	 *  Whether a file exists at `config_path` right now.
+	 * 
+	 *  EXISTENCE, NOT VALIDITY. nginx is registered to spawn with
+	 *  `-c <config_path>`, so a missing file means Start exits immediately —
+	 *  and on a fresh install the file is genuinely absent, because
+	 *  `provision_home` seeds directories and the welcome page but writes no
+	 *  config (pinned by `provisioning_no_longer_writes_any_config`). The page
+	 *  disables Start on this and says why, rather than letting the user find
+	 *  out by pressing it. A config that exists can still be refused by nginx;
+	 *  that case is the row's stderr block, not this flag.
+	 */
+	configExists: boolean,
 };
 
 /**
