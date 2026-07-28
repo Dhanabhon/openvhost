@@ -315,6 +315,23 @@ describe('the service control', () => {
 		expect(out).toContain('No config generated yet');
 	});
 
+	it('offers Start with no reason when config existence could not be determined', () => {
+		// `configExists: null` is what the backend reports when its own stat
+		// could not be performed — NOT the same fact as "confirmed absent". Start
+		// stays enabled and, critically, the reason line does not render: naming
+		// NO_CONFIG_REASON here would tell the user to re-Apply for a problem
+		// (a permission error, say) that Apply cannot fix.
+		const out = html({
+			servers: [{ ...nginx, configExists: null }],
+			services: [svc('nginx', { kind: 'stopped' })]
+		});
+		expect(out).toContain('data-testid="ws-start-nginx"');
+		// The same reason-absence assertion the enabled case above makes: a whole-
+		// panel string, so this is about Start specifically, not about "disabled"
+		// never appearing anywhere in the markup.
+		expect(out).not.toContain('ws-start-reason-nginx');
+	});
+
 	it('offers Stop while running', () => {
 		const out = html({ servers: [nginx], services: [svc('nginx', { kind: 'running' })] });
 		expect(out).toContain('data-testid="ws-stop-nginx"');

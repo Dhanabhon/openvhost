@@ -47,6 +47,9 @@ describe('startStopFor', () => {
 		// whose state they were never shown.
 		expect(startStopFor(null, true)).toEqual({ kind: 'none' });
 		expect(startStopFor(null, false)).toEqual({ kind: 'none' });
+		// Same rule when config existence is ALSO unknown: two unknowns do not
+		// combine into a control the user can act on.
+		expect(startStopFor(null, null)).toEqual({ kind: 'none' });
 	});
 
 	it('offers Start when stopped with a config to start against', () => {
@@ -72,6 +75,20 @@ describe('startStopFor', () => {
 		// on a row whose own error text is telling them to try again.
 		expect(startStopFor('failed', true)).toEqual({ kind: 'retry' });
 		expect(startStopFor('failed', false)).toEqual({ kind: 'retry' });
+	});
+
+	it('enables Start with no reason when config existence could not be determined', () => {
+		// `null` means the backend's stat itself failed (a permission error, a
+		// dangling symlink, ...) — that is NOT the same fact as "confirmed
+		// absent", and must not be treated as one. Disabling Start here would
+		// repeat NO_CONFIG_REASON for a cause that has nothing to do with Apply,
+		// and re-running Apply cannot fix it. The honest move is to let the user
+		// try; a genuine failure surfaces as nginx's own stderr on the row.
+		expect(startStopFor('stopped', null)).toEqual({
+			kind: 'start',
+			disabled: false,
+			reason: ''
+		});
 	});
 
 	it('offers Stop while running or still starting', () => {

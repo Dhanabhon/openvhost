@@ -1001,17 +1001,30 @@ pub struct WebServerDto {
     pub version: Option<String>,
     pub supports_hot_reload: bool,
     pub config_path: Option<String>,
-    /// Whether a file exists at `config_path` right now.
+    /// Whether a file exists at `config_path` right now — a TRI-STATE, because
+    /// a filesystem stat has three honest outcomes, not two.
     ///
-    /// EXISTENCE, NOT VALIDITY. nginx is registered to spawn with
-    /// `-c <config_path>`, so a missing file means Start exits immediately —
-    /// and on a fresh install the file is genuinely absent, because
-    /// `provision_home` seeds directories and the welcome page but writes no
-    /// config (pinned by `provisioning_no_longer_writes_any_config`). The page
-    /// disables Start on this and says why, rather than letting the user find
-    /// out by pressing it. A config that exists can still be refused by nginx;
-    /// that case is the row's stderr block, not this flag.
-    pub config_exists: bool,
+    /// `Some(true)`: confirmed present. `Some(false)`: confirmed absent — and
+    /// on a fresh install this is the common case, because `provision_home`
+    /// seeds directories and the welcome page but writes no config (pinned by
+    /// `provisioning_no_longer_writes_any_config`). `None`: the stat could not
+    /// be performed at all (permission denied on a parent directory, a
+    /// dangling symlink from an interrupted atomic write, ...) — this is
+    /// EXISTENCE UNKNOWN, and it must never collapse into `Some(false)`.
+    /// Doing so would tell the user "no config generated yet — apply your
+    /// changes first" when the real cause has nothing to do with Apply and
+    /// re-running it cannot fix it.
+    ///
+    /// EXISTENCE, NOT VALIDITY, in every non-`None` case. nginx is registered
+    /// to spawn with `-c <config_path>`, so a confirmed-missing file means
+    /// Start exits immediately, and the page disables Start on `Some(false)`
+    /// and says why, rather than letting the user find out by pressing it. On
+    /// `None` the page instead leaves Start enabled with no claim about the
+    /// cause — see `startStopFor` — because nginx's own stderr on a genuine
+    /// failure names the real problem, which this DTO cannot. A config that
+    /// exists can still be refused by nginx; that case is the row's stderr
+    /// block, not this flag.
+    pub config_exists: Option<bool>,
 }
 
 impl WebServerDto {
@@ -1027,7 +1040,16 @@ impl WebServerDto {
             version: None,
             supports_hot_reload: false,
             config_path: None,
-            config_exists: false,
+            // `Some(false)`, not `None`. `None` means "a stat was attempted and
+            // could not be performed" — but no stat is ever attempted here at
+            // all, because there is no `config_path` to stat. "a file exists at
+            // config_path" is false for every value of "a file" when
+            // `config_path` is `None`, so this is a confirmed absence we can
+            // state outright, not an unresolved one. It is also moot either way:
+            // `WebServerRow.svelte` gates the whole service control on
+            // `server.serviceId === null` before `config_exists` is ever
+            // consulted, and Apache's `service_id` is `None` too.
+            config_exists: Some(false),
         }
     }
 }
@@ -1085,7 +1107,7 @@ fn stack_paths<'a>(
 fn web_server_rows(
     p: &StackPaths,
     version: Option<String>,
-    config_exists: bool,
+    config_exists: Option<bool>,
 ) -> Vec<WebServerDto> {
     vec![
         WebServerDto {
@@ -1119,9 +1141,16 @@ pub async fn list_web_servers(
     // `tokio::fs`, not `Path::exists()`: a sync stat pins a tokio WORKER, and an
     // OPENVHOST_HOME on a stalled network mount would take the supervisor event
     // pump down with it — the same hazard `read_web_server_config` documents
-    // below. `unwrap_or(false)` because a stat that ERRORS is not evidence the
-    // file is there, and the row must not claim it is.
-    let config_exists = tokio::fs::try_exists(&p.nginx_conf).await.unwrap_or(false);
+    // below. `.ok()`, not `.unwrap_or(false)`: a stat that ERRORS (permission
+    // denied on a parent directory, a dangling symlink from an interrupted
+    // atomic write, ...) is not evidence the file is ABSENT either — it is no
+    // evidence at all, and `unwrap_or(false)` used to collapse that unknown
+    // into the same value as a confirmed absence, which sent the user to
+    // re-Apply for a problem Apply cannot fix. `.ok()` keeps the three
+    // outcomes distinct: `Some(true)`, `Some(false)`, or `None` for "could not
+    // tell" — see `WebServerDto::config_exists`'s doc comment for what each one
+    // means to the page.
+    let config_exists = tokio::fs::try_exists(&p.nginx_conf).await.ok();
     Ok(web_server_rows(p, version, config_exists))
 }
 
@@ -2498,7 +2527,7 @@ mod web_server_ipc_tests {
     #[test]
     fn rows_list_apache_and_report_nginx_from_the_given_paths() {
         let p = sample_paths();
-        let listed = web_server_rows(&p, Some("1.27.3".into()), true);
+        let listed = web_server_rows(&p, Some("1.27.3".into()), Some(true));
 
         let nginx = listed
             .iter()
@@ -2792,37 +2821,62 @@ mod list_web_servers_tests {
 
     #[test]
     fn the_nginx_row_reports_whether_its_config_is_actually_there() {
-        // The page disables Start on this fact, so a row that claims a config
-        // exists when it does not sends the user at a service that will exit
-        // immediately — and one that claims the opposite hides a working button.
+        // The page disables Start on `Some(false)`, so a row that claims
+        // `Some(true)` when the file is absent sends the user at a service that
+        // will exit immediately — and one that claims `Some(false)` when the
+        // file IS there hides a working button. `web_server_rows` only ever
+        // moves the tri-state through; it never invents a third value.
         let p = StackPaths {
             home: PathBuf::from("/x/.openvhost"),
             nginx_bin: PathBuf::from("/opt/homebrew/opt/nginx/bin/nginx"),
             nginx_conf: PathBuf::from("/x/.openvhost/config/generated/nginx/nginx.conf"),
         };
 
-        let present = web_server_rows(&p, None, true);
+        let present = web_server_rows(&p, None, Some(true));
         let nginx = present
             .iter()
             .find(|r| r.id == "nginx")
             .expect("an nginx row");
-        assert!(nginx.config_exists, "true must reach the nginx row");
+        assert_eq!(
+            nginx.config_exists,
+            Some(true),
+            "Some(true) must reach the nginx row"
+        );
 
-        let absent = web_server_rows(&p, None, false);
+        let absent = web_server_rows(&p, None, Some(false));
         let nginx = absent
             .iter()
             .find(|r| r.id == "nginx")
             .expect("an nginx row");
-        assert!(!nginx.config_exists, "false must reach the nginx row");
+        assert_eq!(
+            nginx.config_exists,
+            Some(false),
+            "Some(false) must reach the nginx row"
+        );
+
+        // The unknown case: a stat that could not be performed must reach the
+        // row AS `None`, not collapse into `Some(false)` on the way through.
+        let unknown = web_server_rows(&p, None, None);
+        let nginx = unknown
+            .iter()
+            .find(|r| r.id == "nginx")
+            .expect("an nginx row");
+        assert_eq!(
+            nginx.config_exists, None,
+            "None must reach the nginx row unchanged, not become Some(false)"
+        );
     }
 
     #[test]
-    fn apache_never_claims_a_config() {
-        // Apache is unsupported and has no config path at all. Reporting `true`
-        // here would be the row asserting something about a file it cannot name.
+    fn apache_never_claims_a_confirmed_config() {
+        // Apache is unsupported and has no config path at all, so `Some(true)`
+        // (a confirmed presence) would be the row asserting something about a
+        // file it cannot even name. `Some(false)` is what this crate picks —
+        // see `WebServerDto::apache`'s doc comment for why that is a confirmed
+        // absence rather than an unresolved `None`.
         let apache = WebServerDto::apache();
         assert_eq!(apache.config_path, None);
-        assert!(!apache.config_exists);
+        assert_eq!(apache.config_exists, Some(false));
     }
 
     /// Closes the gap `the_nginx_row_reports_whether_its_config_is_actually_there`
@@ -2857,8 +2911,9 @@ mod list_web_servers_tests {
             .iter()
             .find(|r| r.id == "nginx")
             .unwrap_or_else(|| panic!("nginx must be listed, got {rows:?}"));
-        assert!(
+        assert_eq!(
             nginx.config_exists,
+            Some(true),
             "the file is there; the row must say so"
         );
 
@@ -2868,9 +2923,55 @@ mod list_web_servers_tests {
             .iter()
             .find(|r| r.id == "nginx")
             .unwrap_or_else(|| panic!("nginx must be listed, got {rows:?}"));
-        assert!(
-            !nginx.config_exists,
+        assert_eq!(
+            nginx.config_exists,
+            Some(false),
             "the file is gone; the row must not claim otherwise"
+        );
+    }
+
+    /// The stat seam directly: `tokio::fs::try_exists` really does return `Err`
+    /// when the path cannot be traversed (a locked-down parent directory here,
+    /// standing in for the permission-denied / dangling-symlink cases named in
+    /// `WebServerDto::config_exists`'s doc comment), and `.ok()` — the exact
+    /// mapping `list_web_servers` applies — turns that `Err` into `None`, never
+    /// into `Some(false)`.
+    ///
+    /// This does not drive `list_web_servers` end to end the way the test above
+    /// does, because there is no portable, non-root way to make THAT command's
+    /// own stat fail without also breaking `tauri::test`'s mock app setup (which
+    /// itself touches the temp directory tree). What it does cover, faithfully,
+    /// is the one line the whole fix is about: `try_exists(..).await.ok()`.
+    #[tokio::test]
+    async fn a_stat_that_cannot_be_performed_yields_none_not_some_false() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let locked_dir = home.path().join("locked");
+        std::fs::create_dir(&locked_dir).unwrap();
+        let conf = locked_dir.join("nginx.conf");
+
+        // Strip ALL permissions, including execute, so the directory cannot be
+        // traversed even by its owner — this is what turns the stat below into
+        // a permission error rather than a confirmed absence.
+        std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = tokio::fs::try_exists(&conf).await;
+
+        // Restore permissions before the tempdir's Drop tries to remove it.
+        std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "a stat through an untraversable parent must error, not report \
+             Ok(false); got {result:?}"
+        );
+        assert_eq!(
+            result.ok(),
+            None,
+            "the mapping list_web_servers applies (.ok()) must turn that error \
+             into None — collapsing it into Some(false) is the bug this test \
+             guards against"
         );
     }
 }

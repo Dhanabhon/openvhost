@@ -52,17 +52,37 @@ export type StartStopControl =
  * `configExists` only ever gates `start`. A `failed` service has already been
  * started once, and a `running` one is a live process; neither decision has
  * anything to do with a file being on disk right now.
+ *
+ * `configExists` is a TRI-STATE (`boolean | null`), matching the backend's
+ * `config_exists`: a filesystem stat has three honest outcomes, and
+ * `true`/`false` alone cannot carry "could not tell". `null` means the stat
+ * itself failed — a permission error on a parent directory, a dangling
+ * symlink from an interrupted atomic write, and so on — which is NOT the same
+ * fact as "confirmed absent", and must not be treated as one.
  */
 export function startStopFor(
 	statusKind: ServiceStatus['state']['kind'] | null,
-	configExists: boolean
+	configExists: boolean | null
 ): StartStopControl {
 	if (statusKind === null) return { kind: 'none' };
 	if (statusKind === 'failed') return { kind: 'retry' };
 	if (statusKind === 'stopped') {
-		return configExists
-			? { kind: 'start', disabled: false, reason: '' }
-			: { kind: 'start', disabled: true, reason: NO_CONFIG_REASON };
+		if (configExists === false) {
+			return { kind: 'start', disabled: true, reason: NO_CONFIG_REASON };
+		}
+		// `configExists === true` is the ordinary enabled case. `configExists ===
+		// null` — existence UNKNOWN — is deliberately handled the SAME way:
+		// Start enabled, with no reason shown. We could not determine whether the
+		// config is there, so the honest move is not to guess a confident wrong
+		// diagnosis ("no config generated yet — apply your changes first") when
+		// the real cause might be a permission error that Apply cannot fix. If
+		// the user presses Start and the config genuinely is missing (or
+		// otherwise bad), nginx itself refuses to start and the service goes to
+		// `failed` — Task 4 of this plan renders that failure's stderr tail on
+		// the row, so the user ends up reading nginx's own words naming the
+		// actual problem. That is strictly more useful, and strictly more
+		// honest, than a confident sentence this function cannot back up.
+		return { kind: 'start', disabled: false, reason: '' };
 	}
 	return { kind: 'stop' };
 }
