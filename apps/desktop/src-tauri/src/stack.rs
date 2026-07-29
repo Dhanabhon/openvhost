@@ -19,7 +19,7 @@ use openvhost_core::site::apply::LISTEN_PORT;
 // `macos_stack` constructs them today), and `php_fpm_spec` below is called
 // from `commands.rs`, which is ungated too.
 use openvhost_core::{InstalledRuntimes, PhpRuntime};
-use openvhost_proc::{ServiceSpec, SpawnSpec};
+use openvhost_proc::{DEFAULT_GRACE, ReadinessProbe, ServiceSpec, SpawnSpec};
 
 /// Apple Silicon default paths, used when probing finds nothing: the rows
 /// still register, and Start yields an honest Failed naming the missing
@@ -92,6 +92,11 @@ pub fn php_fpm_spec(home: &Path, rt: &PhpRuntime) -> ServiceSpec {
             cwd: None,
             env: vec![],
         },
+        // Defaults only (openvhost-proc's per-service readiness probe + stop
+        // grace, added for the MySQL lifecycle slice): today's behavior,
+        // byte-for-byte unchanged.
+        readiness: ReadinessProbe::default(),
+        grace: DEFAULT_GRACE,
     }
 }
 
@@ -209,6 +214,9 @@ pub fn macos_stack() -> MacosStack {
             cwd: None,
             env: vec![],
         },
+        // Defaults only — see `php_fpm_spec`'s matching comment above.
+        readiness: ReadinessProbe::default(),
+        grace: DEFAULT_GRACE,
     });
 
     MacosStack {

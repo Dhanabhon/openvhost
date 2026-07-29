@@ -24,8 +24,9 @@ use std::time::{Duration, Instant};
 
 use openvhost_proc::platform::process_start_time;
 use openvhost_proc::{
-    FileRegistry, InstanceLock, ProcIdentity, ProcessRegistry, ServiceSpec, ServiceState,
-    SpawnSpec, SupervisedRecord, Supervisor, default_driver, default_reaper,
+    DEFAULT_GRACE, FileRegistry, InstanceLock, ProcIdentity, ProcessRegistry, ReadinessProbe,
+    ServiceSpec, ServiceState, SpawnSpec, SupervisedRecord, Supervisor, default_driver,
+    default_reaper,
 };
 
 fn sleeper_spec() -> ServiceSpec {
@@ -39,6 +40,8 @@ fn sleeper_spec() -> ServiceSpec {
             cwd: None,
             env: vec![],
         },
+        readiness: ReadinessProbe::default(),
+        grace: DEFAULT_GRACE,
     }
 }
 

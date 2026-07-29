@@ -53,10 +53,18 @@ pub const QUIT_MENU_ITEM_ID: &str = "openvhost:quit";
 /// How long [`stop_all_with`] waits for services to actually reach a stopped
 /// state before giving up on the stragglers.
 ///
-/// Must exceed `openvhost-proc`'s `GRACE_DEADLINE` (5s): `Supervisor::stop` only
-/// REQUESTS a graceful stop, and the service task waits out that grace period
-/// before escalating to a kill. A timeout at or under 5s would abandon exactly
-/// the processes the kill was about to reap.
+/// Must exceed `openvhost-proc`'s `DEFAULT_GRACE` (5s, formerly a private
+/// `GRACE_DEADLINE` constant — now per-`ServiceSpec`, see `ServiceSpec::grace`):
+/// `Supervisor::stop` only REQUESTS a graceful stop, and the service task waits
+/// out that spec's grace period before escalating to a kill. A timeout at or
+/// under 5s would abandon exactly the processes the kill was about to reap.
+///
+/// nginx/php-fpm both still use `DEFAULT_GRACE`, so 8s stays correct for them.
+/// A future spec with a LONGER grace (the roadmap's MySQL lifecycle slice
+/// proposes 15s, for a clean InnoDB shutdown) would need this timeout raised
+/// too, or `stop_all_with` would report it as a straggler mid-shutdown even
+/// though it was still within its own grace window — flagged here rather than
+/// silently left for that slice to rediscover.
 pub const STOP_ALL_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Snapshot cadence while waiting. The supervisor's snapshot is an in-memory

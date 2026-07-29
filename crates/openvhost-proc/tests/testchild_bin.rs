@@ -56,3 +56,47 @@ fn http_mode_serves_200_and_sentinel() {
         "200 body lacks the sentinel: {resp}"
     );
 }
+
+/// The probe double at the BINARY level (a fresh process per attempt, a
+/// counter file as the only memory across invocations) — the mechanism the
+/// supervisor's `ReadinessProbe::Command` tests (`tests/readiness.rs`) build
+/// on. Proven here in isolation, independent of the supervisor.
+#[test]
+fn probe_mode_fails_until_the_nth_attempt_then_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("counter");
+
+    let run_once = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_proc_testchild"))
+            .args([
+                "--probe-state",
+                state.to_str().unwrap(),
+                "--probe-succeed-after",
+                "3",
+            ])
+            .output()
+            .unwrap()
+    };
+
+    let first = run_once();
+    assert_eq!(first.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&first.stderr).contains("ERROR probe not ready (attempt 1/3)"),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    let second = run_once();
+    assert_eq!(second.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&second.stderr).contains("attempt 2/3"));
+
+    let third = run_once();
+    assert_eq!(third.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&third.stdout).contains("probe ready on attempt 3"));
+
+    // The pid sentinel proves this process really ran (each attempt
+    // overwrites it) — the property `tests/readiness.rs` relies on to prove
+    // the supervisor never leaks a probe subprocess.
+    let pid_path = state.with_extension("pid");
+    assert!(pid_path.exists(), "probe mode must record its own pid");
+}

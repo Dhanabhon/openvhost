@@ -5,7 +5,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{broadcast, mpsc};
 
@@ -14,12 +14,60 @@ use crate::events::{LogLine, ServiceState, ServiceStatus, StreamSource, Supervis
 use crate::log::{RING_CAPACITY, RingBuffer, STDERR_TAIL, classify_level};
 use crate::platform::{ProcessDriver, SpawnSpec};
 
+/// How the supervisor decides a freshly spawned child has actually become
+/// ready to use, distinct from merely having survived spawning (P1 MySQL
+/// lifecycle design, spec D4). `Default` is today's `nginx`/`php-fpm`
+/// behavior, verbatim — an existing [`ServiceSpec`] that does not opt in
+/// keeps this shape byte-for-byte.
+#[derive(Debug, Clone)]
+pub enum ReadinessProbe {
+    /// `Running` fires once the child has survived this long without
+    /// exiting, raced against the child's own exit — today's behavior.
+    AliveAfter(Duration),
+    /// Re-run `argv` (a fresh process per attempt, spawned through the same
+    /// [`ProcessDriver`] as every other child) until one exits `0` (ready)
+    /// or `deadline` elapses without a success — whichever comes first. The
+    /// service stays `Starting` for the whole wait.
+    ///
+    /// A child that exits — with ANY code — while a `Command` probe is
+    /// still outstanding is always classified `Failed` (unless a stop was
+    /// independently requested): unlike `AliveAfter`, "ready" was never
+    /// confirmed, so a clean-looking exit code is not a clean stop.
+    Command {
+        argv: Vec<String>,
+        deadline: Duration,
+    },
+}
+
+impl Default for ReadinessProbe {
+    /// `AliveAfter(500ms)` — today's behavior.
+    fn default() -> Self {
+        Self::AliveAfter(DEFAULT_READY_AFTER)
+    }
+}
+
+/// The `AliveAfter` bound backing [`ReadinessProbe::default`] — today's
+/// 500ms race window, named so it is defined exactly once (was a private
+/// `RUNNING_AFTER` constant in `service_task.rs`).
+pub const DEFAULT_READY_AFTER: Duration = Duration::from_millis(500);
+
+/// The stop grace backing any [`ServiceSpec`] that does not set its own —
+/// today's 5s, named so it is defined exactly once (was a private
+/// `GRACE_DEADLINE` constant in `service_task.rs`; now per-spec, spec D4).
+pub const DEFAULT_GRACE: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Clone)]
 pub struct ServiceSpec {
     pub id: String,
     pub display_name: String,
     pub endpoint: Option<String>,
     pub spawn: SpawnSpec,
+    /// How to decide `Starting` → `Running`. Defaults to
+    /// [`ReadinessProbe::default`] (today's behavior, unchanged).
+    pub readiness: ReadinessProbe,
+    /// Stop path: SIGTERM → wait this long → SIGKILL. Defaults to
+    /// [`DEFAULT_GRACE`] (5s, today's hardcoded value).
+    pub grace: Duration,
 }
 
 pub(crate) struct Entry {
@@ -154,7 +202,7 @@ impl Supervisor {
     /// Must be called from within a tokio runtime context: spawns the
     /// service task with `tokio::spawn`.
     pub fn start(&self, id: &str) -> Result<(), ProcError> {
-        let (spawn, stop_flag, control_rx, prior) = {
+        let (spawn, readiness, grace, stop_flag, control_rx, prior) = {
             let mut entries = self.inner.entries.lock().unwrap_or_else(|e| e.into_inner());
             let e = entries
                 .get_mut(id)
@@ -180,6 +228,8 @@ impl Supervisor {
             e.state = ServiceState::Starting;
             (
                 e.spec.spawn.clone(),
+                e.spec.readiness.clone(),
+                e.spec.grace,
                 Arc::clone(&e.stop_requested),
                 ctl_rx,
                 prior,
@@ -202,7 +252,7 @@ impl Supervisor {
         let inner = Arc::clone(&self.inner);
         let id_owned = id.to_string();
         tokio::spawn(crate::service_task::run(
-            inner, id_owned, spawn, stop_flag, control_rx,
+            inner, id_owned, spawn, readiness, grace, stop_flag, control_rx,
         ));
         Ok(())
     }

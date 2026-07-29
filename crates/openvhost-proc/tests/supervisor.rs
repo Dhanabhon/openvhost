@@ -10,7 +10,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use openvhost_proc::{
-    ServiceSpec, ServiceState, SpawnSpec, Supervisor, SupervisorEvent, default_driver,
+    DEFAULT_GRACE, ReadinessProbe, ServiceSpec, ServiceState, SpawnSpec, Supervisor,
+    SupervisorEvent, default_driver,
 };
 use tokio::sync::broadcast;
 
@@ -34,6 +35,8 @@ fn svc(id: &str, args: &[&str]) -> ServiceSpec {
         display_name: id.to_string(),
         endpoint: None,
         spawn: testchild_spec(args),
+        readiness: ReadinessProbe::default(),
+        grace: DEFAULT_GRACE,
     }
 }
 
@@ -269,6 +272,8 @@ async fn register_does_not_clobber_live_service() {
         display_name: "clobbered".to_string(),
         endpoint: None,
         spawn: testchild_spec(&["--lines", "1", "--interval-ms", "1"]),
+        readiness: ReadinessProbe::default(),
+        grace: DEFAULT_GRACE,
     });
 
     let after = sup.snapshot().into_iter().find(|s| s.id == "t7").unwrap();
@@ -302,6 +307,8 @@ async fn spawn_failure_is_failed_with_pointing_detail() {
             cwd: None,
             env: vec![],
         },
+        readiness: ReadinessProbe::default(),
+        grace: DEFAULT_GRACE,
     });
     let mut rx = sup.subscribe();
     sup.start("t5").unwrap();

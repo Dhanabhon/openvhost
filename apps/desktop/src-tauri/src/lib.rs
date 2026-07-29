@@ -14,8 +14,8 @@ use std::ffi::OsString;
 use std::sync::Arc;
 
 use openvhost_proc::{
-    FileRegistry, InstanceLock, ServiceSpec, SpawnSpec, Supervisor, SupervisorEvent,
-    default_driver, default_reaper,
+    DEFAULT_GRACE, FileRegistry, InstanceLock, ReadinessProbe, ServiceSpec, SpawnSpec, Supervisor,
+    SupervisorEvent, default_driver, default_reaper,
 };
 use tauri::Manager;
 use tauri_specta::{Builder, Event, collect_commands, collect_events};
@@ -111,6 +111,9 @@ fn demo_ticker_spec() -> ServiceSpec {
             cwd: None,
             env: vec![],
         },
+        // Defaults only — see `stack::php_fpm_spec`'s matching comment.
+        readiness: ReadinessProbe::default(),
+        grace: DEFAULT_GRACE,
     }
 }
 
