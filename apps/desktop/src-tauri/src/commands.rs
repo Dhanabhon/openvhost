@@ -2860,6 +2860,20 @@ fn redact(text: &str, secret: &str) -> String {
     text.replace(secret, "<redacted>")
 }
 
+/// [`redact`] against every secret in `secrets`, in order. Exists for
+/// `reset_mysql_root_password`, which has TWO live secrets in play at
+/// once — the CURRENT stored password (used to authenticate, via the
+/// ephemeral defaults-file) and the freshly generated one the `ALTER USER`
+/// is trying to set — and a failure detail could in principle echo back
+/// either. Review fix wave finding 1 (CRITICAL): redacting only the new
+/// password left the current, STILL-VALID one reachable through a failure
+/// path.
+fn redact_all(text: &str, secrets: &[&str]) -> String {
+    secrets
+        .iter()
+        .fold(text.to_string(), |acc, secret| redact(&acc, secret))
+}
+
 /// An ephemeral, 0600, RAII-deleted MySQL `--defaults-file` carrying a
 /// credential (spec D2 step 5 / D3): written just before use, deleted on
 /// EVERY path (success, error, panic-unwind) via `Drop`, never left on disk
@@ -2889,7 +2903,6 @@ impl EphemeralDefaultsFile {
         socket: &Path,
         password: &openvhost_core::mysql::RootPassword,
     ) -> std::io::Result<Self> {
-        use std::io::Write as _;
         let run_dir = socket.parent().unwrap_or(Path::new("."));
         std::fs::create_dir_all(run_dir)?;
         let name = format!(".mysql-defaults-{}", uuid::Uuid::new_v4().simple());
@@ -2899,7 +2912,7 @@ impl EphemeralDefaultsFile {
             password.expose(),
             socket.display()
         );
-        let mut f = {
+        let f = {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
@@ -2917,9 +2930,27 @@ impl EphemeralDefaultsFile {
                     .open(&path)?
             }
         };
-        f.write_all(contents.as_bytes())?;
+        write_or_cleanup(&path, f, contents.as_bytes())?;
         Ok(Self { path })
     }
+}
+
+/// Write `contents` to the just-`create_new`'d `f` at `path`, removing
+/// `path` if the write itself fails. Review fix wave finding 3: `create_new`
+/// succeeding is not enough to make it safe to leave a file on disk —
+/// without this, a write failure AFTER creation (a full disk, a quota, any
+/// I/O error mid-write) left a leftover file behind with no
+/// `EphemeralDefaultsFile` guard ever constructed to clean it up (the early
+/// `?` returned before `Self { path }` was ever built). Split out of
+/// [`EphemeralDefaultsFile::write`] so this specific failure path is
+/// directly testable without needing to induce a REAL disk-full condition.
+fn write_or_cleanup(path: &Path, mut f: std::fs::File, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    if let Err(e) = f.write_all(contents) {
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
+    Ok(())
 }
 
 impl Drop for EphemeralDefaultsFile {
@@ -2937,6 +2968,37 @@ impl Drop for EphemeralDefaultsFile {
 /// no-secret-in-events test below), while `initialize_mysql` supplies a
 /// closure that actually calls `.emit`.
 type InitLogSink = Arc<dyn Fn(&str, String) + Send + Sync>;
+
+/// A secret that becomes known PARTWAY through `run_mysql_init` (the
+/// generated root password does not exist until the SetPassword step), but
+/// must be scrubbed from every line logged from that point on — including
+/// lines from readers that were already spawned, and already hold their own
+/// clone of the log sink, before the secret existed (the temp server's
+/// stdout/stderr, drained from `StartTempServer` onward). Review fix wave
+/// finding 2: wrapping `log` in a NEW redacting closure once the secret
+/// exists does not reach those already-spawned readers — they hold their
+/// OWN `Arc` clone of the OLD sink, made before the rebinding, and are
+/// never told about a later one. A cell consulted BY ONE SINK, at CALL
+/// TIME rather than at closure-construction time, closes that gap: every
+/// clone of the sink, however early it was made, reads the SAME cell, so
+/// setting it once is enough for every clone to start redacting.
+type SecretCell = Arc<std::sync::Mutex<Option<String>>>;
+
+/// Wrap `inner` in a sink that redacts against whatever `cell` currently
+/// holds, checked on EVERY call rather than once at construction — see
+/// [`SecretCell`]'s doc comment. `run_mysql_init` builds exactly one of
+/// these, before spawning anything that might clone it, and every later
+/// `.clone()` (the temp server's stdout/stderr readers, the `run_task`
+/// pump for the Initialize step) shares the same cell transparently.
+fn redacting_sink(inner: InitLogSink, cell: SecretCell) -> InitLogSink {
+    Arc::new(move |stream: &str, line: String| {
+        let scrubbed = match cell.lock().unwrap_or_else(|e| e.into_inner()).as_deref() {
+            Some(secret) if !secret.is_empty() => redact(&line, secret),
+            _ => line,
+        };
+        inner(stream, scrubbed);
+    })
+}
 
 fn emit_init_log(app: &tauri::AppHandle, major: &str, stream: &str, line: String) {
     let _ = MysqlInitLogEvent {
@@ -3109,6 +3171,17 @@ async fn run_mysql_init(
             )
         };
     }
+
+    // Wrapped ONCE, here, before anything is spawned or cloned — see
+    // `SecretCell`/`redacting_sink`'s doc comments (review fix wave finding
+    // 2). `secret_cell` starts empty; SetPassword populates it the moment
+    // the password is generated, and every clone of `log` made BEFORE that
+    // point (the temp server's stdout/stderr readers, spawned from
+    // StartTempServer onward) starts redacting from then on too, because
+    // they all consult this SAME cell rather than a value baked in at
+    // clone time.
+    let secret_cell: SecretCell = Arc::new(std::sync::Mutex::new(None));
+    let log: InitLogSink = redacting_sink(log, Arc::clone(&secret_cell));
 
     // ---- Render ----
     log("stdout", "rendering my.cnf".to_string());
@@ -3293,15 +3366,14 @@ async fn run_mysql_init(
     log("stdout", "setting the root password".to_string());
     let password = openvhost_core::mysql::generate_root_password();
     let alter_sql = openvhost_core::mysql::alter_user_sql(&password);
-    // From here on, EVERY log call and failure reason is scrubbed of the
-    // password value before it can reach an emitted event or this command's
-    // own return value — see `redact`'s doc comment.
+    // From here on, EVERY log call — including from readers spawned
+    // earlier, e.g. the temp server's stdout/stderr — and every failure
+    // reason built below is scrubbed of the password value before it can
+    // reach an emitted event or this command's own return value. Poking
+    // the cell (not rebinding `log` to a new closure) is what reaches
+    // those already-spawned readers too — see `SecretCell`'s doc comment.
     let secret = password.expose().to_string();
-    let log: InitLogSink = {
-        let inner = log.clone();
-        let secret = secret.clone();
-        Arc::new(move |stream: &str, line: String| inner(stream, redact(&line, &secret)))
-    };
+    *secret_cell.lock().unwrap_or_else(|e| e.into_inner()) = Some(secret.clone());
     match openvhost_conf::mysql_alter_password_unauthenticated(
         &ctx.runtime.mysql,
         &ctx.paths.init_socket,
@@ -3788,26 +3860,33 @@ pub async fn reset_mysql_root_password(
         openvhost_conf::mysql_exec_with_defaults_file(&runtime.mysql, &defaults_file.path, &sql)
             .await;
     drop(defaults_file); // RAII delete, before acting on the result.
+    // Both secrets are live here: the CURRENT password authenticated the
+    // connection (via the just-dropped `defaults_file`), and the NEW one is
+    // what `ALTER USER` tried to set — a failure detail could in principle
+    // echo back either, so every redaction below scrubs both (review fix
+    // wave finding 1: redacting only the new password left the current,
+    // STILL-VALID one reachable through a failure path).
+    let secrets = [current.root_password.expose(), new_password.expose()];
 
     let outcome = result.map_err(|e| IpcError::Core {
-        message: redact(&e.to_string(), new_password.expose()),
+        message: redact_all(&e.to_string(), &secrets),
     })?;
     if outcome.ok {
         repo.upsert(&major, &new_password).await?;
         Ok(MysqlResetOutcomeDto::Reset)
     } else if looks_like_auth_failure(&outcome.stderr) {
         Ok(MysqlResetOutcomeDto::AuthFailed {
-            detail: redact(&outcome.stderr, new_password.expose()),
+            detail: redact_all(&outcome.stderr, &secrets),
         })
     } else {
         Err(IpcError::Core {
-            message: redact(
+            message: redact_all(
                 &if outcome.stderr.trim().is_empty() {
                     "ALTER USER failed".to_string()
                 } else {
                     outcome.stderr
                 },
-                new_password.expose(),
+                &secrets,
             ),
         })
     }
@@ -3914,18 +3993,67 @@ mod mysql_ipc_tests {
         p
     }
 
-    fn fake_runtime(
-        dir: &Path,
-        major: &openvhost_core::mysql::MysqlMajor,
-    ) -> openvhost_core::mysql::MysqlRuntime {
-        fake_runtime_with_mysql(dir, major, "cat > /dev/null\nexit 0")
+    // ---- write_or_cleanup (review fix wave finding 3) ----
+
+    #[test]
+    fn write_or_cleanup_succeeds_and_leaves_the_file_when_the_write_works() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("candidate");
+        let f = std::fs::File::create(&path).unwrap();
+        write_or_cleanup(&path, f, b"hello").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
     }
 
-    /// Like [`fake_runtime`], but with a caller-supplied `mysql` (the ALTER
-    /// USER step's own binary) script — used by the temp-server-containment
-    /// regression test below, which needs that ONE step to hang so there is
-    /// a window to abort the whole init task while the temp server is
-    /// confirmed alive.
+    /// `f` here is a pipe's write end whose READ end was closed the moment
+    /// it was created: writing to a pipe with no reader raises `EPIPE`
+    /// (Rust's runtime ignores `SIGPIPE` at startup specifically so this
+    /// surfaces as an `Err` rather than terminating the process). `path` is
+    /// a SEPARATE, real file — `write_or_cleanup`'s own contract is just
+    /// "write via the given handle; on failure, remove the given path", so
+    /// the two do not need to be the same underlying file for this test to
+    /// isolate that behavior. Deterministic, and touches no process-wide
+    /// state (no rlimit, no real disk pressure), so this is safe to run
+    /// alongside every other test in this binary's default parallel
+    /// execution — `/dev/full` (the more obvious choice) does not exist on
+    /// macOS, and a raw `close()` of the fd `f` itself already owns trips
+    /// libstd's own double-close IO-safety abort.
+    #[test]
+    fn write_or_cleanup_removes_the_file_when_the_write_itself_fails() {
+        use std::os::unix::io::FromRawFd;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("candidate");
+        std::fs::write(&path, b"").unwrap();
+        assert!(path.exists());
+
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        // SAFETY: `read_fd` is a freshly created, valid, owned fd from the
+        // `pipe()` call immediately above, closed here (and only here) so
+        // the pipe has no reader for the rest of this test.
+        unsafe {
+            libc::close(read_fd);
+        }
+        // SAFETY: `write_fd` is a freshly created, valid, owned fd from the
+        // same `pipe()` call; this is the only place that takes ownership
+        // of it (as this `File`), and it is never touched as a raw fd again.
+        let f = unsafe { std::fs::File::from_raw_fd(write_fd) };
+
+        let _err = write_or_cleanup(&path, f, b"secret contents").unwrap_err();
+        assert!(
+            !path.exists(),
+            "the partially-written file must be removed when the write fails"
+        );
+    }
+
+    /// A working MySQL runtime built entirely from fakes: `mysqld` handles
+    /// `--validate-config`/`--initialize-insecure`/`--skip-networking`,
+    /// `mysqladmin` handles `ping`/`shutdown` (shared body, [`FAKE_MYSQLADMIN_BODY`]),
+    /// and the caller supplies `mysql_body` for the ALTER USER step — used
+    /// by the temp-server-containment regression test below, which needs
+    /// that ONE step to hang so there is a window to abort the whole init
+    /// task while the temp server is confirmed alive.
     fn fake_runtime_with_mysql(
         dir: &Path,
         major: &openvhost_core::mysql::MysqlMajor,
@@ -3966,6 +4094,134 @@ esac
 "#,
             ),
             mysql: fake_cli(dir, "mysql", mysql_body),
+            mysqladmin: fake_cli(dir, "mysqladmin", FAKE_MYSQLADMIN_BODY),
+        }
+    }
+
+    /// Shared by every fake runtime in this module: `ping` is gated on the
+    /// server's own pidfile (a real `mysqladmin ping` only succeeds once
+    /// the server is genuinely accepting connections — without this gate,
+    /// `ping` always says yes and `poll_until_ready` proceeds long before
+    /// the fake server, a SEPARATE process, has reached its own
+    /// `echo $$ > "$socket.pid"` line, so a later `shutdown` call races
+    /// ahead of that write and silently kills nothing); `shutdown` reads
+    /// the target socket from either `--socket=` or a `--defaults-file`'s
+    /// `socket=` line and signals whatever pid it finds there.
+    const FAKE_MYSQLADMIN_BODY: &str = r#"
+socket=""
+for arg in "$@"; do
+  case "$arg" in
+    --socket=*) socket="${arg#--socket=}" ;;
+    --defaults-file=*)
+      f="${arg#--defaults-file=}"
+      socket=$(sed -n 's/^socket=//p' "$f")
+      ;;
+  esac
+done
+case "$*" in
+  *ping*)
+    if [ -f "$socket.pid" ]; then
+      exit 0
+    else
+      exit 1
+    fi
+    ;;
+  *shutdown*)
+    if [ -f "$socket.pid" ]; then
+      kill "$(cat "$socket.pid")" 2>/dev/null
+    fi
+    exit 0
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+"#;
+
+    /// Like [`fake_runtime`], but the temp server's OWN stdout leaks the
+    /// SQL text `mysql` (the ALTER client) received on stdin — standing in
+    /// for a server that happens to log something containing the
+    /// credential it was just given. Real `mysqld`/`mysql` are two
+    /// SEPARATE processes with no shared memory, so the fake `mysql`
+    /// writes what it read to a marker file next to the socket
+    /// (`<init_socket>.alter-sql-seen`), and the fake `mysqld` server loop
+    /// polls for that file and echoes its contents to ITS OWN stdout —
+    /// which is exactly the stream `run_mysql_init`'s `drain_and_forward`
+    /// readers pick up. Exists for the review fix wave's finding 2: those
+    /// readers are spawned (and clone the log sink) BEFORE the password
+    /// exists, so they are the one path a "rebind `log` to a new
+    /// redacting wrapper once the secret exists" fix does not reach.
+    fn fake_runtime_that_leaks_the_alter_sql_via_server_stdout(
+        dir: &Path,
+        major: &openvhost_core::mysql::MysqlMajor,
+    ) -> openvhost_core::mysql::MysqlRuntime {
+        openvhost_core::mysql::MysqlRuntime {
+            major: major.clone(),
+            mysqld: fake_cli(
+                dir,
+                "mysqld",
+                r#"
+datadir=""
+socket=""
+for arg in "$@"; do
+  case "$arg" in
+    --datadir=*) datadir="${arg#--datadir=}" ;;
+    --socket=*) socket="${arg#--socket=}" ;;
+  esac
+done
+case "$*" in
+  *--validate-config*)
+    exit 0
+    ;;
+  *--initialize-insecure*)
+    mkdir -p "$datadir/mysql"
+    echo "[auto]" > "$datadir/auto.cnf"
+    exit 0
+    ;;
+  *--skip-networking*)
+    echo $$ > "$socket.pid"
+    trap 'exit 0' TERM
+    while true; do
+      if [ -f "$socket.alter-sql-seen" ]; then
+        echo "observed on the wire: $(cat "$socket.alter-sql-seen")"
+        rm -f "$socket.alter-sql-seen"
+        touch "$socket.alter-sql-echoed"
+      fi
+      sleep 0.01
+    done
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+"#,
+            ),
+            mysql: fake_cli(
+                dir,
+                "mysql",
+                r#"
+socket=""
+for arg in "$@"; do
+  case "$arg" in
+    --socket=*) socket="${arg#--socket=}" ;;
+  esac
+done
+cat > "$socket.alter-sql-seen"
+exit 0
+"#,
+            ),
+            // A DEDICATED mysqladmin (not the shared `FAKE_MYSQLADMIN_BODY`):
+            // `shutdown` here waits (bounded, 5s) for the server's
+            // `alter-sql-echoed` marker before killing it. A poll-based
+            // "leak" is otherwise an unwinnable race — a shell blocked in
+            // `sleep` does not act on a pending TERM until that sleep call
+            // itself returns (verified against this exact shell empirically
+            // while designing this fixture), so an ordinary shutdown call
+            // almost always kills the server before its loop gets another
+            // chance to notice the marker file, making the leak this
+            // fixture exists to simulate silently never happen. Explicit
+            // synchronization, not a shorter poll interval, is what makes
+            // this deterministic.
             mysqladmin: fake_cli(
                 dir,
                 "mysqladmin",
@@ -3982,12 +4238,6 @@ for arg in "$@"; do
 done
 case "$*" in
   *ping*)
-    # Gated on the pidfile — a real `mysqladmin ping` only succeeds once
-    # the server is genuinely accepting connections. Without this gate,
-    # `ping` always says yes and `poll_until_ready` proceeds long before
-    # the fake server (a separate process) has reached its own
-    # `echo $$ > "$socket.pid"` line, so the LATER `shutdown` call races
-    # ahead of that write and silently kills nothing.
     if [ -f "$socket.pid" ]; then
       exit 0
     else
@@ -3996,6 +4246,12 @@ case "$*" in
     ;;
   *shutdown*)
     if [ -f "$socket.pid" ]; then
+      i=0
+      while [ ! -f "$socket.alter-sql-echoed" ] && [ "$i" -lt 500 ]; do
+        sleep 0.01
+        i=$((i + 1))
+      done
+      rm -f "$socket.alter-sql-echoed"
       kill "$(cat "$socket.pid")" 2>/dev/null
     fi
     exit 0
@@ -4161,7 +4417,12 @@ esac
     async fn no_emitted_log_line_contains_the_generated_password() {
         let home = tempfile::tempdir().unwrap();
         let major = openvhost_core::mysql::MysqlMajor::parse("8.4").unwrap();
-        let runtime = fake_runtime(home.path(), &major);
+        // The leak-simulating runtime (not plain `fake_runtime`): its temp
+        // server echoes the ALTER SQL back on its OWN stdout during the
+        // SetPassword window, exercising the `drain_and_forward` reader
+        // path — review fix wave finding 2's blind spot — not just the
+        // direct `log(...)` calls a naive fix could leave uncovered.
+        let runtime = fake_runtime_that_leaks_the_alter_sql_via_server_stdout(home.path(), &major);
         let paths = openvhost_core::mysql::mysql_paths(home.path(), &major);
 
         let lines: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -4337,6 +4598,84 @@ esac
         }
     }
 
+    /// REVIEW FIX WAVE, finding 1 (CRITICAL): the ephemeral defaults-file
+    /// `reset_mysql_root_password` writes to authenticate carries the
+    /// CURRENT (still-valid) stored password, not the freshly generated
+    /// one — so a failure detail that happens to echo back what it
+    /// authenticated with leaks the credential that is STILL ACTIVE on the
+    /// running server, which is strictly worse than leaking the new one
+    /// (that one is about to be overwritten if the ALTER ever succeeds; the
+    /// current one keeps working regardless). The fake `mysql` below reads
+    /// its own `--defaults-file` (exactly as a real client would to
+    /// authenticate) and echoes the password it found there back on
+    /// stderr — standing in for any diagnostic that quotes its own
+    /// connection parameters — then fails with an "Access denied" shape so
+    /// this exercises the `AuthFailed` branch specifically.
+    #[tokio::test]
+    async fn reset_redacts_the_current_password_from_a_failure_detail() {
+        let home = tempfile::tempdir().unwrap();
+        let major = openvhost_core::mysql::MysqlMajor::parse("8.4").unwrap();
+
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let db = Db::open_in_memory().await.unwrap();
+        let current_password = openvhost_core::mysql::generate_root_password();
+        openvhost_core::mysql::MysqlInstanceRepo::new(&db)
+            .upsert(&major, &current_password)
+            .await
+            .unwrap();
+        app.manage(db);
+        app.manage(Some(StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: home.path().join("nginx"),
+            nginx_conf: home.path().join("nginx.conf"),
+        }));
+        let fake_mysql = fake_cli(
+            home.path(),
+            "mysql",
+            r#"
+pw=""
+for arg in "$@"; do
+  case "$arg" in
+    --defaults-file=*)
+      f="${arg#--defaults-file=}"
+      pw=$(sed -n 's/^password=//p' "$f")
+      ;;
+  esac
+done
+echo "ERROR 1045 (28000): Access denied for user 'root'@'localhost' (using password: $pw)" 1>&2
+exit 1
+"#,
+        );
+        app.manage(RwLock::new(Some(vec![
+            openvhost_core::mysql::MysqlRuntime {
+                major: major.clone(),
+                mysqld: home.path().join("mysqld"),
+                mysql: fake_mysql,
+                mysqladmin: home.path().join("mysqladmin"),
+            },
+        ])));
+
+        let outcome = reset_mysql_root_password(
+            "8.4".to_string(),
+            app.state::<Db>(),
+            app.state::<Option<StackPaths>>(),
+            app.state::<RwLock<Option<Vec<openvhost_core::mysql::MysqlRuntime>>>>(),
+        )
+        .await
+        .unwrap();
+
+        let detail = match outcome {
+            MysqlResetOutcomeDto::AuthFailed { detail } => detail,
+            other => panic!("expected AuthFailed, got {other:?}"),
+        };
+        assert!(
+            !detail.contains(current_password.expose()),
+            "the CURRENT (still-valid) password leaked into a reset failure detail: {detail:?}"
+        );
+    }
+
     // ---- redact ----
 
     #[test]
@@ -4344,6 +4683,23 @@ esac
         let s = redact("pw=abc123 again abc123", "abc123");
         assert_eq!(s, "pw=<redacted> again <redacted>");
         assert!(!s.contains("abc123"));
+    }
+
+    #[test]
+    fn redact_all_scrubs_every_secret_independent_of_which_one_appears() {
+        let secrets = ["current-pw", "new-pw"];
+        assert_eq!(
+            redact_all("auth used current-pw", &secrets),
+            "auth used <redacted>"
+        );
+        assert_eq!(
+            redact_all("ALTER failed setting new-pw", &secrets),
+            "ALTER failed setting <redacted>"
+        );
+        assert_eq!(
+            redact_all("current-pw and new-pw both present", &secrets),
+            "<redacted> and <redacted> both present"
+        );
     }
 
     /// Defense-in-depth pin for `verify_mysql_connection`: even an EXOTIC
