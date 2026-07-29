@@ -113,10 +113,17 @@ pub fn scaffold(docroot: &Docroot, name: &SiteName, domain: &Domain) -> Scaffold
     }
 }
 
-/// Any non-directory entry whose file stem is `index` (ASCII case-insensitive)
-/// blocks generation: covers index.html / index.htm / index.php / INDEX.HTML,
-/// identically on case-insensitive (APFS default) and case-sensitive volumes.
+/// Blocks generation only for a real web entry point: file stem `index` AND
+/// extension `html` / `htm` / `php` (both compared `eq_ignore_ascii_case`, so
+/// `INDEX.HTML` / `Index.Php` still block). That is what nginx's template
+/// actually serves (`index index.php index.html;`), so a non-web `index.*`
+/// file (`.js`, `.ts`, `.css`, …) no longer suppresses the placeholder.
+/// `.htm` stays blocking even though nginx never serves it: generating
+/// `index.html` beside a user's `index.htm` would silently shadow it, which
+/// is worse than the 404 it would get otherwise.
 fn existing_index(dir: &std::path::Path) -> std::io::Result<Option<String>> {
+    const WEB_INDEX_EXTENSIONS: [&str; 3] = ["html", "htm", "php"];
+
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         if entry.file_type()?.is_dir() {
@@ -126,10 +133,16 @@ fn existing_index(dir: &std::path::Path) -> std::io::Result<Option<String>> {
         let Some(fname) = fname.to_str() else {
             continue;
         };
-        if std::path::Path::new(fname)
+        let path = std::path::Path::new(fname);
+        let is_web_entry_point = path
             .file_stem()
-            .is_some_and(|s| s.eq_ignore_ascii_case("index"))
-        {
+            .is_some_and(|stem| stem.eq_ignore_ascii_case("index"))
+            && path.extension().is_some_and(|ext| {
+                WEB_INDEX_EXTENSIONS
+                    .iter()
+                    .any(|web_ext| ext.eq_ignore_ascii_case(web_ext))
+            });
+        if is_web_entry_point {
             return Ok(Some(fname.to_string()));
         }
     }
@@ -324,6 +337,20 @@ mod tests {
         let docroot = scaffold_path(&parent, &n("my-site")).unwrap();
         std::fs::create_dir(docroot.as_path()).unwrap();
         std::fs::create_dir(docroot.as_path().join("index")).unwrap();
+
+        let outcome = scaffold(&docroot, &n("my-site"), &dom("my-site.localhost"));
+        assert_eq!(outcome, ScaffoldOutcome::Created);
+        assert!(docroot.as_path().join("index.html").exists());
+    }
+
+    #[test]
+    fn scaffold_generates_despite_non_web_index_files() {
+        let parent_dir = tempfile::tempdir().unwrap();
+        let parent = d(parent_dir.path().to_str().unwrap());
+        let docroot = scaffold_path(&parent, &n("my-site")).unwrap();
+        std::fs::create_dir(docroot.as_path()).unwrap();
+        std::fs::write(docroot.as_path().join("index.js"), "console.log('hi');").unwrap();
+        std::fs::write(docroot.as_path().join("index.ts"), "console.log('hi');").unwrap();
 
         let outcome = scaffold(&docroot, &n("my-site"), &dom("my-site.localhost"));
         assert_eq!(outcome, ScaffoldOutcome::Created);

@@ -134,6 +134,12 @@ the suffix; that test must keep exercising the moved body. The other copy in the
   directive is `index index.php index.html;`, so a pre-existing `index.php` wins anyway.
   `read_dir` failure → `Failed { step: Inspect }` — never a blind write.
 
+Amended 2026-07-29 (owner-approved follow-up to PR #34): the entry-point check now
+blocks only `index.{html,htm,php}` stems+extensions (both ASCII case-insensitive).
+Non-web `index.*` files (`.js`, `.ts`, `.css`, …) no longer suppress generation — they
+produced a green "kept existing" notice over a 404. `.htm` remains blocked because
+generating `index.html` beside a user's `index.htm` would silently shadow it.
+
 ### D5 — No canonicalization, no symlinked-parent rejection
 
 There is no privilege boundary: the scaffold runs as the user, in a folder the user
