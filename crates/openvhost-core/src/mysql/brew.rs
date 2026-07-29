@@ -31,6 +31,20 @@ use crate::error::CoreError;
 /// stale entry fails loudly at install time rather than silently.
 pub const MYSQL_CATALOGUE: [&str; 1] = ["8.4"];
 
+/// The shared "well-formed but not offered by this build" error — used by
+/// both [`MysqlMajor::parse`]'s layer-2 check and
+/// [`mysql_brew_install_spec`]'s own guard, so the two call sites can never
+/// drift to different wording for the identical condition.
+fn not_cataloged_error(version: &str) -> CoreError {
+    CoreError::Validation {
+        field: "mysql_version",
+        reason: format!(
+            "MySQL {version} is not offered by this build (offered: {})",
+            MYSQL_CATALOGUE.join(", ")
+        ),
+    }
+}
+
 /// Shape check shared by [`MysqlMajor::parse`] (untrusted input: shape AND
 /// catalogue membership) and [`MysqlMajor::from_probe`] (discovery: shape
 /// only) — digits, one dot, digits, nothing else. No `regex` dependency:
@@ -62,10 +76,17 @@ fn is_major_minor_shape(s: &str) -> bool {
 /// path into the type:
 ///
 /// - [`MysqlMajor::parse`] is the untrusted-input gate: shape AND
-///   [`MYSQL_CATALOGUE`] membership. This is the ONLY constructor reachable
-///   from outside this crate (IPC ingress, [`mysql_brew_install_spec`]) — it
-///   is what stops a caller from asking this build to install or initialize
-///   a formula this build has never tested.
+///   [`MYSQL_CATALOGUE`] membership. It is the ONLY constructor a caller
+///   outside this crate can invoke to build a *fresh* value from a string —
+///   but it is NOT, by itself, what stops an out-of-catalogue major from
+///   reaching [`mysql_brew_install_spec`]: [`crate::mysql::MysqlRuntime`]'s
+///   `major` field is `pub`, so a caller can obtain an already-built,
+///   out-of-catalogue `MysqlMajor` from a discovered runtime and hand it
+///   straight to that function, regardless of which constructor originally
+///   built it. [`mysql_brew_install_spec`] therefore re-checks
+///   [`MysqlMajor::is_cataloged`] itself before composing anything — the
+///   catalogue guarantee is enforced at that boundary, never assumed from
+///   provenance.
 /// - `MysqlMajor::from_probe` is `pub(crate)`: shape only, no catalogue
 ///   check. Its only caller is [`crate::mysql::discover_mysql`], which
 ///   sources the string from this crate's own bounded `mysqld --version`
@@ -99,13 +120,7 @@ impl MysqlMajor {
         // untested (or intentionally unsupported, e.g. "8.0") version reach
         // `brew install`.
         if !MYSQL_CATALOGUE.contains(&s) {
-            return Err(CoreError::Validation {
-                field: "mysql_version",
-                reason: format!(
-                    "MySQL {s} is not offered by this build (offered: {})",
-                    MYSQL_CATALOGUE.join(", ")
-                ),
-            });
+            return Err(not_cataloged_error(s));
         }
         Ok(Self(s.to_string()))
     }
@@ -138,7 +153,17 @@ impl MysqlMajor {
 /// itself is located via the EXISTING [`crate::find_brew`] — Homebrew's own
 /// location is not PHP-specific, so this module does not duplicate that
 /// lookup for MySQL.
+///
+/// Re-checks [`MysqlMajor::is_cataloged`] itself before composing anything,
+/// rather than trusting the caller to have obtained `major` via `parse`: a
+/// `MysqlMajor` built by the discovery-only `from_probe` can reach here
+/// through [`crate::mysql::MysqlRuntime`]'s `pub major` field just as easily
+/// as one built by `parse` can, and the two are indistinguishable at the
+/// type level once constructed. See [`MysqlMajor`]'s doc comment.
 pub fn mysql_brew_install_spec(brew: &Path, major: &MysqlMajor) -> Result<SpawnSpec, CoreError> {
+    if !major.is_cataloged() {
+        return Err(not_cataloged_error(major.as_str()));
+    }
     if !brew.is_absolute() {
         return Err(CoreError::Validation {
             field: "brew_path",
@@ -372,6 +397,45 @@ mod tests {
             "the inherited ambient PATH leaked into the composed value: {path}"
         );
         assert_eq!(path, "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin");
+    }
+
+    #[test]
+    fn refuses_to_compose_an_install_spec_for_an_out_of_catalogue_major() {
+        // The escape this guards against: `from_probe` (discovery-only,
+        // shape-checked but never catalogue-checked) constructs a
+        // `MysqlMajor` for ANY shape-valid probed version, and
+        // `MysqlRuntime.major` is a `pub` field — so a caller can discover a
+        // 9.x install, read `.major` off the returned `MysqlRuntime`, and
+        // hand that value straight to this function without ever going
+        // through `parse`. Reproduce that exact path (via the real,
+        // publicly-reachable `discover_mysql`) rather than calling
+        // `from_probe` directly, so this test fails if the guard is ever
+        // narrowed to distrust only one construction path.
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join("opt").join("mysql@9.7").join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        for name in ["mysqld", "mysql", "mysqladmin"] {
+            std::fs::write(bin_dir.join(name), b"#!/bin/sh\n").unwrap();
+        }
+        let found = crate::mysql::discover_mysql(&[dir.path()], &|_| Some("9.7".to_string()));
+        assert_eq!(found.len(), 1, "got {found:?}");
+        assert!(!found[0].major.is_cataloged());
+
+        let err = mysql_brew_install_spec(
+            std::path::Path::new("/opt/homebrew/bin/brew"),
+            &found[0].major,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CoreError::Validation {
+                    field: "mysql_version",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
     }
 
     #[test]
