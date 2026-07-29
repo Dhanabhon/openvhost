@@ -18,7 +18,8 @@ use std::path::{Path, PathBuf};
 use crate::ctx::to_config_path;
 use crate::engine::render;
 use crate::error::ConfError;
-use crate::{GeneratedFile, ValidationReport};
+use crate::inspect::{ProbeFailure, run_bounded};
+use crate::{GeneratedFile, PROBE_TIMEOUT, ValidationReport};
 
 /// Every path `my.cnf` needs for one MySQL major, as plain values.
 ///
@@ -155,6 +156,184 @@ impl MysqlValidator {
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         })
     }
+}
+
+/// One bounded, contained `mysqladmin`/`mysql` CLI invocation's result (Task
+/// 5: the staged-init sequence's `mysqladmin ping`/`ALTER USER`/`mysqladmin
+/// shutdown` steps, plus `reset_mysql_root_password`/`verify_mysql_connection`
+/// — spec D2/D3/D7). Same shape as [`ValidationReport`], kept as its own type
+/// rather than reused: these calls also want `stdout` (the `ALTER`/`SELECT`
+/// response), which a config-validation report has no reason to carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MysqlCliOutcome {
+    /// True iff the CLI exited 0. Never derived from stderr emptiness — the
+    /// same discipline [`MysqlValidator`] and every other validator in this
+    /// crate apply, for the identical reason (a clean run can still write to
+    /// stderr).
+    pub ok: bool,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// # Golden-rule-4 reading applies here too
+///
+/// See `crate::inspect`'s module-level "golden-rule-4 reading" doc comment
+/// (CONFIRMED by security-auditor, 2026-07-26) for the full six-condition
+/// test a one-shot tool invocation must meet to spawn outside
+/// `openvhost-proc`. Every function below reuses [`run_bounded`] itself
+/// (Task 5 widened it to `pub(crate)` and to accept optional stdin, rather
+/// than duplicating its containment logic a third time — see that widening's
+/// own doc comment) so all six conditions are inherited verbatim: (1)
+/// [`PROBE_TIMEOUT`]; (2) `run_bounded`'s own process-group kill; (3) every
+/// argument below is either a literal flag or a path/string this crate's
+/// caller derived from managed state — never client-supplied; (4)
+/// unprivileged, no privileged helper, no system-state mutation (`mysqladmin
+/// shutdown` stops OUR OWN unelevated `mysqld` child, the same way `nginx -s
+/// quit` would); (5)/(6) inherited from `run_bounded`.
+///
+/// Maps [`ProbeFailure`] onto [`ConfError`] exactly like [`validate_live`]
+/// does, so a caller sees the identical two failure shapes
+/// (`ValidatorSpawn`/`ValidatorTimeout`) regardless of which mysql tool it
+/// asked this crate to run.
+async fn run_mysql_cli(
+    cmd: &mut tokio::process::Command,
+    bin: &Path,
+    stdin: Option<&[u8]>,
+) -> Result<MysqlCliOutcome, ConfError> {
+    match run_bounded(cmd, stdin).await {
+        Ok(out) => Ok(MysqlCliOutcome {
+            ok: out.status.success(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        }),
+        Err(ProbeFailure::Io(source)) => Err(ConfError::ValidatorSpawn {
+            bin: bin.display().to_string(),
+            source,
+        }),
+        Err(ProbeFailure::TimedOut) => Err(ConfError::ValidatorTimeout {
+            bin: bin.display().to_string(),
+            secs: PROBE_TIMEOUT.as_secs(),
+        }),
+    }
+}
+
+fn socket_arg(socket: &Path) -> OsString {
+    let mut a = OsString::from("--socket=");
+    a.push(socket.as_os_str());
+    a
+}
+
+fn defaults_file_arg(path: &Path) -> OsString {
+    let mut a = OsString::from("--defaults-file=");
+    a.push(path.as_os_str());
+    a
+}
+
+/// The exact `mysqladmin ping` argv (spec D4), as plain strings: shared by
+/// [`mysqladmin_ping`] below (the staged-init sequence's OWN one-off poll
+/// against the network-less temp server, spec D2 step 3) and
+/// `apps/desktop/src-tauri/src/stack.rs`'s `mysql_spec` (the SUPERVISOR's
+/// ongoing `ReadinessProbe::Command` against the final, running server) —
+/// ONE function producing the argv for BOTH call sites is what stops them
+/// drifting apart into two subtly different pings. `Vec<String>`, not
+/// `Vec<OsString>`: `openvhost_proc::ReadinessProbe::Command.argv` is typed
+/// `Vec<String>`, so this shape is dictated by that caller; the lossy
+/// `.display()` conversion below is unavoidable for that one, though every
+/// OTHER function in this module builds its argv as `OsString` instead.
+pub fn mysqladmin_ping_argv(mysqladmin: &Path, socket: &Path) -> Vec<String> {
+    vec![
+        mysqladmin.display().to_string(),
+        "--no-defaults".to_string(),
+        "--no-login-paths".to_string(),
+        "--protocol=SOCKET".to_string(),
+        format!("--socket={}", socket.display()),
+        "--user=root".to_string(),
+        "--connect-timeout=1".to_string(),
+        "--silent".to_string(),
+        "ping".to_string(),
+    ]
+}
+
+/// ONE `mysqladmin ping` attempt against `socket` (spec D2 step 3). Needs no
+/// credential — `mysqladmin ping` succeeds even when authentication would be
+/// denied, so this proves only that the server is LISTENING, never that any
+/// particular credential works. Deliberately not a `Result`, mirroring
+/// `probe_nginx_version`: a single failed attempt during a retry loop is an
+/// EXPECTED outcome, not an exceptional one — the caller decides how many
+/// attempts fit inside its own deadline (spec D2's 10s cap).
+pub async fn mysqladmin_ping(mysqladmin: &Path, socket: &Path) -> bool {
+    let argv = mysqladmin_ping_argv(mysqladmin, socket);
+    let Some((program, rest)) = argv.split_first() else {
+        return false;
+    };
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(rest);
+    run_bounded(&mut cmd, None)
+        .await
+        .is_ok_and(|out| out.status.success())
+}
+
+/// Run `sql` on `mysql_bin` against `socket`, authenticating as `root` with
+/// NO password (spec D2 step 4: right after `--initialize-insecure`,
+/// `root@localhost` has an empty password — this is the ONE call in the
+/// staged-init sequence that runs before any credential exists at all). `sql`
+/// crosses via STDIN, never argv/env (the caller is
+/// `crate::mysql::alter_user_sql`'s output, i.e. the freshly generated root
+/// password itself, spec D3).
+pub async fn mysql_alter_password_unauthenticated(
+    mysql_bin: &Path,
+    socket: &Path,
+    sql: &str,
+) -> Result<MysqlCliOutcome, ConfError> {
+    let mut cmd = tokio::process::Command::new(mysql_bin);
+    cmd.arg("--no-defaults")
+        .arg("--protocol=SOCKET")
+        .arg(socket_arg(socket))
+        .arg("--user=root");
+    run_mysql_cli(&mut cmd, mysql_bin, Some(sql.as_bytes())).await
+}
+
+/// Run `sql` on `mysql_bin`, authenticating via an ALREADY-WRITTEN
+/// `--defaults-file` (spec D3: an ephemeral, 0600, RAII-deleted file the
+/// command layer writes — this function only ever reads its path, never its
+/// contents). `sql` crosses via STDIN. Used by BOTH
+/// `reset_mysql_root_password` (an `ALTER USER` script, which produces no
+/// output either way) and `verify_mysql_connection` (a
+/// `SELECT VERSION(), @@port` query) — the two share nothing but
+/// "authenticate with a stored/known credential and run a script", so one
+/// function serves both rather than forking near-duplicates.
+///
+/// `--batch --skip-column-names` makes the OUTPUT SHAPE deterministic for
+/// the query caller rather than relying on `mysql`'s own "is stdin a tty"
+/// auto-detection (it already batches non-interactive input, but naming the
+/// flags explicitly means this function's contract does not quietly depend
+/// on that heuristic): a query with rows prints them tab-separated with NO
+/// header line, so `verify_mysql_connection` can split the first line on
+/// `\t` rather than skipping a header first. Harmless for `ALTER USER`,
+/// which produces no rows to format either way.
+pub async fn mysql_exec_with_defaults_file(
+    mysql_bin: &Path,
+    defaults_file: &Path,
+    sql: &str,
+) -> Result<MysqlCliOutcome, ConfError> {
+    let mut cmd = tokio::process::Command::new(mysql_bin);
+    cmd.arg(defaults_file_arg(defaults_file))
+        .arg("--batch")
+        .arg("--skip-column-names");
+    run_mysql_cli(&mut cmd, mysql_bin, Some(sql.as_bytes())).await
+}
+
+/// `mysqladmin shutdown` against the temp server, authenticating via an
+/// ephemeral `--defaults-file` (spec D2 step 5) — the credential was JUST set
+/// by the preceding `ALTER USER`, so an unauthenticated shutdown (like the
+/// ping above) would now be refused.
+pub async fn mysqladmin_shutdown(
+    mysqladmin: &Path,
+    defaults_file: &Path,
+) -> Result<MysqlCliOutcome, ConfError> {
+    let mut cmd = tokio::process::Command::new(mysqladmin);
+    cmd.arg(defaults_file_arg(defaults_file)).arg("shutdown");
+    run_mysql_cli(&mut cmd, mysqladmin, None).await
 }
 
 #[cfg(test)]
@@ -323,6 +502,144 @@ port=3306
             .validate(Path::new("/tmp/ovh/config/generated/mysql/8.4/my.cnf"))
             .await
             .unwrap_err();
+        assert!(matches!(e, ConfError::ValidatorSpawn { .. }), "got {e:?}");
+    }
+
+    // ---- mysqladmin_ping / mysql_alter_password_unauthenticated /
+    // mysql_exec_with_defaults_file / mysqladmin_shutdown ----
+
+    /// A fake CLI tool: any name, any body. Generalizes `fake_mysqld` (kept
+    /// separate above so its existing callers stay untouched) for the admin
+    /// CLI functions below, which fake `mysqladmin`/`mysql` rather than
+    /// `mysqld`.
+    fn fake_bin(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    #[test]
+    fn ping_argv_matches_spec_d4_exactly() {
+        let argv = mysqladmin_ping_argv(
+            Path::new("/opt/homebrew/opt/mysql@8.4/bin/mysqladmin"),
+            Path::new("/tmp/ovh/run/mysql-8.4.sock"),
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "/opt/homebrew/opt/mysql@8.4/bin/mysqladmin".to_string(),
+                "--no-defaults".to_string(),
+                "--no-login-paths".to_string(),
+                "--protocol=SOCKET".to_string(),
+                "--socket=/tmp/ovh/run/mysql-8.4.sock".to_string(),
+                "--user=root".to_string(),
+                "--connect-timeout=1".to_string(),
+                "--silent".to_string(),
+                "ping".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn ping_reports_true_on_a_clean_exit() {
+        let d = tempfile::tempdir().unwrap();
+        let bin = fake_bin(d.path(), "mysqladmin", "exit 0");
+        assert!(mysqladmin_ping(&bin, Path::new("/tmp/x.sock")).await);
+    }
+
+    #[tokio::test]
+    async fn ping_reports_false_on_a_nonzero_exit() {
+        let d = tempfile::tempdir().unwrap();
+        let bin = fake_bin(d.path(), "mysqladmin", "exit 1");
+        assert!(!mysqladmin_ping(&bin, Path::new("/tmp/x.sock")).await);
+    }
+
+    #[tokio::test]
+    async fn ping_reports_false_when_the_binary_does_not_exist() {
+        assert!(
+            !mysqladmin_ping(
+                Path::new("/nonexistent/mysqladmin"),
+                Path::new("/tmp/x.sock")
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_alter_feeds_sql_on_stdin_not_argv() {
+        // The fake echoes argv to stderr and stdin to stdout, so this test
+        // can assert BOTH: the SQL text appears on stdin, never on argv.
+        let d = tempfile::tempdir().unwrap();
+        let bin = fake_bin(d.path(), "mysql", "echo \"$@\" 1>&2; cat");
+        let r = mysql_alter_password_unauthenticated(
+            &bin,
+            Path::new("/tmp/init.sock"),
+            "ALTER USER 'root'@'localhost' IDENTIFIED BY 'secretpw';",
+        )
+        .await
+        .unwrap();
+        assert!(r.ok);
+        assert!(
+            r.stdout.contains("secretpw"),
+            "the SQL must reach the child via stdin: {r:?}"
+        );
+        assert!(
+            !r.stderr.contains("secretpw"),
+            "the SQL must NEVER appear on argv: {r:?}"
+        );
+        assert!(r.stderr.contains("--protocol=SOCKET"));
+        assert!(r.stderr.contains("--socket=/tmp/init.sock"));
+        assert!(r.stderr.contains("--user=root"));
+        assert!(
+            !r.stderr.contains("--password"),
+            "no password flag at all — root has none yet: {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_with_defaults_file_puts_the_defaults_file_and_batch_flags_on_argv() {
+        let d = tempfile::tempdir().unwrap();
+        let bin = fake_bin(d.path(), "mysql", "echo \"$@\" 1>&2; cat");
+        let defaults = d.path().join("defaults.cnf");
+        std::fs::write(&defaults, "[client]\nuser=root\n").unwrap();
+        let r = mysql_exec_with_defaults_file(&bin, &defaults, "SELECT VERSION();")
+            .await
+            .unwrap();
+        assert!(r.ok);
+        assert_eq!(
+            r.stderr.trim_end(),
+            format!(
+                "--defaults-file={} --batch --skip-column-names",
+                defaults.display()
+            )
+        );
+        assert!(r.stdout.contains("SELECT VERSION();"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_puts_only_the_defaults_file_and_shutdown_on_argv() {
+        let d = tempfile::tempdir().unwrap();
+        let bin = fake_bin(d.path(), "mysqladmin", r#"echo "$@" 1>&2"#);
+        let defaults = d.path().join("defaults.cnf");
+        std::fs::write(&defaults, "[client]\nuser=root\n").unwrap();
+        let r = mysqladmin_shutdown(&bin, &defaults).await.unwrap();
+        assert!(r.ok);
+        assert_eq!(
+            r.stderr.trim_end(),
+            format!("--defaults-file={} shutdown", defaults.display())
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_cli_errors_map_to_conferror_like_the_validator_does() {
+        let e = mysqladmin_shutdown(
+            Path::new("/nonexistent/mysqladmin"),
+            Path::new("/tmp/defaults.cnf"),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(e, ConfError::ValidatorSpawn { .. }), "got {e:?}");
     }
 }

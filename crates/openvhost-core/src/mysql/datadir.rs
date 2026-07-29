@@ -84,12 +84,27 @@ fn guard_socket_path(path: &Path) -> Result<(), CoreError> {
     Ok(())
 }
 
+/// `<home>/data/mysql` — the shared parent directory for every major's
+/// datadir AND every major's staging directories (see
+/// [`MysqlPaths::staging_parent`], which is this exact path, just computed
+/// once per major even though the path itself never actually depends on
+/// `major`). Split out as its own function (Task 5, plan
+/// `docs/superpowers/plans/2026-07-29-p1-db-mysql.md`) because
+/// `sweep_stale_staging` (spec D2: "swept on rescan") wants to run ONCE per
+/// rescan, covering every major's leftovers together — it has no reason to
+/// take a `major` at all, and computing a whole [`MysqlPaths`] for one
+/// arbitrary major just to reach its `staging_parent` field would need an
+/// arbitrary major to plug in for no other purpose.
+pub fn mysql_data_root(home: &Path) -> PathBuf {
+    home.join("data").join("mysql")
+}
+
 /// Derive every path this major needs from `home` + `major`. Pure and
 /// infallible (see the CONFINEMENT ARGUMENT on [`MysqlPaths`]) — see
 /// [`MysqlPaths::check_socket_lengths`] for the guard callers must run
 /// before using either socket path.
 pub fn mysql_paths(home: &Path, major: &MysqlMajor) -> MysqlPaths {
-    let data_root = home.join("data").join("mysql");
+    let data_root = mysql_data_root(home);
     let run_root = home.join("run");
     let major_str = major.as_str();
     MysqlPaths {
@@ -512,6 +527,21 @@ mod tests {
         let paths = mysql_paths(&home, &major);
         assert_eq!(paths.pid_file, PathBuf::from("/tmp/ovh/run/mysql-8.4.pid"));
         assert_eq!(paths.pid_file.parent(), paths.socket.parent());
+    }
+
+    #[test]
+    fn mysql_data_root_matches_every_majors_staging_parent() {
+        // The whole reason `mysql_data_root` exists on its own: it must never
+        // drift from what `mysql_paths` computes per-major.
+        let home = PathBuf::from("/tmp/ovh");
+        assert_eq!(mysql_data_root(&home), PathBuf::from("/tmp/ovh/data/mysql"));
+        for major_str in ["8.4", "9.7"] {
+            let major = MysqlMajor::from_probe(major_str.to_string()).unwrap();
+            assert_eq!(
+                mysql_paths(&home, &major).staging_parent,
+                mysql_data_root(&home)
+            );
+        }
     }
 
     #[test]

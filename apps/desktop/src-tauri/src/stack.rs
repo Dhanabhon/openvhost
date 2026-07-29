@@ -9,6 +9,7 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[cfg(target_os = "macos")]
 use openvhost_core::platform::macos::demo_stack::{BrewStack, find_brew_binaries, provision_home};
@@ -18,6 +19,7 @@ use openvhost_core::site::apply::LISTEN_PORT;
 // own doc comment for why portable types are named ungated even though only
 // `macos_stack` constructs them today), and `php_fpm_spec` below is called
 // from `commands.rs`, which is ungated too.
+use openvhost_core::mysql::{DatadirState, MysqlRuntime, classify_datadir, mysql_paths};
 use openvhost_core::{InstalledRuntimes, PhpRuntime};
 use openvhost_proc::{DEFAULT_GRACE, ReadinessProbe, ServiceSpec, SpawnSpec};
 
@@ -100,6 +102,73 @@ pub fn php_fpm_spec(home: &Path, rt: &PhpRuntime) -> ServiceSpec {
     }
 }
 
+/// `ServiceSpec::grace` for every `mysql-<major>` row (P1 MySQL lifecycle
+/// design, spec D4): SIGTERM is mysqld's documented clean-shutdown signal, and
+/// a flushing InnoDB can legitimately exceed the 5s `DEFAULT_GRACE`
+/// nginx/php-fpm use — a SIGKILL mid-flush then forces crash recovery on the
+/// NEXT start. `pub(crate)`, not private: `quit.rs`'s quit-budget test
+/// (`STOP_ALL_TIMEOUT` must outlive the longest registered grace) pins
+/// against this constant rather than a bare literal `15`, so the two cannot
+/// silently drift apart.
+pub(crate) const MYSQL_GRACE: Duration = Duration::from_secs(15);
+
+/// How long [`mysql_spec`]'s readiness probe (`mysqladmin ping`) may keep
+/// retrying before the service is declared `Failed` (spec D4).
+const MYSQL_READY_DEADLINE: Duration = Duration::from_secs(15);
+
+/// The `mysql-<major>` service row for one runtime: id, display name, TCP
+/// endpoint, and the exact spawn + readiness spec (spec D4).
+///
+/// `endpoint` is `127.0.0.1:3306` — a literal, NOT this major's unix socket
+/// path — deliberately unlike [`php_fpm_spec`]'s own `endpoint` (that pool's
+/// socket): MySQL's socket is an internal implementation detail this app
+/// uses for its own admin calls, but the address a HUMAN would actually
+/// connect a `mysql` client or a GUI tool to is the TCP endpoint, so that is
+/// what the Services panel row should show. The socket path itself is
+/// surfaced separately, via `MysqlInstanceDto::socket_path` (`commands.rs`).
+///
+/// Argv is exactly `["--defaults-file=<my.cnf>"]` (spec D4: "`--defaults-file`
+/// first is a mysqld requirement; everything else lives in the file so the
+/// spec is stable") — built via `OsString`, not `format!` + `.display()`, for
+/// the same non-lossy-path reason `MysqlValidator::validate` gives.
+pub fn mysql_spec(home: &Path, rt: &MysqlRuntime) -> ServiceSpec {
+    let paths = mysql_paths(home, &rt.major);
+    let mut defaults_file_arg = OsString::from("--defaults-file=");
+    defaults_file_arg.push(paths.my_cnf.as_os_str());
+    ServiceSpec {
+        id: format!("mysql-{}", rt.major.as_str()),
+        display_name: format!("MySQL {}", rt.major.as_str()),
+        endpoint: Some("127.0.0.1:3306".to_string()),
+        spawn: SpawnSpec {
+            program: rt.mysqld.clone(),
+            args: vec![defaults_file_arg],
+            cwd: None,
+            env: vec![],
+        },
+        readiness: ReadinessProbe::Command {
+            argv: openvhost_conf::mysqladmin_ping_argv(&rt.mysqladmin, &paths.socket),
+            deadline: MYSQL_READY_DEADLINE,
+        },
+        grace: MYSQL_GRACE,
+    }
+}
+
+/// Whether `rt`'s datadir is already initialized — the ONLY MySQL runtimes
+/// `macos_stack`/a rescan register a supervisor row for at all (spec D6:
+/// "registration reuses whatever nginx/php-fpm do at startup for
+/// already-initialized instances"). An installed-but-not-yet-initialized
+/// major has no datadir to serve, so there is nothing to start; a `Foreign`
+/// one is rendered on the Databases page, never adopted into a service row.
+/// Read from disk every time (never a stored boolean) — the same discipline
+/// `classify_datadir` itself documents.
+pub(crate) fn mysql_datadir_is_initialized(home: &Path, rt: &MysqlRuntime) -> bool {
+    let paths = mysql_paths(home, &rt.major);
+    matches!(
+        classify_datadir(&paths.datadir),
+        Ok(DatadirState::Initialized)
+    )
+}
+
 /// The multi-version PHP walk `macos_stack` performs at startup, factored out
 /// of it so a test can hand it a fake prefix and a fake probe instead of the
 /// machine's real Homebrew installs and a spawned `php-fpm -v`.
@@ -120,6 +189,20 @@ fn discover_installed_php(
     openvhost_core::discover_php_in(prefixes, probe)
 }
 
+/// The MySQL discovery walk `macos_stack` performs at startup, factored out
+/// exactly like [`discover_installed_php`] and for the identical reason: a
+/// test hands it a fake prefix and a fake probe instead of the machine's real
+/// Homebrew installs and a spawned `mysqld --version`. Thin pass-through to
+/// `openvhost_core::mysql::discover_mysql`, which has its own thorough test
+/// suite (`openvhost-core/src/mysql/discover.rs`) — not re-tested here.
+#[cfg(target_os = "macos")]
+fn discover_installed_mysql(
+    prefixes: &[&Path],
+    probe: &dyn Fn(&Path) -> Option<String>,
+) -> Vec<MysqlRuntime> {
+    openvhost_core::mysql::discover_mysql(prefixes, probe)
+}
+
 /// Specs to register, the paths they were built from, and the runtimes probed
 /// while building them. `paths` is `None` exactly when the home could not be
 /// resolved — the same condition that already produces zero specs.
@@ -128,6 +211,12 @@ pub struct MacosStack {
     pub specs: Vec<ServiceSpec>,
     pub paths: Option<StackPaths>,
     pub runtimes: Option<InstalledRuntimes>,
+    /// Every discovered MySQL runtime, regardless of whether its datadir is
+    /// initialized (spec D6: the Databases page needs the FULL list to
+    /// render `InstalledNotInitialized`/`DatadirForeign` rows, not just the
+    /// ones that got a supervisor row in `specs`). `None` under the identical
+    /// condition `runtimes`/`paths` are `None` under.
+    pub mysql_runtimes: Option<Vec<MysqlRuntime>>,
 }
 
 /// Build the supervised stack rows: one nginx row, and one `php-fpm-<major>`
@@ -150,6 +239,7 @@ pub fn macos_stack() -> MacosStack {
                 specs: vec![],
                 paths: None,
                 runtimes: None,
+                mysql_runtimes: None,
             };
         }
     };
@@ -193,11 +283,30 @@ pub fn macos_stack() -> MacosStack {
         tauri::async_runtime::block_on(openvhost_conf::probe_php_fpm_version(bin))
     });
 
+    // Same "spawn the version probe exactly once, at startup" discipline as
+    // PHP above, and the identical sync-closure-over-async-probe bridge
+    // (`tauri::async_runtime::block_on` is safe here because this whole
+    // function runs from `lib.rs`'s synchronous `setup()` closure, never from
+    // inside a tokio worker — see the PHP walk's own comment for why that
+    // distinction matters).
+    let mysql: Vec<MysqlRuntime> = discover_installed_mysql(&prefixes, &|bin| {
+        tauri::async_runtime::block_on(openvhost_conf::probe_mysqld_version(bin))
+    });
+
     let nginx_conf = home.join("config/generated/nginx/nginx.conf");
 
     let mut specs = Vec::new();
     for rt in &php {
         specs.push(php_fpm_spec(&home, rt));
+    }
+    // Spec D6: "registration reuses whatever nginx/php-fpm do at startup for
+    // ALREADY-INITIALIZED instances" — an installed-but-not-yet-initialized
+    // major gets no row here (nothing to start yet); the Databases page
+    // (Task 6) still lists it via `mysql_runtimes` below.
+    for rt in &mysql {
+        if mysql_datadir_is_initialized(&home, rt) {
+            specs.push(mysql_spec(&home, rt));
+        }
     }
     specs.push(ServiceSpec {
         id: "nginx".into(),
@@ -230,6 +339,7 @@ pub fn macos_stack() -> MacosStack {
             nginx_bin: brew.nginx,
             php,
         }),
+        mysql_runtimes: Some(mysql),
     }
 }
 

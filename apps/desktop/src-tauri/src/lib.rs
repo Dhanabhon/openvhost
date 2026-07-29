@@ -52,11 +52,20 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::rescan_php_runtimes,
             commands::install_php,
             commands::pending_php_install,
+            commands::mysql_environment,
+            commands::rescan_mysql,
+            commands::install_mysql,
+            commands::initialize_mysql,
+            commands::mysql_root_password,
+            commands::reset_mysql_root_password,
+            commands::verify_mysql_connection,
         ])
         .events(collect_events![
             commands::ServiceStateEvent,
             commands::ServiceLogEvent,
             commands::PhpInstallLogEvent,
+            commands::MysqlInstallLogEvent,
+            commands::MysqlInitLogEvent,
             quit::QuitRequestedEvent
         ])
         // `LogLine`/`ServiceLogEvent` carry `ts_ms: u64` (millisecond epoch
@@ -233,22 +242,23 @@ pub fn run() {
                             ));
                             supervisor.register(demo_ticker_spec());
                             #[cfg(target_os = "macos")]
-                            let (stack_paths, stack_runtimes) = {
+                            let (stack_paths, stack_runtimes, mysql_runtimes) = {
                                 let stack = stack::macos_stack();
                                 for spec in stack.specs {
                                     supervisor.register(spec);
                                 }
-                                (stack.paths, stack.runtimes)
+                                (stack.paths, stack.runtimes, stack.mysql_runtimes)
                             };
                             // No stack builder for this target yet, so `None` is the
                             // NORMAL state here — the home resolved fine, there is
                             // simply nothing to point the Web Server page at. See
                             // `commands::stack_paths` for the message that renders.
                             #[cfg(not(target_os = "macos"))]
-                            let (stack_paths, stack_runtimes): (
+                            let (stack_paths, stack_runtimes, mysql_runtimes): (
                                 Option<stack::StackPaths>,
                                 Option<openvhost_core::InstalledRuntimes>,
-                            ) = (None, None);
+                                Option<Vec<openvhost_core::mysql::MysqlRuntime>>,
+                            ) = (None, None, None);
                             // Manage the Option ITSELF, unconditionally. Tauri implements
                             // `CommandArg` only for `State<'r, T>` — there is no impl for
                             // `Option<State<'r, T>>` — so a command cannot take an
@@ -279,6 +289,12 @@ pub fn run() {
                             // relaunch. The lock is the seam a later rescan/install writes
                             // through; every reader here just takes the read side.
                             app.manage(std::sync::RwLock::new(stack_runtimes));
+                            // Same reasoning as `stack_runtimes` above, for MySQL's own
+                            // runtime list (P1 MySQL lifecycle design): `install_mysql`/
+                            // `rescan_mysql` write through this after launch, and
+                            // `initialize_mysql`/`reset_mysql_root_password`/
+                            // `verify_mysql_connection` read it rather than re-probing.
+                            app.manage(std::sync::RwLock::new(mysql_runtimes));
                             let mut rx = supervisor.subscribe();
                             let handle = app.handle().clone();
                             tauri::async_runtime::spawn(async move {

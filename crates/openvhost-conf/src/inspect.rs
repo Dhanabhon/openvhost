@@ -77,10 +77,14 @@ use crate::error::ConfError;
 /// error instead of a spinner that never resolves.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Why a bounded probe run failed. Private: each probe maps this onto its own
-/// public failure shape (`ConfError` for `validate_live`, `None` for the version
-/// probe), so the shared runner does not have to know either.
-enum ProbeFailure {
+/// Why a bounded probe run failed. `pub(crate)` (not `pub`, and not private
+/// either — widened from private for Task 5's `crate::mysql`, a sibling
+/// in-crate module that reuses [`run_bounded`] and needs to map this onto ITS
+/// own public failure shapes too): each caller maps this onto its own public
+/// failure shape (`ConfError` for `validate_live`/`crate::mysql`, `None` for
+/// the version probes), so the shared runner does not have to know any of
+/// them.
+pub(crate) enum ProbeFailure {
     /// The binary could not be launched, or its pipes could not be drained.
     Io(std::io::Error),
     /// `PROBE_TIMEOUT` elapsed. The process group has been killed.
@@ -146,50 +150,67 @@ fn probe_env() -> Vec<(OsString, OsString)> {
 /// probes previously disagreed about how much of it they needed; one copy is the
 /// only way they cannot drift apart again.
 ///
-/// `stdin` is `null` so a probe can never block reading a terminal it inherited
-/// — matching what `Command::output()` (which the version probe used to call)
-/// already did.
-///
-/// The GROUP part is `#[cfg(unix)]`. On Windows this degrades to `kill_on_drop`
-/// alone, i.e. the direct child only; containment there means Job Objects, which
-/// is deferred with the rest of the Windows surface (spec: macOS-first). That is
-/// a strict subset of the unix behaviour, not a different contract — the
-/// `Result` a caller sees is identical either way.
-///
-/// LIMITATION: the wait joins on EOF of the child's pipes, not on the child's
-/// own exit — see [`validate_live`]'s doc comment.
-async fn run_bounded(
+/// `stdin`: `None` means the child's stdin is `null` — a probe can never block
+/// reading a terminal it inherited, matching what `Command::output()` (which the
+/// version probe used to call) already did. `Some(bytes)` pipes `bytes` in and
+/// then closes the write end (EOF), for the ONE caller that genuinely needs to
+/// feed a child something on stdin rather than merely read its output
+/// (`crate::mysql`'s `ALTER USER` step, P1 MySQL lifecycle design spec D2/D3:
+/// the credential must never cross via argv or env). Widened here (Task 5)
+/// rather than duplicated in a second runner, for the identical "one copy of
+/// the subtle containment" reason the doc above already gives.
+pub(crate) async fn run_bounded(
     cmd: &mut tokio::process::Command,
+    stdin: Option<&[u8]>,
 ) -> Result<std::process::Output, ProbeFailure> {
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // Condition (6) of the module doc's reading: explicitly assembled, never
-        // inherited. `env_clear` also drops anything the CALLER already set on
-        // `cmd` — deliberate, and the reason this pair lives here rather than in
-        // each probe: `run_bounded` owns the child's environment outright, so a
-        // future probe cannot forget to clear it. A probe that genuinely needs an
-        // extra variable adds it to `probe_env` (and to `assemble_env`, its
-        // source of truth) rather than setting it on the command.
-        .env_clear()
-        .envs(probe_env())
-        // Secondary net, for "the caller drops this whole future" — the timeout
-        // arm below does the real reclaiming. On its own this is NOT enough:
-        // `kill_on_drop`, exactly like `Child::kill()`, only ever signals the
-        // single tracked pid, so a shell-wrapped binary's forked grandchild
-        // survives it (empirically proven against the fake in this module's
-        // timeout test).
-        .kill_on_drop(true);
+    cmd.stdin(if stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    // Condition (6) of the module doc's reading: explicitly assembled, never
+    // inherited. `env_clear` also drops anything the CALLER already set on
+    // `cmd` — deliberate, and the reason this pair lives here rather than in
+    // each probe: `run_bounded` owns the child's environment outright, so a
+    // future probe cannot forget to clear it. A probe that genuinely needs an
+    // extra variable adds it to `probe_env` (and to `assemble_env`, its
+    // source of truth) rather than setting it on the command.
+    .env_clear()
+    .envs(probe_env())
+    // Secondary net, for "the caller drops this whole future" — the timeout
+    // arm below does the real reclaiming. On its own this is NOT enough:
+    // `kill_on_drop`, exactly like `Child::kill()`, only ever signals the
+    // single tracked pid, so a shell-wrapped binary's forked grandchild
+    // survives it (empirically proven against the fake in this module's
+    // timeout test).
+    .kill_on_drop(true);
     // Own process group, set atomically at spawn (posix_spawn attribute, so no
     // post-fork setpgid race), so the timeout arm can reclaim grandchildren too.
     #[cfg(unix)]
     cmd.process_group(0);
 
-    let child = cmd.spawn().map_err(ProbeFailure::Io)?;
+    let mut child = cmd.spawn().map_err(ProbeFailure::Io)?;
     // Snapshotted BEFORE `wait_with_output` consumes `child` below.
     // `process_group(0)` makes this pid double as the pgid.
     #[cfg(unix)]
     let pgid = child.id();
+
+    if let Some(bytes) = stdin {
+        // Written, then the handle is DROPPED (not merely flushed) so the
+        // child sees EOF on stdin — `mysql`'s batch-mode reader (the only
+        // caller that passes `Some` here) waits for EOF before executing a
+        // script with no trailing sentinel of its own. A write failure here
+        // (e.g. the child exited early, closing its read end) is not fatal
+        // to this function: `wait_with_output` below still runs and reports
+        // whatever the child actually did.
+        use tokio::io::AsyncWriteExt;
+        if let Some(mut si) = child.stdin.take() {
+            let _ = si.write_all(bytes).await;
+            let _ = si.shutdown().await;
+        }
+    }
 
     match tokio::time::timeout(PROBE_TIMEOUT, child.wait_with_output()).await {
         Ok(res) => res.map_err(ProbeFailure::Io),
@@ -287,7 +308,7 @@ fn kill_process_group(pgid: Option<u32>) {
 pub async fn probe_nginx_version(bin: &Path, err_log: &Path) -> Option<String> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.arg("-e").arg(err_log).arg("-v");
-    let out = run_bounded(&mut cmd).await.ok()?;
+    let out = run_bounded(&mut cmd, None).await.ok()?;
     // nginx writes its banner to STDERR, not stdout.
     parse_version(&String::from_utf8_lossy(&out.stderr))
 }
@@ -330,7 +351,7 @@ fn parse_version_line(line: &str) -> Option<String> {
 pub async fn probe_php_fpm_version(bin: &Path) -> Option<String> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.arg("-v");
-    let out = run_bounded(&mut cmd).await.ok()?;
+    let out = run_bounded(&mut cmd, None).await.ok()?;
     parse_php_version(&String::from_utf8_lossy(&out.stdout))
 }
 
@@ -342,6 +363,47 @@ fn parse_php_version(stdout: &str) -> Option<String> {
 
 fn parse_php_version_line(line: &str) -> Option<String> {
     let token = line.strip_prefix("PHP ")?.split_whitespace().next()?;
+    let mut parts = token.split('.');
+    let major = parts.next()?;
+    let minor = parts.next()?;
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(major) || !digits(minor) {
+        return None;
+    }
+    Some(format!("{major}.{minor}"))
+}
+
+/// The installed `mysqld`'s `major.minor` (`8.4` from
+/// `/opt/homebrew/opt/mysql@8.4/bin/mysqld  Ver 8.4.11 for macos15.4 on arm64
+/// (Homebrew)`), or `None` for any failure — missing binary, unparseable
+/// banner, timeout. Deliberately not a `Result`, mirroring
+/// [`probe_php_fpm_version`]: `crate::mysql::discover_mysql`'s caller
+/// (`openvhost-core::mysql::discover_mysql`'s probe closure, per its own doc
+/// comment) needs exactly this shape — a discovered runtime whose version
+/// happens to be unreadable should still be discoverable rather than making
+/// the whole scan fail.
+///
+/// `mysqld --version` writes its banner to STDOUT, in a `Ver <version> for
+/// <platform> ...` shape — a different stream AND shape from both
+/// [`probe_nginx_version`] (stderr, `nginx/<version>`) and
+/// [`probe_php_fpm_version`] (stdout, `PHP <version>`), so this needs its own
+/// parser rather than reusing either.
+pub async fn probe_mysqld_version(bin: &Path) -> Option<String> {
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.arg("--version");
+    let out = run_bounded(&mut cmd, None).await.ok()?;
+    parse_mysqld_version(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Line-by-line, mirroring [`parse_php_version`]'s "a preceding line must
+/// never consume the banner" discipline.
+fn parse_mysqld_version(stdout: &str) -> Option<String> {
+    stdout.lines().find_map(parse_mysqld_version_line)
+}
+
+fn parse_mysqld_version_line(line: &str) -> Option<String> {
+    let after_ver = line.split_once("Ver ")?.1;
+    let token = after_ver.split_whitespace().next()?;
     let mut parts = token.split('.');
     let major = parts.next()?;
     let minor = parts.next()?;
@@ -372,7 +434,7 @@ pub async fn validate_live(
 ) -> Result<ValidationReport, ConfError> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.arg("-e").arg(err_log).arg("-t").arg("-c").arg(conf);
-    match run_bounded(&mut cmd).await {
+    match run_bounded(&mut cmd, None).await {
         Ok(out) => Ok(ValidationReport {
             // Exit code ONLY — nginx writes to stderr even on success.
             ok: out.status.success(),
@@ -606,7 +668,7 @@ mod tests {
         // of inherited listening socket descriptors.
         cmd.env("NGINX", "3;").env("OPENVHOST_MUST_NOT_LEAK", "1");
         assert!(
-            run_bounded(&mut cmd).await.is_ok(),
+            run_bounded(&mut cmd, None).await.is_ok(),
             "the fake should have run"
         );
 
@@ -834,5 +896,38 @@ mod tests {
         assert_eq!(parse_php_version(""), None);
         assert_eq!(parse_php_version("PHP notaversion"), None);
         assert_eq!(parse_php_version("PHP 8"), None);
+    }
+
+    #[tokio::test]
+    async fn mysqld_version_is_read_from_the_ver_token_on_stdout() {
+        let d = tempfile::tempdir().unwrap();
+        let bin = fake_bin(
+            d.path(),
+            "mysqld",
+            "echo '/opt/homebrew/opt/mysql@8.4/bin/mysqld  Ver 8.4.11 for macos15.4 on arm64 (Homebrew)'",
+        );
+        assert_eq!(probe_mysqld_version(&bin).await.as_deref(), Some("8.4"));
+    }
+
+    #[tokio::test]
+    async fn mysqld_version_is_none_when_the_binary_does_not_exist() {
+        assert_eq!(
+            probe_mysqld_version(Path::new("/nonexistent/mysqld")).await,
+            None
+        );
+    }
+
+    #[test]
+    fn parses_the_mysqld_banner_down_to_major_minor() {
+        let out = "/opt/homebrew/opt/mysql@8.4/bin/mysqld  Ver 8.4.11 for macos15.4 on arm64 (Homebrew)\n";
+        assert_eq!(parse_mysqld_version(out), Some("8.4".to_string()));
+    }
+
+    #[test]
+    fn rejects_banners_that_are_not_mysqld() {
+        assert_eq!(parse_mysqld_version("nginx version: nginx/1.27.3"), None);
+        assert_eq!(parse_mysqld_version(""), None);
+        assert_eq!(parse_mysqld_version("Ver notaversion"), None);
+        assert_eq!(parse_mysqld_version("Ver 8"), None);
     }
 }

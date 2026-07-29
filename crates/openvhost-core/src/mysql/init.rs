@@ -18,6 +18,21 @@ use std::path::{Path, PathBuf};
 
 use super::datadir::{DS_STORE, is_stale_staging_name};
 use super::{DatadirState, MysqlMajor, classify_datadir};
+use crate::error::CoreError;
+
+/// Write a rendered `my.cnf` ([`openvhost_conf::GeneratedFile`]) atomically
+/// (spec D5: "written with `atomicfile::write_atomic` as a `GeneratedFile`").
+/// Thin — mirrors `site::apply::commit`'s own atomic-write wrapper
+/// (`crate::atomicfile::write_atomic`) rather than duplicating its logic;
+/// exists as its own `pub fn` here (Task 5) because that wrapper is scoped to
+/// `ApplyPlan`/`ApplyError` and `crate::atomicfile` itself is `pub(crate)` —
+/// nothing outside this crate could otherwise reach the hardened write at
+/// all. The command layer (plan Task 5) drives the render (Task 3's
+/// `openvhost_conf::generate_my_cnf`) and calls this to persist it, exactly
+/// like `site::apply::commit` drives its own `GeneratedFile`s.
+pub fn write_generated_config(file: &openvhost_conf::GeneratedFile) -> Result<(), CoreError> {
+    Ok(crate::atomicfile::write_atomic(&file.path, &file.contents)?)
+}
 
 /// A fresh v4 UUID rendered in "simple" form: 32 lowercase hex characters,
 /// no hyphens. Shared by [`generate_root_password`] (spec D3: "uuid v4
@@ -383,6 +398,42 @@ mod tests {
             !sql.contains("'ab'cd'"),
             "a single, undoubled quote would break out of the string literal: {sql:?}"
         );
+    }
+
+    // ---- write_generated_config ----
+
+    #[test]
+    fn write_generated_config_writes_the_file_and_creates_parents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("generated").join("mysql").join("my.cnf");
+        let file = openvhost_conf::GeneratedFile {
+            path: path.clone(),
+            contents: "[mysqld]\ndatadir=/x\n".to_string(),
+        };
+
+        write_generated_config(&file).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), file.contents);
+    }
+
+    #[test]
+    fn write_generated_config_is_atomic_no_temp_file_left_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("my.cnf");
+        let file = openvhost_conf::GeneratedFile {
+            path: path.clone(),
+            contents: "[mysqld]\n".to_string(),
+        };
+
+        write_generated_config(&file).unwrap();
+
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "my.cnf")
+            .collect();
+        assert!(leftovers.is_empty(), "got {leftovers:?}");
     }
 
     // ---- staging_dir_path ----

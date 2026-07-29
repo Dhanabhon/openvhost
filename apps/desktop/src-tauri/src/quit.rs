@@ -53,19 +53,33 @@ pub const QUIT_MENU_ITEM_ID: &str = "openvhost:quit";
 /// How long [`stop_all_with`] waits for services to actually reach a stopped
 /// state before giving up on the stragglers.
 ///
-/// Must exceed `openvhost-proc`'s `DEFAULT_GRACE` (5s, formerly a private
-/// `GRACE_DEADLINE` constant — now per-`ServiceSpec`, see `ServiceSpec::grace`):
-/// `Supervisor::stop` only REQUESTS a graceful stop, and the service task waits
-/// out that spec's grace period before escalating to a kill. A timeout at or
-/// under 5s would abandon exactly the processes the kill was about to reap.
+/// Must exceed the LONGEST `grace` among registered [`ServiceSpec`]s
+/// (`openvhost-proc`'s `ServiceSpec::grace` — nginx/php-fpm use
+/// `DEFAULT_GRACE`, 5s; MySQL, added by the P1 MySQL lifecycle design, uses
+/// 15s for a clean InnoDB shutdown, spec D4): `Supervisor::stop` only
+/// REQUESTS a graceful stop, and the service task waits out that spec's own
+/// grace period before escalating to a kill. A timeout at or under the
+/// longest registered grace would report a service still legitimately
+/// inside its own shutdown window as an abandoned straggler.
 ///
-/// nginx/php-fpm both still use `DEFAULT_GRACE`, so 8s stays correct for them.
-/// A future spec with a LONGER grace (the roadmap's MySQL lifecycle slice
-/// proposes 15s, for a clean InnoDB shutdown) would need this timeout raised
-/// too, or `stop_all_with` would report it as a straggler mid-shutdown even
-/// though it was still within its own grace window — flagged here rather than
-/// silently left for that slice to rediscover.
-pub const STOP_ALL_TIMEOUT: Duration = Duration::from_secs(8);
+/// This was 8s (`DEFAULT_GRACE` + a 3s buffer) before MySQL's 15s grace
+/// landed — the doc comment on THIS constant already flagged that the day a
+/// longer-grace spec arrived, this timeout would need raising too, rather
+/// than leaving that slice to rediscover it. It is now MySQL's 15s grace plus
+/// the SAME 3s buffer the old value used relative to `DEFAULT_GRACE` (5s + 3s
+/// = 8s ⇒ 15s + 3s = 18s), so the ratio of "how much slack beyond the
+/// longest grace" is unchanged, not just the number.
+///
+/// A per-call value DERIVED from whichever specs are actually registered
+/// (`Supervisor` has no accessor for a spec's `grace` today) was considered
+/// and passed over for this slice: it would need a new `openvhost-proc`
+/// accessor purely to serve this one call site, for a workspace that — as of
+/// this slice — has exactly two grace values in use, not an open-ended set.
+/// A documented constant that already carries its own "next slice, check
+/// this" flag (this comment) is the simpler fix for two known values; if a
+/// THIRD, longer grace ever lands, apply the identical reasoning again rather
+/// than let this drift silently.
+pub const STOP_ALL_TIMEOUT: Duration = Duration::from_secs(18);
 
 /// Snapshot cadence while waiting. The supervisor's snapshot is an in-memory
 /// read, so this is cheap; it only bounds how long after the last service stops
@@ -507,6 +521,25 @@ mod tests {
         assert!(STOP_ALL_TIMEOUT > Duration::from_secs(5));
     }
 
+    /// THE QUIT-BUDGET TEST (P1 MySQL lifecycle design decision 1): MySQL's
+    /// `ServiceSpec::grace` is 15s (`crate::stack::MYSQL_GRACE`) — longer than
+    /// the 5s `DEFAULT_GRACE` nginx/php-fpm use, which is what the OLD
+    /// `STOP_ALL_TIMEOUT` (8s) was sized against. Pinned against the REAL
+    /// constant `mysql_spec` builds its `ServiceSpec` with, not a bare
+    /// literal `15`, so this test cannot silently pass after `MYSQL_GRACE`
+    /// changes without `STOP_ALL_TIMEOUT` changing to match.
+    ///
+    /// VACUITY: this is exactly the pre-fix value's own shape
+    /// (`stop_all_timeout_outlives_the_supervisor_grace_deadline` above,
+    /// asserting `> 5s` against `DEFAULT_GRACE`) — reverting `STOP_ALL_TIMEOUT`
+    /// to 8s makes THIS test fail while that one keeps passing, which is the
+    /// point: the old test alone was not enough to catch a quit budget sized
+    /// for nginx/php-fpm but not MySQL.
+    #[test]
+    fn stop_all_timeout_outlives_mysqls_longer_grace() {
+        assert!(STOP_ALL_TIMEOUT > crate::stack::MYSQL_GRACE);
+    }
+
     // -----------------------------------------------------------------------
     // C1: `abort_and_wait_with` / `abort_pending_install`.
     // -----------------------------------------------------------------------
@@ -609,8 +642,11 @@ mod tests {
         ));
 
         let lock = app.state::<crate::commands::InstallLock>();
-        lock.inner()
-            .set_running("8.4".to_string(), install_task.abort_handle());
+        lock.inner().set_running(
+            crate::commands::InstallKind::Php,
+            "8.4".to_string(),
+            install_task.abort_handle(),
+        );
 
         // Wait for proof the child is actually running before quitting on it.
         let pid: i32 = tokio::time::timeout(Duration::from_secs(5), async {
