@@ -164,6 +164,22 @@ fn format_probe_detail(code: Option<i32>, stdout: &str, stderr: &str) -> String 
     detail
 }
 
+/// Like [`format_probe_detail`], but for an attempt that was still running
+/// when the overall deadline elapsed and got killed by us — never had a
+/// chance to report its own exit code, so the framing says so rather than
+/// implying the probe's own logic decided to stop.
+fn format_deadline_kill_detail(stdout: &str, stderr: &str) -> String {
+    let mut detail = "probe still running when the deadline elapsed (killed)".to_string();
+    if !stderr.is_empty() {
+        detail.push_str(": ");
+        detail.push_str(stderr);
+    } else if !stdout.is_empty() {
+        detail.push_str(": ");
+        detail.push_str(stdout);
+    }
+    detail
+}
+
 /// Outcome of ONE `Command` probe attempt, raced against the supervised
 /// child's own exit and the overall probe deadline. Whichever of the three
 /// loses, the probe subprocess (if it was ever spawned) is explicitly killed
@@ -172,9 +188,19 @@ fn format_probe_detail(code: Option<i32>, stdout: &str, stderr: &str) -> String 
 /// branch's future drop would leak it.
 enum ProbeRace {
     Success,
-    NotReady { detail: String },
+    NotReady {
+        detail: String,
+    },
     ChildExited(Option<std::process::ExitStatus>),
-    DeadlineElapsed,
+    /// `Some(detail)` when an attempt was actually spawned and in flight
+    /// when the deadline hit — its captured stdout/stderr IS the most
+    /// relevant diagnostic (review fix: this used to be silently dropped).
+    /// `None` when the deadline had already elapsed before this call could
+    /// even start an attempt — nothing fresher than the caller's own
+    /// last-seen detail from a PRIOR completed attempt.
+    DeadlineElapsed {
+        detail: Option<String>,
+    },
 }
 
 async fn probe_attempt_raced(
@@ -185,7 +211,7 @@ async fn probe_attempt_raced(
 ) -> ProbeRace {
     let remaining = deadline_at.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        return ProbeRace::DeadlineElapsed;
+        return ProbeRace::DeadlineElapsed { detail: None };
     }
     let Some((program, rest)) = argv.split_first() else {
         return ProbeRace::NotReady {
@@ -234,11 +260,17 @@ async fn probe_attempt_raced(
             ProbeRace::ChildExited(status.ok())
         }
         _ = tokio::time::sleep(remaining) => {
+            // Review fix: capture this (killed, in-flight) attempt's own
+            // output the same way the `Ok(s)` branch above does, instead of
+            // discarding it — this is the attempt the deadline actually
+            // caught, so its diagnostics are the most relevant of all.
             let _ = inner.driver.kill(&mut probe);
             let _ = probe.wait().await;
-            let _ = out_task.await;
-            let _ = err_task.await;
-            ProbeRace::DeadlineElapsed
+            let stdout = out_task.await.unwrap_or_default();
+            let stderr = err_task.await.unwrap_or_default();
+            ProbeRace::DeadlineElapsed {
+                detail: Some(format_deadline_kill_detail(&stdout, &stderr)),
+            }
         }
     }
 }
@@ -282,14 +314,19 @@ async fn run_command_probe(
         match probe_attempt_raced(inner, child, argv, deadline_at).await {
             ProbeRace::Success => return ReadyOutcome::Ready,
             ProbeRace::ChildExited(status) => return ReadyOutcome::ChildExitedDuringProbe(status),
-            ProbeRace::DeadlineElapsed => {
+            ProbeRace::DeadlineElapsed { detail } => {
+                // Review fix: prefer the JUST-KILLED in-flight attempt's own
+                // fresh output when there is one — only fall back to the
+                // last COMPLETED attempt's detail when the deadline elapsed
+                // between attempts (nothing was in flight to report on).
+                let detail = detail.unwrap_or(last_detail);
                 Inner::push_supervisor_log(
                     inner,
                     id,
-                    format!("readiness probe deadline elapsed: {last_detail}"),
+                    format!("readiness probe deadline elapsed: {detail}"),
                 );
                 return ReadyOutcome::ProbeDeadlineElapsed {
-                    diagnostics: vec![format!("probe: {last_detail}")],
+                    diagnostics: vec![format!("probe: {detail}")],
                 };
             }
             ProbeRace::NotReady { detail } => {

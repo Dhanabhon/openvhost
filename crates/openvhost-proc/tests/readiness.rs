@@ -271,6 +271,64 @@ async fn command_probe_deadline_elapsed_fails_with_probe_diagnostics_and_kills_t
     }
 }
 
+/// Review fix: the deadline can also elapse WHILE a probe attempt is still
+/// in flight (spec D4's real consumer, `mysqladmin --connect-timeout=1
+/// ... ping`, can run ~1s — a plausible case, not a corner). The prior test
+/// above only ever hits the "deadline elapsed BETWEEN attempts" branch
+/// (700ms deadline / near-instant attempts), so it cannot exercise this.
+/// This probe deliberately hangs for far longer than the deadline, after
+/// printing a distinctive marker to stderr — proving the KILLED in-flight
+/// attempt's own output (not a stale previous attempt's, and not just "no
+/// attempt completed") reaches the Failed diagnostics.
+const MID_ATTEMPT_MARKER: &str = "PROBE_MID_ATTEMPT_STDERR_MARKER_7f3a";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn command_probe_deadline_mid_attempt_carries_that_attempts_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("counter");
+    let sup = Supervisor::new(default_driver());
+    let _guard = StopGuard {
+        sup: &sup,
+        id: "probe-mid",
+    };
+    // Never reaches succeed_after and hangs 10s per attempt — far longer
+    // than the 1s deadline below, so the deadline reliably fires while the
+    // FIRST attempt is still asleep, well after it has already printed its
+    // marker (immediately, before the sleep) but well before it could ever
+    // exit on its own.
+    let mut argv = probe_argv_with_delay(&state, 1_000_000, 10_000);
+    argv.push("--probe-stderr-marker".to_string());
+    argv.push(MID_ATTEMPT_MARKER.to_string());
+    sup.register(command_probe_svc(
+        "probe-mid",
+        // Stays alive well past the probe's own short deadline below.
+        &["--lines", "100", "--interval-ms", "100"],
+        argv,
+        Duration::from_secs(1),
+    ));
+    let mut rx = sup.subscribe();
+    sup.start("probe-mid").unwrap();
+    wait_state(&mut rx, "probe-mid", Duration::from_secs(2), |s| {
+        matches!(s, ServiceState::Starting)
+    })
+    .await;
+
+    let final_state = wait_state(&mut rx, "probe-mid", Duration::from_secs(5), |s| {
+        matches!(s, ServiceState::Failed { .. })
+    })
+    .await;
+    match final_state {
+        ServiceState::Failed { stderr_tail, .. } => {
+            assert!(
+                stderr_tail.iter().any(|l| l.contains(MID_ATTEMPT_MARKER)),
+                "expected the killed in-flight attempt's own stderr marker \
+                 in stderr_tail, got {stderr_tail:?}"
+            );
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}
+
 // -------------------------------------------------------------------------
 // (c) Per-service grace: a long grace outlasts an 8s-ignoring child; the
 // PAIRED short-grace test is the vacuity proof (brief: "set grace back to

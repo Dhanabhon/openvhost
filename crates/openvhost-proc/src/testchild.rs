@@ -33,6 +33,13 @@ pub struct TestchildArgs {
     /// window during which one probe attempt is "in flight", for tests that
     /// need to race it against the supervised child's own exit.
     pub probe_delay_ms: u64,
+    /// If set, printed to stderr (flushed immediately — stderr is unbuffered
+    /// in Rust) right after the pid sentinel and BEFORE `probe_delay_ms`'s
+    /// sleep: gives a probe attempt a distinctive, capturable stderr line
+    /// before it hangs, for tests that need to prove a KILLED in-flight
+    /// attempt's own output (not a previous attempt's) reached the
+    /// supervisor's diagnostics.
+    pub probe_stderr_marker: Option<String>,
 }
 
 impl Default for TestchildArgs {
@@ -48,6 +55,7 @@ impl Default for TestchildArgs {
             probe_state: None,
             probe_succeed_after: None,
             probe_delay_ms: 0,
+            probe_stderr_marker: None,
         }
     }
 }
@@ -92,6 +100,13 @@ pub fn parse(args: &[String]) -> Result<TestchildArgs, String> {
                 out.probe_succeed_after = Some(next_u64("--probe-succeed-after")?)
             }
             "--probe-delay-ms" => out.probe_delay_ms = next_u64("--probe-delay-ms")?,
+            "--probe-stderr-marker" => {
+                out.probe_stderr_marker = Some(
+                    it.next()
+                        .ok_or("--probe-stderr-marker needs a value")?
+                        .clone(),
+                );
+            }
             other => return Err(format!("unknown flag {other}")),
         }
     }
@@ -101,7 +116,12 @@ pub fn parse(args: &[String]) -> Result<TestchildArgs, String> {
 #[allow(clippy::collapsible_if)]
 pub fn run(args: TestchildArgs) -> i32 {
     if let (Some(state), Some(succeed_after)) = (&args.probe_state, args.probe_succeed_after) {
-        return run_probe(state, succeed_after, args.probe_delay_ms);
+        return run_probe(
+            state,
+            succeed_after,
+            args.probe_delay_ms,
+            args.probe_stderr_marker.as_deref(),
+        );
     }
     if let Some(port) = args.http_port {
         return serve_http(port);
@@ -151,10 +171,24 @@ pub fn run(args: TestchildArgs) -> i32 {
 /// Writes its own pid to `<state>.pid` FIRST, before any delay — tests that
 /// need to prove this attempt actually started (and later, that it left no
 /// process behind) read that file rather than needing any handle back into
-/// the supervisor internals that spawned it.
-fn run_probe(state: &std::path::Path, succeed_after: u64, delay_ms: u64) -> i32 {
+/// the supervisor internals that spawned it. `stderr_marker`, if set, is
+/// printed to stderr immediately after the pid sentinel and before the
+/// delay — so a test can prove a specific, still-in-flight (killed) attempt's
+/// own output reached the supervisor, not a previous attempt's.
+fn run_probe(
+    state: &std::path::Path,
+    succeed_after: u64,
+    delay_ms: u64,
+    stderr_marker: Option<&str>,
+) -> i32 {
     let pid_path = state.with_extension("pid");
     let _ = std::fs::write(&pid_path, std::process::id().to_string());
+    if let Some(marker) = stderr_marker {
+        // Stderr is unbuffered in Rust (unlike stdout), so this reaches the
+        // reader on the other end of the pipe immediately — no explicit
+        // flush needed, matching this file's existing `eprintln!` call sites.
+        eprintln!("{marker}");
+    }
     if delay_ms > 0 {
         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
     }
@@ -289,6 +323,7 @@ mod tests {
                 probe_state: None,
                 probe_succeed_after: None,
                 probe_delay_ms: 0,
+                probe_stderr_marker: None,
             }
         );
     }
@@ -328,6 +363,12 @@ mod tests {
     #[test]
     fn parse_probe_succeed_after_rejects_non_numeric() {
         assert!(parse(&s(&["--probe-succeed-after", "nope"])).is_err());
+    }
+
+    #[test]
+    fn parse_probe_stderr_marker_flag() {
+        let a = parse(&s(&["--probe-stderr-marker", "HELLO_MARKER"])).unwrap();
+        assert_eq!(a.probe_stderr_marker, Some("HELLO_MARKER".to_string()));
     }
 
     // Binary-level behavior tests live in tests/testchild_bin.rs:
