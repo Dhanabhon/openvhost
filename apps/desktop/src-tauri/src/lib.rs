@@ -4,6 +4,11 @@
 //! stays tauri-free and this crate owns the bridge.
 
 mod commands;
+// The MySQL admin-CLI spawns (`mysqladmin`/`mysql` — ping, ALTER USER,
+// shutdown): orchestration-layer child processes, not config generation —
+// see this module's own doc comment for why they live here rather than in
+// openvhost-conf (review fix wave finding 4).
+mod mysql_admin;
 mod quit;
 
 // Ungated: `stack::StackPaths` is a portable type named by `commands.rs` on

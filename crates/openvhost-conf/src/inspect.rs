@@ -77,20 +77,6 @@ use crate::error::ConfError;
 /// error instead of a spinner that never resolves.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Why a bounded probe run failed. `pub(crate)` (not `pub`, and not private
-/// either — widened from private for Task 5's `crate::mysql`, a sibling
-/// in-crate module that reuses [`run_bounded`] and needs to map this onto ITS
-/// own public failure shapes too): each caller maps this onto its own public
-/// failure shape (`ConfError` for `validate_live`/`crate::mysql`, `None` for
-/// the version probes), so the shared runner does not have to know any of
-/// them.
-pub(crate) enum ProbeFailure {
-    /// The binary could not be launched, or its pipes could not be drained.
-    Io(std::io::Error),
-    /// `PROBE_TIMEOUT` elapsed. The process group has been killed.
-    TimedOut,
-}
-
 /// The environment a probe's child runs in: this list and nothing else. Condition
 /// (6) of the module doc's golden-rule-4 reading.
 ///
@@ -153,16 +139,27 @@ fn probe_env() -> Vec<(OsString, OsString)> {
 /// `stdin`: `None` means the child's stdin is `null` — a probe can never block
 /// reading a terminal it inherited, matching what `Command::output()` (which the
 /// version probe used to call) already did. `Some(bytes)` pipes `bytes` in and
-/// then closes the write end (EOF), for the ONE caller that genuinely needs to
-/// feed a child something on stdin rather than merely read its output
-/// (`crate::mysql`'s `ALTER USER` step, P1 MySQL lifecycle design spec D2/D3:
-/// the credential must never cross via argv or env). Widened here (Task 5)
-/// rather than duplicated in a second runner, for the identical "one copy of
-/// the subtle containment" reason the doc above already gives.
-pub(crate) async fn run_bounded(
+/// then closes the write end (EOF), for a caller that genuinely needs to feed a
+/// child something on stdin rather than merely read its output (e.g. a
+/// credential that must never cross via argv or env).
+///
+/// `pub`, not `pub(crate)` (review fix wave finding 4): the credential-mutating
+/// MySQL admin-CLI spawns (`mysqladmin`/`mysql` — ping/ALTER/shutdown) do not
+/// belong in THIS crate — this module's own golden-rule-4 reading was
+/// security-confirmed for READ-ONLY version/config probes, not for spawns that
+/// reach a running, Supervisor-registered instance and mutate credentials — so
+/// they live in the command/orchestration layer
+/// (`apps/desktop/src-tauri/src/mysql_admin.rs`) and reuse this EXACT
+/// containment via this re-export, rather than a second implementation of the
+/// subtle drop-ordering logic below. Returns [`ConfError`] directly (rather
+/// than a crate-private intermediate failure type) precisely so that reuse
+/// does not require exposing anything else — `program_of` derives the `bin`
+/// field from `cmd` itself, so a caller need not pass its own binary path
+/// redundantly alongside it.
+pub async fn run_bounded(
     cmd: &mut tokio::process::Command,
     stdin: Option<&[u8]>,
-) -> Result<std::process::Output, ProbeFailure> {
+) -> Result<std::process::Output, ConfError> {
     cmd.stdin(if stdin.is_some() {
         Stdio::piped()
     } else {
@@ -191,7 +188,10 @@ pub(crate) async fn run_bounded(
     #[cfg(unix)]
     cmd.process_group(0);
 
-    let mut child = cmd.spawn().map_err(ProbeFailure::Io)?;
+    let mut child = cmd.spawn().map_err(|source| ConfError::ValidatorSpawn {
+        bin: program_of(cmd),
+        source,
+    })?;
     // Snapshotted BEFORE `wait_with_output` consumes `child` below.
     // `process_group(0)` makes this pid double as the pgid.
     #[cfg(unix)]
@@ -199,7 +199,7 @@ pub(crate) async fn run_bounded(
 
     if let Some(bytes) = stdin {
         // Written, then the handle is DROPPED (not merely flushed) so the
-        // child sees EOF on stdin — `mysql`'s batch-mode reader (the only
+        // child sees EOF on stdin — a batch-mode reader (the only kind of
         // caller that passes `Some` here) waits for EOF before executing a
         // script with no trailing sentinel of its own. A write failure here
         // (e.g. the child exited early, closing its read end) is not fatal
@@ -213,7 +213,10 @@ pub(crate) async fn run_bounded(
     }
 
     match tokio::time::timeout(PROBE_TIMEOUT, child.wait_with_output()).await {
-        Ok(res) => res.map_err(ProbeFailure::Io),
+        Ok(res) => res.map_err(|source| ConfError::ValidatorSpawn {
+            bin: program_of(cmd),
+            source,
+        }),
         Err(_) => {
             // DROP ORDERING HERE IS LOAD-BEARING. `child` is owned by the
             // `wait_with_output` future inside the `Timeout` temporary in this
@@ -230,9 +233,20 @@ pub(crate) async fn run_bounded(
             // our group. Keep the `.await` in the scrutinee.
             #[cfg(unix)]
             kill_process_group(pgid);
-            Err(ProbeFailure::TimedOut)
+            Err(ConfError::ValidatorTimeout {
+                bin: program_of(cmd),
+                secs: PROBE_TIMEOUT.as_secs(),
+            })
         }
     }
+}
+
+/// The program `cmd` was constructed with, read back from the command itself
+/// (rather than threaded through as a second parameter) so every error this
+/// function raises names the right binary with no chance of drifting from
+/// what was actually spawned.
+fn program_of(cmd: &tokio::process::Command) -> String {
+    cmd.as_std().get_program().to_string_lossy().into_owned()
 }
 
 /// SIGKILL the timed-out probe's whole process group.
@@ -434,21 +448,12 @@ pub async fn validate_live(
 ) -> Result<ValidationReport, ConfError> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.arg("-e").arg(err_log).arg("-t").arg("-c").arg(conf);
-    match run_bounded(&mut cmd, None).await {
-        Ok(out) => Ok(ValidationReport {
-            // Exit code ONLY — nginx writes to stderr even on success.
-            ok: out.status.success(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        }),
-        Err(ProbeFailure::Io(source)) => Err(ConfError::ValidatorSpawn {
-            bin: bin.display().to_string(),
-            source,
-        }),
-        Err(ProbeFailure::TimedOut) => Err(ConfError::ValidatorTimeout {
-            bin: bin.display().to_string(),
-            secs: PROBE_TIMEOUT.as_secs(),
-        }),
-    }
+    let out = run_bounded(&mut cmd, None).await?;
+    Ok(ValidationReport {
+        // Exit code ONLY — nginx writes to stderr even on success.
+        ok: out.status.success(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    })
 }
 
 // Unix-only: the fakes are `#!/bin/sh` scripts made executable via

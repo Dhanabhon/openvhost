@@ -146,7 +146,7 @@ pub fn mysql_spec(home: &Path, rt: &MysqlRuntime) -> ServiceSpec {
             env: vec![],
         },
         readiness: ReadinessProbe::Command {
-            argv: openvhost_conf::mysqladmin_ping_argv(&rt.mysqladmin, &paths.socket),
+            argv: crate::mysql_admin::mysqladmin_ping_argv(&rt.mysqladmin, &paths.socket),
             deadline: MYSQL_READY_DEADLINE,
         },
         grace: MYSQL_GRACE,

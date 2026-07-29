@@ -3114,7 +3114,7 @@ async fn poll_until_ready(
 ) -> bool {
     let deadline_at = tokio::time::Instant::now() + deadline;
     loop {
-        if openvhost_conf::mysqladmin_ping(mysqladmin, socket).await {
+        if crate::mysql_admin::mysqladmin_ping(mysqladmin, socket).await {
             return true;
         }
         if matches!(server_child.try_wait(), Ok(Some(_))) {
@@ -3374,7 +3374,7 @@ async fn run_mysql_init(
     // those already-spawned readers too — see `SecretCell`'s doc comment.
     let secret = password.expose().to_string();
     *secret_cell.lock().unwrap_or_else(|e| e.into_inner()) = Some(secret.clone());
-    match openvhost_conf::mysql_alter_password_unauthenticated(
+    match crate::mysql_admin::mysql_alter_password_unauthenticated(
         &ctx.runtime.mysql,
         &ctx.paths.init_socket,
         &alter_sql,
@@ -3424,7 +3424,7 @@ async fn run_mysql_init(
         }
     };
     let shutdown_result =
-        openvhost_conf::mysqladmin_shutdown(&ctx.runtime.mysqladmin, &defaults_file.path).await;
+        crate::mysql_admin::mysqladmin_shutdown(&ctx.runtime.mysqladmin, &defaults_file.path).await;
     drop(defaults_file); // RAII delete, before acting on the result.
     match shutdown_result {
         Ok(outcome) if outcome.ok => {}
@@ -3856,9 +3856,12 @@ pub async fn reset_mysql_root_password(
 
     let new_password = openvhost_core::mysql::generate_root_password();
     let sql = openvhost_core::mysql::alter_user_sql(&new_password);
-    let result =
-        openvhost_conf::mysql_exec_with_defaults_file(&runtime.mysql, &defaults_file.path, &sql)
-            .await;
+    let result = crate::mysql_admin::mysql_exec_with_defaults_file(
+        &runtime.mysql,
+        &defaults_file.path,
+        &sql,
+    )
+    .await;
     drop(defaults_file); // RAII delete, before acting on the result.
     // Both secrets are live here: the CURRENT password authenticated the
     // connection (via the just-dropped `defaults_file`), and the NEW one is
@@ -3931,7 +3934,7 @@ pub async fn verify_mysql_connection(
         }
     };
 
-    let result = openvhost_conf::mysql_exec_with_defaults_file(
+    let result = crate::mysql_admin::mysql_exec_with_defaults_file(
         &runtime.mysql,
         &defaults_file.path,
         "SELECT VERSION(), @@port;",
