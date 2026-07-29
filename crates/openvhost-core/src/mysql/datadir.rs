@@ -41,6 +41,12 @@ pub struct MysqlPaths {
     /// `<home>/run/mysql-<major>-init.sock` — the network-less temp server
     /// used only during staged init (spec D2 step 2).
     pub init_socket: PathBuf,
+    /// `<home>/run/mysql-<major>.pid` — mysqld's `pid-file` (spec D5's
+    /// `my.cnf` template; `openvhost_conf::MysqlCtx::pid_file` mirrors this
+    /// field, copied over field-by-field by the command layer). Lives
+    /// alongside [`Self::socket`]/[`Self::init_socket`] in the same
+    /// user-only `run` directory nginx's own pid file already uses.
+    pub pid_file: PathBuf,
     /// `<home>/config/custom/mysql/<major>/conf.d` — the user's own
     /// `!includedir`, never written by this app.
     pub custom_confd: PathBuf,
@@ -84,6 +90,7 @@ fn guard_socket_path(path: &Path) -> Result<(), CoreError> {
 /// before using either socket path.
 pub fn mysql_paths(home: &Path, major: &MysqlMajor) -> MysqlPaths {
     let data_root = home.join("data").join("mysql");
+    let run_root = home.join("run");
     let major_str = major.as_str();
     MysqlPaths {
         datadir: data_root.join(major_str),
@@ -93,10 +100,9 @@ pub fn mysql_paths(home: &Path, major: &MysqlMajor) -> MysqlPaths {
             .join("mysql")
             .join(major_str)
             .join("my.cnf"),
-        socket: home.join("run").join(format!("mysql-{major_str}.sock")),
-        init_socket: home
-            .join("run")
-            .join(format!("mysql-{major_str}-init.sock")),
+        socket: run_root.join(format!("mysql-{major_str}.sock")),
+        init_socket: run_root.join(format!("mysql-{major_str}-init.sock")),
+        pid_file: run_root.join(format!("mysql-{major_str}.pid")),
         custom_confd: home
             .join("config")
             .join("custom")
@@ -113,6 +119,18 @@ pub fn mysql_paths(home: &Path, major: &MysqlMajor) -> MysqlPaths {
 /// could easily have just one).
 const SENTINEL_DIR: &str = "mysql";
 const SENTINEL_FILE: &str = "auto.cnf";
+
+/// The ONLY directory entry [`classify_datadir`] ignores outright — nothing
+/// broader (amendment to spec D2). macOS Finder writes this file into
+/// almost any directory it has ever displayed, including one nobody has
+/// intentionally put content into: without this exemption, a final datadir
+/// nobody has touched but Finder has merely *looked at* would classify as
+/// [`DatadirState::Foreign`] and incorrectly block a legitimate init.
+/// `crate::mysql::finalize_staging` (init.rs) has the other half of this
+/// story — the OS's `rename(2)` still requires the destination directory to
+/// be genuinely empty, so ignoring this entry in classification is not
+/// enough on its own; finalize must also delete it before renaming.
+pub(crate) const DS_STORE: &str = ".DS_Store";
 
 /// What a datadir directory actually contains, established the ONE way spec
 /// D2 allows: by reading the filesystem. Never a state.db boolean — a
@@ -135,7 +153,10 @@ pub enum DatadirState {
 /// Classify `dir` by reading it — see [`DatadirState`]. A missing directory
 /// is [`DatadirState::NotInitialized`], not an error: the datadir may not
 /// have been provisioned yet (mirrors `home::dir_size_no_follow`'s identical
-/// "missing root is not fatal" convention).
+/// "missing root is not fatal" convention). [`DS_STORE`] entries are ignored
+/// outright (never pushed to the offender list, never treated as evidence
+/// of anything) — a directory containing only that file classifies exactly
+/// like an empty one.
 pub fn classify_datadir(dir: &Path) -> io::Result<DatadirState> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -149,6 +170,9 @@ pub fn classify_datadir(dir: &Path) -> io::Result<DatadirState> {
     for entry in entries {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
+        if name == DS_STORE {
+            continue; // macOS Finder clutter — never counts toward classification
+        }
         let file_type = entry.file_type()?;
         if name == SENTINEL_DIR && file_type.is_dir() {
             has_sentinel_dir = true;
@@ -183,7 +207,12 @@ pub fn classify_datadir(dir: &Path) -> io::Result<DatadirState> {
 /// regex a second time — and deliberately does NOT go through
 /// [`MysqlMajor::parse`]: a stale leftover for a major this build no longer
 /// offers must still be recognized and swept.
-fn is_stale_staging_name(name: &str) -> bool {
+///
+/// `pub(crate)`, not private: `crate::mysql::remove_staging_dir` (init.rs)
+/// reuses this exact shape check before deleting a specific staging
+/// directory, rather than re-implementing it — the two call sites must
+/// never be able to drift to different definitions of "staging-shaped".
+pub(crate) fn is_stale_staging_name(name: &str) -> bool {
     let Some(rest) = name.strip_prefix('.') else {
         return false;
     };
@@ -311,6 +340,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_ds_store_only_directory_is_not_initialized() {
+        // Amendment: Finder can write `.DS_Store` into a directory nobody
+        // has put real content into yet — that must still read as
+        // NotInitialized, not Foreign, or a legitimate init would be
+        // blocked from ever starting.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".DS_Store"), b"binary-plist-ish").unwrap();
+        assert_eq!(
+            classify_datadir(tmp.path()).unwrap(),
+            DatadirState::NotInitialized
+        );
+    }
+
+    #[test]
+    fn ds_store_alongside_a_stray_file_is_still_foreign() {
+        // Vacuity for "nothing broader": .DS_Store must not mask a
+        // genuinely foreign directory just because it's also present.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".DS_Store"), b"x").unwrap();
+        std::fs::write(tmp.path().join("some-note.txt"), b"hi").unwrap();
+        match classify_datadir(tmp.path()).unwrap() {
+            DatadirState::Foreign { detail } => {
+                assert!(detail.contains("some-note.txt"), "detail: {detail}");
+                assert!(
+                    !detail.contains(".DS_Store"),
+                    "the ignored entry must not even appear in the offender list: {detail}"
+                );
+            }
+            other => panic!("expected Foreign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ds_store_alongside_both_sentinels_is_still_initialized() {
+        // Clutter must not break the normal, already-initialized case either.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".DS_Store"), b"x").unwrap();
+        std::fs::create_dir(tmp.path().join("mysql")).unwrap();
+        std::fs::write(tmp.path().join("auto.cnf"), b"[auto]\n").unwrap();
+        assert_eq!(
+            classify_datadir(tmp.path()).unwrap(),
+            DatadirState::Initialized
+        );
+    }
+
     // ---- sweep_stale_staging ----
 
     #[test]
@@ -420,11 +495,23 @@ mod tests {
             paths.init_socket,
             PathBuf::from("/tmp/ovh/run/mysql-8.4-init.sock")
         );
+        assert_eq!(paths.pid_file, PathBuf::from("/tmp/ovh/run/mysql-8.4.pid"));
         assert_eq!(
             paths.custom_confd,
             PathBuf::from("/tmp/ovh/config/custom/mysql/8.4/conf.d")
         );
         assert_eq!(paths.staging_parent, PathBuf::from("/tmp/ovh/data/mysql"));
+    }
+
+    #[test]
+    fn pid_file_lives_in_run_alongside_the_sockets() {
+        // openvhost-conf's MysqlCtx.pid_file mirrors this field, and its own
+        // fixture already assumes `<home>/run/mysql-<major>.pid`.
+        let home = PathBuf::from("/tmp/ovh");
+        let major = MysqlMajor::parse("8.4").unwrap();
+        let paths = mysql_paths(&home, &major);
+        assert_eq!(paths.pid_file, PathBuf::from("/tmp/ovh/run/mysql-8.4.pid"));
+        assert_eq!(paths.pid_file.parent(), paths.socket.parent());
     }
 
     #[test]

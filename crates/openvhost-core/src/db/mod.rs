@@ -92,6 +92,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn in_memory_db_runs_the_mysql_instances_migration() {
+        let db = Db::open_in_memory().await.unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM mysql_instances")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
     async fn open_is_idempotent_on_the_same_file() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
