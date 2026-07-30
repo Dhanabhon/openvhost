@@ -9,16 +9,17 @@
 
 	// Defaults to 'sites', which is what `/` renders (routes/+page.svelte) — so the landing
 	// page needs no `active` of its own, and a new route that forgets the prop highlights the
-	// rail's default destination rather than an unrelated one. Services, Web server and
-	// Languages pass it explicitly (routes/services/+page.svelte, routes/web-server/+page.svelte,
-	// routes/languages/+page.svelte). Keep this union and default in step with Rail.svelte's own.
+	// rail's default destination rather than an unrelated one. Services, Web server, Languages
+	// and Databases pass it explicitly (routes/services/+page.svelte, routes/web-server/+page.svelte,
+	// routes/languages/+page.svelte, routes/databases/+page.svelte). Keep this union and default
+	// in step with Rail.svelte's own.
 	let {
 		runningCount,
 		active = 'sites',
 		children
 	}: {
 		runningCount: number;
-		active?: 'services' | 'sites' | 'web-server' | 'languages';
+		active?: 'services' | 'sites' | 'web-server' | 'languages' | 'databases';
 		children: import('svelte').Snippet;
 	} = $props();
 </script>
