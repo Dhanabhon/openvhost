@@ -876,15 +876,43 @@ mod tests {
     }
 
     /// Spec D5's privacy guarantee, asserted as an explicit ABSENCE — not
-    /// merely that `$uri` is present. `$request` (the whole request line)
-    /// and `$request_uri`/`$args` (the raw query string) would all leak a
-    /// `?token=…`/`?api_key=…` into a file the UI renders and users
-    /// screenshot; `$uri` never does, by construction. `$request_method`
+    /// merely that `$uri` is present. This is the CLOSED set of nginx
+    /// variables that can expose the raw request line or the query string,
+    /// each considered deliberately rather than typed from memory:
+    /// - `$request` — the whole request line (bare-token checked below,
+    ///   see why).
+    /// - `$request_uri` — path + query string as originally received.
+    /// - `$args` — the query string alone.
+    /// - `$query_string` — nginx documents this as an EXACT alias of
+    ///   `$args`. A review caught this one missing: it would have passed
+    ///   every assertion here while silently defeating the guarantee, which
+    ///   is exactly the class of regression this test exists to catch.
+    /// - `$arg_<name>` (dynamic family, e.g. `$arg_token`) — extracts ONE
+    ///   named query parameter. Not an alias of `$args`, but it leaks
+    ///   exactly the class of value spec D5 exists to keep out (arguably
+    ///   the MORE likely real mistake: a future edit reaching for "just
+    ///   this one useful id" rather than the whole query string). Checked
+    ///   as the literal prefix `$arg_`, which cannot collide with any
+    ///   wanted variable here (none contain that substring).
+    ///
+    /// `$uri` never leaks a query string, by construction. `$request_method`
     /// legitimately CONTAINS the substring `$request`, so a naive
     /// `!contains("$request")` would reject the very field this format is
     /// required to carry — `contains_bare_variable` checks `$request` as
     /// its own token instead, so this assertion cannot vacuously pass by
     /// rejecting a correct implementation.
+    ///
+    /// Considered and deliberately NOT included: `$http_referer` (a
+    /// PREVIOUS page's URL, arriving via a request HEADER rather than this
+    /// request's own request line/query — a real but categorically
+    /// different leak, and one this format does not reference at all);
+    /// `$cookie_<name>`/`$http_<name>` (session/auth data via headers, same
+    /// "different data class, not in this format" reasoning). Folding every
+    /// sensitive nginx variable into this test would blur what it is
+    /// actually pinning (spec D5's specific "no query string" call); a
+    /// header- or cookie-borne leak deserves its own dedicated design
+    /// discussion if one is ever proposed here, not silent coverage inside
+    /// this one.
     #[test]
     fn the_log_format_never_carries_the_full_request_line_or_the_raw_query_string() {
         let c = main_conf();
@@ -897,7 +925,7 @@ mod tests {
             "log_format must never reference the bare $request variable (the full \
              request line, including the query string): {log_format_line:?}"
         );
-        for forbidden in ["$request_uri", "$args"] {
+        for forbidden in ["$request_uri", "$args", "$query_string", "$arg_"] {
             assert!(
                 !log_format_line.contains(forbidden),
                 "log_format must never reference {forbidden:?} (query-string leak): \
