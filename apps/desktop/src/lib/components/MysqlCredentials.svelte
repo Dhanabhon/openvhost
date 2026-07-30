@@ -19,6 +19,7 @@
 		socketPath,
 		user = 'root',
 		password,
+		revealed = false,
 		revealing = false,
 		passwordError = '',
 		confirmingReset = false,
@@ -41,13 +42,23 @@
 		port?: number;
 		socketPath: string;
 		user?: string;
-		/** `undefined` = masked (never fetched, or forgotten via Hide) —
-		 *  MANDATORY (spec D3/D6): this component renders the fixed masked
-		 *  placeholder whenever this is `undefined`, regardless of any other
-		 *  prop, and the real value only ever arrives here via
-		 *  `DatabasesStore.reveal()`/`copyPassword()`, both explicit user
-		 *  actions. NEVER fetched by this component itself. */
+		/** The cached value once fetched — `undefined` before any fetch. NOT
+		 *  the display gate on its own (see `revealed`): `copyPassword()`
+		 *  fetches into this SAME cache without ever revealing on screen, so a
+		 *  defined `password` alone must never be read as "show it". The real
+		 *  value only ever arrives here via `DatabasesStore.reveal()`/
+		 *  `copyPassword()`, both explicit user actions — NEVER fetched by
+		 *  this component itself. */
 		password?: string;
+		/** The DISPLAY gate — MANDATORY (spec D3/D6, review fix): whether the
+		 *  field currently shows `password` in plaintext. Set ONLY by an
+		 *  explicit Reveal action (`DatabasesStore.reveal`), cleared ONLY by
+		 *  Hide (`forgetPassword`). Deliberately INDEPENDENT of whether
+		 *  `password` is cached — a Copy click populates the cache (so the
+		 *  clipboard write has a value) but must NEVER flip this, or Copy
+		 *  would silently un-mask the field on screen (e.g. during a screen
+		 *  share) even though the user asked only to copy it. */
+		revealed?: boolean;
 		revealing?: boolean;
 		passwordError?: string;
 		confirmingReset?: boolean;
@@ -57,13 +68,14 @@
 		verifying?: boolean;
 		verifyResult?: MysqlConnectionProofDto;
 		verifyError?: string;
-		/** Reveal/Hide toggle: fetch-if-needed then show, or forget the cached
-		 *  value — wired to `DatabasesStore.reveal`/`forgetPassword`. */
+		/** Reveal/Hide toggle: fetch-if-needed then turn `revealed` on, or
+		 *  forget the cached value and turn `revealed` off — wired to
+		 *  `DatabasesStore.reveal`/`forgetPassword`. */
 		onReveal: () => void;
 		onHide: () => void;
 		/** Fetch-if-needed then copy to the clipboard — does NOT itself flip
-		 *  the field to plaintext (spec D6: Reveal and Copy are separate
-		 *  affordances). */
+		 *  `revealed` (spec D6 MANDATORY: Reveal and Copy are separate
+		 *  affordances, and Copy must never un-mask the on-screen field). */
 		onCopyPassword: () => void;
 		onRequestReset: () => void;
 		onCancelReset: () => void;
@@ -71,7 +83,11 @@
 		onVerify: () => void;
 	} = $props();
 
-	const isRevealed = $derived(password !== undefined);
+	/** Both signals must agree: `revealed` is the user's ask, `password !==
+	 *  undefined` is a defensive floor so a `revealed: true` with nothing yet
+	 *  cached (a race, or a caller bug) can never try to render `undefined`
+	 *  as plaintext. */
+	const isRevealed = $derived(revealed && password !== undefined);
 	const displayValue = $derived(isRevealed ? password : MASKED_PASSWORD_PLACEHOLDER);
 </script>
 

@@ -61,10 +61,12 @@
 	/** Fetch-if-needed then write to the clipboard — the store owns the
 	 *  fetch-and-cache half (spec D3/D6: never fetched eagerly), this page
 	 *  owns the browser-API half (see `MysqlCredentials.svelte`'s own note on
-	 *  why that split exists). */
+	 *  why that split exists). Review fix (MANDATORY): calls
+	 *  `store.copyPassword`, NOT `store.reveal` — the latter also turns the
+	 *  on-screen display gate on, and Copy must never un-mask the field (a
+	 *  screen-share is exactly the scenario this avoids). */
 	async function onCopyPassword(major: string): Promise<void> {
-		await store.reveal(major);
-		const password = store.passwords[major];
+		const password = await store.copyPassword(major);
 		if (password !== undefined) await copyToClipboard(password);
 	}
 
@@ -174,6 +176,7 @@
 								? null
 								: (servicesStore.services.find((s) => s.id === instance.serviceId)?.state ?? null)}
 							password={store.passwords[instance.major]}
+							revealed={store.revealed[instance.major] ?? false}
 							revealing={store.revealing[instance.major] ?? false}
 							passwordError={store.passwordError[instance.major] ?? ''}
 							resetting={store.resetting[instance.major] ?? false}

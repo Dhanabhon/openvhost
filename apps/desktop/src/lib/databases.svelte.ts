@@ -2,7 +2,7 @@
 // State for the Databases page: the MySQL environment snapshot, the one
 // install/init that may be running (they share one InstallLock, spec D7, so
 // at most one of `installing`/`initializing` is ever non-'' at a time), their
-// live logs, revealed root passwords (fetched ONLY on demand — spec D3/D6
+// live logs, cached root passwords (fetched ONLY on demand — spec D3/D6
 // MANDATORY: never eagerly), and the per-major outcome of the last
 // reset/verify attempt.
 //
@@ -14,6 +14,12 @@
 // "drop the previous verdict as the run STARTS" discipline — a fresh red
 // beside a stale green from an earlier click is the exact bug that
 // discipline exists to prevent.
+//
+// Review fix: `passwords` (cache presence) and `revealed` (the on-screen
+// display gate) are deliberately TWO separate dictionaries. `reveal()` sets
+// both; `copyPassword()` — Copy — only ever touches the cache, never the
+// gate, so a Copy click can never silently un-mask the field (see
+// `revealed`'s own doc comment for the screen-share scenario this fixes).
 import { errorMessage } from './errors';
 import { anyMysqlInstalled, type MysqlInitFailure, type UiLog } from './databases.derive';
 import type {
@@ -70,12 +76,27 @@ export class DatabasesStore {
 	 *  to `mysqlRowState` via {@link initFailureFor}. */
 	initOutcome = $state<{ major: string; outcome: MysqlInitOutcomeDto } | null>(null);
 
-	/** Revealed root passwords, keyed by major. MANDATORY (spec D3/D6): never
-	 *  populated except by an explicit {@link reveal} call — never on mount,
-	 *  never as a side effect of `refresh`/`rescan`/`install`/`initialize`. */
+	/** Cached root passwords, keyed by major. MANDATORY (spec D3/D6): never
+	 *  populated except by an explicit {@link reveal}/{@link copyPassword}
+	 *  call — never on mount, never as a side effect of
+	 *  `refresh`/`rescan`/`install`/`initialize`. NOT the display gate — see
+	 *  {@link revealed}. A defined `passwords[major]` means "fetched and
+	 *  cached", nothing about whether it should currently be shown in
+	 *  plaintext. */
 	passwords = $state<Record<string, string>>({});
 	passwordError = $state<Record<string, string>>({});
 	revealing = $state<Record<string, boolean>>({});
+	/**
+	 * The DISPLAY gate, keyed by major — true ONLY after an explicit
+	 * {@link reveal} call, cleared by {@link forgetPassword} (Hide). Review
+	 * fix: this used to not exist at all, and `MysqlCredentials.svelte` masked
+	 * purely on `passwords[major] !== undefined` — so `copyPassword()`
+	 * fetching into the SAME cache silently un-masked the field on a Copy
+	 * click with no Reveal ever pressed (a screen-share hazard). Kept
+	 * deliberately separate from `passwords` so a cache hit alone can never
+	 * flip the UI to plaintext.
+	 */
+	revealed = $state<Record<string, boolean>>({});
 
 	resetting = $state<Record<string, boolean>>({});
 	resetOutcome = $state<Record<string, MysqlResetOutcomeDto>>({});
@@ -219,34 +240,67 @@ export class DatabasesStore {
 
 	/**
 	 * Fetch and cache `major`'s root password, UNLESS it is already cached —
-	 * the Reveal/Copy affordance's one and only path to the real value (spec
-	 * D3/D6 MANDATORY: never fetched eagerly). Idempotent by design, so both
-	 * Reveal and Copy can call this without doubling the IPC round trip once
-	 * the value is already on screen.
+	 * the ONE place either {@link reveal} or {@link copyPassword} reaches the
+	 * real value (spec D3/D6 MANDATORY: never fetched eagerly). Idempotent by
+	 * design, so both callers share one IPC round trip once the value is
+	 * already cached. Deliberately does NOT touch {@link revealed}: that is
+	 * the caller's decision, not this fetch's — see the two public methods
+	 * below.
 	 */
-	async reveal(major: string): Promise<void> {
-		if (this.passwords[major] !== undefined) return;
+	private async ensurePassword(major: string): Promise<string | undefined> {
+		if (this.passwords[major] !== undefined) return this.passwords[major];
 		this.passwordError = { ...this.passwordError, [major]: '' };
 		this.revealing = { ...this.revealing, [major]: true };
 		try {
 			const password = await this.api.mysqlRootPassword(major);
 			this.passwords = { ...this.passwords, [major]: password };
+			return password;
 		} catch (e) {
 			this.passwordError = { ...this.passwordError, [major]: errorMessage(e) };
+			return undefined;
 		} finally {
 			this.revealing = { ...this.revealing, [major]: false };
 		}
 	}
 
 	/**
-	 * Drops a cached password from memory — the "Hide" control's dismiss/clear
-	 * action, never an IPC call. Also used by {@link resetPassword} to
-	 * invalidate a now-stale cached value the instant a reset starts. A no-op,
-	 * not an error, when nothing was cached.
+	 * The Reveal button: fetch-if-needed via {@link ensurePassword}, then turn
+	 * the display gate ON — the only method that ever does. Never flips the
+	 * gate on a failed fetch (nothing to reveal).
+	 */
+	async reveal(major: string): Promise<void> {
+		const password = await this.ensurePassword(major);
+		if (password !== undefined) {
+			this.revealed = { ...this.revealed, [major]: true };
+		}
+	}
+
+	/**
+	 * The Copy button: fetch-if-needed via the SAME {@link ensurePassword}
+	 * cache Reveal uses, returning the value for the caller to write to the
+	 * clipboard. Review fix (MANDATORY): deliberately does NOT touch
+	 * {@link revealed} — Copy must never un-mask the on-screen field (a
+	 * screen-share is exactly the scenario this protects), even though it
+	 * fetches and caches the identical secret Reveal does.
+	 */
+	async copyPassword(major: string): Promise<string | undefined> {
+		return this.ensurePassword(major);
+	}
+
+	/**
+	 * Drops a cached password AND turns the display gate off — the "Hide"
+	 * control's dismiss/clear action, never an IPC call. Also used by
+	 * {@link resetPassword} to invalidate a now-stale cached value (and
+	 * un-reveal it) the instant a reset starts. A no-op, not an error, when
+	 * nothing was cached or revealed.
 	 */
 	forgetPassword(major: string): void {
-		if (this.passwords[major] === undefined) return;
-		this.passwords = withoutKey(this.passwords, major);
+		if (this.passwords[major] !== undefined) {
+			this.passwords = withoutKey(this.passwords, major);
+		}
+		if (this.revealed[major]) {
+			this.revealed = withoutKey(this.revealed, major);
+		}
 	}
 
 	/**

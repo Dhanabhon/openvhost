@@ -43,6 +43,7 @@ function renderRow(
 		catalogedMajorsList: string[];
 		serviceState: ServiceStatus['state'] | null;
 		password?: string;
+		revealed: boolean;
 		revealing: boolean;
 		passwordError: string;
 		resetting: boolean;
@@ -71,6 +72,7 @@ function renderRow(
 			catalogedMajorsList: props.catalogedMajorsList ?? ['8.4'],
 			serviceState: props.serviceState ?? null,
 			password: props.password,
+			revealed: props.revealed ?? false,
 			revealing: props.revealing ?? false,
 			passwordError: props.passwordError ?? '',
 			resetting: props.resetting ?? false,
@@ -215,6 +217,29 @@ describe('MysqlRow — ready', () => {
 		expect(body).toContain('data-testid="mysql-credentials-8.4"');
 		expect(body).toContain('/Users/x/.openvhost/run/mysql-8.4.sock');
 		expect(body).toContain('data-testid="verify-connection-8.4"');
+	});
+
+	// Review fix, pinned at the wiring layer too (MysqlCredentials.svelte.test.ts
+	// pins the component's own logic in isolation): a cached password with the
+	// display gate off must stay masked even once threaded through the row.
+	it('keeps the password masked when cached but not revealed, even through the row', () => {
+		const body = renderRow({
+			instance: ready,
+			password: 'not-a-real-password',
+			revealed: false
+		});
+		expect(body).not.toContain('not-a-real-password');
+		expect(body).toContain('type="password"');
+	});
+
+	it('shows the password only once both cached and revealed, threaded through the row', () => {
+		const body = renderRow({
+			instance: ready,
+			password: 'not-a-real-password',
+			revealed: true
+		});
+		expect(body).toContain('not-a-real-password');
+		expect(body).toContain('type="text"');
 	});
 
 	it('offers Start when stopped, Stop when running, Retry when failed', () => {

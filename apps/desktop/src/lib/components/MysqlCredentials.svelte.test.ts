@@ -32,6 +32,7 @@ function renderCredentials(
 		major: string;
 		socketPath: string;
 		password?: string;
+		revealed: boolean;
 		revealing: boolean;
 		passwordError: string;
 		confirmingReset: boolean;
@@ -48,6 +49,7 @@ function renderCredentials(
 			major: props.major ?? '8.4',
 			socketPath: props.socketPath ?? '/Users/x/.openvhost/run/mysql-8.4.sock',
 			password: props.password,
+			revealed: props.revealed ?? false,
 			revealing: props.revealing ?? false,
 			passwordError: props.passwordError ?? '',
 			confirmingReset: props.confirmingReset ?? false,
@@ -95,15 +97,38 @@ describe('MysqlCredentials — password field (masked by default)', () => {
 		expect(body).not.toContain(FAKE_REVEALED);
 	});
 
-	it('switches to the real value and a text input once a password is supplied', () => {
-		const body = renderCredentials({ password: FAKE_REVEALED });
+	it('switches to the real value and a text input once revealed=true AND a password is supplied', () => {
+		const body = renderCredentials({ password: FAKE_REVEALED, revealed: true });
 		expect(body).toContain(FAKE_REVEALED);
 		expect(body).toContain('type="text"');
 	});
 
+	// Review fix (the actual regression this task shipped and a reviewer
+	// caught): masking must be gated SOLELY by `revealed`, never by
+	// `password !== undefined` alone. `DatabasesStore.copyPassword()` fetches
+	// and caches the very same value `reveal()` does — so if the component
+	// treated a defined `password` as "show it", a Copy click (which never
+	// sets the display gate) would still silently un-mask the field the
+	// instant its cache-fill resolved. Screen-share scenario: user clicks
+	// Copy meaning clipboard-only, and the root password renders in
+	// cleartext on the shared screen.
+	it('stays masked when a password IS cached but revealed is false — the exact Copy-without-Reveal case', () => {
+		const body = renderCredentials({ password: FAKE_REVEALED, revealed: false });
+		expect(body).not.toContain(FAKE_REVEALED);
+		expect(body).toMatch(/value="[•]+"/);
+		expect(body).toContain('type="password"');
+		expect(body).toMatch(/>\s*Reveal\s*</);
+		expect(body).not.toMatch(/>\s*Hide\s*</);
+	});
+
 	it('offers Reveal when masked and Hide once revealed', () => {
-		expect(renderCredentials({ password: undefined })).toMatch(/>\s*Reveal\s*</);
-		expect(renderCredentials({ password: FAKE_REVEALED })).toMatch(/>\s*Hide\s*</);
+		expect(renderCredentials({ password: undefined, revealed: false })).toMatch(/>\s*Reveal\s*</);
+		expect(renderCredentials({ password: FAKE_REVEALED, revealed: true })).toMatch(/>\s*Hide\s*</);
+	});
+
+	it('never shows Hide while revealed is false, even with a password cached (Copy must not relabel the toggle)', () => {
+		const body = renderCredentials({ password: FAKE_REVEALED, revealed: false });
+		expect(body).not.toMatch(/>\s*Hide\s*</);
 	});
 
 	it('disables Reveal/Copy while a reveal is in flight', () => {

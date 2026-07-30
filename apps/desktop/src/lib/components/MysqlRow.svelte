@@ -35,6 +35,7 @@
 		catalogedMajorsList,
 		serviceState,
 		password,
+		revealed,
 		revealing,
 		passwordError,
 		resetting,
@@ -91,9 +92,15 @@
 		 *  installed, or installed but not yet Initialized — `instance.serviceId`
 		 *  is `null` in both cases, spec D6). */
 		serviceState: ServiceStatus['state'] | null;
-		/** `undefined` = masked. See `MysqlCredentials.svelte`'s identical prop —
-		 *  threaded straight through, never read or branched on here. */
+		/** The cached value, once fetched. See `MysqlCredentials.svelte`'s
+		 *  identical prop — threaded straight through, never read or branched
+		 *  on here. NOT the display gate; see `revealed`. */
 		password?: string;
+		/** The DISPLAY gate — see `MysqlCredentials.svelte`'s identical prop
+		 *  (review fix: separate from `password`'s mere cache presence, so a
+		 *  Copy click can never silently un-mask the field). Threaded straight
+		 *  through, never read or branched on here. */
+		revealed: boolean;
 		revealing: boolean;
 		passwordError: string;
 		resetting: boolean;
@@ -343,6 +350,7 @@
 			major={instance.major}
 			socketPath={instance.socketPath ?? ''}
 			{password}
+			{revealed}
 			{revealing}
 			{passwordError}
 			{confirmingReset}

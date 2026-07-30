@@ -389,6 +389,53 @@ describe('DatabasesStore — password reveal (never fetched eagerly)', () => {
 		expect(() => s.forgetPassword('8.4')).not.toThrow();
 		expect(s.passwords['8.4']).toBeUndefined();
 	});
+
+	// Review fix: Copy must never un-mask the field on screen (a screen-share
+	// scenario is exactly why) — it fetches/caches the SAME value Reveal does,
+	// but must leave the separate display gate (`revealed`) untouched. Before
+	// this fix there was no such gate at all: masking derived solely from
+	// `passwords[major] !== undefined`, so calling the same cache-fill for
+	// Copy silently flipped the field to plaintext.
+	it('copyPassword yields the value without ever turning on the display gate', async () => {
+		const rootPassword = vi.fn(async () => FAKE_REVEALED);
+		const s = new DatabasesStore(api({ mysqlRootPassword: rootPassword }));
+		expect(s.revealed['8.4']).not.toBe(true);
+		const value = await s.copyPassword('8.4');
+		expect(value).toBe(FAKE_REVEALED);
+		expect(s.passwords['8.4']).toBe(FAKE_REVEALED);
+		expect(s.revealed['8.4']).not.toBe(true);
+		expect(rootPassword).toHaveBeenCalledTimes(1);
+	});
+
+	it('reveal() turns the display gate on; forgetPassword() (Hide) turns it back off', async () => {
+		const s = new DatabasesStore(api({ mysqlRootPassword: vi.fn(async () => FAKE_REVEALED) }));
+		await s.reveal('8.4');
+		expect(s.revealed['8.4']).toBe(true);
+		s.forgetPassword('8.4');
+		expect(s.revealed['8.4']).not.toBe(true);
+	});
+
+	it('reveal() after a prior copyPassword() reuses the cache and still turns the gate on', async () => {
+		const rootPassword = vi.fn(async () => FAKE_REVEALED);
+		const s = new DatabasesStore(api({ mysqlRootPassword: rootPassword }));
+		await s.copyPassword('8.4');
+		expect(s.revealed['8.4']).not.toBe(true);
+		await s.reveal('8.4');
+		expect(s.revealed['8.4']).toBe(true);
+		expect(rootPassword).toHaveBeenCalledTimes(1); // shared cache, no re-fetch
+	});
+
+	it('does not turn the display gate on when reveal() itself fails to fetch', async () => {
+		const s = new DatabasesStore(
+			api({
+				mysqlRootPassword: vi.fn(async () => {
+					throw { kind: 'core', message: 'no stored root password' };
+				})
+			})
+		);
+		await s.reveal('8.4');
+		expect(s.revealed['8.4']).not.toBe(true);
+	});
 });
 
 describe('DatabasesStore — reset password', () => {
