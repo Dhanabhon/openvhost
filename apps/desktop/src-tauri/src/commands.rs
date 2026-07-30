@@ -3117,20 +3117,29 @@ async fn drain_and_forward(stream: openvhost_proc::OutputStream, log: InitLogSin
     }
 }
 
-/// `mysqld --no-defaults --initialize-insecure --datadir=<staging>` (spec D2
-/// step 1) — built via `OsString`, not `format!` + `.display()`, for the
-/// same non-lossy-path reason `MysqlValidator::validate` gives.
+/// `mysqld --no-defaults --initialize-insecure --datadir=<staging>
+/// --mysqlx=OFF` (spec D2 step 1) — built via `OsString`, not `format!` +
+/// `.display()`, for the same non-lossy-path reason `MysqlValidator::validate`
+/// gives.
 ///
 /// `--no-defaults` is deliberate containment, kept on its own merits — NOT a
 /// fix for a datadir-mismatch bug, which does not exist (an earlier fix wave
 /// claimed combining `--defaults-file=<my_cnf>` with argv `--datadir=<staging>`
 /// corrupted InnoDB's undo-tablespace bookkeeping; that diagnosis was WRONG,
 /// a misdiagnosis of the leading-dot bug below, and is retracted — see spec
-/// D2's dated correction note for the full, corrected history). This step
-/// needs no my.cnf setting at all, since every path it cares about is
-/// already explicit argv; `--no-defaults` additionally makes it ignore any
-/// machine-wide option file (e.g. `/etc/my.cnf`) during the insecure init
-/// window, which is worth keeping regardless.
+/// D2's dated correction note for the full, corrected history). A SEPARATE
+/// earlier claim — that `--no-defaults` gains exclusion of machine-wide
+/// option files (`/etc/my.cnf`, `~/.my.cnf`) — was ALSO wrong:
+/// `--defaults-file=<path>` already excludes those on its own. The genuine
+/// gain: the rendered my.cnf ends with `!includedir <custom_confd>`, so
+/// under `--defaults-file` this step would read whatever the USER has
+/// dropped into that directory — arbitrary user-controlled configuration
+/// reaching the init sequence. `--no-defaults` removes all of it.
+///
+/// `--mysqlx=OFF`: this step starts no server at all (`--initialize-insecure`
+/// writes the datadir and exits), so there is no listener of any kind here
+/// regardless — added purely for symmetry with [`mysqld_temp_server_spec`]
+/// below, where the identical flag is load-bearing, not decorative.
 fn mysqld_init_spec(mysqld: &Path, staging: &Path) -> openvhost_proc::SpawnSpec {
     let mut datadir_arg = OsString::from("--datadir=");
     datadir_arg.push(staging.as_os_str());
@@ -3140,6 +3149,7 @@ fn mysqld_init_spec(mysqld: &Path, staging: &Path) -> openvhost_proc::SpawnSpec 
             OsString::from("--no-defaults"),
             OsString::from("--initialize-insecure"),
             datadir_arg,
+            OsString::from("--mysqlx=OFF"),
         ],
         cwd: None,
         env: vec![],
@@ -3147,13 +3157,28 @@ fn mysqld_init_spec(mysqld: &Path, staging: &Path) -> openvhost_proc::SpawnSpec 
 }
 
 /// `mysqld --no-defaults --datadir=<staging> --skip-networking
-/// --socket=<init_socket>` (spec D2 step 2) — the network-less temp server.
-/// Same deliberate-containment reasoning as [`mysqld_init_spec`]'s doc
-/// comment above — `--no-defaults` is kept on its own merits, not as a fix
-/// for the retracted datadir-mismatch misdiagnosis (see spec D2's dated
-/// correction note). This step's real failure mode, confirmed live and
-/// unrelated to `--defaults-file`, was a datadir basename starting with a
-/// dot — fixed in `openvhost_core::mysql::staging_dir_path`.
+/// --socket=<init_socket> --mysqlx=OFF` (spec D2 step 2) — the network-less
+/// temp server. Same deliberate-containment reasoning for `--no-defaults` as
+/// [`mysqld_init_spec`]'s doc comment above (kept on its own merits, not as a
+/// fix for the retracted datadir-mismatch misdiagnosis — see spec D2's dated
+/// correction note). This step's real STARTUP failure mode, confirmed live
+/// and unrelated to `--defaults-file`, was a datadir basename starting with
+/// a dot — fixed in `openvhost_core::mysql::staging_dir_path`.
+///
+/// `--mysqlx=OFF` is LOAD-BEARING here, not decorative — do not "simplify"
+/// it away. Measured directly against real mysql@8.4.11: with this flag
+/// absent (mysqlx at its default), this exact invocation binds
+/// `/tmp/mysqlx.sock` at mode `srwxrwxrwx` — world read/write, OUTSIDE the
+/// 0700 home this app otherwise confines every socket to — AND `*:33060`.
+/// `--skip-networking` suppresses the CLASSIC protocol's TCP listener only;
+/// it does not touch the X Plugin's listener, unix socket or TCP, at all.
+/// Both are live for the entire window between this server starting and
+/// `SetPassword`'s `ALTER USER` succeeding — i.e. while `root@localhost`
+/// still has the EMPTY password `--initialize-insecure` left it with. Any
+/// local user (not just a network-adjacent one) could connect as root
+/// through that world-writable socket during that window. Adding
+/// `--mysqlx=OFF` was verified, in the same measurement session, to bind no
+/// socket at all.
 fn mysqld_temp_server_spec(
     mysqld: &Path,
     staging: &Path,
@@ -3170,6 +3195,7 @@ fn mysqld_temp_server_spec(
             datadir_arg,
             OsString::from("--skip-networking"),
             socket_arg,
+            OsString::from("--mysqlx=OFF"),
         ],
         cwd: None,
         env: vec![],
@@ -4148,17 +4174,38 @@ mod mysql_ipc_tests {
 
     // ---- argv shape: no --defaults-file pre-finalize ----
     //
-    // `--no-defaults` is deliberate containment on its own merits (ignores
-    // any machine-wide option file, e.g. `/etc/my.cnf`; neither pre-finalize
-    // step needs a my.cnf setting at all, since every path is already
-    // explicit argv) — NOT a fix for a datadir-mismatch bug, which does not
-    // exist. An earlier fix wave claimed combining `--defaults-file=<my.cnf>`
-    // with argv `--datadir=<staging>` corrupted InnoDB's undo-tablespace
-    // bookkeeping; that diagnosis was WRONG (a misdiagnosis of the
-    // leading-dot staging-basename bug, decisively isolated afterward — see
-    // spec D2's dated correction note) and is retracted. These two tests
-    // still pin the argv SHAPE (worth keeping regardless of the retraction),
-    // just not for the reason originally recorded here.
+    // `--no-defaults` is deliberate containment on its own merits — NOT a
+    // fix for a datadir-mismatch bug, which does not exist. An earlier fix
+    // wave claimed combining `--defaults-file=<my.cnf>` with argv
+    // `--datadir=<staging>` corrupted InnoDB's undo-tablespace bookkeeping;
+    // that diagnosis was WRONG (a misdiagnosis of the leading-dot
+    // staging-basename bug, decisively isolated afterward — see spec D2's
+    // dated correction note) and is retracted. A SEPARATE earlier claim in
+    // this same comment — that `--no-defaults` gains exclusion of
+    // machine-wide option files (`/etc/my.cnf`, `~/.my.cnf`) — was ALSO
+    // wrong: `--defaults-file=<path>` already excludes those on its own; that
+    // was never something `--no-defaults` added. The genuine gain: our
+    // rendered my.cnf ends with `!includedir <custom_confd>`, so under
+    // `--defaults-file` both pre-finalize steps read whatever the USER has
+    // dropped into that directory — arbitrary user-controlled configuration
+    // reaching the init sequence while root@localhost still has an EMPTY
+    // password. `--no-defaults` removes ALL of it, user-controlled included.
+    //
+    // Audit finding (security-auditor BLOCK, HIGH): the previous version of
+    // these two tests pinned the ABSENCE of `--defaults-file` without
+    // pinning what explicitly replaced the settings it used to carry — so
+    // dropping `mysqlx=OFF` (which my.cnf carried, silently lost when
+    // `--defaults-file` was removed) slipped through unnoticed. The X
+    // Plugin's default is ON, binding `*:33060` — a listener with no
+    // narrower bind-address of its own, live for the entire window between
+    // temp-server start and `ALTER USER`, i.e. while root@localhost has an
+    // EMPTY password from `--initialize-insecure`. Fixed by adding
+    // `--mysqlx=OFF` explicitly to both specs' argv (redundant but harmless
+    // for `mysqld_init_spec`, which starts no server at all — kept for
+    // symmetry). These four tests now pin BOTH the absence of
+    // `--defaults-file` AND the exact positive argv shape, so a future edit
+    // that silently drops any one flag fails loudly instead of compiling
+    // clean.
 
     #[test]
     fn mysqld_init_spec_carries_no_defaults_file_and_no_defaults_first() {
@@ -4186,6 +4233,34 @@ mod mysql_ipc_tests {
         );
         assert!(
             args.contains(&"--datadir=/tmp/ovh/data/mysql/init-8-4-deadbeef".to_string()),
+            "got {args:?}"
+        );
+        assert!(args.contains(&"--mysqlx=OFF".to_string()), "got {args:?}");
+    }
+
+    /// Exhaustive sibling to the test above (audit-mandated): an EXACT match
+    /// on the whole argv list, not just `.contains()` checks, so a future
+    /// edit that drops (or silently reorders ahead of `--no-defaults`) any
+    /// one of these settings fails loudly rather than compiling clean.
+    #[test]
+    fn mysqld_init_spec_argv_is_exactly_the_required_set() {
+        let spec = mysqld_init_spec(
+            Path::new("/opt/homebrew/opt/mysql@8.4/bin/mysqld"),
+            Path::new("/tmp/ovh/data/mysql/init-8-4-deadbeef"),
+        );
+        let args: Vec<String> = spec
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "--no-defaults".to_string(),
+                "--initialize-insecure".to_string(),
+                "--datadir=/tmp/ovh/data/mysql/init-8-4-deadbeef".to_string(),
+                "--mysqlx=OFF".to_string(),
+            ],
             "got {args:?}"
         );
     }
@@ -4220,7 +4295,44 @@ mod mysql_ipc_tests {
             "got {args:?}"
         );
         assert!(
+            args.contains(&"--mysqlx=OFF".to_string()),
+            "got {args:?} — measured on real mysql@8.4.11: at its default, the X \
+             Plugin binds /tmp/mysqlx.sock at mode srwxrwxrwx (world read/write, \
+             outside the 0700 home) AND *:33060, for the entire window \
+             root@localhost has an empty password; --skip-networking is TCP-only \
+             and does not touch either"
+        );
+        assert!(
             args.contains(&"--socket=/tmp/ovh/run/mysql-8.4-init.sock".to_string()),
+            "got {args:?}"
+        );
+    }
+
+    /// Exhaustive sibling to the test above (audit-mandated): an EXACT match
+    /// on the whole argv list, not just `.contains()` checks, so a future
+    /// edit that drops (or silently reorders ahead of `--no-defaults`) any
+    /// one of these settings fails loudly rather than compiling clean.
+    #[test]
+    fn mysqld_temp_server_spec_argv_is_exactly_the_required_set() {
+        let spec = mysqld_temp_server_spec(
+            Path::new("/opt/homebrew/opt/mysql@8.4/bin/mysqld"),
+            Path::new("/tmp/ovh/data/mysql/init-8-4-deadbeef"),
+            Path::new("/tmp/ovh/run/mysql-8.4-init.sock"),
+        );
+        let args: Vec<String> = spec
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "--no-defaults".to_string(),
+                "--datadir=/tmp/ovh/data/mysql/init-8-4-deadbeef".to_string(),
+                "--skip-networking".to_string(),
+                "--socket=/tmp/ovh/run/mysql-8.4-init.sock".to_string(),
+                "--mysqlx=OFF".to_string(),
+            ],
             "got {args:?}"
         );
     }

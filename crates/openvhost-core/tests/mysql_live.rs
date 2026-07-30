@@ -229,8 +229,8 @@ fn mysqladmin_ping_argv(mysqladmin: &Path, socket: &Path) -> Vec<String> {
     ]
 }
 
-/// `mysqld --no-defaults --initialize-insecure --datadir=<staging>` (spec D2
-/// step 1). Mirrors `commands.rs::mysqld_init_spec`.
+/// `mysqld --no-defaults --initialize-insecure --datadir=<staging>
+/// --mysqlx=OFF` (spec D2 step 1). Mirrors `commands.rs::mysqld_init_spec`.
 ///
 /// `--no-defaults` is deliberate containment, kept on its own merits — NOT a
 /// fix for a datadir-mismatch bug, which does not exist (an earlier fix
@@ -238,10 +238,19 @@ fn mysqladmin_ping_argv(mysqladmin: &Path, socket: &Path) -> Vec<String> {
 /// `--datadir=<staging>` corrupted InnoDB's undo-tablespace bookkeeping;
 /// that diagnosis was WRONG, a misdiagnosis of the leading-dot
 /// staging-basename bug, and is retracted — see spec D2's dated correction
-/// note for the corrected history). This step needs no my.cnf setting at
-/// all, since every path is already explicit argv; `--no-defaults`
-/// additionally makes it ignore any machine-wide option file (e.g.
-/// `/etc/my.cnf`), which is worth keeping regardless.
+/// note for the corrected history). A SEPARATE earlier claim — that
+/// `--no-defaults` gains exclusion of machine-wide option files
+/// (`/etc/my.cnf`, `~/.my.cnf`) — was ALSO wrong: `--defaults-file=<path>`
+/// already excludes those on its own. The genuine gain: the rendered
+/// my.cnf ends with `!includedir <custom_confd>`, so under `--defaults-file`
+/// this step would read whatever the USER has dropped into that directory
+/// — arbitrary user-controlled configuration reaching the init sequence.
+/// `--no-defaults` removes all of it.
+///
+/// `--mysqlx=OFF`: this step starts no server at all (`--initialize-insecure`
+/// writes the datadir and exits), so there is no listener of any kind here
+/// regardless — added purely for symmetry with [`mysqld_temp_server_spec`]
+/// below, where the identical flag is load-bearing, not decorative.
 fn mysqld_init_spec(mysqld: &Path, staging: &Path) -> SpawnSpec {
     let mut datadir_arg = OsString::from("--datadir=");
     datadir_arg.push(staging.as_os_str());
@@ -251,6 +260,7 @@ fn mysqld_init_spec(mysqld: &Path, staging: &Path) -> SpawnSpec {
             OsString::from("--no-defaults"),
             OsString::from("--initialize-insecure"),
             datadir_arg,
+            OsString::from("--mysqlx=OFF"),
         ],
         cwd: None,
         env: vec![],
@@ -258,14 +268,30 @@ fn mysqld_init_spec(mysqld: &Path, staging: &Path) -> SpawnSpec {
 }
 
 /// `mysqld --no-defaults --datadir=<staging> --skip-networking
-/// --socket=<init_socket>` (spec D2 step 2). Mirrors
+/// --socket=<init_socket> --mysqlx=OFF` (spec D2 step 2). Mirrors
 /// `commands.rs::mysqld_temp_server_spec`. Same deliberate-containment
-/// reasoning as [`mysqld_init_spec`] above — this step's REAL failure mode,
-/// confirmed live and unrelated to `--defaults-file`, was a datadir
-/// basename starting with a dot (the fatal InnoDB undo-tablespace error,
-/// "Can't create UNDO tablespace innodb_undo_001 since './undo_001' already
-/// exists", is genuinely what a real mysqld prints for that cause too — see
-/// `staging_dir_path`'s doc comment and spec D2's dated correction note).
+/// reasoning for `--no-defaults` as [`mysqld_init_spec`] above. This step's
+/// real STARTUP failure mode, confirmed live and unrelated to
+/// `--defaults-file`, was a datadir basename starting with a dot (the
+/// fatal InnoDB undo-tablespace error, "Can't create UNDO tablespace
+/// innodb_undo_001 since './undo_001' already exists", is genuinely what a
+/// real mysqld prints for that cause too — see `staging_dir_path`'s doc
+/// comment and spec D2's dated correction note).
+///
+/// `--mysqlx=OFF` is LOAD-BEARING here, not decorative — do not "simplify"
+/// it away. Measured directly against real mysql@8.4.11: with this flag
+/// absent (mysqlx at its default), this exact invocation binds
+/// `/tmp/mysqlx.sock` at mode `srwxrwxrwx` — world read/write, OUTSIDE the
+/// 0700 home this app otherwise confines every socket to — AND `*:33060`.
+/// `--skip-networking` suppresses the CLASSIC protocol's TCP listener only;
+/// it does not touch the X Plugin's listener, unix socket or TCP, at all.
+/// Both are live for the entire window between this server starting and
+/// `SetPassword`'s `ALTER USER` succeeding — i.e. while `root@localhost`
+/// still has the EMPTY password `--initialize-insecure` left it with. Any
+/// local user (not just a network-adjacent one) could connect as root
+/// through that world-writable socket during that window. Adding
+/// `--mysqlx=OFF` was verified, in the same measurement session, to bind no
+/// socket at all.
 fn mysqld_temp_server_spec(mysqld: &Path, staging: &Path, init_socket: &Path) -> SpawnSpec {
     let mut datadir_arg = OsString::from("--datadir=");
     datadir_arg.push(staging.as_os_str());
@@ -276,6 +302,7 @@ fn mysqld_temp_server_spec(mysqld: &Path, staging: &Path, init_socket: &Path) ->
             datadir_arg,
             OsString::from("--skip-networking"),
             socket_arg(init_socket),
+            OsString::from("--mysqlx=OFF"),
         ],
         cwd: None,
         env: vec![],
