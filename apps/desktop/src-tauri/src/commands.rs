@@ -7181,10 +7181,27 @@ mod log_ipc_tests {
     // resolve straight to a `LogPaths`-derived path, and `read_window` would
     // report `exists: false` (a missing file is not an error — spec D3), so
     // the call would return `Ok`, not `Err`. Asserting `Err(Validation)` is
-    // therefore a genuine red/green distinction, not a tautology.
+    // therefore a genuine red/green distinction, not a tautology — confirmed
+    // directly: temporarily replacing `check_catalogue`'s call in
+    // `resolve_log_path` with a no-op made exactly these tests fail (and no
+    // others), then reverting made them pass again.
+    //
+    // These tests deliberately do NOT assert "no filesystem call happened":
+    // nothing in this code path ever creates `<home>/logs` either on
+    // rejection OR on a successful-but-missing-file read (only `Apply`/
+    // `ensure_log_dir` create that directory), so a directory-existence
+    // check would be true either way and prove nothing. The actual
+    // guarantee — that a rejected catalogue check can reach no filesystem
+    // call at all — is structural, not something a black-box test here can
+    // observe: `resolve_log_path`'s body is a straight `?`-chain,
+    // `check_catalogue(...).await?` returns early on `Err`, so `derive_path`
+    // (and therefore `read_window`) is never reached once the catalogue
+    // check fails. What these tests DO prove, and the only claim their names
+    // make, is that the rejection is a `Validation` error on the right
+    // field — not a silently-passed-through `Ok`.
 
     #[tokio::test]
-    async fn unknown_site_is_rejected_without_touching_the_filesystem() {
+    async fn unknown_site_is_rejected_with_a_validation_error() {
         let home = tempfile::tempdir().unwrap();
         let app = tauri::test::mock_builder()
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
@@ -7211,10 +7228,6 @@ mod log_ipc_tests {
             IpcError::Validation { field, .. } => assert_eq!(field, "domain"),
             other => panic!("expected Validation on domain, got {other:?}"),
         }
-        assert!(
-            !home.path().join("logs").exists(),
-            "a rejected catalogue check must never create or touch <home>/logs"
-        );
     }
 
     #[tokio::test]
@@ -7253,7 +7266,7 @@ mod log_ipc_tests {
     }
 
     #[tokio::test]
-    async fn uninstalled_php_major_is_rejected_without_touching_the_filesystem() {
+    async fn uninstalled_php_major_is_rejected_with_a_validation_error() {
         let home = tempfile::tempdir().unwrap();
         let app = tauri::test::mock_builder()
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
@@ -7283,7 +7296,65 @@ mod log_ipc_tests {
             IpcError::Validation { field, .. } => assert_eq!(field, "php_version"),
             other => panic!("expected Validation on php_version, got {other:?}"),
         }
-        assert!(!home.path().join("logs").exists());
+    }
+
+    // ---- derive_path: a ServiceRing source has no on-disk path -----------
+    //
+    // Spec D7's two-mechanism seam: a `ServiceRing` source must be REJECTED
+    // by both file-reading commands, never silently routed to a path arm
+    // (which would mean reading/revealing whatever `paths.root()` or some
+    // other arm's path happens to resolve to under a ring id). Vacuity
+    // method: temporarily made `derive_path`'s `ServiceRing` arm fall
+    // through to `paths.nginx_error()` instead of returning early — both
+    // tests below failed (rejecting nothing, `read_log_window` returned
+    // `Ok` and `reveal_log_folder_target` returned nginx's log directory);
+    // reverting made them pass again.
+
+    #[tokio::test]
+    async fn a_ring_source_is_rejected_by_read_log_window() {
+        let home = tempfile::tempdir().unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(Db::open_in_memory().await.unwrap());
+        app.manage(stack(home.path()));
+        app.manage(RwLock::new(None::<InstalledRuntimes>));
+
+        let err = read_log_window(
+            app.state::<Db>(),
+            app.state::<RwLock<Option<InstalledRuntimes>>>(),
+            app.state::<Option<StackPaths>>(),
+            query(LogSourceDto::ServiceRing { id: "nginx".into() }, None),
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            IpcError::Validation { field, .. } => assert_eq!(field, "source"),
+            other => panic!("expected Validation on source, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_ring_source_is_rejected_by_reveal_log_folder_target() {
+        let home = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().await.unwrap();
+        let runtimes = RwLock::new(None::<InstalledRuntimes>);
+        let log_paths = openvhost_core::LogPaths::new(home.path());
+
+        let err = reveal_log_folder_target(
+            LogSourceDto::ServiceRing { id: "nginx".into() },
+            &db,
+            &runtimes,
+            &log_paths,
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            IpcError::Validation { field, .. } => assert_eq!(field, "source"),
+            other => panic!("expected Validation on source, got {other:?}"),
+        }
     }
 
     // ---- confinement: a symlink at a derived log path is refused --------
@@ -7478,6 +7549,48 @@ mod log_ipc_tests {
         }
     }
 
+    /// `file_row`'s POSITIVE branch: the previous test only ever sees a
+    /// fresh, empty fixture home, so `exists`/`size_bytes` are always the
+    /// `false`/`None` arm there — this is the only test that puts a REAL
+    /// file at a listed path and checks `list_log_sources` reports it, byte
+    /// count included, rather than exercising that shape only indirectly
+    /// through `read_log_window`.
+    #[tokio::test]
+    async fn list_log_sources_reports_a_real_files_existence_and_size() {
+        let home = tempfile::tempdir().unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(Db::open_in_memory().await.unwrap());
+        app.manage(stack(home.path()));
+        app.manage(RwLock::new(None::<InstalledRuntimes>));
+        app.manage(Arc::new(Supervisor::new(openvhost_proc::default_driver())));
+
+        let log_dir = home.path().join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let contents = b"line one\nline two\n";
+        std::fs::write(log_dir.join("nginx.error.log"), contents).unwrap();
+
+        let rows = list_log_sources(
+            app.state::<Db>(),
+            app.state::<RwLock<Option<InstalledRuntimes>>>(),
+            app.state::<Option<StackPaths>>(),
+            app.state::<Arc<Supervisor>>(),
+        )
+        .await
+        .unwrap();
+
+        let row = rows
+            .iter()
+            .find(|r| r.source == LogSourceDto::NginxError)
+            .expect("an nginx error row");
+        assert!(
+            row.exists,
+            "a real file at the path must report exists: true"
+        );
+        assert_eq!(row.size_bytes, Some(contents.len() as u64));
+    }
+
     // ---- read_log_window: cursor round-trip ------------------------------
 
     #[tokio::test]
@@ -7539,7 +7652,7 @@ mod log_ipc_tests {
     // taking the derived path's parent.
 
     #[tokio::test]
-    async fn reveal_log_folder_target_rejects_an_unknown_site_without_touching_the_filesystem() {
+    async fn reveal_log_folder_target_rejects_an_unknown_site_with_a_validation_error() {
         let home = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().await.unwrap();
         let runtimes = RwLock::new(None::<InstalledRuntimes>);
@@ -7560,7 +7673,6 @@ mod log_ipc_tests {
             IpcError::Validation { field, .. } => assert_eq!(field, "domain"),
             other => panic!("expected Validation on domain, got {other:?}"),
         }
-        assert!(!home.path().join("logs").exists());
     }
 
     #[tokio::test]
