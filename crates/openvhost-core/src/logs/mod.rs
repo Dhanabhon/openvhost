@@ -21,10 +21,21 @@
 //! boundary. The IPC layer (not this crate) is responsible for turning a
 //! caller-supplied request into a `LogPaths`-derived path before either of
 //! these is ever called with it (spec D5).
+//!
+//! [`dirs::ensure_log_dir`] is the single function every REAL (persistent,
+//! on the actual home) log-directory creation call site in this crate and
+//! the desktop app goes through (spec D5: `0700`, explicitly, not merely
+//! inherited from `<home>`) — the creation-side counterpart to `LogPaths`
+//! owning every log-directory PATH. `openvhost-conf`'s own `validate()`
+//! methods still create a directory independently, under a THROWAWAY
+//! validation home for shape-checking only — see [`dirs`]'s doc comment and
+//! that crate's module docs for why this function cannot reach them.
 
+mod dirs;
 mod paths;
 mod read;
 
+pub use dirs::ensure_log_dir;
 pub use paths::LogPaths;
 pub use read::{
     DEFAULT_LINE_BYTES, DEFAULT_PAYLOAD_BYTES, DEFAULT_ROWS, DEFAULT_SCAN_BYTES, LogCursor,

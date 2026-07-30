@@ -36,56 +36,48 @@ pub struct FileChange {
 pub struct ApplyPlan {
     pub gen_root: PathBuf,
     pub main_conf: PathBuf,
-    /// The php-fpm per-major log directory for every INSTALLED PHP runtime
-    /// (`render_set` renders a pool config for each one regardless of
-    /// whether any site currently uses it), so `commit()` can create it
-    /// before that config ever points a php-fpm process at a file inside it.
+    /// Every log directory that must exist before `commit()` installs a
+    /// generated config pointing a validator (nginx/php-fpm) at a file
+    /// inside it (P1 live-log-viewer design, spec D2): one entry per
+    /// installed PHP runtime's per-major pool directory (`render_set`
+    /// renders a pool config for every INSTALLED major regardless of
+    /// whether any site currently uses it), plus one entry per SERVABLE
+    /// site's own directory ([`is_servable`] — the SAME predicate
+    /// `render_set` filters its site-config loop on, so a disabled site or
+    /// one on Apache, which gets no `access_log`/`error_log` directive in
+    /// the first place, gets no entry here either).
     ///
-    /// A narrow, targeted fix, not the general mechanism: this crate's P1
-    /// live-log-viewer bug fix moved php-fpm's `error_log` from a flat
-    /// `<home>/logs/php-fpm.log` (whose parent, `logs/`, `provision_home`
-    /// already creates) to `<home>/logs/services/php-fpm-<major>/error.log`
-    /// — one directory LEVEL DEEPER, per major, which nothing else yet
-    /// creates. Without this, every existing install breaks the moment that
-    /// fix ships: php-fpm refuses to start at all ("failed to open
-    /// error_log ... No such file or directory"). The P1 design (spec D2)
-    /// plans a fuller `log_dirs` mechanism covering the NEW per-site
-    /// directories too (`logs/sites/<domain>/`, `0700`, `provision_home`
-    /// seeding) — this field covers only what THIS fix requires, computed
-    /// the same read-only way `plan()` computes everything else, and is
-    /// expected to be folded into that fuller mechanism when it lands.
-    pub php_fpm_log_dirs: Vec<PathBuf>,
-    /// The per-site log directory (`<home>/logs/sites/<domain>/`) for every
-    /// SERVABLE site (`render_set`'s own `is_servable` filter — the same one
-    /// this list uses), so `commit()` can create it before the rendered site
-    /// config's new `access_log`/`error_log` directives (P1 live-log-viewer
-    /// design, Task 3) ever point nginx at a file inside it.
+    /// This is the ONE mechanism the design always intended — it folds
+    /// together what were two narrower, independent interim fixes
+    /// (`ApplyPlan::php_fpm_log_dirs` from the php-fpm per-major log-path
+    /// change, `ApplyPlan::site_log_dirs` from the per-site nginx log
+    /// directives), each of which existed only to stop its own template
+    /// change from breaking every install the moment it shipped. `commit()`
+    /// creates every directory named here at mode `0700` (spec D5) before
+    /// installing any generated file or running validation.
     ///
-    /// A narrow, targeted fix, not the general mechanism — mirrors
-    /// [`Self::php_fpm_log_dirs`]'s own doc comment exactly: without this,
-    /// every existing install with at least one enabled nginx site breaks
-    /// the moment that template change ships, because `nginx -t` refuses
-    /// with "open() ... failed (2: No such file or directory)" before the
-    /// generated config is ever installed. The P1 design (spec D2) plans a
-    /// fuller `log_dirs` mechanism that ALSO chmods `0700` and has
-    /// `provision_home` seed `logs/sites`/`logs/services` up front (Task 4)
-    /// — this field covers only what the template change requires, computed
-    /// the same read-only way `plan()` computes everything else, and is
-    /// expected to be folded into that fuller mechanism when it lands.
-    pub site_log_dirs: Vec<PathBuf>,
+    /// Computed purely (no I/O) by [`log_dirs`], so `plan()` stays
+    /// read-only — populating this field must never touch disk.
+    pub log_dirs: Vec<PathBuf>,
     /// Sorted by path. EMPTY means the disk already matches the sites — that
     /// is exactly the condition the banner hides on.
     pub changes: Vec<FileChange>,
 }
 
-/// See [`ApplyPlan::php_fpm_log_dirs`]. Pure path arithmetic — no I/O — so
-/// `plan()` stays read-only. `PhpVersion::parse` is not expected to fail for
-/// an already-probed, already-installed runtime major; if it somehow does,
-/// this fails the whole plan rather than silently dropping that major's
-/// directory (and therefore its ability to start).
-fn php_fpm_log_dirs(home: &Path, php: &[PhpRuntime]) -> Result<Vec<PathBuf>, ApplyError> {
+/// See [`ApplyPlan::log_dirs`]. Pure path arithmetic — no I/O — so `plan()`
+/// stays read-only. Sorted for a deterministic result, mirroring `plan()`'s
+/// own `changes` ordering.
+///
+/// `PhpVersion::parse` is not expected to fail for an already-probed,
+/// already-installed runtime major; if it somehow does, this fails the whole
+/// plan rather than silently dropping that major's directory (and therefore
+/// its ability to start). `Domain` is already a validated newtype by the
+/// time a `Site` reaches this pipeline, so the site half has no equivalent
+/// parse step that could fail.
+fn log_dirs(home: &Path, php: &[PhpRuntime], sites: &[Site]) -> Result<Vec<PathBuf>, ApplyError> {
     let paths = LogPaths::new(home);
-    php.iter()
+    let mut dirs: Vec<PathBuf> = php
+        .iter()
         .map(|rt| {
             let major = PhpVersion::parse(&rt.major)?;
             let error_log = paths.php_fpm_error(&major);
@@ -104,24 +96,15 @@ fn php_fpm_log_dirs(home: &Path, php: &[PhpRuntime]) -> Result<Vec<PathBuf>, App
                 }
             })
         })
-        .collect()
-}
-
-/// See [`ApplyPlan::site_log_dirs`]. Pure path arithmetic — no I/O — so
-/// `plan()` stays read-only. Filtered by [`is_servable`] — the SAME
-/// predicate `render_set` filters its site-config loop on — so this list
-/// never claims a directory for a site that gets no `access_log`/`error_log`
-/// directive in the first place (a disabled site, or one on Apache).
-/// `Domain` is already a validated newtype by the time a `Site` reaches this
-/// pipeline, so unlike [`php_fpm_log_dirs`] there is no parse step that
-/// could fail here.
-fn site_log_dirs(home: &Path, sites: &[Site]) -> Vec<PathBuf> {
-    let paths = LogPaths::new(home);
-    sites
-        .iter()
-        .filter(|s| is_servable(s))
-        .map(|s| paths.site_dir(&s.domain))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    dirs.extend(
+        sites
+            .iter()
+            .filter(|s| is_servable(s))
+            .map(|s| paths.site_dir(&s.domain)),
+    );
+    dirs.sort();
+    Ok(dirs)
 }
 
 /// Read a generated-config path if it exists, refusing anything that is not a
@@ -341,8 +324,7 @@ pub fn plan(input: &ApplyInput) -> Result<ApplyPlan, ApplyError> {
     Ok(ApplyPlan {
         main_conf: gen_root.join("nginx/nginx.conf"),
         gen_root,
-        php_fpm_log_dirs: php_fpm_log_dirs(&input.home, &input.runtimes.php)?,
-        site_log_dirs: site_log_dirs(&input.home, &input.sites),
+        log_dirs: log_dirs(&input.home, &input.runtimes.php, &input.sites)?,
         changes,
     })
 }
@@ -598,50 +580,20 @@ mod tests {
         assert!(outside.join("victim.conf").exists());
     }
 
-    /// P1 live-log-viewer bug fix (Task 1): moving php-fpm's `error_log` to a
-    /// per-major directory means `plan()` must now also report that
-    /// directory per installed major — see `ApplyPlan::php_fpm_log_dirs`'s
-    /// doc comment for why. `plan()` must stay read-only, so neither
-    /// directory may exist on disk merely from calling it.
+    /// P1 live-log-viewer design, Task 4 (spec D2): `ApplyPlan::log_dirs`
+    /// folds together what were two narrower interim fixes landed
+    /// independently — one covering only the php-fpm per-major directories
+    /// (from moving `error_log` off a flat shared file), one covering only
+    /// per-site directories (from the new `access_log`/`error_log`
+    /// directives) — into the ONE mechanism the design always intended.
+    /// This test exercises BOTH sources in a single plan: every installed
+    /// PHP major contributes its pool directory, every SERVABLE site
+    /// contributes its own directory, and a disabled site contributes
+    /// nothing (it never gets an `access_log`/`error_log` directive from
+    /// `render_set` in the first place). `plan()` must stay read-only, so
+    /// none of these may exist on disk merely from calling it.
     #[test]
-    fn php_fpm_log_dirs_cover_every_installed_major_and_touch_no_disk() {
-        let home = tempfile::tempdir().unwrap();
-        let i = input_with_home(
-            home.path(),
-            vec![site("app", "app.localhost", "8.4", true)],
-            &["8.3", "8.4"],
-        );
-        let p = plan(&i).unwrap();
-
-        let paths = crate::LogPaths::new(home.path());
-        let expected_dir = |major: &str| {
-            paths
-                .php_fpm_error(&crate::PhpVersion::parse(major).unwrap())
-                .parent()
-                .unwrap()
-                .to_path_buf()
-        };
-        let mut want = vec![expected_dir("8.3"), expected_dir("8.4")];
-        want.sort();
-        let mut got = p.php_fpm_log_dirs.clone();
-        got.sort();
-        assert_eq!(got, want);
-
-        for dir in &p.php_fpm_log_dirs {
-            assert!(!dir.exists(), "{dir:?} must not be created by plan() alone");
-        }
-    }
-
-    /// P1 live-log-viewer bug fix (Task 3): giving every site config its own
-    /// `access_log`/`error_log` means `plan()` must now also report that
-    /// site's log directory — see `ApplyPlan::site_log_dirs`'s doc comment
-    /// for why. Only SERVABLE sites get a directory: a disabled site (or one
-    /// on Apache) is never rendered by `render_set`, so it never gets an
-    /// `access_log`/`error_log` directive pointing at one either. `plan()`
-    /// must stay read-only, so nothing may exist on disk merely from calling
-    /// it.
-    #[test]
-    fn site_log_dirs_cover_every_servable_site_and_touch_no_disk() {
+    fn log_dirs_cover_every_installed_major_and_every_servable_site_and_touch_no_disk() {
         let home = tempfile::tempdir().unwrap();
         let i = input_with_home(
             home.path(),
@@ -649,16 +601,32 @@ mod tests {
                 site("app", "app.localhost", "8.4", true),
                 site("off", "off.localhost", "8.4", false),
             ],
-            &["8.4"],
+            &["8.3", "8.4"],
         );
         let p = plan(&i).unwrap();
 
         let paths = crate::LogPaths::new(home.path());
-        let want =
-            vec![paths.site_dir(&crate::site::model::Domain::parse("app.localhost").unwrap())];
-        assert_eq!(p.site_log_dirs, want);
+        let php_dir = |major: &str| {
+            paths
+                .php_fpm_error(&crate::PhpVersion::parse(major).unwrap())
+                .parent()
+                .unwrap()
+                .to_path_buf()
+        };
+        let mut want = vec![
+            php_dir("8.3"),
+            php_dir("8.4"),
+            paths.site_dir(&crate::site::model::Domain::parse("app.localhost").unwrap()),
+        ];
+        want.sort();
+        let mut got = p.log_dirs.clone();
+        got.sort();
+        assert_eq!(
+            got, want,
+            "off.localhost is disabled and must not contribute a directory"
+        );
 
-        for dir in &p.site_log_dirs {
+        for dir in &p.log_dirs {
             assert!(!dir.exists(), "{dir:?} must not be created by plan() alone");
         }
     }

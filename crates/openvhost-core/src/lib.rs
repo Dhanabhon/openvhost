@@ -22,7 +22,7 @@ pub use home::{home_disk_usage, resolve_home};
 pub use info::{CoreInfo, core_info};
 pub use logs::{
     LogCursor, LogLevel, LogLimits, LogPaths, LogQuery, LogReset, LogRow, LogWindow,
-    classify_level, read_window,
+    classify_level, ensure_log_dir, read_window,
 };
 pub use mysql::{
     DatadirState, MYSQL_CATALOGUE, MysqlInitOutcome, MysqlInitStep, MysqlInstance,
