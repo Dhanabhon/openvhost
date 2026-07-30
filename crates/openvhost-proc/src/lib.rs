@@ -26,7 +26,7 @@ pub use orphan::{
 pub use platform::{
     OutputStream, ProcessDriver, SpawnSpec, SpawnedChild, default_driver, default_reaper,
 };
-pub use supervisor::{ServiceSpec, Supervisor};
+pub use supervisor::{DEFAULT_GRACE, DEFAULT_READY_AFTER, ReadinessProbe, ServiceSpec, Supervisor};
 // `Stream` is re-exported as `TaskStream`: this crate already exports
 // `StreamSource` from `events`, and two similarly-named types in one
 // namespace is how call sites end up importing the wrong one.

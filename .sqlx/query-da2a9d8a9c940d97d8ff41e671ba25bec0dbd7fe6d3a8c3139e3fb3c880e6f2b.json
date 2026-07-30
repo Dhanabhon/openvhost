@@ -1,0 +1,50 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT major, root_password, initialized_at FROM mysql_instances WHERE major = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "major",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "mysql_instances",
+            "name": "major"
+          }
+        }
+      },
+      {
+        "name": "root_password",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "mysql_instances",
+            "name": "root_password"
+          }
+        }
+      },
+      {
+        "name": "initialized_at",
+        "ordinal": 2,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "mysql_instances",
+            "name": "initialized_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "da2a9d8a9c940d97d8ff41e671ba25bec0dbd7fe6d3a8c3139e3fb3c880e6f2b"
+}

@@ -11,6 +11,17 @@ import type {
 	InstallOutcomeDto,
 	IpcError,
 	LogLine,
+	MysqlConnectionProofDto,
+	MysqlDatadirStateDto,
+	MysqlEnvironmentDto,
+	MysqlInitLogEvent,
+	MysqlInitOutcomeDto,
+	MysqlInitStepDto,
+	MysqlInstallLogEvent,
+	MysqlInstallOutcomeDto,
+	MysqlInstanceDto,
+	MysqlResetOutcomeDto,
+	PendingInstallDto,
 	PhpEnvironmentDto,
 	PhpInstallLogEvent,
 	PhpRuntimeDto,
@@ -38,6 +49,17 @@ export type {
 	InstallOutcomeDto,
 	IpcError,
 	LogLine,
+	MysqlConnectionProofDto,
+	MysqlDatadirStateDto,
+	MysqlEnvironmentDto,
+	MysqlInitLogEvent,
+	MysqlInitOutcomeDto,
+	MysqlInitStepDto,
+	MysqlInstallLogEvent,
+	MysqlInstallOutcomeDto,
+	MysqlInstanceDto,
+	MysqlResetOutcomeDto,
+	PendingInstallDto,
 	PhpEnvironmentDto,
 	PhpInstallLogEvent,
 	PhpRuntimeDto,
@@ -313,10 +335,107 @@ export async function onPhpInstallLog(cb: (ev: PhpInstallLogEvent) => void): Pro
 }
 
 /**
- * The major currently installing, if any. Read by the quit dialog: a build in
- * progress is invisible to the services list (it is not a supervised
- * service), so without this a quit would silently discard it.
+ * Whatever is currently installing or initializing, if anything — PHP or
+ * MySQL alike (review fix wave, Important 1). Read by the quit dialog: a
+ * build/init in progress is invisible to the services list (it is not a
+ * supervised service), so without this a quit would silently discard it.
+ * `null` only when nothing is running. Replaces the old PHP-only
+ * `pendingPhpInstall`, which returned `null` for a MySQL occupant too,
+ * leaving the quit dialog blind to it entirely.
  */
-export async function pendingPhpInstall(): Promise<string | null> {
-	return unwrap(commands.pendingPhpInstall());
+export async function pendingInstall(): Promise<PendingInstallDto | null> {
+	return unwrap(commands.pendingInstall());
+}
+
+/**
+ * Read-only MySQL environment summary for the Databases page: whether
+ * Homebrew was found, where it looked, and one row per catalogue/installed
+ * major with its on-disk datadir state. Spawns nothing — safe to call on page
+ * mount and after every install/initialize.
+ */
+export async function mysqlEnvironment(): Promise<MysqlEnvironmentDto> {
+	return unwrap(commands.mysqlEnvironment());
+}
+
+/**
+ * Explicit, user-initiated re-probe behind the Databases page's rescan
+ * affordance. Unlike {@link mysqlEnvironment}, this spawns a version probe per
+ * candidate binary and sweeps abandoned staging directories left by a crashed
+ * or force-quit init attempt.
+ */
+export async function rescanMysql(): Promise<MysqlEnvironmentDto> {
+	return unwrap(commands.rescanMysql());
+}
+
+/**
+ * Install a MySQL major via Homebrew. Streams its output live through
+ * {@link onMysqlInstallLog} while it runs, then resolves with the outcome —
+ * including `detected`, which can be `false` even when `exitCode` is `0`.
+ * Shares the same install lock as {@link installPhp}: only one of
+ * `installPhp`/`installMysql`/`initializeMysql` can run at a time.
+ */
+export async function installMysql(major: string): Promise<MysqlInstallOutcomeDto> {
+	return unwrap(commands.installMysql(major));
+}
+
+/** Subscribe to `mysql-install-log`. Same `IpcError` contract as {@link onServiceState}. */
+export async function onMysqlInstallLog(
+	cb: (ev: MysqlInstallLogEvent) => void
+): Promise<() => void> {
+	try {
+		return await events.mysqlInstallLogEvent.listen((e) => cb(e.payload));
+	} catch (e) {
+		throw normalizeError(e);
+	}
+}
+
+/**
+ * Initialize a MySQL major's datadir: render + validate `my.cnf`, run the
+ * staged init sequence with a generated root password, and — on success —
+ * register the service so it appears in the Services panel. Streams progress
+ * live through {@link onMysqlInitLog}. `alreadyInitialized`/`foreign` are
+ * expected, non-error outcomes (a foreign datadir is reported, never
+ * touched); `failed` names the step and reason. Shares the install lock —
+ * see {@link installMysql}.
+ */
+export async function initializeMysql(major: string): Promise<MysqlInitOutcomeDto> {
+	return unwrap(commands.initializeMysql(major));
+}
+
+/** Subscribe to `mysql-init-log`. Same `IpcError` contract as {@link onServiceState}. */
+export async function onMysqlInitLog(cb: (ev: MysqlInitLogEvent) => void): Promise<() => void> {
+	try {
+		return await events.mysqlInitLogEvent.listen((e) => cb(e.payload));
+	} catch (e) {
+		throw normalizeError(e);
+	}
+}
+
+/**
+ * Reveal the stored root password for `major`, for the masked password
+ * field's Reveal/Copy affordance. Throws if `major` has never been
+ * initialized.
+ */
+export async function mysqlRootPassword(major: string): Promise<string> {
+	return unwrap(commands.mysqlRootPassword(major));
+}
+
+/**
+ * Regenerate `major`'s root password (reset-by-regenerate — there is no
+ * user-chosen password this slice). `authFailed` is a distinct, renderable
+ * outcome (never a thrown error): the stored password may be stale, e.g.
+ * after restoring a datadir from an old backup outside the app.
+ */
+export async function resetMysqlRootPassword(major: string): Promise<MysqlResetOutcomeDto> {
+	return unwrap(commands.resetMysqlRootPassword(major));
+}
+
+/**
+ * `SELECT VERSION(), @@port` through the running server, authenticating with
+ * the stored credential — the Databases page's "Verify connection"
+ * affordance. Every failure mode (`authFailed`/`failed`) is a renderable
+ * outcome, never a thrown error, so the button always has something to show.
+ */
+export async function verifyMysqlConnection(major: string): Promise<MysqlConnectionProofDto> {
+	return unwrap(commands.verifyMysqlConnection(major));
 }

@@ -1,0 +1,594 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//! Datadir lifecycle: where MySQL state lives on disk ([`mysql_paths`]),
+//! what state a datadir is actually in — read from disk, never a stored
+//! boolean (see [`classify_datadir`]) — and cleanup of abandoned staged-init
+//! directories ([`sweep_stale_staging`]). See spec D2:
+//! `docs/superpowers/specs/2026-07-29-p1-db-mysql-design.md`.
+
+use std::io;
+use std::path::{Path, PathBuf};
+
+use crate::error::CoreError;
+use crate::site::apply::MAX_SOCKET_PATH_BYTES;
+
+use super::MysqlMajor;
+
+/// Every generated/state path for one MySQL major, all derived from the
+/// resolved OpenVHost home + a [`MysqlMajor`].
+///
+/// CONFINEMENT ARGUMENT (spec D2, the Docroot lesson: a newtype's shape
+/// guard is confinement, not policy — state it explicitly rather than
+/// re-learn it): every field below is `home.join(...)...join(major.as_str())`
+/// — never a path supplied by an untrusted caller. `home` comes only from
+/// [`crate::resolve_home`] (an env override or the OS user-home lookup —
+/// never IPC input), and `major.as_str()` can only ever be ASCII digits and
+/// a single `.` (enforced identically by both of [`MysqlMajor`]'s
+/// constructors — see its doc comment), so it can never contain a path
+/// separator or `..`. Nothing about *where* these paths point is steerable
+/// from outside this process, regardless of whether `major` came from the
+/// strict, catalogue-checked `parse` or the discovery-only `from_probe`.
+/// Whether `major` is allowed to be installed/initialized is a separate,
+/// orthogonal policy question (`MysqlMajor::is_cataloged`), decided by the
+/// caller — never by path derivation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MysqlPaths {
+    /// `<home>/data/mysql/<major>/` — the live datadir once initialized.
+    pub datadir: PathBuf,
+    /// `<home>/config/generated/mysql/<major>/my.cnf`.
+    pub my_cnf: PathBuf,
+    /// `<home>/run/mysql-<major>.sock` — the running server's socket.
+    pub socket: PathBuf,
+    /// `<home>/run/mysql-<major>-init.sock` — the network-less temp server
+    /// used only during staged init (spec D2 step 2).
+    pub init_socket: PathBuf,
+    /// `<home>/run/mysql-<major>.pid` — mysqld's `pid-file` (spec D5's
+    /// `my.cnf` template; `openvhost_conf::MysqlCtx::pid_file` mirrors this
+    /// field, copied over field-by-field by the command layer). Lives
+    /// alongside [`Self::socket`]/[`Self::init_socket`] in the same
+    /// user-only `run` directory nginx's own pid file already uses.
+    pub pid_file: PathBuf,
+    /// `<home>/config/custom/mysql/<major>/conf.d` — the user's own
+    /// `!includedir`, never written by this app.
+    pub custom_confd: PathBuf,
+    /// `<home>/data/mysql/` — parent of both `datadir` and every staging
+    /// directory for every major, so the finishing `rename` at the end of
+    /// init is atomic (same filesystem, same parent). Also the argument
+    /// [`sweep_stale_staging`] expects.
+    pub staging_parent: PathBuf,
+}
+
+impl MysqlPaths {
+    /// Guards [`Self::socket`] and [`Self::init_socket`] against Darwin's
+    /// `sun_path` ceiling. Reuses the exact constant
+    /// ([`crate::site::apply::MAX_SOCKET_PATH_BYTES`]) and error variant
+    /// (`CoreError::SocketPathTooLong`) `site::apply::socket_path` uses for
+    /// php-fpm's socket — the same 104-byte `sun_path` limit applies to
+    /// every unix socket this app binds, mysqld's included, so this reuses
+    /// rather than reinvents that guard. [`mysql_paths`] itself never fails
+    /// (pure path joining); this is the explicit, separate check callers
+    /// run before acting on either socket path.
+    pub fn check_socket_lengths(&self) -> Result<(), CoreError> {
+        guard_socket_path(&self.socket)?;
+        guard_socket_path(&self.init_socket)
+    }
+}
+
+fn guard_socket_path(path: &Path) -> Result<(), CoreError> {
+    let len = path.as_os_str().as_encoded_bytes().len();
+    if len > MAX_SOCKET_PATH_BYTES {
+        return Err(CoreError::SocketPathTooLong {
+            path: path.to_path_buf(),
+            len,
+        });
+    }
+    Ok(())
+}
+
+/// `<home>/data/mysql` — the shared parent directory for every major's
+/// datadir AND every major's staging directories (see
+/// [`MysqlPaths::staging_parent`], which is this exact path, just computed
+/// once per major even though the path itself never actually depends on
+/// `major`). Split out as its own function (Task 5, plan
+/// `docs/superpowers/plans/2026-07-29-p1-db-mysql.md`) because
+/// `sweep_stale_staging` (spec D2: "swept on rescan") wants to run ONCE per
+/// rescan, covering every major's leftovers together — it has no reason to
+/// take a `major` at all, and computing a whole [`MysqlPaths`] for one
+/// arbitrary major just to reach its `staging_parent` field would need an
+/// arbitrary major to plug in for no other purpose.
+pub fn mysql_data_root(home: &Path) -> PathBuf {
+    home.join("data").join("mysql")
+}
+
+/// Derive every path this major needs from `home` + `major`. Pure and
+/// infallible (see the CONFINEMENT ARGUMENT on [`MysqlPaths`]) — see
+/// [`MysqlPaths::check_socket_lengths`] for the guard callers must run
+/// before using either socket path.
+pub fn mysql_paths(home: &Path, major: &MysqlMajor) -> MysqlPaths {
+    let data_root = mysql_data_root(home);
+    let run_root = home.join("run");
+    let major_str = major.as_str();
+    MysqlPaths {
+        datadir: data_root.join(major_str),
+        my_cnf: home
+            .join("config")
+            .join("generated")
+            .join("mysql")
+            .join(major_str)
+            .join("my.cnf"),
+        socket: run_root.join(format!("mysql-{major_str}.sock")),
+        init_socket: run_root.join(format!("mysql-{major_str}-init.sock")),
+        pid_file: run_root.join(format!("mysql-{major_str}.pid")),
+        custom_confd: home
+            .join("config")
+            .join("custom")
+            .join("mysql")
+            .join(major_str)
+            .join("conf.d"),
+        staging_parent: data_root,
+    }
+}
+
+/// Directory entries that mark an already-`--initialize`d MySQL datadir: the
+/// system schema directory and MySQL's own bootstrap marker file. Both must
+/// be present — either alone is not enough evidence (a half-copied backup
+/// could easily have just one).
+const SENTINEL_DIR: &str = "mysql";
+const SENTINEL_FILE: &str = "auto.cnf";
+
+/// The ONLY directory entry [`classify_datadir`] ignores outright — nothing
+/// broader (amendment to spec D2). macOS Finder writes this file into
+/// almost any directory it has ever displayed, including one nobody has
+/// intentionally put content into: without this exemption, a final datadir
+/// nobody has touched but Finder has merely *looked at* would classify as
+/// [`DatadirState::Foreign`] and incorrectly block a legitimate init.
+/// `crate::mysql::finalize_staging` (init.rs) has the other half of this
+/// story — the OS's `rename(2)` still requires the destination directory to
+/// be genuinely empty, so ignoring this entry in classification is not
+/// enough on its own; finalize must also delete it before renaming.
+pub(crate) const DS_STORE: &str = ".DS_Store";
+
+/// What a datadir directory actually contains, established the ONE way spec
+/// D2 allows: by reading the filesystem. Never a state.db boolean — a
+/// restored or hand-copied datadir must classify correctly even though
+/// state.db has never heard of it, which is exactly the "genuinely ready"
+/// property a boolean cannot provide (this codebase has already hit that
+/// bug class once, for service status).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DatadirState {
+    /// Missing, or present but empty: safe to `--initialize` into.
+    NotInitialized,
+    /// Both sentinels are present: a real, already-initialized datadir.
+    Initialized,
+    /// Present, non-empty, and NOT recognizably a MySQL datadir. Rendered
+    /// honestly to the user (spec D2) — never adopted, never deleted, never
+    /// initialized into.
+    Foreign { detail: String },
+}
+
+/// Classify `dir` by reading it — see [`DatadirState`]. A missing directory
+/// is [`DatadirState::NotInitialized`], not an error: the datadir may not
+/// have been provisioned yet (mirrors `home::dir_size_no_follow`'s identical
+/// "missing root is not fatal" convention). [`DS_STORE`] entries are ignored
+/// outright (never pushed to the offender list, never treated as evidence
+/// of anything) — a directory containing only that file classifies exactly
+/// like an empty one.
+pub fn classify_datadir(dir: &Path) -> io::Result<DatadirState> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(DatadirState::NotInitialized),
+        Err(e) => return Err(e),
+    };
+
+    let mut names: Vec<String> = Vec::new();
+    let mut has_sentinel_dir = false;
+    let mut has_sentinel_file = false;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == DS_STORE {
+            continue; // macOS Finder clutter — never counts toward classification
+        }
+        let file_type = entry.file_type()?;
+        if name == SENTINEL_DIR && file_type.is_dir() {
+            has_sentinel_dir = true;
+        } else if name == SENTINEL_FILE && file_type.is_file() {
+            has_sentinel_file = true;
+        }
+        names.push(name);
+    }
+
+    if names.is_empty() {
+        return Ok(DatadirState::NotInitialized);
+    }
+    if has_sentinel_dir && has_sentinel_file {
+        return Ok(DatadirState::Initialized);
+    }
+
+    names.sort();
+    Ok(DatadirState::Foreign {
+        detail: format!(
+            "{} does not look like a MySQL datadir (missing {SENTINEL_DIR}/ and/or \
+             {SENTINEL_FILE}; found: {})",
+            dir.display(),
+            names.join(", ")
+        ),
+    })
+}
+
+/// Staging directories look like `init-<major-dashed>-<uuid>` (spec D2) — no
+/// leading dot, the literal `init-`, a major-shaped prefix with its own dot
+/// dash-encoded (e.g. `8-4` for major `8.4`), a dash, then a non-empty
+/// suffix. Reuses [`MysqlMajor::from_probe`] for the "major-shaped" half of
+/// that check (after re-inserting the dot the generator dashed out) rather
+/// than re-implementing the shape regex a second time — and deliberately
+/// does NOT go through [`MysqlMajor::parse`]: a stale leftover for a major
+/// this build no longer offers must still be recognized and swept.
+///
+/// Live-run finding, corrected — decisive single-variable matrix against
+/// real mysqld 8.4.11 (two earlier diagnoses recorded against this shape in
+/// this crate's history, "interior dots" and "datadir mismatch", were WRONG
+/// and are retracted; see spec D2's dated correction note for the full
+/// story): a datadir basename that STARTS WITH A DOT cannot restart after
+/// `--initialize` — `.stg`, `.a`, `.aaaa`, `.init8`, `.aaaaaaaa`, `.aaa-aaa`
+/// all FAIL; `stg`, `aaa-aaa`, `init-8-4-abc`, and a 24-character all-`a`
+/// name all PASS. Hyphens, digits, and length are not factors — only the
+/// leading dot. This shape therefore has NO leading dot, unlike the two
+/// earlier (incorrect) fix attempts. The staging directory is consequently
+/// VISIBLE under its parent, not hidden — verified nothing else in this
+/// codebase lists that parent's children assuming they are exclusively
+/// major-shaped final datadirs (this function, and `sweep_stale_staging`
+/// below which calls it, are the only code that enumerates it at all). No
+/// back-compat sweep for the old dotted shape — the feature never shipped,
+/// so no installed datadir anywhere can have a staging leftover in that
+/// shape.
+///
+/// `pub(crate)`, not private: `crate::mysql::remove_staging_dir` (init.rs)
+/// reuses this exact shape check before deleting a specific staging
+/// directory, rather than re-implementing it — the two call sites must
+/// never be able to drift to different definitions of "staging-shaped".
+pub(crate) fn is_stale_staging_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("init-") else {
+        return false;
+    };
+    let mut parts = rest.splitn(3, '-');
+    let (Some(major_p1), Some(major_p2), Some(suffix)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    !suffix.is_empty() && MysqlMajor::from_probe(format!("{major_p1}.{major_p2}")).is_some()
+}
+
+/// Remove abandoned staging directories directly under `parent` (spec D2:
+/// `init-<major-dashed>-<uuid>`), returning what was removed. Meant to run on
+/// rescan — a crash or force-quit mid-init leaves one of these behind. The
+/// FINAL datadir (bare `<major>`, e.g. `8.4` — no `init-` prefix) is a
+/// completely different name shape and is never touched here.
+///
+/// Only removes entries that are BOTH (a) directories and (b) name-shaped
+/// like a staging directory (see `is_stale_staging_name`); anything else
+/// in `parent` — an unrelated directory, a final datadir, or even a
+/// symlink that happens to share the name shape — is left exactly alone.
+/// `entry.file_type()` does not follow symlinks (unlike `entry.metadata()`
+/// on some platforms), so a symlink squatting on the pattern is reported as
+/// a symlink, not a directory, and is skipped — the same "never follow a
+/// link into an unintended traversal" discipline `home::dir_size_no_follow`
+/// documents for the `packages/.../current` link.
+///
+/// A missing `parent` is not an error: nothing has been provisioned yet.
+pub fn sweep_stale_staging(parent: &Path) -> io::Result<Vec<PathBuf>> {
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+
+    let mut removed = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue; // non-UTF-8 name: can never match our ASCII pattern
+        };
+        if !is_stale_staging_name(&name) {
+            continue;
+        }
+        if !entry.file_type()?.is_dir() {
+            continue; // never a symlink, never a stray same-named file
+        }
+        let path = entry.path();
+        std::fs::remove_dir_all(&path)?;
+        removed.push(path);
+    }
+    removed.sort();
+    Ok(removed)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    // ---- classify_datadir ----
+
+    #[test]
+    fn a_missing_directory_is_not_initialized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("does-not-exist");
+        assert_eq!(
+            classify_datadir(&dir).unwrap(),
+            DatadirState::NotInitialized
+        );
+    }
+
+    #[test]
+    fn an_empty_directory_is_not_initialized() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            classify_datadir(tmp.path()).unwrap(),
+            DatadirState::NotInitialized
+        );
+    }
+
+    #[test]
+    fn both_sentinels_present_means_initialized() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("mysql")).unwrap();
+        std::fs::write(tmp.path().join("auto.cnf"), b"[auto]\n").unwrap();
+        // A real datadir has many more files; classification must not need
+        // an exhaustive match, only both sentinels present.
+        std::fs::write(tmp.path().join("ibdata1"), b"").unwrap();
+        assert_eq!(
+            classify_datadir(tmp.path()).unwrap(),
+            DatadirState::Initialized
+        );
+    }
+
+    #[test]
+    fn only_the_sentinel_dir_without_auto_cnf_is_foreign() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("mysql")).unwrap();
+        match classify_datadir(tmp.path()).unwrap() {
+            DatadirState::Foreign { .. } => {}
+            other => panic!("expected Foreign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn only_auto_cnf_without_the_sentinel_dir_is_foreign() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("auto.cnf"), b"[auto]\n").unwrap();
+        match classify_datadir(tmp.path()).unwrap() {
+            DatadirState::Foreign { .. } => {}
+            other => panic!("expected Foreign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_stray_file_is_foreign_and_names_the_offender() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("some-note.txt"), b"hi").unwrap();
+        match classify_datadir(tmp.path()).unwrap() {
+            DatadirState::Foreign { detail } => {
+                assert!(detail.contains("some-note.txt"), "detail: {detail}");
+            }
+            other => panic!("expected Foreign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_ds_store_only_directory_is_not_initialized() {
+        // Amendment: Finder can write `.DS_Store` into a directory nobody
+        // has put real content into yet — that must still read as
+        // NotInitialized, not Foreign, or a legitimate init would be
+        // blocked from ever starting.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".DS_Store"), b"binary-plist-ish").unwrap();
+        assert_eq!(
+            classify_datadir(tmp.path()).unwrap(),
+            DatadirState::NotInitialized
+        );
+    }
+
+    #[test]
+    fn ds_store_alongside_a_stray_file_is_still_foreign() {
+        // Vacuity for "nothing broader": .DS_Store must not mask a
+        // genuinely foreign directory just because it's also present.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".DS_Store"), b"x").unwrap();
+        std::fs::write(tmp.path().join("some-note.txt"), b"hi").unwrap();
+        match classify_datadir(tmp.path()).unwrap() {
+            DatadirState::Foreign { detail } => {
+                assert!(detail.contains("some-note.txt"), "detail: {detail}");
+                assert!(
+                    !detail.contains(".DS_Store"),
+                    "the ignored entry must not even appear in the offender list: {detail}"
+                );
+            }
+            other => panic!("expected Foreign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ds_store_alongside_both_sentinels_is_still_initialized() {
+        // Clutter must not break the normal, already-initialized case either.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".DS_Store"), b"x").unwrap();
+        std::fs::create_dir(tmp.path().join("mysql")).unwrap();
+        std::fs::write(tmp.path().join("auto.cnf"), b"[auto]\n").unwrap();
+        assert_eq!(
+            classify_datadir(tmp.path()).unwrap(),
+            DatadirState::Initialized
+        );
+    }
+
+    // ---- sweep_stale_staging ----
+
+    #[test]
+    fn removes_a_stale_staging_directory_and_reports_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("init-8-4-a1b2c3d4e5f6");
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::write(staging.join("leftover"), b"x").unwrap();
+
+        let removed = sweep_stale_staging(tmp.path()).unwrap();
+
+        assert_eq!(removed, vec![staging.clone()]);
+        assert!(
+            !staging.exists(),
+            "staging directory should have been removed"
+        );
+    }
+
+    #[test]
+    fn a_non_staging_name_is_never_removed() {
+        // Vacuity check named in the brief: point sweep at a directory whose
+        // name is NOT staging-shaped and confirm it survives untouched.
+        let tmp = tempfile::tempdir().unwrap();
+        let innocent = tmp.path().join("not-a-staging-dir");
+        std::fs::create_dir(&innocent).unwrap();
+
+        let removed = sweep_stale_staging(tmp.path()).unwrap();
+
+        assert!(removed.is_empty(), "got {removed:?}");
+        assert!(
+            innocent.exists(),
+            "an unrelated directory must never be removed"
+        );
+    }
+
+    #[test]
+    fn a_finished_datadir_is_never_removed() {
+        // The FINAL datadir is named bare `<major>` (e.g. `8.4`) — never
+        // `init-`-prefixed — must never be mistaken for a staging leftover.
+        let tmp = tempfile::tempdir().unwrap();
+        let finished = tmp.path().join("8.4");
+        std::fs::create_dir(&finished).unwrap();
+
+        let removed = sweep_stale_staging(tmp.path()).unwrap();
+
+        assert!(removed.is_empty(), "got {removed:?}");
+        assert!(finished.exists());
+    }
+
+    #[test]
+    fn a_missing_parent_is_not_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("nope");
+        assert_eq!(
+            sweep_stale_staging(&missing).unwrap(),
+            Vec::<PathBuf>::new()
+        );
+    }
+
+    #[test]
+    fn several_stale_dirs_are_all_removed_and_returned_sorted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("init-8-4-aaaa");
+        let b = tmp.path().join("init-8-4-bbbb");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+
+        let removed = sweep_stale_staging(tmp.path()).unwrap();
+
+        assert_eq!(removed, vec![a, b]); // lexicographic: "aaaa" < "bbbb"
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_named_like_a_staging_directory_is_never_removed() {
+        // file_type() does not follow symlinks (the home.rs `current`-link
+        // lesson) — a symlink squatting on the staging name pattern must
+        // survive, even if it points at a real directory.
+        let tmp = tempfile::tempdir().unwrap();
+        let real_dir = tmp.path().join("real-target");
+        std::fs::create_dir(&real_dir).unwrap();
+        let squatter = tmp.path().join("init-8-4-deadbeef");
+        std::os::unix::fs::symlink(&real_dir, &squatter).unwrap();
+
+        let removed = sweep_stale_staging(tmp.path()).unwrap();
+
+        assert!(removed.is_empty(), "got {removed:?}");
+        assert!(squatter.exists(), "the symlink itself must survive");
+        assert!(real_dir.exists(), "and its target must survive too");
+    }
+
+    // ---- mysql_paths + socket length guard ----
+
+    #[test]
+    fn mysql_paths_derives_every_path_under_home() {
+        let home = PathBuf::from("/tmp/ovh");
+        let major = MysqlMajor::parse("8.4").unwrap();
+        let paths = mysql_paths(&home, &major);
+
+        assert_eq!(paths.datadir, PathBuf::from("/tmp/ovh/data/mysql/8.4"));
+        assert_eq!(
+            paths.my_cnf,
+            PathBuf::from("/tmp/ovh/config/generated/mysql/8.4/my.cnf")
+        );
+        assert_eq!(paths.socket, PathBuf::from("/tmp/ovh/run/mysql-8.4.sock"));
+        assert_eq!(
+            paths.init_socket,
+            PathBuf::from("/tmp/ovh/run/mysql-8.4-init.sock")
+        );
+        assert_eq!(paths.pid_file, PathBuf::from("/tmp/ovh/run/mysql-8.4.pid"));
+        assert_eq!(
+            paths.custom_confd,
+            PathBuf::from("/tmp/ovh/config/custom/mysql/8.4/conf.d")
+        );
+        assert_eq!(paths.staging_parent, PathBuf::from("/tmp/ovh/data/mysql"));
+    }
+
+    #[test]
+    fn pid_file_lives_in_run_alongside_the_sockets() {
+        // openvhost-conf's MysqlCtx.pid_file mirrors this field, and its own
+        // fixture already assumes `<home>/run/mysql-<major>.pid`.
+        let home = PathBuf::from("/tmp/ovh");
+        let major = MysqlMajor::parse("8.4").unwrap();
+        let paths = mysql_paths(&home, &major);
+        assert_eq!(paths.pid_file, PathBuf::from("/tmp/ovh/run/mysql-8.4.pid"));
+        assert_eq!(paths.pid_file.parent(), paths.socket.parent());
+    }
+
+    #[test]
+    fn mysql_data_root_matches_every_majors_staging_parent() {
+        // The whole reason `mysql_data_root` exists on its own: it must never
+        // drift from what `mysql_paths` computes per-major.
+        let home = PathBuf::from("/tmp/ovh");
+        assert_eq!(mysql_data_root(&home), PathBuf::from("/tmp/ovh/data/mysql"));
+        for major_str in ["8.4", "9.7"] {
+            let major = MysqlMajor::from_probe(major_str.to_string()).unwrap();
+            assert_eq!(
+                mysql_paths(&home, &major).staging_parent,
+                mysql_data_root(&home)
+            );
+        }
+    }
+
+    #[test]
+    fn staging_parent_is_the_direct_parent_of_datadir() {
+        // D2: staging lives in the SAME parent as the final datadir so the
+        // finishing rename is atomic (same filesystem, same directory).
+        let home = PathBuf::from("/tmp/ovh");
+        let major = MysqlMajor::parse("8.4").unwrap();
+        let paths = mysql_paths(&home, &major);
+        assert_eq!(paths.datadir.parent(), Some(paths.staging_parent.as_path()));
+    }
+
+    #[test]
+    fn short_home_passes_the_socket_length_guard() {
+        let major = MysqlMajor::parse("8.4").unwrap();
+        let paths = mysql_paths(&PathBuf::from("/tmp/ovh"), &major);
+        assert!(paths.check_socket_lengths().is_ok());
+    }
+
+    #[test]
+    fn a_home_too_deep_for_the_socket_is_refused() {
+        // Mirrors site::apply's identical guard test for php-fpm's socket —
+        // same constant, same error, reused rather than reinvented.
+        let deep_home = PathBuf::from(format!("/tmp/{}", "d".repeat(120)));
+        let major = MysqlMajor::parse("8.4").unwrap();
+        let paths = mysql_paths(&deep_home, &major);
+        let err = paths.check_socket_lengths().unwrap_err();
+        assert!(matches!(err, CoreError::SocketPathTooLong { .. }));
+    }
+}

@@ -190,15 +190,95 @@ export const commands = {
 	 */
 	installPhp: (major: string) => typedError<InstallOutcomeDto, IpcError>(__TAURI_INVOKE("install_php", { major })),
 	/**
-	 *  The major currently installing, if any — for the quit dialog: a build in
-	 *  progress is invisible to `pending_service_ids` (it is not a supervised
-	 *  service), so without this the confirmation would silently discard it.
+	 *  Whatever is currently installing or initializing, if anything — for the
+	 *  quit dialog: a build/init in progress is invisible to
+	 *  `pending_service_ids` (it is not a supervised service), so without this
+	 *  the confirmation would silently discard it. Kind-agnostic (review fix
+	 *  wave Important 1 — see `InstallKind`'s doc comment): PHP and MySQL both
+	 *  surface here, and `QuitDialog` renders the sentence matching `kind`.
 	 */
-	pendingPhpInstall: () => typedError<string | null, IpcError>(__TAURI_INVOKE("pending_php_install")),
+	pendingInstall: () => typedError<{
+	kind: InstallKindDto,
+	label: string,
+} | null, IpcError>(__TAURI_INVOKE("pending_install")),
+	/**
+	 *  Read-only environment summary for the Databases page: whether Homebrew
+	 *  was found, where it looked, and one row per MySQL major (spec D7).
+	 *  Deliberately spawns NOTHING — mirrors `php_environment`'s identical
+	 *  contract exactly (reads the managed `RwLock` + `find_brew()`, a
+	 *  filesystem check). `rescan_mysql` is the one that actually probes.
+	 */
+	mysqlEnvironment: () => typedError<MysqlEnvironmentDto, IpcError>(__TAURI_INVOKE("mysql_environment")),
+	/**
+	 *  The explicit, user-initiated re-probe behind the Databases page's rescan
+	 *  affordance — mirrors `rescan_php_runtimes` exactly, including blocking on
+	 *  `InstallLock` for the identical reason (a rescan racing a completed
+	 *  install must never silently revert it).
+	 */
+	rescanMysql: () => typedError<MysqlEnvironmentDto, IpcError>(__TAURI_INVOKE("rescan_mysql")),
+	/**
+	 *  Install a MySQL major via Homebrew, streaming its output live, then
+	 *  rescan so a freshly installed version (if it appears) is picked up —
+	 *  mirrors `install_php` exactly, sharing `InstallLock` (decision 5) — see
+	 *  `InstallKind`'s doc comment for why the quit dialog's PHP-specific copy
+	 *  is unaffected by this.
+	 */
+	installMysql: (major: string) => typedError<MysqlInstallOutcomeDto, IpcError>(__TAURI_INVOKE("install_mysql", { major })),
+	/**
+	 *  Drives Task 4's staged-init sequence for one MySQL major (spec D2),
+	 *  streaming log events live, exactly like `install_php`: `run_task`-style
+	 *  child spawning, a held `AbortHandle` (shared `InstallLock`, decision 5),
+	 *  a `Drop` guard, streamed events. Renders+validates via Task 3 first;
+	 *  registers/refreshes the service ONLY on full success. The pre-flight
+	 *  decision (catalogue gate, datadir classification) is
+	 *  [`initialize_mysql_gate`] — see its doc comment.
+	 */
+	initializeMysql: (major: string) => typedError<MysqlInitOutcomeDto, IpcError>(__TAURI_INVOKE("initialize_mysql", { major })),
+	/**
+	 *  The stored root password for `major` (spec D3's outbound reveal — the
+	 *  ONE place this crosses IPC, deliberately, for the masked field's
+	 *  Reveal/Copy affordance).
+	 * 
+	 *  SECURITY (audit H2): this command is the SOLE place in the entire
+	 *  codebase sanctioned to de-redact a `RootPassword` into a plain `String`
+	 *  for a RETURN value. Every other command that touches a stored or
+	 *  freshly generated credential (`initialize_mysql`,
+	 *  `reset_mysql_root_password`, `verify_mysql_connection`) sends it only to
+	 *  a child's stdin or an ephemeral 0600 defaults-file
+	 *  (`EphemeralDefaultsFile`), never back across IPC — see `RootPassword::expose`'s
+	 *  own doc comment for that discipline. This command's `Result` must NEVER
+	 *  be logged: verified today by grep — no Tauri command-result logging
+	 *  exists anywhere in this codebase (nothing wraps
+	 *  `specta_builder.invoke_handler()`/`tauri::Builder::invoke_handler` with a
+	 *  tracing/logging layer of any kind, and neither `log`/`tracing` nor any
+	 *  equivalent crate is even a dependency of this crate). This comment is the
+	 *  tripwire for the day someone adds one: such a layer MUST special-case
+	 *  this command (or, better, generically redact every `String`-typed
+	 *  command result) before it ships.
+	 */
+	mysqlRootPassword: (major: string) => typedError<string, IpcError>(__TAURI_INVOKE("mysql_root_password", { major })),
+	/**
+	 *  Regenerate MySQL's root password (spec D3: "reset-by-regenerate ships",
+	 *  user-chosen deferred): authenticates with the STORED (old) password via
+	 *  an ephemeral 0600 defaults-file, runs `ALTER USER` over stdin with a
+	 *  freshly generated password, and — only once that succeeds — persists the
+	 *  new value. A stale stored password (spec Deferred: "desync between
+	 *  state.db and a restored datadir") maps to `AuthFailed`, a distinct,
+	 *  renderable outcome, never a generic error.
+	 */
+	resetMysqlRootPassword: (major: string) => typedError<MysqlResetOutcomeDto, IpcError>(__TAURI_INVOKE("reset_mysql_root_password", { major })),
+	/**
+	 *  `SELECT VERSION(), @@port` through the running server's socket,
+	 *  authenticating with the stored credential via an ephemeral 0600
+	 *  defaults-file (spec D7's "it works" moment for the Databases page).
+	 */
+	verifyMysqlConnection: (major: string) => typedError<MysqlConnectionProofDto, IpcError>(__TAURI_INVOKE("verify_mysql_connection", { major })),
 };
 
 /** Events */
 export const events = {
+	mysqlInitLogEvent: makeEvent<MysqlInitLogEvent>("mysql-init-log-event"),
+	mysqlInstallLogEvent: makeEvent<MysqlInstallLogEvent>("mysql-install-log-event"),
 	phpInstallLogEvent: makeEvent<PhpInstallLogEvent>("php-install-log-event"),
 	quitRequestedEvent: makeEvent<QuitRequestedEvent>("quit-requested-event"),
 	serviceLogEvent: makeEvent<ServiceLogEvent>("service-log-event"),
@@ -272,6 +352,13 @@ export type HomeUsageDto = {
 };
 
 /**
+ *  Wire-safe copy of [`InstallKind`] for [`PendingInstallDto`] — `InstallKind`
+ *  itself carries no `specta::Type`/`Serialize`; it is purely an internal
+ *  discriminator for `InstallLock`'s slot.
+ */
+export type InstallKindDto = "php" | "mysql";
+
+/**
  *  The outcome of an `install_php` call. `detected: false` alongside
  *  `exit_code: Some(0)` is the case that matters most: brew reporting success
  *  while no `php-fpm` appears afterwards is the silent-failure class this
@@ -307,6 +394,121 @@ export type LogLine = {
 	tsMs: number,
 	level: LogLevel,
 	line: string,
+};
+
+/**
+ *  `verify_mysql_connection`'s outcome (spec D7: "returns version/port or
+ *  failure detail" — the WHOLE contract is outcome-shaped, never an
+ *  `IpcError`, so the "Verify connection" button always has something to
+ *  render).
+ */
+export type MysqlConnectionProofDto = { kind: "ok"; version: string; port: number } | { kind: "authFailed"; detail: string } | { kind: "failed"; detail: string };
+
+/**
+ *  Mirrors `openvhost_core::mysql::DatadirState` 1:1 as a wire-safe copy
+ *  (that type carries no `specta::Type`/`Serialize`, since openvhost-core
+ *  does not depend on either) — read from disk every time, never a
+ *  state.db boolean (spec D2).
+ */
+export type MysqlDatadirStateDto = { kind: "notInitialized" } | { kind: "initialized" } | { kind: "foreign"; detail: string };
+
+/**
+ *  What the Databases page needs to decide which state to show (spec D6).
+ *  `brew_found: false` means the page must guide, not list.
+ */
+export type MysqlEnvironmentDto = {
+	brewFound: boolean,
+	brewSearched: string[],
+	instances: MysqlInstanceDto[],
+};
+
+/**
+ *  One line of `initialize_mysql`'s staged-init sequence, streamed live —
+ *  same shape as [`MysqlInstallLogEvent`], a separate type so the frontend
+ *  can tell an install log from an init log without inspecting content.
+ */
+export type MysqlInitLogEvent = {
+	major: string,
+	tsMs: number,
+	stream: string,
+	line: string,
+};
+
+/**
+ *  Mirrors `openvhost_core::mysql::MysqlInitOutcome` 1:1 as a wire-safe copy
+ *  (spec D7's `initialize_mysql`).
+ */
+export type MysqlInitOutcomeDto = { kind: "initialized" } | { kind: "alreadyInitialized" } | { kind: "foreign"; detail: string } | { kind: "failed"; step: MysqlInitStepDto; reason: string };
+
+/**
+ *  Mirrors `openvhost_core::mysql::MysqlInitStep` 1:1 as a wire-safe copy —
+ *  a stable discriminator for the UI, never parsed out of free text (the
+ *  `ScaffoldStep` precedent).
+ */
+export type MysqlInitStepDto = "render" | "validate" | "initialize" | "startTempServer" | "setPassword" | "shutdown" | "finalize";
+
+/**
+ *  One line of `brew install mysql@<major>`'s output, forwarded live while an
+ *  install runs. Same shape and reasoning as [`PhpInstallLogEvent`].
+ */
+export type MysqlInstallLogEvent = {
+	major: string,
+	tsMs: number,
+	stream: string,
+	line: string,
+};
+
+/**  Mirrors `InstallOutcomeDto` for MySQL (spec D7's `install_mysql`). */
+export type MysqlInstallOutcomeDto = {
+	major: string,
+	exitCode: number | null,
+	detected: boolean,
+};
+
+/**
+ *  One row on the Databases page: a catalogue major (installed or not), or
+ *  an installed major outside the catalogue (spec D1 — "a user's 9.x
+ *  renders as a row without an Install button").
+ */
+export type MysqlInstanceDto = {
+	major: string,
+	/**
+	 *  Whether THIS BUILD offers to install this major (`MYSQL_CATALOGUE`
+	 *  membership) — false means no Install affordance, never a broken one.
+	 */
+	cataloged: boolean,
+	installed: boolean,
+	path: string | null,
+	/**
+	 *  `Some` ONLY once BOTH installed and the datadir is genuinely
+	 *  Initialized — exactly when `service_id` also names a real
+	 *  supervisor row (never merely "installed", unlike PHP's pool, which
+	 *  gets a row the moment it is installed: MySQL's row is gated on the
+	 *  datadir too, spec D6).
+	 */
+	socketPath: string | null,
+	serviceId: string | null,
+	datadirState: MysqlDatadirStateDto,
+};
+
+/**
+ *  `reset_mysql_root_password`'s outcome (spec D7 + Deferred: "distinct
+ *  auth-failure state"). Auth failure is an EXPECTED, renderable outcome —
+ *  the stored password may be stale (a restored/hand-copied datadir) —
+ *  never thrown as an `IpcError`; a spawn/other failure still is.
+ */
+export type MysqlResetOutcomeDto = { kind: "reset" } | { kind: "authFailed"; detail: string };
+
+/**
+ *  What [`pending_install`] reports: which kind of install/init occupies
+ *  `InstallLock`'s shared slot, and its label — e.g. `"8.4"` for a PHP
+ *  install, `"MySQL 8.4"` for a MySQL install, `"MySQL 8.4 initialization"`
+ *  for an init run (see `install_php`/`install_mysql`/`initialize_mysql`'s
+ *  own `set_running` calls for the exact shapes).
+ */
+export type PendingInstallDto = {
+	kind: InstallKindDto,
+	label: string,
 };
 
 /**

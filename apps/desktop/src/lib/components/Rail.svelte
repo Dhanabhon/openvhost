@@ -2,14 +2,15 @@
 <script lang="ts">
 	import { resolve } from '$app/paths';
 
-	// 'sites', 'services', 'web-server' and 'languages' are real destinations. The union stays
-	// narrow on purpose — Logs/Settings join it once their own slices land.
+	// 'sites', 'services', 'web-server', 'languages' and 'databases' are real destinations. The
+	// union stays narrow on purpose — Logs/Settings join it once their own slices land.
 	//
 	// Defaults to 'sites' because Sites is what `/` renders: the app's landing page needs no
 	// `active` of its own, and an unset prop can only ever highlight the destination the user
 	// is most likely on. AppShell.svelte defaults the same way — change both together.
-	let { active = 'sites' }: { active?: 'services' | 'sites' | 'web-server' | 'languages' } =
-		$props();
+	let {
+		active = 'sites'
+	}: { active?: 'services' | 'sites' | 'web-server' | 'languages' | 'databases' } = $props();
 </script>
 
 <nav class="rail" aria-label="Main">
@@ -124,6 +125,35 @@
 			<path d="M11.5 5 15 9l-3.5 4" />
 		</svg>
 		Languages
+	</a>
+
+	<!-- Databases: MySQL lifecycle today, MariaDB later (spec Deferred) — its own `/databases`
+	     route, after Languages: task brief order (both "what runtimes/services are managed"
+	     destinations sit together, ahead of the Logs/Settings placeholders). -->
+	<a
+		class="nav-item"
+		href={resolve('/databases')}
+		aria-current={active === 'databases' ? 'page' : undefined}
+	>
+		<!-- Hand-drawn (18px, currentColor stroke, 1.6 width) rather than a real MySQL dolphin
+		     mark — same reasoning as the other rail glyphs: the rail names a section, not a
+		     brand. A stacked-cylinder "database" glyph reads as "data storage" generically. -->
+		<svg
+			width="18"
+			height="18"
+			viewBox="0 0 18 18"
+			fill="none"
+			stroke="currentColor"
+			stroke-width="1.6"
+			stroke-linecap="round"
+			stroke-linejoin="round"
+			aria-hidden="true"
+		>
+			<ellipse cx="9" cy="4.5" rx="6" ry="2" />
+			<path d="M3 4.5v9c0 1.1 2.7 2 6 2s6-.9 6-2v-9" />
+			<path d="M3 9c0 1.1 2.7 2 6 2s6-.9 6-2" />
+		</svg>
+		Databases
 	</a>
 
 	<!-- Logs: inert placeholder — full log-viewer redesign is slice B. -->

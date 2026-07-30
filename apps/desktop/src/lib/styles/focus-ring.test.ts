@@ -82,35 +82,48 @@ describe('a focused quiet button', () => {
 });
 
 describe('focused, invalid form controls', () => {
-	// The other three controls with a visible border of their own: `.input` in
-	// `WebServerSettingsForm.svelte` and `SiteDrawer.svelte`, and `.trigger` in
-	// `Select.svelte` (its `role="combobox"` stand-in for a native `<select>`).
-	// Same doubled-frame bug as `.btn-quiet`, fixed the same way — plus a hard
-	// requirement `.btn-quiet` never had: an INVALID control must read red even
-	// while focused, never the focus ring's colour.
+	// The four controls with a visible border of their own: `.input` in
+	// `WebServerSettingsForm.svelte`, `SiteDrawer.svelte` and
+	// `MysqlCredentials.svelte` (its masked root-password field), and
+	// `.trigger` in `Select.svelte` (its `role="combobox"` stand-in for a
+	// native `<select>`). Same doubled-frame bug as `.btn-quiet`, fixed the
+	// same way — plus a hard requirement `.btn-quiet` never had: an INVALID
+	// control must read red even while focused, never the focus ring's
+	// colour.
 	//
 	// Each file's own rules live beside the selector they modify (a global
 	// `.input:focus-visible` in tokens.css would tie with the component's own
 	// scoped `.input` rule at identical specificity and lose to load order —
-	// see this task's report), which is exactly the setup that let the three
-	// copies drift from each other unnoticed. Comparing their rule BODIES
-	// against each other, not just against a fixed expectation, is what makes
-	// that drift a test failure instead of a future bug report.
+	// see this task's report), which is exactly the setup that let the first
+	// three copies drift from each other unnoticed. Comparing their rule
+	// BODIES against each other, not just against a fixed expectation, is
+	// what makes that drift a test failure instead of a future bug report.
+	//
+	// `MysqlCredentials` has no invalid state of its own (the password field
+	// is never user-typed, so nothing there can be "invalid") — it is
+	// included in the ordinary-focus comparison below but sits out the
+	// invalid-focus one, same as any future bordered control that never
+	// carries `aria-invalid` would.
 	const files: Record<string, string> = {
 		WebServerSettingsForm: readFileSync(
 			new URL('../components/WebServerSettingsForm.svelte', import.meta.url),
 			'utf8'
 		),
 		SiteDrawer: readFileSync(new URL('../components/SiteDrawer.svelte', import.meta.url), 'utf8'),
-		Select: readFileSync(new URL('../components/Select.svelte', import.meta.url), 'utf8')
+		Select: readFileSync(new URL('../components/Select.svelte', import.meta.url), 'utf8'),
+		MysqlCredentials: readFileSync(
+			new URL('../components/MysqlCredentials.svelte', import.meta.url),
+			'utf8'
+		)
 	};
 
-	/** Selector each file uses for its bordered control: `.input` for the two
-	 * forms, `.trigger` for `Select`'s combobox button. */
+	/** Selector each file uses for its bordered control: `.input` for the
+	 * three form-shaped ones, `.trigger` for `Select`'s combobox button. */
 	const selectors: Record<string, string> = {
 		WebServerSettingsForm: '.input',
 		SiteDrawer: '.input',
-		Select: '.trigger'
+		Select: '.trigger',
+		MysqlCredentials: '.input'
 	};
 
 	/** The body (no braces) of `<selector>:focus-visible`, escaping the selector's
@@ -145,8 +158,14 @@ describe('focused, invalid form controls', () => {
 	}
 
 	const names = Object.keys(files);
+	// `MysqlCredentials` sits out the invalid-focus checks: its password field
+	// is never user-typed (read-only, generated), so it never carries
+	// `aria-invalid` and has no `[aria-invalid='true']:focus-visible` rule to
+	// compare — the same way a future bordered control with no invalid state
+	// would.
+	const invalidNames = names.filter((name) => name !== 'MysqlCredentials');
 
-	it('closes the gap and recolours the border on every one of the three controls', () => {
+	it('closes the gap and recolours the border on every one of the four controls', () => {
 		for (const name of names) {
 			const block = focusBlock(files[name], selectors[name]);
 			expect(block, name).toMatch(/outline-offset:\s*0/);
@@ -155,7 +174,7 @@ describe('focused, invalid form controls', () => {
 	});
 
 	it('turns the whole band red — border AND outline — when an invalid control is focused', () => {
-		for (const name of names) {
+		for (const name of invalidNames) {
 			const block = invalidFocusBlock(files[name], selectors[name]);
 			expect(block, name).toMatch(/border-color:\s*var\(--vh-fail\)/);
 			expect(block, name).toMatch(/outline-color:\s*var\(--vh-fail\)/);
@@ -165,15 +184,15 @@ describe('focused, invalid form controls', () => {
 		}
 	});
 
-	it('keeps the ordinary focus rule identical across all three controls', () => {
+	it('keeps the ordinary focus rule identical across all four controls', () => {
 		const [first, ...rest] = names.map((name) =>
 			normalise(focusBlock(files[name], selectors[name]))
 		);
 		for (const block of rest) expect(block).toBe(first);
 	});
 
-	it('keeps the invalid-focus rule identical across all three controls', () => {
-		const [first, ...rest] = names.map((name) =>
+	it('keeps the invalid-focus rule identical across the controls that have one', () => {
+		const [first, ...rest] = invalidNames.map((name) =>
 			normalise(invalidFocusBlock(files[name], selectors[name]))
 		);
 		for (const block of rest) expect(block).toBe(first);

@@ -121,9 +121,9 @@ impl RenderCtx {
 /// The single chokepoint for embedding a path into a config template: reject
 /// non-UTF-8 (Tera cannot render it), normalize `\` to `/`, strip a `\\?\` /
 /// `\\?\UNC\` verbatim prefix (nginx's parser understands neither), and
-/// reject an embedded `"`, ASCII control character, or `$` — the crate's
-/// central quoting invariant. Every generated directive double-quotes its
-/// path value, so a path containing `"` (e.g. a docroot of
+/// reject an embedded `"`, `$`, `#`, `;`, or ASCII control character — the
+/// crate's central quoting invariant. Every generated directive
+/// double-quotes its path value, so a path containing `"` (e.g. a docroot of
 /// `/tmp/x" ; daemon on; #`) would splice an injected directive that still
 /// passes `nginx -t`. `$` matters for a different reason: nginx's `root` is a
 /// *complex value* that expands variables even inside double quotes, so a
@@ -131,10 +131,18 @@ impl RenderCtx {
 /// `root "/tmp/projects/app$http_x_root";` — a directive that still passes
 /// `nginx -t` but resolves the document root (and, via
 /// `SCRIPT_FILENAME $document_root$fastcgi_script_name`, the PHP script path)
-/// from an attacker-controlled request header at request time. The same
-/// chokepoint feeds the php-fpm pool template's unquoted INI `listen =`,
-/// `error_log =`, and `include=` lines, where `$` is also expanded. A no-op
-/// on ordinary, clean unix paths.
+/// from an attacker-controlled request header at request time. `#` and `;`
+/// guard a THIRD dialect this chokepoint also feeds: `openvhost_conf::mysql`
+/// renders `my.cnf`, an INI file, whose parser treats `#` and `;` as
+/// comment leaders with NO quoting escape at all — unlike nginx, where a
+/// bare `#`/`;` inside a double-quoted value is inert, my.cnf has nothing
+/// that could neutralize either character. A `datadir`/`socket`/`pid-file`
+/// path containing one would silently truncate the value `mysqld` actually
+/// reads from that point to end-of-line — not a syntax error `--validate-config`
+/// would catch, just a quietly wrong path. The same chokepoint also feeds the
+/// php-fpm pool template's unquoted INI `listen =`, `error_log =`, and
+/// `include=` lines, where `$` is expanded and the identical comment-leader
+/// hazard applies. A no-op on ordinary, clean unix paths.
 pub(crate) fn to_config_path(p: &Path) -> Result<String, ConfError> {
     let s = p
         .to_str()
@@ -144,11 +152,17 @@ pub(crate) fn to_config_path(p: &Path) -> Result<String, ConfError> {
         .map(|rest| format!(r"\\{rest}"))
         .unwrap_or_else(|| s.strip_prefix(r"\\?\").unwrap_or(s).to_string());
     let s = s.replace('\\', "/");
-    if s.contains('"') || s.contains('$') || s.bytes().any(|b| b.is_ascii_control()) {
+    if s.contains('"')
+        || s.contains('$')
+        || s.contains('#')
+        || s.contains(';')
+        || s.bytes().any(|b| b.is_ascii_control())
+    {
         return Err(ConfError::InvalidField {
             field: "path",
             value: s,
-            reason: "must not contain a double-quote, dollar sign, or control character",
+            reason: "must not contain a double-quote, dollar sign, hash, semicolon, \
+                     or control character",
         });
     }
     Ok(s)
@@ -266,6 +280,33 @@ mod tests {
             newline,
             Err(ConfError::InvalidField { field: "path", .. })
         ));
+    }
+
+    /// Audit finding M1: `#` and `;` are the my.cnf/INI dialect's comment
+    /// leaders (`openvhost_conf::mysql`'s templates render through this same
+    /// chokepoint) — everything from the leader to end-of-line is silently
+    /// DROPPED by that parser, not rejected. Unlike nginx (where a bare `#`
+    /// or `;` inside a double-quoted directive value is inert), my.cnf has
+    /// no quoting at all for these two characters: a datadir/socket path
+    /// containing either would silently truncate the value MySQL actually
+    /// uses, which is a distinct hazard from the quote/`$`/control-char class
+    /// above and gets its own independent assertion per character (RED
+    /// against pre-fix code: both currently pass straight through).
+    #[test]
+    fn to_config_path_rejects_ini_comment_leaders() {
+        let hash = to_config_path(Path::new("/tmp/x#comment"));
+        assert!(
+            matches!(hash, Err(ConfError::InvalidField { field: "path", .. })),
+            "got {hash:?}"
+        );
+        let semicolon = to_config_path(Path::new("/tmp/x;comment"));
+        assert!(
+            matches!(
+                semicolon,
+                Err(ConfError::InvalidField { field: "path", .. })
+            ),
+            "got {semicolon:?}"
+        );
     }
 
     #[test]

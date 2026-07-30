@@ -12,7 +12,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use openvhost_proc::testchild::E2E_BODY;
-use openvhost_proc::{ServiceSpec, ServiceState, SpawnSpec, Supervisor, default_driver};
+use openvhost_proc::{
+    DEFAULT_GRACE, ReadinessProbe, ServiceSpec, ServiceState, SpawnSpec, Supervisor, default_driver,
+};
 
 fn http_spec(port: u16) -> ServiceSpec {
     ServiceSpec {
@@ -25,6 +27,8 @@ fn http_spec(port: u16) -> ServiceSpec {
             cwd: None,
             env: vec![],
         },
+        readiness: ReadinessProbe::default(),
+        grace: DEFAULT_GRACE,
     }
 }
 

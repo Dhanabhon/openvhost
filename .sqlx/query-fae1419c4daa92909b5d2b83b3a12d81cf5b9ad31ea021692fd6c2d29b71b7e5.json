@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM mysql_instances WHERE major = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "fae1419c4daa92909b5d2b83b3a12d81cf5b9ad31ea021692fd6c2d29b71b7e5"
+}

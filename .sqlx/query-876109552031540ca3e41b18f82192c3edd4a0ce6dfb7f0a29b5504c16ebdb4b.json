@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO mysql_instances (major, root_password, initialized_at) VALUES (?, ?, ?) ON CONFLICT(major) DO UPDATE SET root_password = excluded.root_password, initialized_at = excluded.initialized_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "876109552031540ca3e41b18f82192c3edd4a0ce6dfb7f0a29b5504c16ebdb4b"
+}

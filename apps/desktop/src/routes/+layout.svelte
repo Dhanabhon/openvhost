@@ -7,9 +7,10 @@
 		confirmQuit,
 		onQuitRequested,
 		onServiceState,
-		pendingPhpInstall,
+		pendingInstall,
 		quitDialogReady,
-		type IpcError
+		type IpcError,
+		type PendingInstallDto
 	} from '$lib/ipc';
 	import { errorMessage } from '$lib/errors';
 	import { servicesStore } from '$lib/services.shared.svelte';
@@ -28,13 +29,15 @@
 	// Read live, not snapshotted when the dialog opened: a service that stops while
 	// the user reads the dialog should drop out of the sentence.
 	const pending = $derived(pendingServiceNames(servicesStore.services));
-	// A PHP install in progress is invisible to `pending` — it is not a
-	// supervised service — so it is fetched separately, once, at the moment the
-	// dialog is about to open. Not reactive/polled: unlike services (which push
-	// state changes the layout already subscribes to), there is no live event
-	// for "an install just started/finished", and asking on every open is cheap
-	// enough that polling continuously would only add complexity for no benefit.
-	let installingMajor = $state<string | null>(null);
+	// An install (PHP or MySQL alike — review fix wave, Important 1) in
+	// progress is invisible to `pending` — it is not a supervised service —
+	// so it is fetched separately, once, at the moment the dialog is about
+	// to open. Not reactive/polled: unlike services (which push state
+	// changes the layout already subscribes to), there is no live event for
+	// "an install just started/finished", and asking on every open is cheap
+	// enough that polling continuously would only add complexity for no
+	// benefit.
+	let pendingInstallInfo = $state<PendingInstallDto | null>(null);
 
 	async function onConfirmQuit(): Promise<void> {
 		if (quitting) return;
@@ -110,15 +113,15 @@
 			try {
 				const stop = await onQuitRequested(() => {
 					quitError = '';
-					installingMajor = null;
+					pendingInstallInfo = null;
 					quitOpen = true;
 					// Fire-and-forget: a failure here must not block the dialog from
 					// opening — it only means the install sentence is missing, not
-					// that the whole confirmation is broken. `installingMajor` stays
+					// that the whole confirmation is broken. `pendingInstallInfo` stays
 					// `null`, the same as "nothing is installing".
-					void pendingPhpInstall()
-						.then((major) => {
-							installingMajor = major;
+					void pendingInstall()
+						.then((info) => {
+							pendingInstallInfo = info;
 						})
 						.catch(() => {});
 				});
@@ -169,7 +172,7 @@
 {#if quitOpen}
 	<QuitDialog
 		{pending}
-		{installingMajor}
+		pendingInstall={pendingInstallInfo}
 		{quitting}
 		error={quitError}
 		onCancel={onCancelQuit}

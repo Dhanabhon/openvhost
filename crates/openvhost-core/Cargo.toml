@@ -24,6 +24,9 @@ specta = ["dep:specta"]
 serde_json = "1"
 tempfile = "3"
 tokio = { workspace = true }
+# Only used by the macOS-gated `tests/mysql_live.rs` orphan-check
+# (`libc::kill(pid, 0)`), mirroring openvhost-proc's identical dev-dependency.
+libc = "0.2"
 
 [lints]
 workspace = true

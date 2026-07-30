@@ -29,4 +29,36 @@ pub enum CoreError {
     /// A domain value failed validation at the boundary (parse-don't-validate).
     #[error("invalid {field}: {reason}")]
     Validation { field: &'static str, reason: String },
+    /// A filesystem write outside the provisioning path (which already has
+    /// its own [`CoreError::ProvisionIo`]) and outside the site-apply plan
+    /// (which has its own `site::apply::ApplyError::Io`). Added for the
+    /// MySQL init sequence's `my.cnf` write (P1 MySQL lifecycle design, spec
+    /// D5: "written with `atomicfile::write_atomic` as a `GeneratedFile`"),
+    /// which needs the SAME hardened atomic write `site::apply::commit`
+    /// already uses but has no `ApplyPlan` of its own to go through — see
+    /// `crate::mysql::write_generated_config`. A second use site joined it
+    /// with audit finding H1: `crate::db::Db::open`'s own precreate/chmod
+    /// calls that pin `state.db` (and its WAL sidecars) to 0600 are the
+    /// identical shape — a filesystem op with no `ApplyPlan`/provisioning
+    /// context of its own to report through.
+    #[error("{op} {}: {source}", path.display())]
+    Io {
+        op: &'static str,
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+/// Maps the crate-shared hardened atomic write's error (`crate::atomicfile`)
+/// into [`CoreError::Io`] — mirrors `site::apply::error`'s identical
+/// `From<AtomicWriteError> for ApplyError` (a manual impl, not `#[from]`,
+/// because the fields are remapped, not wrapped as-is).
+impl From<crate::atomicfile::AtomicWriteError> for CoreError {
+    fn from(e: crate::atomicfile::AtomicWriteError) -> Self {
+        CoreError::Io {
+            op: e.op,
+            path: e.path,
+            source: e.source,
+        }
+    }
 }

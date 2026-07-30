@@ -2,6 +2,7 @@
 //! Tauri command surface — thin validation + delegation to openvhost-core
 //! (business logic never lives here; master plan §5).
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
@@ -1908,32 +1909,88 @@ pub async fn rescan_php_runtimes(
     })
 }
 
-/// Serializes `install_php`: only one brew install runs at a time. The
-/// call site uses `try_lock`, not `lock` — a second press while an install is
-/// running should be refused with an explanation, not silently queued behind
-/// a build that can take twenty minutes. Mirrors `ApplyLock`'s shape.
+/// Serializes EVERY long-running, abortable background install/init run:
+/// `install_php`, and (P1 MySQL lifecycle design, spec D7/plan Task 5)
+/// `install_mysql` and `initialize_mysql`. Only one runs at a time,
+/// REGARDLESS of kind — the mandatory cross-kind test below is the
+/// generalization proof. The call site uses `try_lock`, not `lock` — a
+/// second press while one is running should be refused with an explanation,
+/// not silently queued behind a build that can take twenty minutes. Mirrors
+/// `ApplyLock`'s shape.
 ///
 /// Also holds the one thing `perform_quit` needs to make the C1 audit finding
 /// stop being true: the in-flight run's `AbortHandle` (see `running`). The
-/// containment `openvhost_proc::run_task` provides — killing brew's whole
+/// containment `openvhost_proc::run_task` provides — killing the whole
 /// process group — is `KillOnDrop`, which only fires when the run's future is
 /// actually DROPPED. Before this, nothing in production ever dropped it:
 /// `install_php` awaited `run_task` inline, so the future lived exactly as
 /// long as the command handler did, and quitting mid-install went straight to
 /// `window.destroy()` and then `process::exit` with no unwinding at all. Now
-/// `install_php` spawns the run so it has a handle to abort, and `perform_quit`
-/// aborts-and-waits on it BEFORE destroying the window — see `quit.rs`.
+/// every one of these commands spawns its run so it has a handle to abort,
+/// and `perform_quit` aborts-and-waits on it BEFORE destroying the window —
+/// see `quit.rs`.
 #[derive(Default)]
 pub struct InstallLock {
     pub(crate) guard: tokio::sync::Mutex<()>,
     running: std::sync::Mutex<Option<RunningInstall>>,
 }
 
-/// The major and abort handle of the one install `install_php` may have in
-/// flight, so `perform_quit` can both abort it and tell the user what major
-/// they are about to lose.
+/// Which of the commands sharing [`InstallLock`] currently occupies its
+/// slot.
+///
+/// Review fix wave, Important 1: this used to gate only a PHP-specific
+/// query (`pending_php_install`/`running_php_major`, both replaced by
+/// [`InstallLock::running_install`]/`pending_install` below) whose own doc
+/// comment deferred generalizing the quit dialog's copy to "the Databases UI
+/// slice (Task 6)" — until this fix, a MySQL install or initialization in
+/// flight was therefore invisible to the quit-confirmation dialog entirely
+/// (`+layout.svelte`'s `pendingInstall`, rendered by `QuitDialog.svelte` as
+/// either `PHP {label} is still installing.` or
+/// `MySQL {label} is still installing.`), the same class of bug as a
+/// service quitting mid-work with no warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InstallKind {
+    Php,
+    Mysql,
+}
+
+/// Wire-safe copy of [`InstallKind`] for [`PendingInstallDto`] — `InstallKind`
+/// itself carries no `specta::Type`/`Serialize`; it is purely an internal
+/// discriminator for `InstallLock`'s slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub enum InstallKindDto {
+    Php,
+    Mysql,
+}
+
+impl From<InstallKind> for InstallKindDto {
+    fn from(kind: InstallKind) -> Self {
+        match kind {
+            InstallKind::Php => Self::Php,
+            InstallKind::Mysql => Self::Mysql,
+        }
+    }
+}
+
+/// What [`pending_install`] reports: which kind of install/init occupies
+/// `InstallLock`'s shared slot, and its label — e.g. `"8.4"` for a PHP
+/// install, `"MySQL 8.4"` for a MySQL install, `"MySQL 8.4 initialization"`
+/// for an init run (see `install_php`/`install_mysql`/`initialize_mysql`'s
+/// own `set_running` calls for the exact shapes).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, specta::Type)]
+pub struct PendingInstallDto {
+    pub kind: InstallKindDto,
+    pub label: String,
+}
+
+/// The kind, label, and abort handle of the one install/init run
+/// `InstallLock` may have in flight, so `perform_quit` can abort it and
+/// `pending_install` can tell the user what they are about to lose,
+/// regardless of kind.
 struct RunningInstall {
-    major: String,
+    kind: InstallKind,
+    label: String,
     abort: tokio::task::AbortHandle,
 }
 
@@ -1941,12 +1998,17 @@ impl InstallLock {
     /// `pub(crate)`, not private: the C1 regression test drives this directly
     /// to reproduce what `install_php` does — spawn a run, record its abort
     /// handle — without going through the full IPC command.
-    pub(crate) fn set_running(&self, major: String, abort: tokio::task::AbortHandle) {
+    pub(crate) fn set_running(
+        &self,
+        kind: InstallKind,
+        label: String,
+        abort: tokio::task::AbortHandle,
+    ) {
         let mut slot = self
             .running
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *slot = Some(RunningInstall { major, abort });
+        *slot = Some(RunningInstall { kind, label, abort });
     }
 
     fn clear_running(&self) {
@@ -1957,20 +2019,26 @@ impl InstallLock {
         *slot = None;
     }
 
-    /// The major currently installing, if any — the quit dialog's copy reads
-    /// this through the `pending_php_install` command.
-    pub(crate) fn running_major(&self) -> Option<String> {
+    /// The kind and label of whatever install/init run currently occupies
+    /// the slot, if any — `None` only when nothing is running. The
+    /// generalization (review fix wave Important 1) of the old PHP-only
+    /// `running_php_major`, which used to `.filter(|r| r.kind == InstallKind::Php)`
+    /// here and silently returned `None` for a MySQL occupant. The quit
+    /// dialog's copy reads this through the [`pending_install`] command.
+    pub(crate) fn running_install(&self) -> Option<(InstallKind, String)> {
         self.running
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-            .map(|r| r.major.clone())
+            .map(|r| (r.kind, r.label.clone()))
     }
 
-    /// A clone of the in-flight run's abort handle, if any. `AbortHandle` is
-    /// cheap to clone (it is a handle, not the task), so `perform_quit` can
-    /// hold its own copy and call `.abort()`/`.is_finished()` on it without
-    /// disturbing whatever `install_php` itself is doing with the run.
+    /// A clone of the in-flight run's abort handle, if any, REGARDLESS of
+    /// kind — `perform_quit` must abort a MySQL install/init exactly as
+    /// eagerly as a PHP one. `AbortHandle` is cheap to clone (it is a
+    /// handle, not the task), so `perform_quit` can hold its own copy and
+    /// call `.abort()`/`.is_finished()` on it without disturbing whatever
+    /// the owning command itself is doing with the run.
     pub(crate) fn running_abort_handle(&self) -> Option<tokio::task::AbortHandle> {
         self.running
             .lock()
@@ -2017,15 +2085,24 @@ impl Drop for RunningInstallGuard<'_> {
     }
 }
 
-/// The major currently installing, if any — for the quit dialog: a build in
-/// progress is invisible to `pending_service_ids` (it is not a supervised
-/// service), so without this the confirmation would silently discard it.
+/// Whatever is currently installing or initializing, if anything — for the
+/// quit dialog: a build/init in progress is invisible to
+/// `pending_service_ids` (it is not a supervised service), so without this
+/// the confirmation would silently discard it. Kind-agnostic (review fix
+/// wave Important 1 — see `InstallKind`'s doc comment): PHP and MySQL both
+/// surface here, and `QuitDialog` renders the sentence matching `kind`.
 #[tauri::command]
 #[specta::specta]
-pub async fn pending_php_install(
+pub async fn pending_install(
     lock: tauri::State<'_, InstallLock>,
-) -> Result<Option<String>, IpcError> {
-    Ok(lock.inner().running_major())
+) -> Result<Option<PendingInstallDto>, IpcError> {
+    Ok(lock
+        .inner()
+        .running_install()
+        .map(|(kind, label)| PendingInstallDto {
+            kind: kind.into(),
+            label,
+        }))
 }
 
 /// Install a PHP major via Homebrew, streaming its output live, then rescan
@@ -2125,8 +2202,11 @@ pub async fn install_php(
         tx,
     ));
     let abort_handle = install_task.abort_handle();
-    lock.inner()
-        .set_running(major.as_str().to_string(), abort_handle.clone());
+    lock.inner().set_running(
+        InstallKind::Php,
+        major.as_str().to_string(),
+        abort_handle.clone(),
+    );
     // Cleared AND aborted on every return path below via `Drop`, including
     // the two `?`s still to come — see `RunningInstallGuard`'s doc comment
     // for why that is a `Drop` impl and not a matching call at each return
@@ -2375,7 +2455,7 @@ mod php_ipc_tests {
         let lock = InstallLock::default();
         let task = tokio::spawn(std::future::pending::<()>());
         let abort = task.abort_handle();
-        lock.set_running("8.4".to_string(), abort.clone());
+        lock.set_running(InstallKind::Php, "8.4".to_string(), abort.clone());
 
         {
             let _guard = RunningInstallGuard { lock: &lock, abort };
@@ -2396,8 +2476,2702 @@ mod php_ipc_tests {
             }
         }
         assert!(
-            lock.running_major().is_none(),
+            lock.running_install().is_none(),
             "expected the guard's Drop impl to also clear the running slot"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // InstallLock generalization proof (P1 MySQL lifecycle design decision
+    // 5): PHP and MySQL installs share ONE lock — a second install of
+    // EITHER kind must be rejected while the other is running.
+    // -------------------------------------------------------------------
+
+    /// Mirrors `rescan_blocks_while_an_install_holds_the_lock` above, but
+    /// holds the guard the way `install_mysql` would (a DIFFERENT kind) and
+    /// asserts `install_php`'s own `try_lock` guard refuses to proceed —
+    /// proving the generalization actually serializes across kinds, not just
+    /// within PHP's own commands as before.
+    #[tokio::test]
+    async fn a_php_install_is_rejected_while_a_mysql_install_holds_the_lock() {
+        let lock = InstallLock::default();
+        let held = lock.guard.lock().await;
+        lock.set_running(
+            InstallKind::Mysql,
+            "MySQL 8.4".to_string(),
+            tokio::spawn(std::future::pending::<()>()).abort_handle(),
+        );
+
+        assert!(
+            lock.guard.try_lock().is_err(),
+            "install_php's try_lock must fail while a MySQL install holds the guard"
+        );
+        // The kind-agnostic quit-dialog signal must see the MySQL occupant,
+        // correctly tagged (review fix wave Important 1 — the old PHP-only
+        // filter hid a MySQL label entirely instead of tagging it).
+        assert_eq!(
+            lock.running_install(),
+            Some((InstallKind::Mysql, "MySQL 8.4".to_string()))
+        );
+        // The kind-agnostic abort handle (what `perform_quit` uses) must
+        // still find something to abort.
+        assert!(lock.running_abort_handle().is_some());
+
+        drop(held);
+    }
+
+    /// The mirror image: a MySQL install (`install_mysql`'s own `try_lock`)
+    /// must be rejected while a PHP install holds the guard.
+    #[tokio::test]
+    async fn a_mysql_install_is_rejected_while_a_php_install_holds_the_lock() {
+        let lock = InstallLock::default();
+        let held = lock.guard.lock().await;
+        lock.set_running(
+            InstallKind::Php,
+            "8.4".to_string(),
+            tokio::spawn(std::future::pending::<()>()).abort_handle(),
+        );
+
+        assert!(
+            lock.guard.try_lock().is_err(),
+            "install_mysql's try_lock must fail while a PHP install holds the guard"
+        );
+        assert_eq!(
+            lock.running_install(),
+            Some((InstallKind::Php, "8.4".to_string()))
+        );
+
+        drop(held);
+    }
+
+    // -------------------------------------------------------------------
+    // pending_install (review fix wave, Important 1): the kind-agnostic
+    // quit-dialog query that replaced pending_php_install.
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn pending_install_reports_a_mysql_occupant_with_its_kind() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let lock = InstallLock::default();
+        lock.set_running(
+            InstallKind::Mysql,
+            "MySQL 8.4 initialization".to_string(),
+            tokio::spawn(std::future::pending::<()>()).abort_handle(),
+        );
+        app.manage(lock);
+
+        let pending = pending_install(app.state::<InstallLock>()).await.unwrap();
+
+        assert_eq!(
+            pending,
+            Some(PendingInstallDto {
+                kind: InstallKindDto::Mysql,
+                label: "MySQL 8.4 initialization".to_string(),
+            }),
+            "a MySQL occupant must be visible, correctly tagged — the whole \
+             point of the generalization"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_install_is_none_when_nothing_is_running() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(InstallLock::default());
+
+        let pending = pending_install(app.state::<InstallLock>()).await.unwrap();
+
+        assert!(pending.is_none());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MySQL (Databases page)
+// spec docs/superpowers/specs/2026-07-29-p1-db-mysql-design.md
+// ---------------------------------------------------------------------------
+
+/// Mirrors `openvhost_core::mysql::DatadirState` 1:1 as a wire-safe copy
+/// (that type carries no `specta::Type`/`Serialize`, since openvhost-core
+/// does not depend on either) — read from disk every time, never a
+/// state.db boolean (spec D2).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum MysqlDatadirStateDto {
+    NotInitialized,
+    Initialized,
+    Foreign { detail: String },
+}
+
+impl From<openvhost_core::mysql::DatadirState> for MysqlDatadirStateDto {
+    fn from(s: openvhost_core::mysql::DatadirState) -> Self {
+        match s {
+            openvhost_core::mysql::DatadirState::NotInitialized => Self::NotInitialized,
+            openvhost_core::mysql::DatadirState::Initialized => Self::Initialized,
+            openvhost_core::mysql::DatadirState::Foreign { detail } => Self::Foreign { detail },
+        }
+    }
+}
+
+/// Classify `dir`'s datadir state for the wire, folding an `io::Error` (e.g.
+/// permission denied) into `Foreign` rather than silently defaulting to
+/// `NotInitialized` — the "never silently downgrade to the safe-looking
+/// state" discipline (the Docroot lesson): a directory this process could
+/// not actually inspect must never render as "safe to initialize into".
+fn classify_datadir_dto(dir: &Path) -> MysqlDatadirStateDto {
+    match openvhost_core::mysql::classify_datadir(dir) {
+        Ok(state) => state.into(),
+        Err(e) => MysqlDatadirStateDto::Foreign {
+            detail: format!("could not inspect {}: {e}", dir.display()),
+        },
+    }
+}
+
+/// One row on the Databases page: a catalogue major (installed or not), or
+/// an installed major outside the catalogue (spec D1 — "a user's 9.x
+/// renders as a row without an Install button").
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct MysqlInstanceDto {
+    pub major: String,
+    /// Whether THIS BUILD offers to install this major (`MYSQL_CATALOGUE`
+    /// membership) — false means no Install affordance, never a broken one.
+    pub cataloged: bool,
+    pub installed: bool,
+    pub path: Option<String>,
+    /// `Some` ONLY once BOTH installed and the datadir is genuinely
+    /// Initialized — exactly when `service_id` also names a real
+    /// supervisor row (never merely "installed", unlike PHP's pool, which
+    /// gets a row the moment it is installed: MySQL's row is gated on the
+    /// datadir too, spec D6).
+    pub socket_path: Option<String>,
+    pub service_id: Option<String>,
+    pub datadir_state: MysqlDatadirStateDto,
+}
+
+/// What the Databases page needs to decide which state to show (spec D6).
+/// `brew_found: false` means the page must guide, not list.
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct MysqlEnvironmentDto {
+    pub brew_found: bool,
+    pub brew_searched: Vec<String>,
+    pub instances: Vec<MysqlInstanceDto>,
+}
+
+/// Mirrors `InstallOutcomeDto` for MySQL (spec D7's `install_mysql`).
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct MysqlInstallOutcomeDto {
+    pub major: String,
+    pub exit_code: Option<i32>,
+    pub detected: bool,
+}
+
+/// One line of `brew install mysql@<major>`'s output, forwarded live while an
+/// install runs. Same shape and reasoning as [`PhpInstallLogEvent`].
+#[derive(Debug, Clone, serde::Serialize, specta::Type, tauri_specta::Event)]
+#[serde(rename_all = "camelCase")]
+pub struct MysqlInstallLogEvent {
+    pub major: String,
+    pub ts_ms: u64,
+    pub stream: String,
+    pub line: String,
+}
+
+/// One line of `initialize_mysql`'s staged-init sequence, streamed live —
+/// same shape as [`MysqlInstallLogEvent`], a separate type so the frontend
+/// can tell an install log from an init log without inspecting content.
+#[derive(Debug, Clone, serde::Serialize, specta::Type, tauri_specta::Event)]
+#[serde(rename_all = "camelCase")]
+pub struct MysqlInitLogEvent {
+    pub major: String,
+    pub ts_ms: u64,
+    pub stream: String,
+    pub line: String,
+}
+
+/// Mirrors `openvhost_core::mysql::MysqlInitStep` 1:1 as a wire-safe copy —
+/// a stable discriminator for the UI, never parsed out of free text (the
+/// `ScaffoldStep` precedent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub enum MysqlInitStepDto {
+    Render,
+    Validate,
+    Initialize,
+    StartTempServer,
+    SetPassword,
+    Shutdown,
+    Finalize,
+}
+
+impl From<openvhost_core::mysql::MysqlInitStep> for MysqlInitStepDto {
+    fn from(s: openvhost_core::mysql::MysqlInitStep) -> Self {
+        use openvhost_core::mysql::MysqlInitStep as S;
+        match s {
+            S::Render => Self::Render,
+            S::Validate => Self::Validate,
+            S::Initialize => Self::Initialize,
+            S::StartTempServer => Self::StartTempServer,
+            S::SetPassword => Self::SetPassword,
+            S::Shutdown => Self::Shutdown,
+            S::Finalize => Self::Finalize,
+        }
+    }
+}
+
+/// Mirrors `openvhost_core::mysql::MysqlInitOutcome` 1:1 as a wire-safe copy
+/// (spec D7's `initialize_mysql`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, specta::Type)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum MysqlInitOutcomeDto {
+    Initialized,
+    AlreadyInitialized,
+    Foreign {
+        detail: String,
+    },
+    Failed {
+        step: MysqlInitStepDto,
+        reason: String,
+    },
+}
+
+impl From<openvhost_core::mysql::MysqlInitOutcome> for MysqlInitOutcomeDto {
+    fn from(o: openvhost_core::mysql::MysqlInitOutcome) -> Self {
+        use openvhost_core::mysql::MysqlInitOutcome as O;
+        match o {
+            O::Initialized => Self::Initialized,
+            O::AlreadyInitialized => Self::AlreadyInitialized,
+            O::Foreign { detail } => Self::Foreign { detail },
+            O::Failed { step, reason } => Self::Failed {
+                step: step.into(),
+                reason,
+            },
+        }
+    }
+}
+
+/// `reset_mysql_root_password`'s outcome (spec D7 + Deferred: "distinct
+/// auth-failure state"). Auth failure is an EXPECTED, renderable outcome —
+/// the stored password may be stale (a restored/hand-copied datadir) —
+/// never thrown as an `IpcError`; a spawn/other failure still is.
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum MysqlResetOutcomeDto {
+    Reset,
+    AuthFailed { detail: String },
+}
+
+/// `verify_mysql_connection`'s outcome (spec D7: "returns version/port or
+/// failure detail" — the WHOLE contract is outcome-shaped, never an
+/// `IpcError`, so the "Verify connection" button always has something to
+/// render).
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum MysqlConnectionProofDto {
+    Ok { version: String, port: u32 },
+    AuthFailed { detail: String },
+    Failed { detail: String },
+}
+
+/// Build one row per catalogue entry, in catalogue order, plus one row for
+/// every installed runtime that falls outside the catalogue. Mirrors
+/// `php_rows` exactly, with MySQL's extra `datadir_state` (spec D2, read
+/// from disk) and `cataloged` (spec D1) fields, and a stricter
+/// `service_id`/`socket_path` gate — see [`MysqlInstanceDto`]'s doc comment.
+fn mysql_rows(
+    home: &Path,
+    installed: &[openvhost_core::mysql::MysqlRuntime],
+) -> Vec<MysqlInstanceDto> {
+    let build = |major: &openvhost_core::mysql::MysqlMajor,
+                 found: Option<&openvhost_core::mysql::MysqlRuntime>| {
+        let mp = openvhost_core::mysql::mysql_paths(home, major);
+        let datadir_state = classify_datadir_dto(&mp.datadir);
+        let registered = found.is_some() && datadir_state == MysqlDatadirStateDto::Initialized;
+        MysqlInstanceDto {
+            major: major.as_str().to_string(),
+            cataloged: major.is_cataloged(),
+            installed: found.is_some(),
+            path: found.map(|rt| rt.mysqld.display().to_string()),
+            socket_path: registered.then(|| mp.socket.display().to_string()),
+            // Same `mysql-<major>` shape `crate::stack::mysql_spec` builds —
+            // formatted directly rather than constructing a whole
+            // `ServiceSpec` just to read its `id` back out.
+            service_id: registered.then(|| format!("mysql-{}", major.as_str())),
+            datadir_state,
+        }
+    };
+
+    let mut rows: Vec<MysqlInstanceDto> = openvhost_core::mysql::MYSQL_CATALOGUE
+        .iter()
+        .filter_map(|m| openvhost_core::mysql::MysqlMajor::parse(m).ok())
+        .map(|major| {
+            let found = installed.iter().find(|rt| rt.major == major);
+            build(&major, found)
+        })
+        .collect();
+
+    for rt in installed {
+        if !rt.major.is_cataloged() {
+            rows.push(build(&rt.major, Some(rt)));
+        }
+    }
+
+    rows
+}
+
+/// Probe every known Homebrew prefix for installed MySQL runtimes. Mirrors
+/// `discover_all_php`'s `spawn_blocking` + `Handle::block_on` bridge exactly
+/// — see its doc comment for why.
+async fn discover_all_mysql() -> Result<Vec<openvhost_core::mysql::MysqlRuntime>, IpcError> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let handle = tokio::runtime::Handle::current();
+        let prefixes: Vec<&Path> = openvhost_core::BREW_PREFIXES
+            .iter()
+            .map(Path::new)
+            .collect();
+        openvhost_core::mysql::discover_mysql(&prefixes, &|bin| {
+            handle.block_on(openvhost_conf::probe_mysqld_version(bin))
+        })
+    })
+    .await
+    .map_err(|e| IpcError::Core {
+        message: format!("the MySQL discovery task failed to run: {e}"),
+    })
+}
+
+/// Probe for installed MySQL runtimes, write the result into the managed
+/// `RwLock`, sweep abandoned staging directories (spec D2: "swept on
+/// rescan"), and register a supervisor row for every major that is BOTH
+/// not already registered AND has an Initialized datadir — mirrors
+/// `rescan_into_state`'s "only register what is genuinely new" discipline
+/// (a live `Failed` row's stderr/exit must survive a rescan), gated on
+/// Initialized rather than merely "installed" (spec D6: nothing to start
+/// without a datadir). Keyed against the SUPERVISOR's own registered ids
+/// rather than a separately tracked "before" list: unlike PHP (installed ⇒
+/// always registered), a MySQL major can be installed for a long time
+/// before ever being initialized, so "was this major known before" is not
+/// the same question as "does it already have a row".
+async fn rescan_mysql_into_state(
+    runtimes: &RwLock<Option<Vec<openvhost_core::mysql::MysqlRuntime>>>,
+    sup: &Supervisor,
+    home: &Path,
+) -> Result<Vec<openvhost_core::mysql::MysqlRuntime>, IpcError> {
+    if let Err(e) =
+        openvhost_core::mysql::sweep_stale_staging(&openvhost_core::mysql::mysql_data_root(home))
+    {
+        eprintln!("mysql: failed to sweep abandoned staging directories: {e}");
+    }
+
+    let found = discover_all_mysql().await?;
+
+    *runtimes.write().map_err(|_| IpcError::Core {
+        message: "mysql runtime list is poisoned".into(),
+    })? = Some(found.clone());
+
+    let already_registered: std::collections::HashSet<String> =
+        sup.snapshot().into_iter().map(|s| s.id).collect();
+    for rt in &found {
+        let id = format!("mysql-{}", rt.major.as_str());
+        if already_registered.contains(&id) {
+            continue;
+        }
+        if crate::stack::mysql_datadir_is_initialized(home, rt) {
+            sup.register(crate::stack::mysql_spec(home, rt));
+        }
+    }
+
+    Ok(found)
+}
+
+/// Look up a cached, already-discovered runtime by major — used by the
+/// commands that need to SPAWN `mysql`/`mysqladmin` (reset, verify) but must
+/// not themselves probe the filesystem/spawn a version check just to find a
+/// path already known from the last environment read/rescan.
+fn find_mysql_runtime(
+    runtimes: &RwLock<Option<Vec<openvhost_core::mysql::MysqlRuntime>>>,
+    major: &openvhost_core::mysql::MysqlMajor,
+) -> Result<openvhost_core::mysql::MysqlRuntime, IpcError> {
+    runtimes
+        .read()
+        .map_err(|_| IpcError::Core {
+            message: "mysql runtime list is poisoned".into(),
+        })?
+        .as_ref()
+        .and_then(|rts| rts.iter().find(|rt| &rt.major == major).cloned())
+        .ok_or_else(|| IpcError::Core {
+            message: format!("MySQL {} is not installed", major.as_str()),
+        })
+}
+
+/// MySQL's canonical wording for ANY grant/authentication failure
+/// (`ERROR 1045 (28000): Access denied for user ...`) — the one heuristic
+/// available to distinguish "the stored credential is stale" (spec
+/// Deferred's desync case) from every other failure, without parsing a
+/// full SQL error-code table.
+fn looks_like_auth_failure(stderr: &str) -> bool {
+    stderr.contains("Access denied")
+}
+
+/// Pull `("8.4.11", 3306)` out of `mysql_exec_with_defaults_file`'s
+/// `--batch --skip-column-names` output for `SELECT VERSION(), @@port` — one
+/// line, tab-separated, no header.
+fn parse_version_and_port(stdout: &str) -> Option<(String, u32)> {
+    let line = stdout.lines().next()?;
+    let mut cols = line.split('\t');
+    let version = cols.next()?.trim().to_string();
+    let port: u32 = cols.next()?.trim().parse().ok()?;
+    if version.is_empty() {
+        return None;
+    }
+    Some((version, port))
+}
+
+/// Replace every occurrence of `secret` with a fixed marker. Defense in
+/// depth for `run_mysql_init`'s SetPassword/Shutdown steps (plan Global
+/// Constraints SECRETS block): NEITHER child is expected to ever echo the
+/// password back on stdout/stderr (it crosses only via stdin or the
+/// ephemeral defaults-file), but an exotic error path — e.g. a real `mysql`
+/// quoting the offending statement back in a syntax-error message — is not
+/// something this function can rule out for every past and future MySQL
+/// version. Scrubbing the one known secret value out of anything these two
+/// steps produce, before it can reach a streamed event OR this command's own
+/// return value, costs nothing on the (expected, tested) path where there
+/// was nothing to redact.
+fn redact(text: &str, secret: &str) -> String {
+    text.replace(secret, "<redacted>")
+}
+
+/// [`redact`] against every secret in `secrets`, in order. Exists for
+/// `reset_mysql_root_password`, which has TWO live secrets in play at
+/// once — the CURRENT stored password (used to authenticate, via the
+/// ephemeral defaults-file) and the freshly generated one the `ALTER USER`
+/// is trying to set — and a failure detail could in principle echo back
+/// either. Review fix wave finding 1 (CRITICAL): redacting only the new
+/// password left the current, STILL-VALID one reachable through a failure
+/// path.
+fn redact_all(text: &str, secrets: &[&str]) -> String {
+    secrets
+        .iter()
+        .fold(text.to_string(), |acc, secret| redact(&acc, secret))
+}
+
+/// An ephemeral, 0600, RAII-deleted MySQL `--defaults-file` carrying a
+/// credential (spec D2 step 5 / D3): written just before use, deleted on
+/// EVERY path (success, error, panic-unwind) via `Drop`, never left on disk
+/// past the single call it was created for.
+struct EphemeralDefaultsFile {
+    path: PathBuf,
+}
+
+impl EphemeralDefaultsFile {
+    /// Write a `[client]` block authenticating as `root` with `password`
+    /// against `socket`, at mode 0600 from the FIRST byte on disk (opened
+    /// with the mode already set — `create_new` + `mode` together, never
+    /// `write` then a separate `chmod`, so there is no window where the file
+    /// is briefly group/world-readable). Lives alongside `socket` itself
+    /// (same `<home>/run` directory every other MySQL runtime file uses).
+    ///
+    /// The password is embedded UNQUOTED, exactly like `my.cnf`'s own
+    /// `[client]` section (`openvhost_conf::generate_my_cnf`'s doc comment):
+    /// MySQL's option-file parser takes the rest of the line, verbatim, as
+    /// the value. Defensible today because the ONLY generator
+    /// (`generate_root_password`) emits pure lowercase hex — no `\n`, no
+    /// leading/trailing space, nothing an option-file line could
+    /// misinterpret — the same "hex charset makes this safe today" caveat
+    /// `alter_user_sql` documents, for the identical deferred future
+    /// (user-chosen passwords, spec D3).
+    ///
+    /// Audit finding M2: `protocol=SOCKET` pins the client to the unix
+    /// socket regardless of the `socket=` line above. Without it, a missing
+    /// or stale socket path is not a hard failure — the `mysql`/`mysqladmin`
+    /// CLI silently falls back to TCP `127.0.0.1:3306`, which may be a
+    /// DIFFERENT mysqld already listening there (spec Owner Caveat 1:
+    /// Homebrew's own `brew services mysql@8.4` unit binds the identical
+    /// port with no root password) — handing that unrelated server this
+    /// app's stored credential over the wire instead of cleanly failing to
+    /// connect.
+    fn write(
+        socket: &Path,
+        password: &openvhost_core::mysql::RootPassword,
+    ) -> std::io::Result<Self> {
+        let run_dir = socket.parent().unwrap_or(Path::new("."));
+        std::fs::create_dir_all(run_dir)?;
+        let name = format!(".mysql-defaults-{}", uuid::Uuid::new_v4().simple());
+        let path = run_dir.join(name);
+        let contents = format!(
+            "[client]\nuser=root\npassword={}\nsocket={}\nprotocol=SOCKET\n",
+            password.expose(),
+            socket.display()
+        );
+        let f = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&path)?
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)?
+            }
+        };
+        write_or_cleanup(&path, f, contents.as_bytes())?;
+        Ok(Self { path })
+    }
+}
+
+/// Write `contents` to the just-`create_new`'d `f` at `path`, removing
+/// `path` if the write itself fails. Review fix wave finding 3: `create_new`
+/// succeeding is not enough to make it safe to leave a file on disk —
+/// without this, a write failure AFTER creation (a full disk, a quota, any
+/// I/O error mid-write) left a leftover file behind with no
+/// `EphemeralDefaultsFile` guard ever constructed to clean it up (the early
+/// `?` returned before `Self { path }` was ever built). Split out of
+/// [`EphemeralDefaultsFile::write`] so this specific failure path is
+/// directly testable without needing to induce a REAL disk-full condition.
+fn write_or_cleanup(path: &Path, mut f: std::fs::File, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    if let Err(e) = f.write_all(contents) {
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
+    Ok(())
+}
+
+impl Drop for EphemeralDefaultsFile {
+    fn drop(&mut self) {
+        // Best-effort: an already-gone file is not worth surfacing, matching
+        // this codebase's other RAII-cleanup Drop impls (e.g.
+        // `RunningInstallGuard` above).
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Where a log line came from, forwarded to the caller-supplied sink rather
+/// than emitted directly — this is what lets `run_mysql_init` be driven from
+/// a test with a `Vec`-collecting sink and no `AppHandle` at all (the
+/// no-secret-in-events test below), while `initialize_mysql` supplies a
+/// closure that actually calls `.emit`.
+type InitLogSink = Arc<dyn Fn(&str, String) + Send + Sync>;
+
+/// A secret that becomes known PARTWAY through `run_mysql_init` (the
+/// generated root password does not exist until the SetPassword step), but
+/// must be scrubbed from every line logged from that point on — including
+/// lines from readers that were already spawned, and already hold their own
+/// clone of the log sink, before the secret existed (the temp server's
+/// stdout/stderr, drained from `StartTempServer` onward). Review fix wave
+/// finding 2: wrapping `log` in a NEW redacting closure once the secret
+/// exists does not reach those already-spawned readers — they hold their
+/// OWN `Arc` clone of the OLD sink, made before the rebinding, and are
+/// never told about a later one. A cell consulted BY ONE SINK, at CALL
+/// TIME rather than at closure-construction time, closes that gap: every
+/// clone of the sink, however early it was made, reads the SAME cell, so
+/// setting it once is enough for every clone to start redacting.
+type SecretCell = Arc<std::sync::Mutex<Option<String>>>;
+
+/// Wrap `inner` in a sink that redacts against whatever `cell` currently
+/// holds, checked on EVERY call rather than once at construction — see
+/// [`SecretCell`]'s doc comment. `run_mysql_init` builds exactly one of
+/// these, before spawning anything that might clone it, and every later
+/// `.clone()` (the temp server's stdout/stderr readers, the `run_task`
+/// pump for the Initialize step) shares the same cell transparently.
+fn redacting_sink(inner: InitLogSink, cell: SecretCell) -> InitLogSink {
+    Arc::new(move |stream: &str, line: String| {
+        let scrubbed = match cell.lock().unwrap_or_else(|e| e.into_inner()).as_deref() {
+            Some(secret) if !secret.is_empty() => redact(&line, secret),
+            _ => line,
+        };
+        inner(stream, scrubbed);
+    })
+}
+
+fn emit_init_log(app: &tauri::AppHandle, major: &str, stream: &str, line: String) {
+    let _ = MysqlInitLogEvent {
+        major: major.to_string(),
+        ts_ms: now_ms(),
+        stream: stream.to_string(),
+        line,
+    }
+    .emit(app);
+}
+
+/// Drains one of the temp server's output streams, forwarding each line to
+/// `log` — mirrors `openvhost_proc::service_task`'s own `spawn_reader`
+/// (hands-off: ends naturally at EOF once the child exits, no explicit
+/// abort needed).
+async fn drain_and_forward(stream: openvhost_proc::OutputStream, log: InitLogSink, label: &str) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut lines = BufReader::new(stream).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        log(label, line);
+    }
+}
+
+/// `mysqld --no-defaults --initialize-insecure --datadir=<staging>
+/// --mysqlx=OFF` (spec D2 step 1) — built via `OsString`, not `format!` +
+/// `.display()`, for the same non-lossy-path reason `MysqlValidator::validate`
+/// gives.
+///
+/// `--no-defaults` is deliberate containment, kept on its own merits — NOT a
+/// fix for a datadir-mismatch bug, which does not exist (an earlier fix wave
+/// claimed combining `--defaults-file=<my_cnf>` with argv `--datadir=<staging>`
+/// corrupted InnoDB's undo-tablespace bookkeeping; that diagnosis was WRONG,
+/// a misdiagnosis of the leading-dot bug below, and is retracted — see spec
+/// D2's dated correction note for the full, corrected history). A SEPARATE
+/// earlier claim — that `--no-defaults` gains exclusion of machine-wide
+/// option files (`/etc/my.cnf`, `~/.my.cnf`) — was ALSO wrong:
+/// `--defaults-file=<path>` already excludes those on its own. The genuine
+/// gain: the rendered my.cnf ends with `!includedir <custom_confd>`, so
+/// under `--defaults-file` this step would read whatever the USER has
+/// dropped into that directory — arbitrary user-controlled configuration
+/// reaching the init sequence. `--no-defaults` removes all of it.
+///
+/// `--mysqlx=OFF`: this step starts no server at all (`--initialize-insecure`
+/// writes the datadir and exits), so there is no listener of any kind here
+/// regardless — added purely for symmetry with [`mysqld_temp_server_spec`]
+/// below, where the identical flag is load-bearing, not decorative.
+fn mysqld_init_spec(mysqld: &Path, staging: &Path) -> openvhost_proc::SpawnSpec {
+    let mut datadir_arg = OsString::from("--datadir=");
+    datadir_arg.push(staging.as_os_str());
+    openvhost_proc::SpawnSpec {
+        program: mysqld.to_path_buf(),
+        args: vec![
+            OsString::from("--no-defaults"),
+            OsString::from("--initialize-insecure"),
+            datadir_arg,
+            OsString::from("--mysqlx=OFF"),
+        ],
+        cwd: None,
+        env: vec![],
+    }
+}
+
+/// `mysqld --no-defaults --datadir=<staging> --skip-networking
+/// --socket=<init_socket> --mysqlx=OFF` (spec D2 step 2) — the network-less
+/// temp server. Same deliberate-containment reasoning for `--no-defaults` as
+/// [`mysqld_init_spec`]'s doc comment above (kept on its own merits, not as a
+/// fix for the retracted datadir-mismatch misdiagnosis — see spec D2's dated
+/// correction note). This step's real STARTUP failure mode, confirmed live
+/// and unrelated to `--defaults-file`, was a datadir basename starting with
+/// a dot — fixed in `openvhost_core::mysql::staging_dir_path`.
+///
+/// `--mysqlx=OFF` is LOAD-BEARING here, not decorative — do not "simplify"
+/// it away. Measured directly against real mysql@8.4.11: with this flag
+/// absent (mysqlx at its default), this exact invocation binds
+/// `/tmp/mysqlx.sock` at mode `srwxrwxrwx` — world read/write, OUTSIDE the
+/// 0700 home this app otherwise confines every socket to — AND `*:33060`.
+/// `--skip-networking` suppresses the CLASSIC protocol's TCP listener only;
+/// it does not touch the X Plugin's listener, unix socket or TCP, at all.
+/// Both are live for the entire window between this server starting and
+/// `SetPassword`'s `ALTER USER` succeeding — i.e. while `root@localhost`
+/// still has the EMPTY password `--initialize-insecure` left it with. Any
+/// local user (not just a network-adjacent one) could connect as root
+/// through that world-writable socket during that window. Adding
+/// `--mysqlx=OFF` was verified, in the same measurement session, to bind no
+/// socket at all.
+fn mysqld_temp_server_spec(
+    mysqld: &Path,
+    staging: &Path,
+    init_socket: &Path,
+) -> openvhost_proc::SpawnSpec {
+    let mut datadir_arg = OsString::from("--datadir=");
+    datadir_arg.push(staging.as_os_str());
+    let mut socket_arg = OsString::from("--socket=");
+    socket_arg.push(init_socket.as_os_str());
+    openvhost_proc::SpawnSpec {
+        program: mysqld.to_path_buf(),
+        args: vec![
+            OsString::from("--no-defaults"),
+            datadir_arg,
+            OsString::from("--skip-networking"),
+            socket_arg,
+            OsString::from("--mysqlx=OFF"),
+        ],
+        cwd: None,
+        env: vec![],
+    }
+}
+
+/// Kills the temp server's whole process group if `run_mysql_init`'s future
+/// is ABANDONED (aborted — e.g. the app quits mid-init) before the server
+/// was deliberately shut down. This child is spawned directly via
+/// `ProcessDriver::spawn`, never through `run_task`/`Supervisor` — unlike
+/// EVERY other child this app spawns, nothing else would ever kill or even
+/// notice it if this guard did not exist, which is precisely the orphaned-
+/// process bug class P0-8's containment work exists to prevent.
+///
+/// Mirrors `openvhost_proc::task`'s own private `KillOnDrop` guard exactly
+/// (that one is not `pub`, so it cannot be reused here) and
+/// `RunningInstallGuard`'s identical reasoning above this function:
+/// `Drop::drop` cannot `.await`, so it can only SIGNAL the kill, never
+/// confirm the exit — the explicit `kill` + `wait().await` pairs already at
+/// every failure arm below remain the CONFIRMED-dead path for a normal
+/// failure; this guard is the backstop for the one path (the future dropped
+/// mid-`.await`, e.g. via `AbortHandle::abort()`) where none of them run at
+/// all. `finished` is set once the server has ACTUALLY exited (the success
+/// path, or after any explicit kill+wait already reaped it), so the normal
+/// paths never attempt a second, redundant signal on the way out — harmless
+/// either way (`kill` on an already-reaped pid is a silent no-op), but
+/// setting it is the honest way to say "this guard already did its job".
+struct TempServerGuard {
+    driver: Arc<dyn openvhost_proc::ProcessDriver>,
+    child: openvhost_proc::SpawnedChild,
+    finished: bool,
+}
+
+impl Drop for TempServerGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.driver.kill(&mut self.child);
+        }
+    }
+}
+
+/// Poll `mysqladmin ping` against `socket` until it succeeds, the temp
+/// server dies on its own, or `deadline` elapses (spec D2 step 3: 10s cap).
+async fn poll_until_ready(
+    mysqladmin: &Path,
+    socket: &Path,
+    server_child: &mut openvhost_proc::SpawnedChild,
+    deadline: std::time::Duration,
+) -> bool {
+    let deadline_at = tokio::time::Instant::now() + deadline;
+    loop {
+        if crate::mysql_admin::mysqladmin_ping(mysqladmin, socket).await {
+            return true;
+        }
+        if matches!(server_child.try_wait(), Ok(Some(_))) {
+            return false; // the temp server died on its own — nothing left to poll
+        }
+        if tokio::time::Instant::now() >= deadline_at {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// Everything one `initialize_mysql` run needs, gathered once so every step
+/// shares identical values instead of each re-deriving them.
+#[derive(Debug)]
+struct MysqlInitCtx {
+    major: openvhost_core::mysql::MysqlMajor,
+    runtime: openvhost_core::mysql::MysqlRuntime,
+    paths: openvhost_core::mysql::MysqlPaths,
+}
+
+/// Drives the staged-init sequence (spec D2) against an ALREADY-CLASSIFIED
+/// `NotInitialized` datadir — the caller (`initialize_mysql`) handles
+/// `AlreadyInitialized`/`Foreign` before this ever runs, and BEFORE `log` is
+/// ever called, so a Foreign datadir is reported "without touching it"
+/// (mandatory test) with zero side effects, not even a log line.
+///
+/// Every failure path removes ONLY the staging directory this attempt
+/// created (`remove_staging_dir`) and, from `StartTempServer` onward, kills
+/// the temp server if it might still be alive — the final datadir is never
+/// created, adopted, or touched by a failed attempt (spec D2). Returns the
+/// generated password alongside the outcome ONLY when that outcome is
+/// `Initialized` — persisting it, and registering the service, is the
+/// CALLER's job (`initialize_mysql` owns `Db`/`Supervisor` state this
+/// pure-ish orchestration function does not take).
+async fn run_mysql_init(
+    ctx: MysqlInitCtx,
+    log: InitLogSink,
+) -> (
+    openvhost_core::mysql::MysqlInitOutcome,
+    Option<openvhost_core::mysql::RootPassword>,
+) {
+    use openvhost_core::mysql::MysqlInitStep as Step;
+    use openvhost_core::mysql::{MysqlInitOutcome as Outcome, remove_staging_dir};
+
+    macro_rules! fail {
+        ($step:expr, $reason:expr) => {
+            return (
+                Outcome::Failed {
+                    step: $step,
+                    reason: $reason,
+                },
+                None,
+            )
+        };
+    }
+
+    // Wrapped ONCE, here, before anything is spawned or cloned — see
+    // `SecretCell`/`redacting_sink`'s doc comments (review fix wave finding
+    // 2). `secret_cell` starts empty; SetPassword populates it the moment
+    // the password is generated, and every clone of `log` made BEFORE that
+    // point (the temp server's stdout/stderr readers, spawned from
+    // StartTempServer onward) starts redacting from then on too, because
+    // they all consult this SAME cell rather than a value baked in at
+    // clone time.
+    let secret_cell: SecretCell = Arc::new(std::sync::Mutex::new(None));
+    let log: InitLogSink = redacting_sink(log, Arc::clone(&secret_cell));
+
+    // ---- Render ----
+    log("stdout", "rendering my.cnf".to_string());
+    let mysql_ctx = openvhost_conf::MysqlCtx {
+        my_cnf: ctx.paths.my_cnf.clone(),
+        datadir: ctx.paths.datadir.clone(),
+        socket: ctx.paths.socket.clone(),
+        pid_file: ctx.paths.pid_file.clone(),
+        custom_confd: ctx.paths.custom_confd.clone(),
+    };
+    let generated = match openvhost_conf::generate_my_cnf(&mysql_ctx) {
+        Ok(f) => f,
+        Err(e) => fail!(Step::Render, e.to_string()),
+    };
+    // Review fix wave (Important 2), corrected post-live-run: the
+    // `custom_confd` directory `!includedir` points at is now ensured INSIDE
+    // `write_generated_config` itself (the chokepoint every producer of a
+    // my.cnf writes through — see its doc comment), not by a separate call
+    // here. A standalone `create_dir_all` at this call site alone covered
+    // only THIS init sequence — it missed the live end-to-end test (which
+    // calls `generate_my_cnf`/`write_generated_config` directly, never this
+    // function) and an already-initialized instance whose directory is
+    // deleted later (see `stack.rs::mysql_spec`'s own ensure for that case).
+    if let Err(e) =
+        openvhost_core::mysql::write_generated_config(&generated, &ctx.paths.custom_confd)
+    {
+        fail!(Step::Render, e.to_string());
+    }
+
+    // ---- Validate ----
+    log("stdout", "validating my.cnf".to_string());
+    let validator = openvhost_conf::MysqlValidator {
+        mysqld: ctx.runtime.mysqld.clone(),
+    };
+    match validator.validate(&ctx.paths.my_cnf).await {
+        Ok(report) if report.ok => {}
+        Ok(report) => fail!(
+            Step::Validate,
+            if report.stderr.trim().is_empty() {
+                "mysqld --validate-config rejected the generated my.cnf".to_string()
+            } else {
+                report.stderr
+            }
+        ),
+        Err(e) => fail!(Step::Validate, e.to_string()),
+    }
+
+    // ---- Initialize ----
+    let staging = openvhost_core::mysql::staging_dir_path(&ctx.paths.staging_parent, &ctx.major);
+    log(
+        "stdout",
+        format!("initializing datadir at {}", staging.display()),
+    );
+    if let Err(e) = std::fs::create_dir_all(&staging) {
+        fail!(
+            Step::Initialize,
+            format!(
+                "failed to create staging directory {}: {e}",
+                staging.display()
+            )
+        );
+    }
+    #[cfg(unix)]
+    if let Err(e) = {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700))
+    } {
+        let _ = remove_staging_dir(&staging);
+        fail!(
+            Step::Initialize,
+            format!("failed to lock down staging directory permissions: {e}")
+        );
+    }
+    let init_spec = mysqld_init_spec(&ctx.runtime.mysqld, &staging);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+    let pump = tokio::spawn({
+        let log = log.clone();
+        async move {
+            while let Some(ev) = rx.recv().await {
+                if let openvhost_proc::TaskEvent::Line { stream, text } = ev {
+                    log(
+                        match stream {
+                            openvhost_proc::TaskStream::Stdout => "stdout",
+                            openvhost_proc::TaskStream::Stderr => "stderr",
+                        },
+                        text,
+                    );
+                }
+            }
+        }
+    });
+    let init_result =
+        openvhost_proc::run_task(openvhost_proc::default_driver(), init_spec, tx).await;
+    let _ = pump.await;
+    match init_result {
+        Ok(Some(0)) => {}
+        Ok(Some(code)) => {
+            let _ = remove_staging_dir(&staging);
+            fail!(
+                Step::Initialize,
+                format!("mysqld --initialize-insecure exited {code}")
+            );
+        }
+        Ok(None) => {
+            let _ = remove_staging_dir(&staging);
+            fail!(
+                Step::Initialize,
+                "mysqld --initialize-insecure was terminated by a signal".to_string()
+            );
+        }
+        Err(e) => {
+            let _ = remove_staging_dir(&staging);
+            fail!(
+                Step::Initialize,
+                format!("failed to run mysqld --initialize-insecure: {e}")
+            );
+        }
+    }
+
+    // ---- StartTempServer ----
+    log(
+        "stdout",
+        "starting the temporary server for password setup".to_string(),
+    );
+    // `<home>/run` normally already exists by the time a user can reach this
+    // command at all (`provision_home` creates it, unconditionally, at app
+    // startup) — but this sequence must not silently DEPEND on that having
+    // happened. Without this, mysqld's `--socket=<home>/run/...` has nowhere
+    // to bind, the fake/real server never gets that far, and every later
+    // step (the readiness poll, then shutdown) fails or hangs having nothing
+    // useful to report — a class of bug a fake-binary test caught directly.
+    let run_dir = ctx.paths.init_socket.parent().unwrap_or(Path::new("."));
+    if let Err(e) = std::fs::create_dir_all(run_dir) {
+        let _ = remove_staging_dir(&staging);
+        fail!(
+            Step::StartTempServer,
+            format!("failed to create {}: {e}", run_dir.display())
+        );
+    }
+    let temp_spec = mysqld_temp_server_spec(&ctx.runtime.mysqld, &staging, &ctx.paths.init_socket);
+    let driver = openvhost_proc::default_driver();
+    let mut server = match driver.spawn(&temp_spec) {
+        Ok(c) => TempServerGuard {
+            driver: Arc::clone(&driver),
+            child: c,
+            finished: false,
+        },
+        Err(e) => {
+            let _ = remove_staging_dir(&staging);
+            fail!(
+                Step::StartTempServer,
+                format!("failed to start the temporary server: {e}")
+            );
+        }
+    };
+    // Drained so a chatty startup can never fill the pipe and block the
+    // child — mirrors `service_task::spawn_reader`'s hands-off style.
+    if let Some(out) = server.child.take_stdout() {
+        tokio::spawn(drain_and_forward(out, log.clone(), "stdout"));
+    }
+    if let Some(err) = server.child.take_stderr() {
+        tokio::spawn(drain_and_forward(err, log.clone(), "stderr"));
+    }
+
+    log(
+        "stdout",
+        "waiting for the temporary server to become reachable".to_string(),
+    );
+    let ready = poll_until_ready(
+        &ctx.runtime.mysqladmin,
+        &ctx.paths.init_socket,
+        &mut server.child,
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+    if !ready {
+        let _ = driver.kill(&mut server.child);
+        let _ = server.child.wait().await;
+        server.finished = true;
+        let _ = remove_staging_dir(&staging);
+        fail!(
+            Step::StartTempServer,
+            "the temporary server never became reachable via mysqladmin ping".to_string()
+        );
+    }
+
+    // ---- SetPassword ----
+    log("stdout", "setting the root password".to_string());
+    let password = openvhost_core::mysql::generate_root_password();
+    let alter_sql = openvhost_core::mysql::alter_user_sql(&password);
+    // From here on, EVERY log call — including from readers spawned
+    // earlier, e.g. the temp server's stdout/stderr — and every failure
+    // reason built below is scrubbed of the password value before it can
+    // reach an emitted event or this command's own return value. Poking
+    // the cell (not rebinding `log` to a new closure) is what reaches
+    // those already-spawned readers too — see `SecretCell`'s doc comment.
+    let secret = password.expose().to_string();
+    *secret_cell.lock().unwrap_or_else(|e| e.into_inner()) = Some(secret.clone());
+    match crate::mysql_admin::mysql_alter_password_unauthenticated(
+        &ctx.runtime.mysql,
+        &ctx.paths.init_socket,
+        &alter_sql,
+    )
+    .await
+    {
+        Ok(outcome) if outcome.ok => {}
+        Ok(outcome) => {
+            let _ = driver.kill(&mut server.child);
+            let _ = server.child.wait().await;
+            server.finished = true;
+            let _ = remove_staging_dir(&staging);
+            fail!(
+                Step::SetPassword,
+                redact(
+                    &if outcome.stderr.trim().is_empty() {
+                        "ALTER USER failed".to_string()
+                    } else {
+                        outcome.stderr
+                    },
+                    &secret,
+                )
+            );
+        }
+        Err(e) => {
+            let _ = driver.kill(&mut server.child);
+            let _ = server.child.wait().await;
+            server.finished = true;
+            let _ = remove_staging_dir(&staging);
+            fail!(Step::SetPassword, redact(&e.to_string(), &secret));
+        }
+    }
+
+    // ---- Shutdown ----
+    log("stdout", "shutting down the temporary server".to_string());
+    let defaults_file = match EphemeralDefaultsFile::write(&ctx.paths.init_socket, &password) {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = driver.kill(&mut server.child);
+            let _ = server.child.wait().await;
+            server.finished = true;
+            let _ = remove_staging_dir(&staging);
+            fail!(
+                Step::Shutdown,
+                format!("failed to write the ephemeral credential file: {e}")
+            );
+        }
+    };
+    let shutdown_result =
+        crate::mysql_admin::mysqladmin_shutdown(&ctx.runtime.mysqladmin, &defaults_file.path).await;
+    drop(defaults_file); // RAII delete, before acting on the result.
+    match shutdown_result {
+        Ok(outcome) if outcome.ok => {}
+        Ok(outcome) => {
+            let _ = driver.kill(&mut server.child);
+            let _ = server.child.wait().await;
+            server.finished = true;
+            let _ = remove_staging_dir(&staging);
+            fail!(
+                Step::Shutdown,
+                redact(
+                    &if outcome.stderr.trim().is_empty() {
+                        "mysqladmin shutdown failed".to_string()
+                    } else {
+                        outcome.stderr
+                    },
+                    &secret,
+                )
+            );
+        }
+        Err(e) => {
+            let _ = driver.kill(&mut server.child);
+            let _ = server.child.wait().await;
+            server.finished = true;
+            let _ = remove_staging_dir(&staging);
+            fail!(Step::Shutdown, redact(&e.to_string(), &secret));
+        }
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(10), server.child.wait()).await {
+        Ok(_) => {
+            server.finished = true;
+        }
+        Err(_) => {
+            let _ = driver.kill(&mut server.child);
+            let _ = server.child.wait().await;
+            server.finished = true;
+            let _ = remove_staging_dir(&staging);
+            fail!(
+                Step::Shutdown,
+                "the temporary server did not exit after mysqladmin shutdown succeeded".to_string()
+            );
+        }
+    }
+
+    // ---- Finalize ----
+    log("stdout", "finalizing".to_string());
+    match openvhost_core::mysql::finalize_staging(&staging, &ctx.paths.datadir) {
+        Outcome::Initialized => {
+            log(
+                "stdout",
+                "root password set; datadir initialized".to_string(),
+            );
+            (Outcome::Initialized, Some(password))
+        }
+        other @ Outcome::Failed { .. } => {
+            let _ = remove_staging_dir(&staging);
+            (other, None)
+        }
+        // `finalize_staging` only ever returns `Initialized` or
+        // `Failed { step: Finalize, .. }` (see its own doc comment) — this
+        // arm exists only so the match stays exhaustive if that ever widens.
+        other => (other, None),
+    }
+}
+
+/// Read-only environment summary for the Databases page: whether Homebrew
+/// was found, where it looked, and one row per MySQL major (spec D7).
+/// Deliberately spawns NOTHING — mirrors `php_environment`'s identical
+/// contract exactly (reads the managed `RwLock` + `find_brew()`, a
+/// filesystem check). `rescan_mysql` is the one that actually probes.
+#[tauri::command]
+#[specta::specta]
+pub async fn mysql_environment(
+    runtimes: tauri::State<'_, RwLock<Option<Vec<openvhost_core::mysql::MysqlRuntime>>>>,
+    paths: tauri::State<'_, Option<StackPaths>>,
+) -> Result<MysqlEnvironmentDto, IpcError> {
+    let p = stack_paths(&paths)?;
+    let installed = runtimes
+        .read()
+        .map_err(|_| IpcError::Core {
+            message: "mysql runtime list is poisoned".into(),
+        })?
+        .clone()
+        .unwrap_or_default();
+    Ok(MysqlEnvironmentDto {
+        brew_found: openvhost_core::find_brew().is_some(),
+        brew_searched: brew_searched_paths(),
+        instances: mysql_rows(&p.home, &installed),
+    })
+}
+
+/// The explicit, user-initiated re-probe behind the Databases page's rescan
+/// affordance — mirrors `rescan_php_runtimes` exactly, including blocking on
+/// `InstallLock` for the identical reason (a rescan racing a completed
+/// install must never silently revert it).
+#[tauri::command]
+#[specta::specta]
+pub async fn rescan_mysql(
+    runtimes: tauri::State<'_, RwLock<Option<Vec<openvhost_core::mysql::MysqlRuntime>>>>,
+    paths: tauri::State<'_, Option<StackPaths>>,
+    sup: tauri::State<'_, Arc<Supervisor>>,
+    lock: tauri::State<'_, InstallLock>,
+) -> Result<MysqlEnvironmentDto, IpcError> {
+    let p = stack_paths(&paths)?;
+    let _guard = lock.inner().guard.lock().await;
+    let installed = rescan_mysql_into_state(runtimes.inner(), sup.inner(), &p.home).await?;
+    Ok(MysqlEnvironmentDto {
+        brew_found: openvhost_core::find_brew().is_some(),
+        brew_searched: brew_searched_paths(),
+        instances: mysql_rows(&p.home, &installed),
+    })
+}
+
+/// Install a MySQL major via Homebrew, streaming its output live, then
+/// rescan so a freshly installed version (if it appears) is picked up —
+/// mirrors `install_php` exactly, sharing `InstallLock` (decision 5) — see
+/// `InstallKind`'s doc comment for why the quit dialog's PHP-specific copy
+/// is unaffected by this.
+#[tauri::command]
+#[specta::specta]
+pub async fn install_mysql(
+    app: tauri::AppHandle,
+    major: String,
+    runtimes: tauri::State<'_, RwLock<Option<Vec<openvhost_core::mysql::MysqlRuntime>>>>,
+    paths: tauri::State<'_, Option<StackPaths>>,
+    sup: tauri::State<'_, Arc<Supervisor>>,
+    lock: tauri::State<'_, InstallLock>,
+) -> Result<MysqlInstallOutcomeDto, IpcError> {
+    // The catalogue gate, before anything else happens (decision 2).
+    let major = openvhost_core::mysql::MysqlMajor::parse(&major)?;
+
+    let Ok(_guard) = lock.inner().guard.try_lock() else {
+        return Err(IpcError::Core {
+            message: "an install is already running".into(),
+        });
+    };
+
+    let p = stack_paths(&paths)?;
+
+    let before: Vec<String> = runtimes
+        .read()
+        .map_err(|_| IpcError::Core {
+            message: "mysql runtime list is poisoned".into(),
+        })?
+        .clone()
+        .unwrap_or_default()
+        .iter()
+        .map(|rt| rt.major.as_str().to_string())
+        .collect();
+
+    if before.iter().any(|m| m == major.as_str()) {
+        return Err(IpcError::Core {
+            message: format!("MySQL {} is already installed", major.as_str()),
+        });
+    }
+
+    let brew = openvhost_core::find_brew().ok_or_else(|| IpcError::Core {
+        message: format!(
+            "Homebrew was not found. Looked for bin/brew under: {}",
+            openvhost_core::BREW_PREFIXES.join(", ")
+        ),
+    })?;
+
+    let spec = openvhost_core::mysql::mysql_brew_install_spec(&brew, &major)?;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+
+    let emitter = app.clone();
+    let for_event = major.as_str().to_string();
+    let pump = tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            if let openvhost_proc::TaskEvent::Line { stream, text } = ev {
+                let _ = MysqlInstallLogEvent {
+                    major: for_event.clone(),
+                    ts_ms: now_ms(),
+                    stream: match stream {
+                        openvhost_proc::TaskStream::Stdout => "stdout".into(),
+                        openvhost_proc::TaskStream::Stderr => "stderr".into(),
+                    },
+                    line: text,
+                }
+                .emit(&emitter);
+            }
+        }
+    });
+
+    let install_task = tokio::spawn(openvhost_proc::run_task(
+        openvhost_proc::default_driver(),
+        spec,
+        tx,
+    ));
+    let abort_handle = install_task.abort_handle();
+    lock.inner().set_running(
+        InstallKind::Mysql,
+        format!("MySQL {}", major.as_str()),
+        abort_handle.clone(),
+    );
+    let _running_guard = RunningInstallGuard {
+        lock: lock.inner(),
+        abort: abort_handle,
+    };
+
+    let exit_code = match install_task.await {
+        Ok(result) => result?,
+        Err(join_err) if join_err.is_cancelled() => {
+            return Err(IpcError::Proc {
+                message: "the install was aborted because the app is quitting".into(),
+            });
+        }
+        Err(join_err) => {
+            return Err(IpcError::Proc {
+                message: format!("the install task ended unexpectedly: {join_err}"),
+            });
+        }
+    };
+    let _ = pump.await;
+
+    let found = rescan_mysql_into_state(runtimes.inner(), sup.inner(), &p.home).await?;
+    let detected = found.iter().any(|r| r.major.as_str() == major.as_str());
+
+    Ok(MysqlInstallOutcomeDto {
+        major: major.as_str().to_string(),
+        exit_code,
+        detected,
+    })
+}
+
+/// `initialize_mysql`'s pre-flight decision: either the command should
+/// return immediately with no app/spawn involvement at all (decision 2's
+/// catalogue rejection, or an already-answered `AlreadyInitialized`/
+/// `Foreign` datadir), or everything needed to drive the real staged-init
+/// sequence has been gathered.
+///
+/// Split out of the command itself (mirroring `write_settings`/
+/// `read_settings` taking `&Db` instead of `State` above) so this ordering —
+/// classify BEFORE touching anything else — is directly testable without a
+/// `tauri::AppHandle`: `tauri::test::mock_builder()` only ever produces one
+/// backed by `MockRuntime`, which is a DIFFERENT concrete type than the
+/// `AppHandle<Wry>` `initialize_mysql`'s signature needs for `.emit()`, so
+/// the full command cannot be invoked directly from a test at all. This
+/// function needs no `AppHandle`, so it can be.
+#[derive(Debug)]
+enum InitializeMysqlGate {
+    Early(Result<MysqlInitOutcomeDto, IpcError>),
+    // Boxed: `MysqlInitCtx` (a `MysqlRuntime` + a `MysqlPaths`, several
+    // `PathBuf`s each) is far larger than `Early`'s payload, and clippy's
+    // `large_enum_variant` flags the size gap — box it rather than pay that
+    // gap's cost on every `Early` value too.
+    Proceed(Box<MysqlInitCtx>),
+}
+
+/// Server-side catalogue gate (decision 2): `MysqlMajor::parse` — the
+/// catalogue-gated constructor — is the ONLY way this reaches `major`, so an
+/// out-of-catalogue discovered major (rendered display-only on the
+/// Databases page) is rejected here before anything else runs, even if a
+/// client somehow sends one.
+///
+/// Datadir classification runs BEFORE any spawn, so `AlreadyInitialized`/
+/// `Foreign` are reported with zero side effects — no staging directory, no
+/// spawn, no log line (mandatory test).
+async fn initialize_mysql_gate(major: String, home: &Path) -> InitializeMysqlGate {
+    use InitializeMysqlGate::{Early, Proceed};
+
+    let major = match openvhost_core::mysql::MysqlMajor::parse(&major) {
+        Ok(m) => m,
+        Err(e) => return Early(Err(e.into())),
+    };
+
+    let init_paths = openvhost_core::mysql::mysql_paths(home, &major);
+    if let Err(e) = init_paths.check_socket_lengths() {
+        return Early(Err(e.into()));
+    }
+
+    match openvhost_core::mysql::classify_datadir(&init_paths.datadir) {
+        Ok(openvhost_core::mysql::DatadirState::Initialized) => {
+            return Early(Ok(MysqlInitOutcomeDto::AlreadyInitialized));
+        }
+        Ok(openvhost_core::mysql::DatadirState::Foreign { detail }) => {
+            return Early(Ok(MysqlInitOutcomeDto::Foreign { detail }));
+        }
+        Ok(openvhost_core::mysql::DatadirState::NotInitialized) => {}
+        Err(e) => {
+            return Early(Err(IpcError::Core {
+                message: format!("could not inspect {}: {e}", init_paths.datadir.display()),
+            }));
+        }
+    }
+
+    let discovered = match discover_all_mysql().await {
+        Ok(d) => d,
+        Err(e) => return Early(Err(e)),
+    };
+    let Some(runtime) = discovered.into_iter().find(|rt| rt.major == major) else {
+        return Early(Err(IpcError::Core {
+            message: format!("MySQL {} is not installed", major.as_str()),
+        }));
+    };
+
+    Proceed(Box::new(MysqlInitCtx {
+        major,
+        runtime,
+        paths: init_paths,
+    }))
+}
+
+/// Drives Task 4's staged-init sequence for one MySQL major (spec D2),
+/// streaming log events live, exactly like `install_php`: `run_task`-style
+/// child spawning, a held `AbortHandle` (shared `InstallLock`, decision 5),
+/// a `Drop` guard, streamed events. Renders+validates via Task 3 first;
+/// registers/refreshes the service ONLY on full success. The pre-flight
+/// decision (catalogue gate, datadir classification) is
+/// [`initialize_mysql_gate`] — see its doc comment.
+#[tauri::command]
+#[specta::specta]
+pub async fn initialize_mysql(
+    app: tauri::AppHandle,
+    major: String,
+    db: tauri::State<'_, Db>,
+    paths: tauri::State<'_, Option<StackPaths>>,
+    sup: tauri::State<'_, Arc<Supervisor>>,
+    lock: tauri::State<'_, InstallLock>,
+) -> Result<MysqlInitOutcomeDto, IpcError> {
+    let p = stack_paths(&paths)?;
+
+    let Ok(_guard) = lock.inner().guard.try_lock() else {
+        return Err(IpcError::Core {
+            message: "an install is already running".into(),
+        });
+    };
+
+    let ctx = match initialize_mysql_gate(major, &p.home).await {
+        InitializeMysqlGate::Early(result) => return result,
+        InitializeMysqlGate::Proceed(ctx) => ctx,
+    };
+    let runtime_for_registration = ctx.runtime.clone();
+    let major_for_upsert = ctx.major.clone();
+    let major_for_log = ctx.major.as_str().to_string();
+
+    let emitter = app.clone();
+    let log: InitLogSink = Arc::new(move |stream: &str, line: String| {
+        emit_init_log(&emitter, &major_for_log, stream, line)
+    });
+
+    let init_task = tokio::spawn(run_mysql_init(*ctx, log));
+    let abort_handle = init_task.abort_handle();
+    lock.inner().set_running(
+        InstallKind::Mysql,
+        format!("MySQL {} initialization", major_for_upsert.as_str()),
+        abort_handle.clone(),
+    );
+    let _running_guard = RunningInstallGuard {
+        lock: lock.inner(),
+        abort: abort_handle,
+    };
+
+    let (outcome, password) = match init_task.await {
+        Ok(result) => result,
+        Err(join_err) if join_err.is_cancelled() => {
+            return Err(IpcError::Proc {
+                message: "the initialization was aborted because the app is quitting".into(),
+            });
+        }
+        Err(join_err) => {
+            return Err(IpcError::Proc {
+                message: format!("the initialization task ended unexpectedly: {join_err}"),
+            });
+        }
+    };
+
+    if let (openvhost_core::mysql::MysqlInitOutcome::Initialized, Some(password)) =
+        (&outcome, &password)
+    {
+        openvhost_core::mysql::MysqlInstanceRepo::new(db.inner())
+            .upsert(&major_for_upsert, password)
+            .await?;
+        sup.register(crate::stack::mysql_spec(&p.home, &runtime_for_registration));
+    }
+
+    Ok(outcome.into())
+}
+
+/// The stored root password for `major` (spec D3's outbound reveal — the
+/// ONE place this crosses IPC, deliberately, for the masked field's
+/// Reveal/Copy affordance).
+///
+/// SECURITY (audit H2): this command is the SOLE place in the entire
+/// codebase sanctioned to de-redact a `RootPassword` into a plain `String`
+/// for a RETURN value. Every other command that touches a stored or
+/// freshly generated credential (`initialize_mysql`,
+/// `reset_mysql_root_password`, `verify_mysql_connection`) sends it only to
+/// a child's stdin or an ephemeral 0600 defaults-file
+/// (`EphemeralDefaultsFile`), never back across IPC — see `RootPassword::expose`'s
+/// own doc comment for that discipline. This command's `Result` must NEVER
+/// be logged: verified today by grep — no Tauri command-result logging
+/// exists anywhere in this codebase (nothing wraps
+/// `specta_builder.invoke_handler()`/`tauri::Builder::invoke_handler` with a
+/// tracing/logging layer of any kind, and neither `log`/`tracing` nor any
+/// equivalent crate is even a dependency of this crate). This comment is the
+/// tripwire for the day someone adds one: such a layer MUST special-case
+/// this command (or, better, generically redact every `String`-typed
+/// command result) before it ships.
+#[tauri::command]
+#[specta::specta]
+pub async fn mysql_root_password(
+    major: String,
+    db: tauri::State<'_, Db>,
+) -> Result<String, IpcError> {
+    let major = openvhost_core::mysql::MysqlMajor::parse(&major)?;
+    let repo = openvhost_core::mysql::MysqlInstanceRepo::new(db.inner());
+    let instance = repo.get(&major).await?.ok_or_else(|| IpcError::Core {
+        message: format!("no stored root password for MySQL {}", major.as_str()),
+    })?;
+    Ok(instance.root_password.expose().to_string())
+}
+
+/// Regenerate MySQL's root password (spec D3: "reset-by-regenerate ships",
+/// user-chosen deferred): authenticates with the STORED (old) password via
+/// an ephemeral 0600 defaults-file, runs `ALTER USER` over stdin with a
+/// freshly generated password, and — only once that succeeds — persists the
+/// new value. A stale stored password (spec Deferred: "desync between
+/// state.db and a restored datadir") maps to `AuthFailed`, a distinct,
+/// renderable outcome, never a generic error.
+#[tauri::command]
+#[specta::specta]
+pub async fn reset_mysql_root_password(
+    major: String,
+    db: tauri::State<'_, Db>,
+    paths: tauri::State<'_, Option<StackPaths>>,
+    runtimes: tauri::State<'_, RwLock<Option<Vec<openvhost_core::mysql::MysqlRuntime>>>>,
+) -> Result<MysqlResetOutcomeDto, IpcError> {
+    let major = openvhost_core::mysql::MysqlMajor::parse(&major)?;
+    let p = stack_paths(&paths)?;
+    let runtime = find_mysql_runtime(runtimes.inner(), &major)?;
+    let mp = openvhost_core::mysql::mysql_paths(&p.home, &major);
+
+    let repo = openvhost_core::mysql::MysqlInstanceRepo::new(db.inner());
+    let current = repo.get(&major).await?.ok_or_else(|| IpcError::Core {
+        message: format!("MySQL {} has no stored credential to reset", major.as_str()),
+    })?;
+
+    let defaults_file =
+        EphemeralDefaultsFile::write(&mp.socket, &current.root_password).map_err(|e| {
+            IpcError::Core {
+                message: format!("failed to write the ephemeral credential file: {e}"),
+            }
+        })?;
+
+    let new_password = openvhost_core::mysql::generate_root_password();
+    let sql = openvhost_core::mysql::alter_user_sql(&new_password);
+    let result = crate::mysql_admin::mysql_exec_with_defaults_file(
+        &runtime.mysql,
+        &defaults_file.path,
+        &sql,
+    )
+    .await;
+    drop(defaults_file); // RAII delete, before acting on the result.
+    // Both secrets are live here: the CURRENT password authenticated the
+    // connection (via the just-dropped `defaults_file`), and the NEW one is
+    // what `ALTER USER` tried to set — a failure detail could in principle
+    // echo back either, so every redaction below scrubs both (review fix
+    // wave finding 1: redacting only the new password left the current,
+    // STILL-VALID one reachable through a failure path).
+    let secrets = [current.root_password.expose(), new_password.expose()];
+
+    let outcome = result.map_err(|e| IpcError::Core {
+        message: redact_all(&e.to_string(), &secrets),
+    })?;
+    if outcome.ok {
+        repo.upsert(&major, &new_password).await?;
+        Ok(MysqlResetOutcomeDto::Reset)
+    } else if looks_like_auth_failure(&outcome.stderr) {
+        Ok(MysqlResetOutcomeDto::AuthFailed {
+            detail: redact_all(&outcome.stderr, &secrets),
+        })
+    } else {
+        Err(IpcError::Core {
+            message: redact_all(
+                &if outcome.stderr.trim().is_empty() {
+                    "ALTER USER failed".to_string()
+                } else {
+                    outcome.stderr
+                },
+                &secrets,
+            ),
+        })
+    }
+}
+
+/// `SELECT VERSION(), @@port` through the running server's socket,
+/// authenticating with the stored credential via an ephemeral 0600
+/// defaults-file (spec D7's "it works" moment for the Databases page).
+#[tauri::command]
+#[specta::specta]
+pub async fn verify_mysql_connection(
+    major: String,
+    db: tauri::State<'_, Db>,
+    paths: tauri::State<'_, Option<StackPaths>>,
+    runtimes: tauri::State<'_, RwLock<Option<Vec<openvhost_core::mysql::MysqlRuntime>>>>,
+) -> Result<MysqlConnectionProofDto, IpcError> {
+    let major = openvhost_core::mysql::MysqlMajor::parse(&major)?;
+    let p = stack_paths(&paths)?;
+    let runtime = find_mysql_runtime(runtimes.inner(), &major)?;
+    let mp = openvhost_core::mysql::mysql_paths(&p.home, &major);
+
+    let repo = openvhost_core::mysql::MysqlInstanceRepo::new(db.inner());
+    let Some(instance) = repo.get(&major).await? else {
+        // Review fix wave, minor 4: the old wording ("has never been
+        // initialized") was true for only ONE of the two ways this branch is
+        // reached. The second: `initialize_mysql` finished
+        // `MysqlInitOutcome::Initialized` (the datadir is genuinely on disk)
+        // but its OWN `repo.upsert(...).await?` call failed right after —
+        // that `?` propagates out of `initialize_mysql` before
+        // `sup.register` ever runs, leaving a real, initialized datadir with
+        // no stored credential and no service row. Rewording to cover both
+        // honestly rather than asserting the (possibly false) stronger claim.
+        // `STALE_CREDENTIAL_RECOVERY` (`databases.derive.ts`) is deliberately
+        // NOT attached here: that copy ends with "use Reset here once you're
+        // back in", but `reset_mysql_root_password` itself requires an
+        // EXISTING stored credential to authenticate with (see its own
+        // `.ok_or_else` a few lines above) — there is nothing for Reset to
+        // authenticate with in EITHER case this branch covers, so pairing it
+        // with that copy would just trade one dishonest sentence for another.
+        return Ok(MysqlConnectionProofDto::Failed {
+            detail: format!(
+                "no stored root password for MySQL {} — initialize it, or reset the \
+                 password if the folder is already initialized",
+                major.as_str()
+            ),
+        });
+    };
+    // Scrubbed from every diagnostic string built below, on the same
+    // defense-in-depth reasoning `run_mysql_init`'s `redact` applies from
+    // SetPassword onward: no child invoked past this point is EXPECTED to
+    // ever echo the credential it authenticated with, but nothing here rules
+    // out an exotic error path doing so, and scrubbing costs nothing on the
+    // (expected, tested) path where there was nothing to redact.
+    let secret = instance.root_password.expose().to_string();
+
+    let defaults_file = match EphemeralDefaultsFile::write(&mp.socket, &instance.root_password) {
+        Ok(f) => f,
+        Err(e) => {
+            return Err(IpcError::Core {
+                message: format!("failed to write the ephemeral credential file: {e}"),
+            });
+        }
+    };
+
+    let result = crate::mysql_admin::mysql_exec_with_defaults_file(
+        &runtime.mysql,
+        &defaults_file.path,
+        "SELECT VERSION(), @@port;",
+    )
+    .await;
+    drop(defaults_file); // RAII delete, before acting on the result.
+
+    let outcome = match result {
+        Ok(o) => o,
+        Err(e) => {
+            return Ok(MysqlConnectionProofDto::Failed {
+                detail: redact(&e.to_string(), &secret),
+            });
+        }
+    };
+
+    if !outcome.ok {
+        return Ok(if looks_like_auth_failure(&outcome.stderr) {
+            MysqlConnectionProofDto::AuthFailed {
+                detail: redact(&outcome.stderr, &secret),
+            }
+        } else {
+            MysqlConnectionProofDto::Failed {
+                detail: redact(
+                    &if outcome.stderr.trim().is_empty() {
+                        "the connection attempt failed".to_string()
+                    } else {
+                        outcome.stderr
+                    },
+                    &secret,
+                ),
+            }
+        });
+    }
+
+    Ok(match parse_version_and_port(&outcome.stdout) {
+        Some((version, port)) => MysqlConnectionProofDto::Ok { version, port },
+        None => MysqlConnectionProofDto::Failed {
+            detail: redact(
+                &format!("could not parse a version/port from: {:?}", outcome.stdout),
+                &secret,
+            ),
+        },
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod mysql_ipc_tests {
+    use tauri::Manager;
+
+    use super::*;
+
+    fn fake_cli(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    // ---- argv shape: no --defaults-file pre-finalize ----
+    //
+    // `--no-defaults` is deliberate containment on its own merits — NOT a
+    // fix for a datadir-mismatch bug, which does not exist. An earlier fix
+    // wave claimed combining `--defaults-file=<my.cnf>` with argv
+    // `--datadir=<staging>` corrupted InnoDB's undo-tablespace bookkeeping;
+    // that diagnosis was WRONG (a misdiagnosis of the leading-dot
+    // staging-basename bug, decisively isolated afterward — see spec D2's
+    // dated correction note) and is retracted. A SEPARATE earlier claim in
+    // this same comment — that `--no-defaults` gains exclusion of
+    // machine-wide option files (`/etc/my.cnf`, `~/.my.cnf`) — was ALSO
+    // wrong: `--defaults-file=<path>` already excludes those on its own; that
+    // was never something `--no-defaults` added. The genuine gain: our
+    // rendered my.cnf ends with `!includedir <custom_confd>`, so under
+    // `--defaults-file` both pre-finalize steps read whatever the USER has
+    // dropped into that directory — arbitrary user-controlled configuration
+    // reaching the init sequence while root@localhost still has an EMPTY
+    // password. `--no-defaults` removes ALL of it, user-controlled included.
+    //
+    // Audit finding (security-auditor BLOCK, HIGH): the previous version of
+    // these two tests pinned the ABSENCE of `--defaults-file` without
+    // pinning what explicitly replaced the settings it used to carry — so
+    // dropping `mysqlx=OFF` (which my.cnf carried, silently lost when
+    // `--defaults-file` was removed) slipped through unnoticed. The X
+    // Plugin's default is ON, binding `*:33060` — a listener with no
+    // narrower bind-address of its own, live for the entire window between
+    // temp-server start and `ALTER USER`, i.e. while root@localhost has an
+    // EMPTY password from `--initialize-insecure`. Fixed by adding
+    // `--mysqlx=OFF` explicitly to both specs' argv (redundant but harmless
+    // for `mysqld_init_spec`, which starts no server at all — kept for
+    // symmetry). These four tests now pin BOTH the absence of
+    // `--defaults-file` AND the exact positive argv shape, so a future edit
+    // that silently drops any one flag fails loudly instead of compiling
+    // clean.
+
+    #[test]
+    fn mysqld_init_spec_carries_no_defaults_file_and_no_defaults_first() {
+        let spec = mysqld_init_spec(
+            Path::new("/opt/homebrew/opt/mysql@8.4/bin/mysqld"),
+            Path::new("/tmp/ovh/data/mysql/init-8-4-deadbeef"),
+        );
+        let args: Vec<String> = spec
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !args.iter().any(|a| a.starts_with("--defaults-file")),
+            "got {args:?}"
+        );
+        assert_eq!(
+            args.first().map(String::as_str),
+            Some("--no-defaults"),
+            "--no-defaults must be first (mysqld requirement), got {args:?}"
+        );
+        assert!(
+            args.contains(&"--initialize-insecure".to_string()),
+            "got {args:?}"
+        );
+        assert!(
+            args.contains(&"--datadir=/tmp/ovh/data/mysql/init-8-4-deadbeef".to_string()),
+            "got {args:?}"
+        );
+        assert!(args.contains(&"--mysqlx=OFF".to_string()), "got {args:?}");
+    }
+
+    /// Exhaustive sibling to the test above (audit-mandated): an EXACT match
+    /// on the whole argv list, not just `.contains()` checks, so a future
+    /// edit that drops (or silently reorders ahead of `--no-defaults`) any
+    /// one of these settings fails loudly rather than compiling clean.
+    #[test]
+    fn mysqld_init_spec_argv_is_exactly_the_required_set() {
+        let spec = mysqld_init_spec(
+            Path::new("/opt/homebrew/opt/mysql@8.4/bin/mysqld"),
+            Path::new("/tmp/ovh/data/mysql/init-8-4-deadbeef"),
+        );
+        let args: Vec<String> = spec
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "--no-defaults".to_string(),
+                "--initialize-insecure".to_string(),
+                "--datadir=/tmp/ovh/data/mysql/init-8-4-deadbeef".to_string(),
+                "--mysqlx=OFF".to_string(),
+            ],
+            "got {args:?}"
+        );
+    }
+
+    #[test]
+    fn mysqld_temp_server_spec_carries_no_defaults_file_and_no_defaults_first() {
+        let spec = mysqld_temp_server_spec(
+            Path::new("/opt/homebrew/opt/mysql@8.4/bin/mysqld"),
+            Path::new("/tmp/ovh/data/mysql/init-8-4-deadbeef"),
+            Path::new("/tmp/ovh/run/mysql-8.4-init.sock"),
+        );
+        let args: Vec<String> = spec
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !args.iter().any(|a| a.starts_with("--defaults-file")),
+            "got {args:?}"
+        );
+        assert_eq!(
+            args.first().map(String::as_str),
+            Some("--no-defaults"),
+            "--no-defaults must be first (mysqld requirement), got {args:?}"
+        );
+        assert!(
+            args.contains(&"--datadir=/tmp/ovh/data/mysql/init-8-4-deadbeef".to_string()),
+            "got {args:?}"
+        );
+        assert!(
+            args.contains(&"--skip-networking".to_string()),
+            "got {args:?}"
+        );
+        assert!(
+            args.contains(&"--mysqlx=OFF".to_string()),
+            "got {args:?} — measured on real mysql@8.4.11: at its default, the X \
+             Plugin binds /tmp/mysqlx.sock at mode srwxrwxrwx (world read/write, \
+             outside the 0700 home) AND *:33060, for the entire window \
+             root@localhost has an empty password; --skip-networking is TCP-only \
+             and does not touch either"
+        );
+        assert!(
+            args.contains(&"--socket=/tmp/ovh/run/mysql-8.4-init.sock".to_string()),
+            "got {args:?}"
+        );
+    }
+
+    /// Exhaustive sibling to the test above (audit-mandated): an EXACT match
+    /// on the whole argv list, not just `.contains()` checks, so a future
+    /// edit that drops (or silently reorders ahead of `--no-defaults`) any
+    /// one of these settings fails loudly rather than compiling clean.
+    #[test]
+    fn mysqld_temp_server_spec_argv_is_exactly_the_required_set() {
+        let spec = mysqld_temp_server_spec(
+            Path::new("/opt/homebrew/opt/mysql@8.4/bin/mysqld"),
+            Path::new("/tmp/ovh/data/mysql/init-8-4-deadbeef"),
+            Path::new("/tmp/ovh/run/mysql-8.4-init.sock"),
+        );
+        let args: Vec<String> = spec
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "--no-defaults".to_string(),
+                "--datadir=/tmp/ovh/data/mysql/init-8-4-deadbeef".to_string(),
+                "--skip-networking".to_string(),
+                "--socket=/tmp/ovh/run/mysql-8.4-init.sock".to_string(),
+                "--mysqlx=OFF".to_string(),
+            ],
+            "got {args:?}"
+        );
+    }
+
+    // ---- write_or_cleanup (review fix wave finding 3) ----
+
+    #[test]
+    fn write_or_cleanup_succeeds_and_leaves_the_file_when_the_write_works() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("candidate");
+        let f = std::fs::File::create(&path).unwrap();
+        write_or_cleanup(&path, f, b"hello").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+    }
+
+    /// `f` here is a pipe's write end whose READ end was closed the moment
+    /// it was created: writing to a pipe with no reader raises `EPIPE`
+    /// (Rust's runtime ignores `SIGPIPE` at startup specifically so this
+    /// surfaces as an `Err` rather than terminating the process). `path` is
+    /// a SEPARATE, real file — `write_or_cleanup`'s own contract is just
+    /// "write via the given handle; on failure, remove the given path", so
+    /// the two do not need to be the same underlying file for this test to
+    /// isolate that behavior. Deterministic, and touches no process-wide
+    /// state (no rlimit, no real disk pressure), so this is safe to run
+    /// alongside every other test in this binary's default parallel
+    /// execution — `/dev/full` (the more obvious choice) does not exist on
+    /// macOS, and a raw `close()` of the fd `f` itself already owns trips
+    /// libstd's own double-close IO-safety abort.
+    #[test]
+    fn write_or_cleanup_removes_the_file_when_the_write_itself_fails() {
+        use std::os::unix::io::FromRawFd;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("candidate");
+        std::fs::write(&path, b"").unwrap();
+        assert!(path.exists());
+
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        // SAFETY: `read_fd` is a freshly created, valid, owned fd from the
+        // `pipe()` call immediately above, closed here (and only here) so
+        // the pipe has no reader for the rest of this test.
+        unsafe {
+            libc::close(read_fd);
+        }
+        // SAFETY: `write_fd` is a freshly created, valid, owned fd from the
+        // same `pipe()` call; this is the only place that takes ownership
+        // of it (as this `File`), and it is never touched as a raw fd again.
+        let f = unsafe { std::fs::File::from_raw_fd(write_fd) };
+
+        let _err = write_or_cleanup(&path, f, b"secret contents").unwrap_err();
+        assert!(
+            !path.exists(),
+            "the partially-written file must be removed when the write fails"
+        );
+    }
+
+    // ---- EphemeralDefaultsFile (audit finding M2) ----
+
+    /// Audit finding M2: without an explicit `protocol=SOCKET`, a missing or
+    /// wrong `socket=` line lets the `mysql`/`mysqladmin` CLI silently fall
+    /// back to TCP `127.0.0.1:3306` — which may be a DIFFERENT mysqld (e.g.
+    /// Homebrew's own `brew services` instance, spec Owner Caveat 1) — and
+    /// hand it this app's stored root credential. Pinning the protocol
+    /// closes that fallback: the client refuses to try TCP at all.
+    #[test]
+    fn ephemeral_defaults_file_pins_the_client_to_the_unix_socket_protocol() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("run").join("mysql-8.4.sock");
+        let password = openvhost_core::mysql::generate_root_password();
+
+        let file = EphemeralDefaultsFile::write(&socket, &password).unwrap();
+
+        let contents = std::fs::read_to_string(&file.path).unwrap();
+        assert!(
+            contents.lines().any(|l| l == "protocol=SOCKET"),
+            "got {contents:?}"
+        );
+    }
+
+    /// A working MySQL runtime built entirely from fakes: `mysqld` handles
+    /// `--validate-config`/`--initialize-insecure`/`--skip-networking`,
+    /// `mysqladmin` handles `ping`/`shutdown` (shared body, [`FAKE_MYSQLADMIN_BODY`]),
+    /// and the caller supplies `mysql_body` for the ALTER USER step — used
+    /// by the temp-server-containment regression test below, which needs
+    /// that ONE step to hang so there is a window to abort the whole init
+    /// task while the temp server is confirmed alive.
+    fn fake_runtime_with_mysql(
+        dir: &Path,
+        major: &openvhost_core::mysql::MysqlMajor,
+        mysql_body: &str,
+    ) -> openvhost_core::mysql::MysqlRuntime {
+        openvhost_core::mysql::MysqlRuntime {
+            major: major.clone(),
+            mysqld: fake_cli(
+                dir,
+                "mysqld",
+                r#"
+datadir=""
+socket=""
+for arg in "$@"; do
+  case "$arg" in
+    --datadir=*) datadir="${arg#--datadir=}" ;;
+    --socket=*) socket="${arg#--socket=}" ;;
+  esac
+done
+case "$*" in
+  *--validate-config*)
+    exit 0
+    ;;
+  *--initialize-insecure*)
+    mkdir -p "$datadir/mysql"
+    echo "[auto]" > "$datadir/auto.cnf"
+    exit 0
+    ;;
+  *--skip-networking*)
+    echo $$ > "$socket.pid"
+    trap 'exit 0' TERM
+    while true; do sleep 1; done
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+"#,
+            ),
+            mysql: fake_cli(dir, "mysql", mysql_body),
+            mysqladmin: fake_cli(dir, "mysqladmin", FAKE_MYSQLADMIN_BODY),
+        }
+    }
+
+    /// Shared by every fake runtime in this module: `ping` is gated on the
+    /// server's own pidfile (a real `mysqladmin ping` only succeeds once
+    /// the server is genuinely accepting connections — without this gate,
+    /// `ping` always says yes and `poll_until_ready` proceeds long before
+    /// the fake server, a SEPARATE process, has reached its own
+    /// `echo $$ > "$socket.pid"` line, so a later `shutdown` call races
+    /// ahead of that write and silently kills nothing); `shutdown` reads
+    /// the target socket from either `--socket=` or a `--defaults-file`'s
+    /// `socket=` line and signals whatever pid it finds there.
+    const FAKE_MYSQLADMIN_BODY: &str = r#"
+socket=""
+for arg in "$@"; do
+  case "$arg" in
+    --socket=*) socket="${arg#--socket=}" ;;
+    --defaults-file=*)
+      f="${arg#--defaults-file=}"
+      socket=$(sed -n 's/^socket=//p' "$f")
+      ;;
+  esac
+done
+case "$*" in
+  *ping*)
+    if [ -f "$socket.pid" ]; then
+      exit 0
+    else
+      exit 1
+    fi
+    ;;
+  *shutdown*)
+    if [ -f "$socket.pid" ]; then
+      kill "$(cat "$socket.pid")" 2>/dev/null
+    fi
+    exit 0
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+"#;
+
+    /// Like [`fake_runtime`], but the temp server's OWN stdout leaks the
+    /// SQL text `mysql` (the ALTER client) received on stdin — standing in
+    /// for a server that happens to log something containing the
+    /// credential it was just given. Real `mysqld`/`mysql` are two
+    /// SEPARATE processes with no shared memory, so the fake `mysql`
+    /// writes what it read to a marker file next to the socket
+    /// (`<init_socket>.alter-sql-seen`), and the fake `mysqld` server loop
+    /// polls for that file and echoes its contents to ITS OWN stdout —
+    /// which is exactly the stream `run_mysql_init`'s `drain_and_forward`
+    /// readers pick up. Exists for the review fix wave's finding 2: those
+    /// readers are spawned (and clone the log sink) BEFORE the password
+    /// exists, so they are the one path a "rebind `log` to a new
+    /// redacting wrapper once the secret exists" fix does not reach.
+    fn fake_runtime_that_leaks_the_alter_sql_via_server_stdout(
+        dir: &Path,
+        major: &openvhost_core::mysql::MysqlMajor,
+    ) -> openvhost_core::mysql::MysqlRuntime {
+        openvhost_core::mysql::MysqlRuntime {
+            major: major.clone(),
+            mysqld: fake_cli(
+                dir,
+                "mysqld",
+                r#"
+datadir=""
+socket=""
+for arg in "$@"; do
+  case "$arg" in
+    --datadir=*) datadir="${arg#--datadir=}" ;;
+    --socket=*) socket="${arg#--socket=}" ;;
+  esac
+done
+case "$*" in
+  *--validate-config*)
+    exit 0
+    ;;
+  *--initialize-insecure*)
+    mkdir -p "$datadir/mysql"
+    echo "[auto]" > "$datadir/auto.cnf"
+    exit 0
+    ;;
+  *--skip-networking*)
+    echo $$ > "$socket.pid"
+    trap 'exit 0' TERM
+    while true; do
+      if [ -f "$socket.alter-sql-seen" ]; then
+        echo "observed on the wire: $(cat "$socket.alter-sql-seen")"
+        rm -f "$socket.alter-sql-seen"
+        touch "$socket.alter-sql-echoed"
+      fi
+      sleep 0.01
+    done
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+"#,
+            ),
+            mysql: fake_cli(
+                dir,
+                "mysql",
+                r#"
+socket=""
+for arg in "$@"; do
+  case "$arg" in
+    --socket=*) socket="${arg#--socket=}" ;;
+  esac
+done
+cat > "$socket.alter-sql-seen"
+exit 0
+"#,
+            ),
+            // A DEDICATED mysqladmin (not the shared `FAKE_MYSQLADMIN_BODY`):
+            // `shutdown` here waits (bounded, 5s) for the server's
+            // `alter-sql-echoed` marker before killing it. A poll-based
+            // "leak" is otherwise an unwinnable race — a shell blocked in
+            // `sleep` does not act on a pending TERM until that sleep call
+            // itself returns (verified against this exact shell empirically
+            // while designing this fixture), so an ordinary shutdown call
+            // almost always kills the server before its loop gets another
+            // chance to notice the marker file, making the leak this
+            // fixture exists to simulate silently never happen. Explicit
+            // synchronization, not a shorter poll interval, is what makes
+            // this deterministic.
+            mysqladmin: fake_cli(
+                dir,
+                "mysqladmin",
+                r#"
+socket=""
+for arg in "$@"; do
+  case "$arg" in
+    --socket=*) socket="${arg#--socket=}" ;;
+    --defaults-file=*)
+      f="${arg#--defaults-file=}"
+      socket=$(sed -n 's/^socket=//p' "$f")
+      ;;
+  esac
+done
+case "$*" in
+  *ping*)
+    if [ -f "$socket.pid" ]; then
+      exit 0
+    else
+      exit 1
+    fi
+    ;;
+  *shutdown*)
+    if [ -f "$socket.pid" ]; then
+      i=0
+      while [ ! -f "$socket.alter-sql-echoed" ] && [ "$i" -lt 500 ]; do
+        sleep 0.01
+        i=$((i + 1))
+      done
+      rm -f "$socket.alter-sql-echoed"
+      kill "$(cat "$socket.pid")" 2>/dev/null
+    fi
+    exit 0
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+"#,
+            ),
+        }
+    }
+
+    // ---- mysql_rows (environment shape) ----
+
+    #[test]
+    fn mysql_rows_lists_the_catalogue_and_reflects_installed_and_initialized_state() {
+        let home = tempfile::tempdir().unwrap();
+        let major = openvhost_core::mysql::MysqlMajor::parse("8.4").unwrap();
+        let installed = vec![openvhost_core::mysql::MysqlRuntime {
+            major: major.clone(),
+            mysqld: PathBuf::from("/opt/homebrew/opt/mysql@8.4/bin/mysqld"),
+            mysql: PathBuf::from("/opt/homebrew/opt/mysql@8.4/bin/mysql"),
+            mysqladmin: PathBuf::from("/opt/homebrew/opt/mysql@8.4/bin/mysqladmin"),
+        }];
+
+        let rows = mysql_rows(home.path(), &installed);
+        assert_eq!(rows.len(), openvhost_core::mysql::MYSQL_CATALOGUE.len());
+        let row = rows.iter().find(|r| r.major == "8.4").unwrap();
+        assert!(row.installed);
+        assert!(row.cataloged);
+        assert_eq!(row.datadir_state, MysqlDatadirStateDto::NotInitialized);
+        assert!(
+            row.service_id.is_none(),
+            "installed but not initialized — no service row yet"
+        );
+        assert!(row.socket_path.is_none());
+
+        let datadir = home.path().join("data/mysql/8.4");
+        std::fs::create_dir_all(datadir.join("mysql")).unwrap();
+        std::fs::write(datadir.join("auto.cnf"), b"[auto]\n").unwrap();
+
+        let rows2 = mysql_rows(home.path(), &installed);
+        let row2 = rows2.iter().find(|r| r.major == "8.4").unwrap();
+        assert_eq!(row2.datadir_state, MysqlDatadirStateDto::Initialized);
+        assert_eq!(row2.service_id.as_deref(), Some("mysql-8.4"));
+        assert!(row2.socket_path.is_some());
+    }
+
+    #[test]
+    fn mysql_rows_still_lists_an_out_of_catalogue_installed_major() {
+        // `MysqlMajor::from_probe` is `pub(crate)` to openvhost-core, so an
+        // out-of-catalogue `MysqlRuntime` is built the same way that crate's
+        // OWN tests build one: through the real, publicly-reachable
+        // `discover_mysql` against a fake prefix, never a private
+        // constructor.
+        let prefix = tempfile::tempdir().unwrap();
+        let bin_dir = prefix.path().join("opt").join("mysql@9.7").join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        for name in ["mysqld", "mysql", "mysqladmin"] {
+            std::fs::write(bin_dir.join(name), b"#!/bin/sh\n").unwrap();
+        }
+        let installed =
+            openvhost_core::mysql::discover_mysql(&[prefix.path()], &|_| Some("9.7".to_string()));
+        assert_eq!(installed.len(), 1);
+
+        let home = tempfile::tempdir().unwrap();
+        let rows = mysql_rows(home.path(), &installed);
+        let row = rows
+            .iter()
+            .find(|r| r.major == "9.7")
+            .expect("an out-of-catalogue installed major must still be listed");
+        assert!(row.installed);
+        assert!(
+            !row.cataloged,
+            "out-of-catalogue major must render with no Install affordance"
+        );
+    }
+
+    // ---- out-of-catalogue action rejection (decision 2) ----
+
+    /// Mirrors PHP's `a_rejected_version_names_the_field_so_the_ui_can_mark_it`
+    /// exactly: `install_mysql`'s FIRST line is `MysqlMajor::parse(&major)?`,
+    /// so proving that parse rejects an out-of-catalogue major with a
+    /// `mysql_version`-named field IS proving the command rejects it before
+    /// anything else runs — the same reasoning the PHP test already
+    /// establishes for its own command.
+    #[test]
+    fn install_mysql_rejects_an_out_of_catalogue_major_server_side() {
+        let e: IpcError = openvhost_core::mysql::MysqlMajor::parse("9.7")
+            .unwrap_err()
+            .into();
+        match e {
+            IpcError::Validation { field, .. } => assert_eq!(field, "mysql_version"),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// The `initialize_mysql` equivalent, driven through the REAL gate
+    /// function the command calls (`initialize_mysql_gate`) rather than the
+    /// full command — see that enum's doc comment for why the full command
+    /// cannot be invoked directly from a test at all.
+    #[tokio::test]
+    async fn initialize_mysql_rejects_an_out_of_catalogue_major_server_side() {
+        let unreached = PathBuf::from("/tmp/openvhost-test-unreached");
+        let gate = initialize_mysql_gate("9.7".to_string(), &unreached).await;
+        match gate {
+            InitializeMysqlGate::Early(Err(IpcError::Validation { field, .. })) => {
+                assert_eq!(field, "mysql_version")
+            }
+            InitializeMysqlGate::Early(other) => {
+                panic!("expected a Validation error, got {other:?}")
+            }
+            InitializeMysqlGate::Proceed(_) => {
+                panic!("an out-of-catalogue major must never reach Proceed")
+            }
+        }
+    }
+
+    // ---- Foreign datadir: reported without touching it ----
+
+    #[tokio::test]
+    async fn initialize_on_a_foreign_datadir_reports_foreign_without_touching_it() {
+        let home = tempfile::tempdir().unwrap();
+        let major_dir = home.path().join("data/mysql/8.4");
+        std::fs::create_dir_all(&major_dir).unwrap();
+        std::fs::write(major_dir.join("some-note.txt"), b"do not touch").unwrap();
+
+        let gate = initialize_mysql_gate("8.4".to_string(), home.path()).await;
+
+        match gate {
+            InitializeMysqlGate::Early(Ok(MysqlInitOutcomeDto::Foreign { detail })) => {
+                assert!(detail.contains("some-note.txt"), "got {detail:?}")
+            }
+            other => panic!("expected Early(Ok(Foreign)), got {other:?}"),
+        }
+        assert!(
+            major_dir.join("some-note.txt").exists(),
+            "the foreign file must survive untouched"
+        );
+        let entries: Vec<_> = std::fs::read_dir(home.path().join("data/mysql"))
+            .unwrap()
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "no staging directory should ever have been created"
+        );
+    }
+
+    // ---- custom conf.d directory (review fix wave, Important 2) ----
+
+    /// The rendered my.cnf's `!includedir` points at `custom_confd`, but
+    /// nothing used to create it — the Render step must create it BEFORE
+    /// Validate ever runs, so neither validate-config nor a real supervised
+    /// start ever meets a missing `!includedir` target.
+    #[tokio::test]
+    async fn render_step_creates_the_custom_confd_directory_before_validation() {
+        let home = tempfile::tempdir().unwrap();
+        let major = openvhost_core::mysql::MysqlMajor::parse("8.4").unwrap();
+        let runtime = fake_runtime_with_mysql(home.path(), &major, "exit 0");
+        let paths = openvhost_core::mysql::mysql_paths(home.path(), &major);
+        let custom_confd = paths.custom_confd.clone();
+        assert!(
+            !custom_confd.exists(),
+            "must not exist before init for this test to prove anything"
+        );
+
+        let ctx = MysqlInitCtx {
+            major: major.clone(),
+            runtime,
+            paths,
+        };
+        let log: InitLogSink = Arc::new(|_stream, _line| {});
+        let (outcome, _password) = run_mysql_init(ctx, log).await;
+
+        assert_eq!(
+            outcome,
+            openvhost_core::mysql::MysqlInitOutcome::Initialized,
+            "the fake-binary sequence must reach full success for this test to prove anything"
+        );
+        assert!(
+            custom_confd.is_dir(),
+            "the Render step must create the custom conf.d directory the rendered \
+             my.cnf's !includedir points at"
+        );
+    }
+
+    // ---- the no-secret-in-events test (SECRETS block, mandatory) ----
+
+    /// Drives `run_mysql_init` end to end against fake `mysqld`/`mysql`/
+    /// `mysqladmin` scripts (a test-injected runtime, per the brief), then
+    /// asserts NONE of the collected log lines — the exact content
+    /// `initialize_mysql` would otherwise hand to `.emit()` as
+    /// `MysqlInitLogEvent`s — contain the password `run_mysql_init` itself
+    /// generated. The sink IS the only path to an emitted event (see
+    /// `InitLogSink`'s doc comment), so this is not a weaker proxy for "no
+    /// secret in events": it is the same content the real command would
+    /// stream, captured before Tauri's own (orthogonal) serialization layer.
+    #[tokio::test]
+    async fn no_emitted_log_line_contains_the_generated_password() {
+        let home = tempfile::tempdir().unwrap();
+        let major = openvhost_core::mysql::MysqlMajor::parse("8.4").unwrap();
+        // The leak-simulating runtime (not plain `fake_runtime`): its temp
+        // server echoes the ALTER SQL back on its OWN stdout during the
+        // SetPassword window, exercising the `drain_and_forward` reader
+        // path — review fix wave finding 2's blind spot — not just the
+        // direct `log(...)` calls a naive fix could leave uncovered.
+        let runtime = fake_runtime_that_leaks_the_alter_sql_via_server_stdout(home.path(), &major);
+        let paths = openvhost_core::mysql::mysql_paths(home.path(), &major);
+
+        let lines: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let for_sink = Arc::clone(&lines);
+        let log: InitLogSink = Arc::new(move |_stream, line| {
+            for_sink.lock().unwrap().push(line);
+        });
+
+        let ctx = MysqlInitCtx {
+            major: major.clone(),
+            runtime,
+            paths,
+        };
+
+        let (outcome, password) = run_mysql_init(ctx, log).await;
+
+        assert_eq!(
+            outcome,
+            openvhost_core::mysql::MysqlInitOutcome::Initialized,
+            "the fake-binary sequence must reach full success for this test to prove anything"
+        );
+        let password = password.expect("Initialized must carry the generated password");
+
+        let captured = lines.lock().unwrap();
+        assert!(
+            !captured.is_empty(),
+            "the sequence should have logged something"
+        );
+        for line in captured.iter() {
+            assert!(
+                !line.contains(password.expose()),
+                "a log line leaked the generated password: {line:?}"
+            );
+        }
+    }
+
+    // ---- TempServerGuard: containment on abort ----
+
+    /// THE TEMP-SERVER CONTAINMENT REGRESSION TEST. The temp server is
+    /// spawned directly via `ProcessDriver::spawn`, outside `run_task`/
+    /// `Supervisor` — nothing else in the app would ever kill it if
+    /// `run_mysql_init`'s future were dropped (aborted, e.g. by
+    /// `perform_quit`) while it was running. Reproduces exactly that: aborts
+    /// the init task while the fake temp server is CONFIRMED alive (its own
+    /// pidfile exists), then polls for the real OS process to actually die.
+    ///
+    /// The fake `mysql` (the ALTER step) hangs for a few seconds so there is
+    /// a real window to observe the temp server's pidfile and issue the
+    /// abort before `SetPassword` would otherwise complete on its own.
+    ///
+    /// VACUITY CHECK (mirrors `quit.rs`'s identical regression test): with
+    /// `TempServerGuard`'s `Drop` impl neutered (commented out its `kill`
+    /// call), this test fails — `still_alive` stays `true` for the whole
+    /// deadline. Restoring it makes the test pass again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn aborting_the_init_task_kills_the_still_running_temp_server() {
+        let home = tempfile::tempdir().unwrap();
+        let major = openvhost_core::mysql::MysqlMajor::parse("8.4").unwrap();
+        let runtime =
+            fake_runtime_with_mysql(home.path(), &major, "cat > /dev/null\nsleep 100\nexit 0");
+        let paths = openvhost_core::mysql::mysql_paths(home.path(), &major);
+        let pidfile = format!("{}.pid", paths.init_socket.display());
+
+        let ctx = MysqlInitCtx {
+            major: major.clone(),
+            runtime,
+            paths,
+        };
+        let log: InitLogSink = Arc::new(|_stream, _line| {});
+        let init_task = tokio::spawn(run_mysql_init(ctx, log));
+
+        // Wait for proof the temp server is actually running before
+        // aborting on it.
+        let pid: i32 = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&pidfile)
+                    && let Ok(pid) = text.trim().parse::<i32>()
+                {
+                    return pid;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the temp server never wrote its pidfile within the deadline");
+
+        // SAFETY: signal 0 performs no action; it only checks existence/permission.
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "temp server {pid} was not alive before aborting on it"
+        );
+
+        init_task.abort();
+        let _ = init_task.await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut still_alive = true;
+        while std::time::Instant::now() < deadline {
+            // SAFETY: signal 0 performs no action; it only checks existence/permission.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                still_alive = false;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Defensive cleanup on both the pass and fail path, same as
+        // `quit.rs`'s identical regression test.
+        if still_alive {
+            // SAFETY: plain kill syscall, cleaning up a leaked descendant.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+
+        assert!(
+            !still_alive,
+            "temp server {pid} was still alive after aborting the init task — \
+             TempServerGuard's Drop never ran or never killed it"
+        );
+    }
+
+    // ---- reset: auth-failure maps to its distinct state ----
+
+    #[tokio::test]
+    async fn reset_maps_an_access_denied_failure_to_the_distinct_auth_failed_state() {
+        let home = tempfile::tempdir().unwrap();
+        let major = openvhost_core::mysql::MysqlMajor::parse("8.4").unwrap();
+
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let db = Db::open_in_memory().await.unwrap();
+        let old_password = openvhost_core::mysql::generate_root_password();
+        openvhost_core::mysql::MysqlInstanceRepo::new(&db)
+            .upsert(&major, &old_password)
+            .await
+            .unwrap();
+        app.manage(db);
+        app.manage(Some(StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: home.path().join("nginx"),
+            nginx_conf: home.path().join("nginx.conf"),
+        }));
+        let fake_mysql = fake_cli(
+            home.path(),
+            "mysql",
+            r#"echo "ERROR 1045 (28000): Access denied for user 'root'@'localhost' (using password: YES)" 1>&2; exit 1"#,
+        );
+        app.manage(RwLock::new(Some(vec![
+            openvhost_core::mysql::MysqlRuntime {
+                major: major.clone(),
+                mysqld: home.path().join("mysqld"),
+                mysql: fake_mysql,
+                mysqladmin: home.path().join("mysqladmin"),
+            },
+        ])));
+
+        let outcome = reset_mysql_root_password(
+            "8.4".to_string(),
+            app.state::<Db>(),
+            app.state::<Option<StackPaths>>(),
+            app.state::<RwLock<Option<Vec<openvhost_core::mysql::MysqlRuntime>>>>(),
+        )
+        .await
+        .unwrap();
+
+        match outcome {
+            MysqlResetOutcomeDto::AuthFailed { detail } => {
+                assert!(detail.contains("Access denied"), "got {detail:?}")
+            }
+            other => panic!("expected AuthFailed, got {other:?}"),
+        }
+    }
+
+    /// REVIEW FIX WAVE, finding 1 (CRITICAL): the ephemeral defaults-file
+    /// `reset_mysql_root_password` writes to authenticate carries the
+    /// CURRENT (still-valid) stored password, not the freshly generated
+    /// one — so a failure detail that happens to echo back what it
+    /// authenticated with leaks the credential that is STILL ACTIVE on the
+    /// running server, which is strictly worse than leaking the new one
+    /// (that one is about to be overwritten if the ALTER ever succeeds; the
+    /// current one keeps working regardless). The fake `mysql` below reads
+    /// its own `--defaults-file` (exactly as a real client would to
+    /// authenticate) and echoes the password it found there back on
+    /// stderr — standing in for any diagnostic that quotes its own
+    /// connection parameters — then fails with an "Access denied" shape so
+    /// this exercises the `AuthFailed` branch specifically.
+    #[tokio::test]
+    async fn reset_redacts_the_current_password_from_a_failure_detail() {
+        let home = tempfile::tempdir().unwrap();
+        let major = openvhost_core::mysql::MysqlMajor::parse("8.4").unwrap();
+
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let db = Db::open_in_memory().await.unwrap();
+        let current_password = openvhost_core::mysql::generate_root_password();
+        openvhost_core::mysql::MysqlInstanceRepo::new(&db)
+            .upsert(&major, &current_password)
+            .await
+            .unwrap();
+        app.manage(db);
+        app.manage(Some(StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: home.path().join("nginx"),
+            nginx_conf: home.path().join("nginx.conf"),
+        }));
+        let fake_mysql = fake_cli(
+            home.path(),
+            "mysql",
+            r#"
+pw=""
+for arg in "$@"; do
+  case "$arg" in
+    --defaults-file=*)
+      f="${arg#--defaults-file=}"
+      pw=$(sed -n 's/^password=//p' "$f")
+      ;;
+  esac
+done
+echo "ERROR 1045 (28000): Access denied for user 'root'@'localhost' (using password: $pw)" 1>&2
+exit 1
+"#,
+        );
+        app.manage(RwLock::new(Some(vec![
+            openvhost_core::mysql::MysqlRuntime {
+                major: major.clone(),
+                mysqld: home.path().join("mysqld"),
+                mysql: fake_mysql,
+                mysqladmin: home.path().join("mysqladmin"),
+            },
+        ])));
+
+        let outcome = reset_mysql_root_password(
+            "8.4".to_string(),
+            app.state::<Db>(),
+            app.state::<Option<StackPaths>>(),
+            app.state::<RwLock<Option<Vec<openvhost_core::mysql::MysqlRuntime>>>>(),
+        )
+        .await
+        .unwrap();
+
+        let detail = match outcome {
+            MysqlResetOutcomeDto::AuthFailed { detail } => detail,
+            other => panic!("expected AuthFailed, got {other:?}"),
+        };
+        assert!(
+            !detail.contains(current_password.expose()),
+            "the CURRENT (still-valid) password leaked into a reset failure detail: {detail:?}"
+        );
+    }
+
+    // ---- redact ----
+
+    #[test]
+    fn redact_replaces_every_occurrence() {
+        let s = redact("pw=abc123 again abc123", "abc123");
+        assert_eq!(s, "pw=<redacted> again <redacted>");
+        assert!(!s.contains("abc123"));
+    }
+
+    #[test]
+    fn redact_all_scrubs_every_secret_independent_of_which_one_appears() {
+        let secrets = ["current-pw", "new-pw"];
+        assert_eq!(
+            redact_all("auth used current-pw", &secrets),
+            "auth used <redacted>"
+        );
+        assert_eq!(
+            redact_all("ALTER failed setting new-pw", &secrets),
+            "ALTER failed setting <redacted>"
+        );
+        assert_eq!(
+            redact_all("current-pw and new-pw both present", &secrets),
+            "<redacted> and <redacted> both present"
+        );
+    }
+
+    /// Defense-in-depth pin for `verify_mysql_connection`: even an EXOTIC
+    /// failure that echoes the stored credential back on stderr (something
+    /// no real `mysql` invocation is expected to do, but not something this
+    /// command can rule out for every past and future MySQL version) must
+    /// never reach the returned `detail`.
+    #[tokio::test]
+    async fn verify_connection_redacts_the_stored_password_from_a_failure_detail() {
+        let home = tempfile::tempdir().unwrap();
+        let major = openvhost_core::mysql::MysqlMajor::parse("8.4").unwrap();
+
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let db = Db::open_in_memory().await.unwrap();
+        let password = openvhost_core::mysql::generate_root_password();
+        openvhost_core::mysql::MysqlInstanceRepo::new(&db)
+            .upsert(&major, &password)
+            .await
+            .unwrap();
+        app.manage(db);
+        app.manage(Some(StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: home.path().join("nginx"),
+            nginx_conf: home.path().join("nginx.conf"),
+        }));
+        // An exotic fake that echoes its own defaults-file's contents back on
+        // stderr before failing — standing in for "some future mysql client
+        // quotes its connection parameters in an error message".
+        let fake_mysql = fake_cli(
+            home.path(),
+            "mysql",
+            r#"
+for arg in "$@"; do
+  case "$arg" in
+    --defaults-file=*) cat "${arg#--defaults-file=}" 1>&2 ;;
+  esac
+done
+exit 1
+"#,
+        );
+        app.manage(RwLock::new(Some(vec![
+            openvhost_core::mysql::MysqlRuntime {
+                major: major.clone(),
+                mysqld: home.path().join("mysqld"),
+                mysql: fake_mysql,
+                mysqladmin: home.path().join("mysqladmin"),
+            },
+        ])));
+
+        let outcome = verify_mysql_connection(
+            "8.4".to_string(),
+            app.state::<Db>(),
+            app.state::<Option<StackPaths>>(),
+            app.state::<RwLock<Option<Vec<openvhost_core::mysql::MysqlRuntime>>>>(),
+        )
+        .await
+        .unwrap();
+
+        let detail = match outcome {
+            MysqlConnectionProofDto::Failed { detail } => detail,
+            other => panic!("expected Failed, got {other:?}"),
+        };
+        assert!(
+            !detail.contains(password.expose()),
+            "the stored password leaked into a failure detail: {detail:?}"
         );
     }
 }

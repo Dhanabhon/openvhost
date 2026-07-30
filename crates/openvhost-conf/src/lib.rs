@@ -8,6 +8,7 @@ mod ctx;
 mod engine;
 mod error;
 mod inspect;
+mod mysql;
 mod phpruntime;
 pub mod settings;
 mod validate;
@@ -15,7 +16,11 @@ mod webserver;
 
 pub use ctx::{GeneratedFile, PhpUpstream, RenderCtx, ValidationReport};
 pub use error::ConfError;
-pub use inspect::{PROBE_TIMEOUT, probe_nginx_version, probe_php_fpm_version, validate_live};
+pub use inspect::{
+    PROBE_TIMEOUT, probe_mysqld_version, probe_nginx_version, probe_php_fpm_version, run_bounded,
+    validate_live,
+};
+pub use mysql::{MysqlCtx, MysqlValidator, generate_my_cnf};
 pub use phpruntime::{PhpFpmRuntime, PhpRuntimeAdapter};
 pub use settings::{
     BodySize, GzipLevel, GzipTypes, OnOff, Seconds, SettingsCheck, WebServerSettings,

@@ -33,6 +33,12 @@ openvhost-proc = { path = "../../../crates/openvhost-proc", features = ["specta"
 # No `specta` feature: nothing from this crate crosses IPC directly — the
 # web-server commands map its `ValidationReport` onto a local DTO.
 openvhost-conf = { path = "../../../crates/openvhost-conf" }
+# The MySQL init sequence's ephemeral `--defaults-file` (spec D2 step 5/D3)
+# needs an unpredictable, collision-proof suffix, mirroring
+# `openvhost-core`'s own `atomicfile::write_atomic`/`staging_dir_path` use of
+# `uuid::Uuid::new_v4().simple()` — already a workspace dependency (core
+# depends on it too), so this adds no new crate to Cargo.lock.
+uuid.workspace = true
 specta = { version = "2.0.0-rc.25", features = ["derive"] }
 specta-typescript = "0.0.12"
 tauri-specta = { version = "2.0.0-rc.25", features = ["derive", "typescript"] }
