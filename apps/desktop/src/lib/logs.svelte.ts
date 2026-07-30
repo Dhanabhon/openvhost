@@ -89,8 +89,46 @@ export class LogsStore {
 	 *  `refresh()` call captures it before awaiting the IPC round trip and
 	 *  discards its own response if the generation moved on in the
 	 *  meantime — the guard against a slow response for a superseded
-	 *  selection contaminating the CURRENT one's rows. */
+	 *  selection contaminating the CURRENT one's rows. See
+	 *  `inFlightGeneration` below for the DIFFERENT guard this alone does
+	 *  not provide: against two overlapping calls that share this SAME
+	 *  value. */
 	private generation = 0;
+	/**
+	 * Re-entrancy guard, keyed on generation rather than a blanket flag:
+	 * the generation a currently in-flight `readLogWindow` call belongs to,
+	 * or `null` when none is in flight. Without this, the poll's next tick
+	 * firing before a `>= POLL_INTERVAL_MS` read resolves (`read_window`
+	 * bounds bytes scanned, not wall-clock time) produces two calls that
+	 * share the same `generation` — `generation` alone does not catch
+	 * this, since it exists to discard a response for a SUPERSEDED
+	 * SELECTION, and two overlapping polls of the SAME selection are not
+	 * that. Both would read the identical `this.cursor` and, since neither
+	 * is "fresh", both would hit `applyWindow`'s append path — duplicating
+	 * rows (review finding on this task; regression test: "does not
+	 * duplicate rows when a second refresh starts before the first
+	 * resolves").
+	 *
+	 * Keyed on generation, NOT a plain boolean, so a genuinely NEW
+	 * selection is never held back by a stale call still finishing for the
+	 * PREVIOUS one: `selectSource`/`restart` bump `generation` before
+	 * calling `refresh()`, so their own call always has a generation that
+	 * DIFFERS from whatever a stale in-flight call was captured with, and
+	 * `refresh()` lets it proceed immediately — the stale one is left to
+	 * resolve on its own and gets discarded by the existing generation
+	 * check above, exactly as it already was before this guard existed.
+	 * (An earlier, plain-boolean version of this guard blocked that case
+	 * too and broke the pre-existing "stale-response guard" test — see
+	 * that regression for the trace.) A call sharing the CURRENT
+	 * generation with one already in flight (two poll ticks, or a poll
+	 * tick racing `jumpToLatest`, neither of which bumps generation) is
+	 * SKIPPED, not queued: `read_log_window` always resumes from `cursor`,
+	 * so a skipped call loses no data — the next call (the following poll
+	 * tick, at most `POLL_INTERVAL_MS` later, or the next explicit action)
+	 * reads the same cursor the skipped call would have and simply catches
+	 * up further.
+	 */
+	private inFlightGeneration: number | null = null;
 
 	constructor(private api: LogsApi) {}
 
@@ -201,10 +239,15 @@ export class LogsStore {
 	 *  transient failure; the failure lands on `readError` instead, which a
 	 *  later successful call clears. A no-op when nothing is selected, so a
 	 *  poll timer left running for a moment after `selected` is cleared
-	 *  costs nothing. */
+	 *  costs nothing. Also a no-op (silently, resolving immediately) when a
+	 *  call already in flight shares its generation — see
+	 *  `inFlightGeneration`'s doc comment for why a DIFFERENT generation
+	 *  (a genuinely new selection) is never held back by this. */
 	async refresh(): Promise<void> {
 		if (this.selected === null) return;
+		if (this.inFlightGeneration === this.generation) return;
 		const generation = this.generation;
+		this.inFlightGeneration = generation;
 		const source = this.selected;
 		try {
 			const w = await this.api.readLogWindow({
@@ -222,6 +265,7 @@ export class LogsStore {
 			this.readError = e as IpcError;
 		} finally {
 			if (generation === this.generation) this.loaded = true;
+			if (this.inFlightGeneration === generation) this.inFlightGeneration = null;
 		}
 	}
 
@@ -243,7 +287,15 @@ export class LogsStore {
 		this.rows =
 			merged.length > MAX_RENDERED_ROWS ? merged.slice(merged.length - MAX_RENDERED_ROWS) : merged;
 
-		if (!fresh && !this.follow && w.rows.length > 0) this.newRowsWhilePaused = true;
+		// Review finding (minor a): a reset silently swaps the whole view
+		// out from under a reader scrolled away from the bottom — MORE
+		// jarring than ordinary new rows arriving, not less — so it earns
+		// the same "Jump to latest" affordance those get, not only its own
+		// separate reset notice (LogBody's unconditional banner covers the
+		// "what happened"; this flag covers "there is something new to
+		// look at"). Still gated on `w.rows.length > 0`: an empty fresh
+		// tail (truncated to nothing) has nothing to jump to.
+		if (!this.follow && w.rows.length > 0) this.newRowsWhilePaused = true;
 	}
 
 	/** Begin polling. Idempotent, mirroring `StatsStore.start()` — a second

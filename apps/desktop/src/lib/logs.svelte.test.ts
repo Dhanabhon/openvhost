@@ -172,6 +172,35 @@ describe('LogsStore cursor / append / reset (spec D3: never double-print)', () =
 		expect(store.reset).toBe('rotated');
 	});
 
+	// Review finding (minor b): the filter and the reset paths are handled
+	// by independent state (needle/case/level vs. `applyWindow`'s `fresh`
+	// branch) — this pins that they actually compose correctly rather than
+	// leaving the combination to be taken on faith. A rotation arriving
+	// while a filter is active must still (1) replace rather than append,
+	// (2) keep the filter itself active for the NEXT call, and (3) not
+	// silently drop back to an unfiltered view.
+	it('a reset combined with an active filter still replaces rows, and the filter survives the reset', async () => {
+		const readLogWindow = vi
+			.fn<() => Promise<LogWindowDto>>()
+			.mockResolvedValueOnce(windowOf({ rows: [row('seed')], cursor: 'c0' })) // selectSource's own seed, no filter yet
+			.mockResolvedValueOnce(windowOf({ rows: [row('old-match')], cursor: 'c1' })) // setNeedle's restart, filtered
+			.mockResolvedValueOnce(
+				windowOf({ rows: [row('new-match')], cursor: 'c2', reset: 'rotated' })
+			); // a LATER poll tick: rotated, filter still active
+		const store = new LogsStore(api({ readLogWindow }));
+		await store.selectSource({ kind: 'nginxError' });
+		await store.setNeedle('match');
+		expect(store.rows.map((r) => r.text)).toEqual(['old-match']);
+
+		await store.refresh(); // a poll tick: the file was rotated, filter still on
+		expect(readLogWindow).toHaveBeenLastCalledWith(
+			expect.objectContaining({ needle: 'match', cursor: 'c1' })
+		);
+		expect(store.rows.map((r) => r.text)).toEqual(['new-match']); // replaced, not appended
+		expect(store.reset).toBe('rotated');
+		expect(store.needle).toBe('match'); // the filter itself is untouched by a reset
+	});
+
 	it('exists:false clears rows rather than leaving stale content on screen', async () => {
 		const readLogWindow = vi
 			.fn<() => Promise<LogWindowDto>>()
@@ -249,6 +278,43 @@ describe('LogsStore follow toggling', () => {
 		store.setFollow(false);
 		await store.refresh();
 		expect(store.newRowsWhilePaused).toBe(true);
+	});
+
+	// Review finding (minor a): a reset silently swaps the WHOLE view out
+	// from under a reader who scrolled away from the bottom — a more
+	// jarring change than ordinary new rows arriving, not a lesser one — so
+	// it earns the identical "Jump to latest" affordance, not just its own
+	// separate reset banner (which stays unconditional, in LogBody, for the
+	// "what happened" half of the story; this flag is the "there is
+	// something new to look at" half).
+	it('also flags newRowsWhilePaused when a reset arrives while paused', async () => {
+		const readLogWindow = vi
+			.fn<() => Promise<LogWindowDto>>()
+			.mockResolvedValueOnce(windowOf({ rows: [row('seed')], cursor: 'c1' }))
+			.mockResolvedValueOnce(
+				windowOf({ rows: [row('fresh-tail')], cursor: 'c2', reset: 'rotated' })
+			);
+		const store = new LogsStore(api({ readLogWindow }));
+		await store.selectSource({ kind: 'nginxError' });
+		store.setFollow(false);
+		await store.refresh();
+		expect(store.newRowsWhilePaused).toBe(true);
+		expect(store.rows.map((r) => r.text)).toEqual(['fresh-tail']); // still replaced, not appended
+	});
+
+	// The other half of that same fix: a reset to an EMPTY fresh tail (a
+	// file truncated to nothing) has nothing to jump to, so it must not
+	// raise a badge pointing at an empty log.
+	it('does not flag newRowsWhilePaused for a reset with no rows in the fresh tail', async () => {
+		const readLogWindow = vi
+			.fn<() => Promise<LogWindowDto>>()
+			.mockResolvedValueOnce(windowOf({ rows: [row('seed')], cursor: 'c1' }))
+			.mockResolvedValueOnce(windowOf({ rows: [], cursor: 'c2', reset: 'truncated' }));
+		const store = new LogsStore(api({ readLogWindow }));
+		await store.selectSource({ kind: 'nginxError' });
+		store.setFollow(false);
+		await store.refresh();
+		expect(store.newRowsWhilePaused).toBe(false);
 	});
 
 	it('does not flag newRowsWhilePaused while following', async () => {
@@ -362,6 +428,77 @@ describe('LogsStore stale-response guard', () => {
 		resolveFirst(windowOf({ rows: [row('first-source-late')], cursor: 'c1' }));
 		await firstSelect;
 		expect(store.rows.map((r) => r.text)).toEqual(['second-source']);
+	});
+});
+
+describe('LogsStore reentrancy guard (overlapping same-generation refreshes)', () => {
+	// The bug: `generation` only discards a response for a SUPERSEDED
+	// SELECTION. Two overlapping calls within the SAME selection (a poll
+	// tick firing again before a >=500ms read resolves — exactly the
+	// sustained-load case) share one generation, so the old guard let BOTH
+	// responses through, and `applyWindow`'s append-when-not-fresh path
+	// applied both — duplicating rows. Reproduced here with two
+	// manually-controlled promises so the overlap is real, not a
+	// same-microtask coincidence (every OTHER test's mock resolves
+	// same-tick, which is exactly why nothing else caught this).
+	it('does not duplicate rows when a second refresh starts before the first resolves', async () => {
+		let resolveFirst: (w: LogWindowDto) => void = () => {};
+		let resolveSecond: (w: LogWindowDto) => void = () => {};
+		const first = new Promise<LogWindowDto>((resolve) => {
+			resolveFirst = resolve;
+		});
+		const second = new Promise<LogWindowDto>((resolve) => {
+			resolveSecond = resolve;
+		});
+		const readLogWindow = vi
+			.fn<() => Promise<LogWindowDto>>()
+			.mockResolvedValueOnce(windowOf({ rows: [row('seed')], cursor: 'c1' }))
+			.mockReturnValueOnce(first)
+			.mockReturnValueOnce(second);
+		const store = new LogsStore(api({ readLogWindow }));
+		await store.selectSource({ kind: 'nginxError' });
+		expect(store.rows.map((r) => r.text)).toEqual(['seed']);
+
+		// Two overlapping calls, neither awaited before the next starts —
+		// the exact interleaving a slow read produces against a fixed-rate
+		// poll timer. Both would read the SAME (not-yet-advanced) cursor
+		// under the old code.
+		const p1 = store.refresh();
+		const p2 = store.refresh();
+
+		// Both windows are computed against cursor 'c1' (nothing has
+		// advanced it yet) — this is what the old code appended TWICE.
+		resolveFirst(windowOf({ rows: [row('a'), row('b')], cursor: 'c2' }));
+		resolveSecond(windowOf({ rows: [row('a'), row('b')], cursor: 'c2' }));
+		await Promise.all([p1, p2]);
+
+		// The guarded call never reaches the api at all — only the seed
+		// plus the ONE call that actually won entry.
+		expect(readLogWindow).toHaveBeenCalledTimes(2);
+		expect(store.rows.map((r) => r.text)).toEqual(['seed', 'a', 'b']);
+	});
+
+	it('the skipped call resolves cleanly rather than hanging', async () => {
+		let resolveFirst: (w: LogWindowDto) => void = () => {};
+		const first = new Promise<LogWindowDto>((resolve) => {
+			resolveFirst = resolve;
+		});
+		const readLogWindow = vi
+			.fn<() => Promise<LogWindowDto>>()
+			.mockResolvedValueOnce(windowOf({ rows: [row('seed')], cursor: 'c1' }))
+			.mockReturnValueOnce(first);
+		const store = new LogsStore(api({ readLogWindow }));
+		await store.selectSource({ kind: 'nginxError' });
+
+		const p1 = store.refresh();
+		const p2 = store.refresh(); // guarded — must not hang waiting on p1
+		// If the guard ever queued/awaited the in-flight call instead of
+		// skipping, this `await` would hang and the test would time out
+		// rather than reach this assertion at all.
+		await expect(p2).resolves.toBeUndefined();
+
+		resolveFirst(windowOf({ rows: [row('a')], cursor: 'c2' }));
+		await p1;
 	});
 });
 
