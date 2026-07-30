@@ -36,7 +36,11 @@ pub enum CoreError {
     /// D5: "written with `atomicfile::write_atomic` as a `GeneratedFile`"),
     /// which needs the SAME hardened atomic write `site::apply::commit`
     /// already uses but has no `ApplyPlan` of its own to go through — see
-    /// `crate::mysql::write_generated_config`.
+    /// `crate::mysql::write_generated_config`. A second use site joined it
+    /// with audit finding H1: `crate::db::Db::open`'s own precreate/chmod
+    /// calls that pin `state.db` (and its WAL sidecars) to 0600 are the
+    /// identical shape — a filesystem op with no `ApplyPlan`/provisioning
+    /// context of its own to report through.
     #[error("{op} {}: {source}", path.display())]
     Io {
         op: &'static str,

@@ -69,3 +69,52 @@ fn provisioning_is_idempotent() {
     provision_home(home.path()).unwrap();
     assert!(home.path().join("www/index.php").is_file());
 }
+
+/// Security audit H1 (THE merge blocker): spec D3's at-rest argument for the
+/// MySQL root credential stored in `state.db` assumes `<home>` is 0700 —
+/// otherwise any other local account can walk in and read it (macOS puts
+/// every account in the `staff` group, and `/Users/<name>` is
+/// group-traversable by default). `short_home()`'s own tempdir already
+/// happens to be 0700 (the `tempfile` crate's own default), which would make
+/// a naive assertion here vacuous — so this deliberately loosens it first to
+/// prove `provision_home` is the one actually tightening it, on EVERY call,
+/// not only when it creates the directory fresh (an install that predates
+/// this fix must be repaired the very next time it launches).
+#[cfg(unix)]
+#[test]
+fn provisioning_locks_the_home_directory_to_0700_even_when_it_already_existed_looser() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = short_home();
+    std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    provision_home(home.path()).unwrap();
+
+    let mode = std::fs::metadata(home.path()).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o700,
+        "home directory must be 0700 after provisioning, even though it already existed looser"
+    );
+}
+
+/// The other half of "apply on every provision, not only creation": a home
+/// directory that does not exist YET must also come out at 0700, not
+/// whatever the ambient umask would otherwise give `create_dir_all`.
+#[cfg(unix)]
+#[test]
+fn provisioning_creates_a_brand_new_home_directory_at_0700() {
+    use std::os::unix::fs::PermissionsExt;
+    let outer = tempfile::Builder::new()
+        .prefix("ovh-outer")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let home = outer.path().join("openvhost-home");
+    assert!(
+        !home.exists(),
+        "must not exist yet for this test to prove anything"
+    );
+
+    provision_home(&home).unwrap();
+
+    let mode = std::fs::metadata(&home).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+}
