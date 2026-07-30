@@ -4166,7 +4166,7 @@ mod mysql_ipc_tests {
     fn mysqld_init_spec_carries_no_defaults_file_and_no_defaults_first() {
         let spec = mysqld_init_spec(
             Path::new("/opt/homebrew/opt/mysql@8.4/bin/mysqld"),
-            Path::new("/tmp/ovh/data/mysql/.8.4.init-deadbeef"),
+            Path::new("/tmp/ovh/data/mysql/.init-8-4-deadbeef"),
         );
         let args: Vec<String> = spec
             .args
@@ -4187,7 +4187,7 @@ mod mysql_ipc_tests {
             "got {args:?}"
         );
         assert!(
-            args.contains(&"--datadir=/tmp/ovh/data/mysql/.8.4.init-deadbeef".to_string()),
+            args.contains(&"--datadir=/tmp/ovh/data/mysql/.init-8-4-deadbeef".to_string()),
             "got {args:?}"
         );
     }
@@ -4196,7 +4196,7 @@ mod mysql_ipc_tests {
     fn mysqld_temp_server_spec_carries_no_defaults_file_and_no_defaults_first() {
         let spec = mysqld_temp_server_spec(
             Path::new("/opt/homebrew/opt/mysql@8.4/bin/mysqld"),
-            Path::new("/tmp/ovh/data/mysql/.8.4.init-deadbeef"),
+            Path::new("/tmp/ovh/data/mysql/.init-8-4-deadbeef"),
             Path::new("/tmp/ovh/run/mysql-8.4-init.sock"),
         );
         let args: Vec<String> = spec
@@ -4214,7 +4214,7 @@ mod mysql_ipc_tests {
             "--no-defaults must be first (mysqld requirement), got {args:?}"
         );
         assert!(
-            args.contains(&"--datadir=/tmp/ovh/data/mysql/.8.4.init-deadbeef".to_string()),
+            args.contains(&"--datadir=/tmp/ovh/data/mysql/.init-8-4-deadbeef".to_string()),
             "got {args:?}"
         );
         assert!(

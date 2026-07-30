@@ -503,20 +503,20 @@ mod tests {
     }
 
     /// Review fix wave, minor 3: a crash or force-quit mid-init leaves a
-    /// `.<major>.init-<uuid>` staging directory behind, and before this fix
-    /// nothing swept it until a user happened to open the Databases page
-    /// (which triggers `rescan_mysql_into_state`, the only existing call
-    /// site). `sweep_stale_mysql_staging_at_startup` is exercised directly
-    /// here — not through `macos_stack()` itself, which resolves the REAL
-    /// `OPENVHOST_HOME` internally and has no injectable home parameter, so
-    /// driving it from a test would mean mutating process-wide env or
-    /// touching the actual user's home directory.
+    /// `.init-<major-dashed>-<uuid>` staging directory behind, and before
+    /// this fix nothing swept it until a user happened to open the
+    /// Databases page (which triggers `rescan_mysql_into_state`, the only
+    /// existing call site). `sweep_stale_mysql_staging_at_startup` is
+    /// exercised directly here — not through `macos_stack()` itself, which
+    /// resolves the REAL `OPENVHOST_HOME` internally and has no injectable
+    /// home parameter, so driving it from a test would mean mutating
+    /// process-wide env or touching the actual user's home directory.
     #[test]
     fn sweep_stale_mysql_staging_at_startup_removes_an_abandoned_staging_dir() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tmp.path();
         let staging =
-            openvhost_core::mysql::mysql_data_root(home).join(".8.4.init-deadbeef00000000");
+            openvhost_core::mysql::mysql_data_root(home).join(".init-8-4-deadbeef00000000");
         std::fs::create_dir_all(&staging).expect("create staging dir");
 
         sweep_stale_mysql_staging_at_startup(home);
