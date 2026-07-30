@@ -47,6 +47,22 @@ pub enum CoreError {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// A path this crate needs to read is not a plain file — refused
+    /// rather than followed (a symlink) or silently skipped. Added for
+    /// `logs::read::read_window` (P1 live-log-viewer design, spec D5):
+    /// mirrors `site::apply::ApplyError::NotAPlainFile`'s reasoning
+    /// applied to a log path. A path derived by `logs::LogPaths` is safe
+    /// by construction, but the FILE actually sitting there could have
+    /// been replaced with a link to something outside `<home>/logs` after
+    /// the fact — refusing it here means that swap is caught even though
+    /// this crate never calls `canonicalize`.
+    #[error("{} is not a plain file (found {found}); refusing to read it", path.display())]
+    NotAPlainFile {
+        path: PathBuf,
+        /// What was actually found there instead — `"a symlink"`,
+        /// `"a directory"`, or `"a special file"`.
+        found: &'static str,
+    },
 }
 
 /// Maps the crate-shared hardened atomic write's error (`crate::atomicfile`)

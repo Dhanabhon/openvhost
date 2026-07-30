@@ -20,7 +20,10 @@ pub use db::Db;
 pub use error::CoreError;
 pub use home::{home_disk_usage, resolve_home};
 pub use info::{CoreInfo, core_info};
-pub use logs::LogPaths;
+pub use logs::{
+    LogCursor, LogLevel, LogLimits, LogPaths, LogQuery, LogReset, LogRow, LogWindow,
+    classify_level, read_window,
+};
 pub use mysql::{
     DatadirState, MYSQL_CATALOGUE, MysqlInitOutcome, MysqlInitStep, MysqlInstance,
     MysqlInstanceRepo, MysqlMajor, MysqlPaths, MysqlRuntime, RootPassword, alter_user_sql,
