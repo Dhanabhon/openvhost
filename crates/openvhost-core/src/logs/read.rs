@@ -59,7 +59,13 @@
 //! newtype ingress → live-catalogue check → [`crate::LogPaths`] derivation
 //! → a `starts_with(<home>/logs)` post-condition), deliberately kept out of
 //! this pure reader so the same function works identically for any log
-//! path a future caller (the CLI, a test) already trusts.
+//! path a future caller (the CLI, a test) already trusts. The same layer
+//! also owns spec D3's 256-byte cap on [`LogQuery::needle`] — this reader
+//! does not enforce a length bound on it.
+//!
+//! [`LogCursor`] is transport-transparent, not opaque — see its own doc
+//! comment for what that means and why it is still safe to round-trip
+//! through IPC unmodified.
 //!
 //! # The ring-classifier seam
 //!
@@ -136,18 +142,36 @@ impl FileIdentity {
     }
 }
 
-/// An opaque resume point for [`read_window`]: which file (by identity, not
-/// path) and how far into it. Round-trips through IPC as a plain
-/// serializable value (its fields stay private, so nothing outside this
-/// module can construct or mutate one — the only way to get a `LogCursor`
-/// is to have already called [`read_window`] once).
+/// A resume point for [`read_window`]: which file (by identity, not path)
+/// and how far into it.
 ///
-/// Reusing a cursor issued for one file against a DIFFERENT file at the
-/// same `path` is safe, not a confinement concern: the identity mismatch
-/// is simply read as [`LogReset::Rotated`] and this restarts from a fresh
-/// tail of whatever is actually at `path` now — the cursor can only ever
-/// change WHERE within an already-trusted `path` a scan resumes, never
-/// WHICH path gets opened.
+/// # Transport-transparent, not opaque
+///
+/// Fields stay private so no OTHER Rust code in this crate can build or
+/// mutate one via a struct literal — the only way to get a `LogCursor` from
+/// safe, ordinary Rust is to have already called [`read_window`] once. That
+/// is weaker than it sounds, though: a derived `Deserialize` impl expands
+/// INSIDE this module (macro hygiene puts derive-generated code in the
+/// item's own defining scope), so it sets these private fields directly,
+/// same as any code written by hand here could. Field privacy stops other
+/// Rust modules from constructing one; it does not stop `serde`. Whatever
+/// JSON an IPC caller (or a compromised renderer) supplies for a cursor can
+/// therefore decode into an arbitrary `(dev, ino, offset)` triple, not
+/// necessarily one this reader actually issued.
+///
+/// That is fine, not a confinement bypass, because a `LogCursor` never
+/// influences WHICH file gets opened — only WHERE, within whichever file
+/// `path` (independently derived and validated by the IPC layer, spec D5)
+/// already resolves to, the scan resumes:
+/// - An `identity` that does not match the file actually at `path` reads as
+///   [`LogReset::Rotated`] and restarts from a fresh tail — a forged
+///   identity can only ever trigger the SAME safe reset a genuine rotation
+///   would.
+/// - A forged `offset` is bounds-checked exactly like a stale one
+///   (`len < offset` ⇒ [`LogReset::Truncated`], fresh tail); anything else
+///   is just a seek position INSIDE a file the caller was already permitted
+///   to read from byte zero. It cannot address anything outside that file,
+///   and it cannot make [`read_window`] open a different one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LogCursor {
     identity: FileIdentity,
@@ -169,6 +193,10 @@ pub struct LogQuery {
     /// pattern comes straight from the renderer, and a backtracking regex
     /// engine given attacker-shaped input is a UI-freezing hazard this
     /// crate does not take on for what is, today, a literal-search feature.
+    ///
+    /// Spec D3's 256-byte cap on this value is enforced at IPC ingress
+    /// (Task 5), not here — `read_window` accepts whatever `String` it is
+    /// given and applies no length bound of its own.
     pub needle: Option<String>,
     /// Only consulted when `needle` is `Some`.
     pub case_sensitive: bool,
@@ -258,7 +286,11 @@ pub struct LogWindow {
     pub reset: Option<LogReset>,
     /// Whether the file has unread bytes beyond the returned `cursor` —
     /// this call stopped on a `rows`/`payload`/`scan` limit rather than
-    /// because the scan ran out of file.
+    /// because the scan ran out of file. `false` in one extra case where
+    /// bytes technically remain: a fresh tail whose leading discarded
+    /// fragment alone consumed the whole `scan` budget never got to
+    /// examine a single real line, so it has no basis to say a retry would
+    /// find anything.
     pub has_more: bool,
     /// The file's total size, as observed at the start of this call.
     pub size_bytes: u64,
@@ -402,7 +434,13 @@ pub fn read_window(
         }),
         exists: true,
         reset,
-        has_more: scan.pos < len,
+        // `scan.pos < len` alone is not enough: when the scan bound was hit
+        // entirely by discarding the leading fragment of a fresh tail (see
+        // `discard_exhausted_budget`'s doc comment), this call never got to
+        // examine a single real line, so it has no basis to claim more IS
+        // reachable — `has_more` says so honestly rather than implying a
+        // retry is guaranteed to find something.
+        has_more: scan.pos < len && !scan.discard_exhausted_budget,
         size_bytes: len,
         scanned_bytes: scan.scanned_bytes,
         truncated_lines: scan.truncated_lines,
@@ -420,6 +458,14 @@ struct ScanOutcome {
     scanned_bytes: u64,
     truncated_lines: u32,
     scan_bound_reached: bool,
+    /// `true` when the scan bound was hit while STILL discarding the
+    /// leading fragment of a fresh tail (spec D3) — this call never got to
+    /// examine so much as one real, filterable line, whether or not that
+    /// discarded fragment itself happened to end in `\n`. Distinct from the
+    /// ordinary `scan_bound_reached` case where real lines WERE examined
+    /// (matched or not) before the bound stopped things — see
+    /// `read_window`'s `has_more` computation, which folds this in.
+    discard_exhausted_budget: bool,
 }
 
 /// Walk `file` forward from `start` one line at a time, applying `query`
@@ -439,7 +485,20 @@ fn scan_forward(
     let mut payload_bytes: u64 = 0;
     let mut truncated_lines: u32 = 0;
     let mut scan_bound_reached = false;
+    let mut discard_exhausted_budget = false;
     let mut first = true;
+
+    // Folded once per CALL, not once per scanned line: `query.needle` never
+    // changes mid-scan, but a scan can visit hundreds of thousands of
+    // lines, and `text.to_lowercase()` (per line, unavoidable — each line's
+    // content really does differ) is already the expensive half of this
+    // comparison; there is no reason to pay the needle's identical fold
+    // that many times too.
+    let needle_lower: Option<String> = if query.case_sensitive {
+        None
+    } else {
+        query.needle.as_ref().map(|n| n.to_lowercase())
+    };
 
     // `Read::take` makes the scan bound PHYSICAL: once `limits.scan` bytes
     // have been pulled from `file` — regardless of how many `read_until`
@@ -477,8 +536,20 @@ fn scan_forward(
                 // else: never found a boundary within the scan span at
                 // all — nothing usable comes out of this call, and `pos`
                 // must not move past `start` either way.
-                if !complete && scanned_bytes >= limits.scan {
+                //
+                // Reaching the bound HERE — whether the discarded fragment
+                // happened to complete right at the edge of the budget
+                // (`complete`) or the budget ran dry before it ever did
+                // (`!complete`) — means the discard alone spent the ENTIRE
+                // scan budget: this call never got to look at a single
+                // real, filterable line. Both flags need to say so
+                // (`discard_exhausted_budget` is what lets `read_window`
+                // also correct `has_more`), which is why this check does
+                // NOT gate on `complete` the way the ordinary trailing-line
+                // check below does.
+                if scanned_bytes >= limits.scan {
                     scan_bound_reached = true;
+                    discard_exhausted_budget = true;
                 }
                 continue;
             }
@@ -502,7 +573,7 @@ fn scan_forward(
             truncated_lines += 1;
         }
         let level = classify_level(&text);
-        if line_matches(&text, level, query) {
+        if line_matches(&text, level, query, needle_lower.as_deref()) {
             payload_bytes += text.len() as u64;
             rows.push(LogRow { level, text });
         }
@@ -525,6 +596,7 @@ fn scan_forward(
         scanned_bytes,
         truncated_lines,
         scan_bound_reached,
+        discard_exhausted_budget,
     })
 }
 
@@ -547,7 +619,14 @@ fn decode_and_cap(line: &[u8], cap: u64) -> (String, bool) {
 /// literal substring, case-insensitive unless `query.case_sensitive`. Runs
 /// on every complete line the scan visits, not only on what gets returned
 /// — see this module's doc comment.
-fn line_matches(text: &str, level: LogLevel, query: &LogQuery) -> bool {
+///
+/// `needle_lower` is `query.needle` lowercased ONCE by the caller
+/// (`scan_forward`), not recomputed here per line — see that function's
+/// comment. It is `Some` exactly when `query.needle` is `Some` and
+/// `query.case_sensitive` is `false`; the `unwrap_or` below is unreachable
+/// in practice but keeps this function correct even if a future caller
+/// passes a mismatched pair.
+fn line_matches(text: &str, level: LogLevel, query: &LogQuery, needle_lower: Option<&str>) -> bool {
     if let Some(min) = query.min_level
         && level_rank(level) < level_rank(min)
     {
@@ -557,7 +636,8 @@ fn line_matches(text: &str, level: LogLevel, query: &LogQuery) -> bool {
         let hit = if query.case_sensitive {
             text.contains(needle.as_str())
         } else {
-            text.to_lowercase().contains(&needle.to_lowercase())
+            let needle_lower = needle_lower.unwrap_or(needle.as_str());
+            text.to_lowercase().contains(needle_lower)
         };
         if !hit {
             return false;
@@ -898,6 +978,69 @@ mod tests {
         assert!(w.scan_bound_reached);
         assert!(w.rows.is_empty());
         assert!(w.scanned_bytes <= limits.scan);
+    }
+
+    /// The combination the previous test does NOT exercise: the scan bound
+    /// hit while still discarding the leading fragment of a fresh tail,
+    /// before this call ever got to examine one real line. Two fixture
+    /// offsets, hand-computed against the SAME file, hit the two ways that
+    /// can happen: the discarded fragment completes (ends in `\n`) exactly
+    /// at the budget's edge, or the budget runs dry before it ever
+    /// completes.
+    ///
+    /// Content: 100 `'A'`s + `'\n'` (bytes 0..=100), then "keep1\n" (101..=106),
+    /// then "keep2\n" (107..=112) — 113 bytes total.
+    #[test]
+    fn discard_consuming_the_whole_budget_sets_scan_bound_reached_and_clears_has_more() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("access.log");
+        let content = format!("{}\nkeep1\nkeep2\n", "A".repeat(100));
+        std::fs::write(&path, &content).unwrap();
+        assert_eq!(content.len(), 113);
+
+        // payload=20 seeks back to offset 93 (113-20), inside the run of
+        // 'A's; unfiltered, so `fresh_tail_start` uses `payload` as the
+        // span. Both sub-cases below only vary `scan`.
+
+        // Sub-case 1: the discard COMPLETES right at the budget's edge.
+        // From offset 93, the '\n' at index 100 is reached in exactly 8
+        // bytes ("AAAAAAA\n") — set scan=8 so that read exhausts the whole
+        // budget. Before this fix, `scan_bound_reached` stayed `false` here
+        // (the `if !complete && ...` guard excluded this branch entirely)
+        // and `has_more` stayed `true` even though nothing beyond the
+        // discarded fragment was ever examined.
+        let limits_complete = LogLimits {
+            rows: 10,
+            payload: 20,
+            line: 200,
+            scan: 8,
+        };
+        let w1 = read_window(&path, None, &LogQuery::default(), &limits_complete).unwrap();
+        assert!(w1.rows.is_empty(), "the whole budget went to the discard");
+        assert_eq!(w1.scanned_bytes, 8);
+        assert!(
+            w1.scan_bound_reached,
+            "the discard alone hit the bound and must say so"
+        );
+        assert!(
+            !w1.has_more,
+            "this call examined zero real lines; it cannot promise a retry finds more"
+        );
+
+        // Sub-case 2: the discard NEVER completes within budget (scan=5
+        // only reaches "AAAAA", no '\n'). This sub-case's `scan_bound_reached`
+        // was already correct before this fix; `has_more` was not.
+        let limits_incomplete = LogLimits {
+            rows: 10,
+            payload: 20,
+            line: 200,
+            scan: 5,
+        };
+        let w2 = read_window(&path, None, &LogQuery::default(), &limits_incomplete).unwrap();
+        assert!(w2.rows.is_empty());
+        assert_eq!(w2.scanned_bytes, 5);
+        assert!(w2.scan_bound_reached);
+        assert!(!w2.has_more);
     }
 
     // -- Filtering reaches back through the file ---------------------------
