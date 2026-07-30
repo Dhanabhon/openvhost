@@ -13,6 +13,33 @@ use crate::error::ConfError;
 use crate::settings::WebServerSettings;
 use crate::{GeneratedFile, ValidationReport};
 
+/// The nginx `log_format` NAME shared between `generate_main_config`'s
+/// declaration and `generate_site_config`'s per-site `access_log` reference
+/// (P1 live-log-viewer design, spec D5's privacy format — built on `$uri`,
+/// never `$request`/`$args`). Threaded through Tera context as
+/// `access_log_format` at BOTH call sites from this ONE Rust constant, so
+/// the two can never name a different format by a typo: nginx would reject
+/// an undefined name at `nginx -t` rather than silently misbehave, but
+/// there is no reason to leave that checkable only by the live validator
+/// when a shared constant forecloses it here.
+const ACCESS_LOG_FORMAT_NAME: &str = "ovh_access";
+
+/// The ONE derivation of a site's per-domain log DIRECTORY this crate uses —
+/// both `generate_site_config`'s rendered `access_log`/`error_log` and
+/// `validate()`'s own pre-creation of that directory go through this,
+/// mirroring `phpruntime.rs`'s `php_fpm_log_dir` (same shared-derivation
+/// discipline, same forcing reason: `openvhost-core`'s
+/// `LogPaths::site_access`/`site_error` cannot be called from this crate —
+/// see `generate_site_config`'s comment below for why — so this crate is
+/// already forced to carry one independent copy of the formula; this helper
+/// stops that one forced copy from ALSO existing twice inside this file).
+///
+/// `home` is the config-path-safe string `to_config_path` already produces —
+/// same convention as `php_fpm_log_dir`.
+fn site_log_dir(home: &str, server_name: &str) -> String {
+    format!("{home}/logs/sites/{server_name}")
+}
+
 #[async_trait]
 pub trait WebServerAdapter: Send + Sync {
     fn id(&self) -> &'static str;
@@ -140,6 +167,7 @@ impl WebServerAdapter for NginxAdapter {
         // renders through this exact function and compares.
         tc.insert("error_log", &format!("{home_str}/logs/nginx.error.log"));
         tc.insert("access_log", &format!("{home_str}/logs/nginx.access.log"));
+        tc.insert("access_log_format", ACCESS_LOG_FORMAT_NAME);
         tc.insert("temp_dir", &format!("{home_str}/run/nginx"));
         tc.insert(
             "generated_sites_glob",
@@ -193,6 +221,22 @@ impl WebServerAdapter for NginxAdapter {
         tc.insert("listen_addr", &ctx.listen_addr.to_string());
         tc.insert("server_name", &ctx.server_name);
         tc.insert("docroot", &docroot);
+        // Per-site, NOT shared with the nginx globals: `<home>/logs/sites/<domain>/`
+        // is NEW (P1 live-log-viewer design, spec D1) — previously every
+        // site's requests/errors landed only in the flat global
+        // nginx.error.log/nginx.access.log, so a line could never be
+        // attributed to a site. This crate cannot depend on
+        // `openvhost-core` (core depends on conf), so this value is
+        // derived independently here (via `site_log_dir`, shared with
+        // `validate()` below) rather than via
+        // `openvhost_core::logs::LogPaths::site_access`/`site_error` — the
+        // two are kept in sync by that module's own
+        // `site_log_values_match_the_confs_independent_render` test, which
+        // renders through this exact function and compares.
+        let site_logs = site_log_dir(&home, &ctx.server_name);
+        tc.insert("access_log", &format!("{site_logs}/access.log"));
+        tc.insert("error_log", &format!("{site_logs}/error.log"));
+        tc.insert("access_log_format", ACCESS_LOG_FORMAT_NAME);
         let contents = render("nginx/site.conf", &tc)?;
         Ok(GeneratedFile {
             path: Self::gen_dir(&ctx.home)
@@ -265,6 +309,20 @@ impl WebServerAdapter for NginxAdapter {
                 source: e,
             })?;
         }
+        // P1 live-log-viewer bug fix (mirrors `phpruntime.rs`'s identical
+        // php-fpm fix): the site config's `access_log`/`error_log` now
+        // point under `logs/sites/<domain>/`, which the loop above does not
+        // create — via the SAME `site_log_dir` helper `generate_site_config`
+        // used just above, so this directory and those rendered directives
+        // can never drift apart. `to_config_path` is guaranteed to succeed
+        // here: `generate_site_config` already called it on this exact
+        // `ctx.home` (as `home`), above.
+        let site_logs = PathBuf::from(site_log_dir(&to_config_path(&ctx.home)?, &ctx.server_name));
+        std::fs::create_dir_all(&site_logs).map_err(|e| ConfError::Io {
+            op: "create_dir",
+            path: site_logs,
+            source: e,
+        })?;
         // `ctx.home` here is the THROWAWAY validation home this fn's own doc
         // comment requires — scratch plumbing for `nginx -t`, not the live
         // log path `openvhost_core::logs::LogPaths` owns, so it is not
@@ -781,5 +839,185 @@ mod tests {
             }
             assert!(t.ends_with(';'), "unterminated directive line: {line:?}");
         }
+    }
+
+    // -- P1 live-log-viewer: per-site logs + a private, named access format --
+    //
+    // Spec D1 (site.conf.tera gains access_log/error_log) + D5 (log_format
+    // built on $uri, never $request/$args — the privacy guarantee).
+
+    #[test]
+    fn main_config_declares_an_explicit_log_format_and_uses_it_for_the_global_access_log() {
+        let c = main_conf();
+        let log_format_line = c
+            .lines()
+            .find(|l| l.trim_start().starts_with("log_format "))
+            .unwrap_or_else(|| panic!("no log_format line in:\n{c}"));
+        assert!(log_format_line.contains(ACCESS_LOG_FORMAT_NAME));
+        assert!(log_format_line.contains("$uri"));
+        assert!(log_format_line.contains("$request_method"));
+        assert!(log_format_line.contains("$server_protocol"));
+        assert!(log_format_line.contains("$status"));
+        assert!(log_format_line.contains("$body_bytes_sent"));
+
+        assert!(c.contains(&format!(
+            r#"access_log "/tmp/ovh/logs/nginx.access.log" {ACCESS_LOG_FORMAT_NAME};"#
+        )));
+
+        // nginx resolves a log_format's NAME while parsing, so an access_log
+        // naming a not-yet-declared format is refused — the declaration
+        // must precede its first reference in the rendered file.
+        let log_format_pos = c.find("log_format ").unwrap();
+        let access_log_pos = c.find("access_log \"").unwrap();
+        assert!(
+            log_format_pos < access_log_pos,
+            "log_format must be declared before access_log references it, got:\n{c}"
+        );
+    }
+
+    /// Spec D5's privacy guarantee, asserted as an explicit ABSENCE — not
+    /// merely that `$uri` is present. `$request` (the whole request line)
+    /// and `$request_uri`/`$args` (the raw query string) would all leak a
+    /// `?token=…`/`?api_key=…` into a file the UI renders and users
+    /// screenshot; `$uri` never does, by construction. `$request_method`
+    /// legitimately CONTAINS the substring `$request`, so a naive
+    /// `!contains("$request")` would reject the very field this format is
+    /// required to carry — `contains_bare_variable` checks `$request` as
+    /// its own token instead, so this assertion cannot vacuously pass by
+    /// rejecting a correct implementation.
+    #[test]
+    fn the_log_format_never_carries_the_full_request_line_or_the_raw_query_string() {
+        let c = main_conf();
+        let log_format_line = c
+            .lines()
+            .find(|l| l.trim_start().starts_with("log_format "))
+            .unwrap_or_else(|| panic!("no log_format line in:\n{c}"));
+        assert!(
+            !contains_bare_variable(log_format_line, "$request"),
+            "log_format must never reference the bare $request variable (the full \
+             request line, including the query string): {log_format_line:?}"
+        );
+        for forbidden in ["$request_uri", "$args"] {
+            assert!(
+                !log_format_line.contains(forbidden),
+                "log_format must never reference {forbidden:?} (query-string leak): \
+                 {log_format_line:?}"
+            );
+        }
+    }
+
+    /// True when `haystack` contains `var` as its OWN nginx-variable token —
+    /// i.e. not immediately followed by another identifier byte
+    /// (`[A-Za-z0-9_]`). Distinguishes the literal `$request` variable from
+    /// `$request_method`/`$request_uri`, which merely start with the same
+    /// substring.
+    fn contains_bare_variable(haystack: &str, var: &str) -> bool {
+        haystack.match_indices(var).any(|(start, _)| {
+            let end = start + var.len();
+            match haystack.as_bytes().get(end) {
+                Some(b) => !(b.is_ascii_alphanumeric() || *b == b'_'),
+                None => true,
+            }
+        })
+    }
+
+    #[test]
+    fn site_config_gets_its_own_access_and_error_log_using_the_shared_format() {
+        let c = NginxAdapter
+            .generate_site_config(&unix_ctx())
+            .unwrap()
+            .contents;
+        assert!(c.contains(&format!(
+            r#"access_log "/tmp/ovh/logs/sites/myapp.localhost/access.log" {ACCESS_LOG_FORMAT_NAME};"#
+        )));
+        assert!(c.contains(r#"error_log "/tmp/ovh/logs/sites/myapp.localhost/error.log" warn;"#));
+    }
+
+    /// P1 live-log-viewer bug fix (Task 3, mirroring Task 1's identical
+    /// php-fpm fix in `phpruntime.rs`): `validate()` used to only ensure
+    /// `run`, `run/nginx`, and the FLAT `logs/` directory existed. Now that
+    /// `generate_site_config` renders a per-site `access_log`/`error_log`
+    /// under `logs/sites/<domain>/`, a real `nginx -t` fails before it ever
+    /// reaches whatever the site config says: "open() ... failed (2: No
+    /// such file or directory)". A fake binary is enough to prove
+    /// `validate()` creates the directory itself — its exit code is
+    /// irrelevant to what this test checks.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn validate_creates_the_per_site_log_directory_before_invoking_the_binary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().to_path_buf();
+        let ctx = RenderCtx::new(
+            home.clone(),
+            "myapp.localhost",
+            home.join("www"),
+            "127.0.0.1:8080".parse().unwrap(),
+            "8.4",
+            PhpUpstream::UnixSocket(home.join("run/php-fpm.sock")),
+            "php_myapp",
+        )
+        .unwrap();
+
+        let bin = home.join("fake-nginx");
+        std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        NginxAdapter.validate(&bin, &ctx).await.unwrap();
+
+        let dir = home.join("logs/sites/myapp.localhost");
+        assert!(
+            dir.is_dir(),
+            "{dir:?} must exist — nginx creates the access_log/error_log FILES but \
+             not their directory"
+        );
+    }
+
+    /// Review-finding-shaped insurance, mirroring `phpruntime.rs`'s
+    /// `validate_creates_exactly_the_directory_generate_pool_config_points_at`:
+    /// drives `generate_site_config` to learn where IT thinks the site's logs
+    /// live — not a hardcoded literal — and asserts `validate()` created
+    /// EXACTLY that directory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn validate_creates_exactly_the_directory_generate_site_config_points_at() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().to_path_buf();
+        let ctx = RenderCtx::new(
+            home.clone(),
+            "myapp.localhost",
+            home.join("www"),
+            "127.0.0.1:8080".parse().unwrap(),
+            "8.4",
+            PhpUpstream::UnixSocket(home.join("run/php-fpm.sock")),
+            "php_myapp",
+        )
+        .unwrap();
+
+        let rendered = NginxAdapter.generate_site_config(&ctx).unwrap().contents;
+        let access_log_line = rendered
+            .lines()
+            .find(|l| l.trim_start().starts_with("access_log "))
+            .unwrap_or_else(|| panic!("no access_log line in:\n{rendered}"));
+        let quoted = access_log_line
+            .split('"')
+            .nth(1)
+            .unwrap_or_else(|| panic!("unexpected access_log line shape: {access_log_line:?}"));
+        let rendered_dir = Path::new(quoted).parent().unwrap().to_path_buf();
+
+        let bin = home.join("fake-nginx");
+        std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        NginxAdapter.validate(&bin, &ctx).await.unwrap();
+
+        assert!(
+            rendered_dir.is_dir(),
+            "validate() must create EXACTLY the directory generate_site_config's \
+             rendered access_log points at ({rendered_dir:?})"
+        );
     }
 }

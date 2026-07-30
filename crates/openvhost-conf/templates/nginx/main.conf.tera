@@ -14,7 +14,13 @@ events {
 }
 
 http {
-    access_log "{{ access_log }}";
+    # Explicit, named, and built on $uri (never $request/$args) so a
+    # site's access log never carries a request's raw query string —
+    # $request/$args would let a `?token=…`/`?api_key=…` reach a file the
+    # UI renders and users screenshot (P1 live-log-viewer design, spec D5).
+    # Site access logs (site.conf.tera) reference this SAME named format.
+    log_format {{ access_log_format }} '$remote_addr - [$time_local] "$request_method $uri $server_protocol" $status $body_bytes_sent';
+    access_log "{{ access_log }}" {{ access_log_format }};
     client_max_body_size {{ client_max_body_size }};
     keepalive_timeout {{ keepalive_timeout }};
     tcp_nodelay {{ tcp_nodelay }};

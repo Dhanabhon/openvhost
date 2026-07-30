@@ -81,6 +81,16 @@ pub fn commit(plan: &ApplyPlan) -> Result<(), ApplyError> {
             source,
         })?;
     }
+    // Ahead of writing any site config: see `ApplyPlan::site_log_dirs`'s doc
+    // comment for why nginx's `-t` refuses the config before it is ever
+    // installed without this.
+    for dir in &plan.site_log_dirs {
+        std::fs::create_dir_all(dir).map_err(|source| ApplyError::Io {
+            op: "create_dir_all",
+            path: dir.clone(),
+            source,
+        })?;
+    }
     for c in &plan.changes {
         match c.kind {
             ChangeKind::Added | ChangeKind::Modified => {
@@ -319,6 +329,7 @@ mod tests {
             gen_root: home.path().join("config/generated"),
             main_conf: home.path().join("config/generated/nginx/nginx.conf"),
             php_fpm_log_dirs: vec![],
+            site_log_dirs: vec![],
             changes: vec![FileChange {
                 path: path.clone(),
                 kind: ChangeKind::Removed,
@@ -376,6 +387,47 @@ mod tests {
             .unwrap()
             .to_path_buf();
         assert!(dir.is_dir(), "{dir:?} must exist after commit()");
+    }
+
+    /// P1 live-log-viewer bug fix (Task 3): without this, every install with
+    /// at least one enabled nginx site breaks the moment the site config
+    /// starts rendering its own `access_log`/`error_log` — see
+    /// `ApplyPlan::site_log_dirs`'s doc comment.
+    #[test]
+    fn commit_creates_the_site_log_directory_before_anything_needs_it() {
+        let home = tempfile::tempdir().unwrap();
+        let i = input_with_home(
+            home.path(),
+            vec![site("app", "app.localhost", "8.4", true)],
+            &["8.4"],
+        );
+        commit(&make_plan(&i).unwrap()).unwrap();
+        let dir = crate::LogPaths::new(home.path())
+            .site_dir(&crate::site::model::Domain::parse("app.localhost").unwrap());
+        assert!(dir.is_dir(), "{dir:?} must exist after commit()");
+    }
+
+    /// A disabled site never gets an `access_log`/`error_log` directive
+    /// (`render_set`'s own `is_servable` filter), so `commit()` must not
+    /// create a log directory for it either — the directory's mere
+    /// existence would be a "not yet created" lie to a future log-viewer
+    /// reader for a site nginx never writes to.
+    #[test]
+    fn commit_does_not_create_a_log_directory_for_a_disabled_site() {
+        let home = tempfile::tempdir().unwrap();
+        let i = input_with_home(
+            home.path(),
+            vec![site("off", "off.localhost", "8.4", false)],
+            &["8.4"],
+        );
+        commit(&make_plan(&i).unwrap()).unwrap();
+        let dir = crate::LogPaths::new(home.path())
+            .site_dir(&crate::site::model::Domain::parse("off.localhost").unwrap());
+        assert!(
+            !dir.exists(),
+            "{dir:?} must not exist — off.localhost is disabled and render_set never gives it \
+             an access_log/error_log directive"
+        );
     }
 
     #[cfg(unix)]

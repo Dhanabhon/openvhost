@@ -8,7 +8,8 @@ use openvhost_conf::GeneratedFile;
 
 use crate::{LogPaths, PhpVersion};
 
-use super::{ApplyError, ApplyInput, PhpRuntime, render_set};
+use super::{ApplyError, ApplyInput, PhpRuntime, is_servable, render_set};
+use crate::site::model::Site;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeKind {
@@ -54,6 +55,24 @@ pub struct ApplyPlan {
     /// the same read-only way `plan()` computes everything else, and is
     /// expected to be folded into that fuller mechanism when it lands.
     pub php_fpm_log_dirs: Vec<PathBuf>,
+    /// The per-site log directory (`<home>/logs/sites/<domain>/`) for every
+    /// SERVABLE site (`render_set`'s own `is_servable` filter — the same one
+    /// this list uses), so `commit()` can create it before the rendered site
+    /// config's new `access_log`/`error_log` directives (P1 live-log-viewer
+    /// design, Task 3) ever point nginx at a file inside it.
+    ///
+    /// A narrow, targeted fix, not the general mechanism — mirrors
+    /// [`Self::php_fpm_log_dirs`]'s own doc comment exactly: without this,
+    /// every existing install with at least one enabled nginx site breaks
+    /// the moment that template change ships, because `nginx -t` refuses
+    /// with "open() ... failed (2: No such file or directory)" before the
+    /// generated config is ever installed. The P1 design (spec D2) plans a
+    /// fuller `log_dirs` mechanism that ALSO chmods `0700` and has
+    /// `provision_home` seed `logs/sites`/`logs/services` up front (Task 4)
+    /// — this field covers only what the template change requires, computed
+    /// the same read-only way `plan()` computes everything else, and is
+    /// expected to be folded into that fuller mechanism when it lands.
+    pub site_log_dirs: Vec<PathBuf>,
     /// Sorted by path. EMPTY means the disk already matches the sites — that
     /// is exactly the condition the banner hides on.
     pub changes: Vec<FileChange>,
@@ -85,6 +104,23 @@ fn php_fpm_log_dirs(home: &Path, php: &[PhpRuntime]) -> Result<Vec<PathBuf>, App
                 }
             })
         })
+        .collect()
+}
+
+/// See [`ApplyPlan::site_log_dirs`]. Pure path arithmetic — no I/O — so
+/// `plan()` stays read-only. Filtered by [`is_servable`] — the SAME
+/// predicate `render_set` filters its site-config loop on — so this list
+/// never claims a directory for a site that gets no `access_log`/`error_log`
+/// directive in the first place (a disabled site, or one on Apache).
+/// `Domain` is already a validated newtype by the time a `Site` reaches this
+/// pipeline, so unlike [`php_fpm_log_dirs`] there is no parse step that
+/// could fail here.
+fn site_log_dirs(home: &Path, sites: &[Site]) -> Vec<PathBuf> {
+    let paths = LogPaths::new(home);
+    sites
+        .iter()
+        .filter(|s| is_servable(s))
+        .map(|s| paths.site_dir(&s.domain))
         .collect()
 }
 
@@ -306,6 +342,7 @@ pub fn plan(input: &ApplyInput) -> Result<ApplyPlan, ApplyError> {
         main_conf: gen_root.join("nginx/nginx.conf"),
         gen_root,
         php_fpm_log_dirs: php_fpm_log_dirs(&input.home, &input.runtimes.php)?,
+        site_log_dirs: site_log_dirs(&input.home, &input.sites),
         changes,
     })
 }
@@ -591,6 +628,37 @@ mod tests {
         assert_eq!(got, want);
 
         for dir in &p.php_fpm_log_dirs {
+            assert!(!dir.exists(), "{dir:?} must not be created by plan() alone");
+        }
+    }
+
+    /// P1 live-log-viewer bug fix (Task 3): giving every site config its own
+    /// `access_log`/`error_log` means `plan()` must now also report that
+    /// site's log directory — see `ApplyPlan::site_log_dirs`'s doc comment
+    /// for why. Only SERVABLE sites get a directory: a disabled site (or one
+    /// on Apache) is never rendered by `render_set`, so it never gets an
+    /// `access_log`/`error_log` directive pointing at one either. `plan()`
+    /// must stay read-only, so nothing may exist on disk merely from calling
+    /// it.
+    #[test]
+    fn site_log_dirs_cover_every_servable_site_and_touch_no_disk() {
+        let home = tempfile::tempdir().unwrap();
+        let i = input_with_home(
+            home.path(),
+            vec![
+                site("app", "app.localhost", "8.4", true),
+                site("off", "off.localhost", "8.4", false),
+            ],
+            &["8.4"],
+        );
+        let p = plan(&i).unwrap();
+
+        let paths = crate::LogPaths::new(home.path());
+        let want =
+            vec![paths.site_dir(&crate::site::model::Domain::parse("app.localhost").unwrap())];
+        assert_eq!(p.site_log_dirs, want);
+
+        for dir in &p.site_log_dirs {
             assert!(!dir.exists(), "{dir:?} must not be created by plan() alone");
         }
     }

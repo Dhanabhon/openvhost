@@ -267,9 +267,62 @@ mod tests {
             )),
             "conf's rendered error_log no longer matches LogPaths::nginx_error:\n{rendered}"
         );
+        // A PREFIX check, not the full directive: the P1 live-log-viewer
+        // slice appended a named `log_format` reference after the quoted
+        // path (spec D5's privacy format), and that format's NAME is
+        // `webserver.rs`'s own concern (see its
+        // `main_config_declares_an_explicit_log_format_and_uses_it_for_the_global_access_log`
+        // test) — this seam test's only job is pinning the PATH against
+        // `LogPaths::nginx_access`.
         assert!(
-            rendered.contains(&format!(r#"access_log "{}";"#, p.nginx_access().display())),
+            rendered.contains(&format!(r#"access_log "{}""#, p.nginx_access().display())),
             "conf's rendered access_log no longer matches LogPaths::nginx_access:\n{rendered}"
+        );
+    }
+
+    /// Same seam as `nginx_log_values_match_the_confs_independent_render`,
+    /// for the NEW per-site paths (P1 live-log-viewer design, spec D1): a
+    /// site's `access_log`/`error_log` are rendered by
+    /// `openvhost-conf`'s `generate_site_config` independently of
+    /// `LogPaths::site_access`/`site_error` (this crate cannot depend on
+    /// `openvhost-conf` in the other direction), so this test renders
+    /// through that REAL function and compares, exactly mirroring how the
+    /// nginx-globals and php-fpm seam tests above already guard their own
+    /// values.
+    #[test]
+    fn site_log_values_match_the_confs_independent_render() {
+        use openvhost_conf::{PhpUpstream, RenderCtx, WebServerAdapter};
+
+        let home = Path::new("/tmp/ovh");
+        let domain = Domain::parse("myapp.localhost").unwrap();
+        let p = LogPaths::new(home);
+        let ctx = RenderCtx::new(
+            home.to_path_buf(),
+            domain.as_str(),
+            home.join("www"),
+            "127.0.0.1:8080".parse().unwrap(),
+            "8.4",
+            PhpUpstream::UnixSocket(home.join("run/php-fpm.sock")),
+            "php_myapp",
+        )
+        .unwrap();
+        let rendered = openvhost_conf::NginxAdapter
+            .generate_site_config(&ctx)
+            .unwrap()
+            .contents;
+        assert!(
+            rendered.contains(&format!(
+                r#"access_log "{}""#,
+                p.site_access(&domain).display()
+            )),
+            "conf's rendered access_log no longer matches LogPaths::site_access:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                r#"error_log "{}""#,
+                p.site_error(&domain).display()
+            )),
+            "conf's rendered error_log no longer matches LogPaths::site_error:\n{rendered}"
         );
     }
 

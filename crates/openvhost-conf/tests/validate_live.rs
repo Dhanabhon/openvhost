@@ -58,6 +58,15 @@ fn materialize_with(ctx: &RenderCtx, settings: &WebServerSettings) -> std::path:
     for d in ["run", "run/nginx", "logs"] {
         std::fs::create_dir_all(ctx.home.join(d)).unwrap();
     }
+    // P1 live-log-viewer: the site config's `access_log`/`error_log` now
+    // point under `logs/sites/<domain>/` (mirroring `webserver.rs`'s own
+    // `NginxAdapter::validate`, which this helper otherwise stands in for —
+    // see the doc comment above). Literal, not a shared helper: this whole
+    // function already hardcodes the nginx-globals formula the same way
+    // (`ctx.home.join("logs/nginx.error.log")`, repeated at every call site
+    // below) — scratch plumbing for a throwaway validation home, not the
+    // live path `openvhost_core::logs::LogPaths` owns.
+    std::fs::create_dir_all(ctx.home.join("logs/sites").join(&ctx.server_name)).unwrap();
     main.path
 }
 
