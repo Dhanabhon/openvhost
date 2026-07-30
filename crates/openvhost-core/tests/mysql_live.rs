@@ -747,6 +747,18 @@ async fn mysql_lifecycle_end_to_end_against_real_mysqld() {
         .expect("a /tmp-based hermetic home must fit the sun_path guard");
 
     // ---- Render + validate my.cnf (spec D5); datadir untouched pre-init ----
+    //
+    // POST-LIVE-RUN FINDING (the reason this call site's arguments changed):
+    // a REAL mysqld treats a missing `!includedir` target as FATAL to its
+    // defaults-file handling — this test originally hit "Fatal error in
+    // defaults handling. Program aborted!" right here, at `--validate-config`,
+    // because nothing had ever created `custom_confd`. The fix lives in
+    // `write_generated_config` itself (the production chokepoint every
+    // producer of a my.cnf writes through), NOT a hand-rolled
+    // `create_dir_all` bolted onto this test — calling the SAME function
+    // production calls, with the SAME arguments, is what makes this test a
+    // genuine twin of the real path rather than a workaround that only
+    // proves the test's own patched-over version works.
     let ctx = MysqlCtx {
         my_cnf: paths.my_cnf.clone(),
         datadir: paths.datadir.clone(),
@@ -755,7 +767,7 @@ async fn mysql_lifecycle_end_to_end_against_real_mysqld() {
         custom_confd: paths.custom_confd.clone(),
     };
     let generated = openvhost_conf::generate_my_cnf(&ctx).expect("my.cnf must render");
-    write_generated_config(&generated).expect("my.cnf must write atomically");
+    write_generated_config(&generated, &paths.custom_confd).expect("my.cnf must write atomically");
     assert!(
         !paths.datadir.exists(),
         "the datadir must not exist before init has ever run"

@@ -22,7 +22,7 @@ use crate::error::CoreError;
 
 /// Write a rendered `my.cnf` ([`openvhost_conf::GeneratedFile`]) atomically
 /// (spec D5: "written with `atomicfile::write_atomic` as a `GeneratedFile`").
-/// Thin — mirrors `site::apply::commit`'s own atomic-write wrapper
+/// Mirrors `site::apply::commit`'s own atomic-write wrapper
 /// (`crate::atomicfile::write_atomic`) rather than duplicating its logic;
 /// exists as its own `pub fn` here (Task 5) because that wrapper is scoped to
 /// `ApplyPlan`/`ApplyError` and `crate::atomicfile` itself is `pub(crate)` —
@@ -30,7 +30,38 @@ use crate::error::CoreError;
 /// all. The command layer (plan Task 5) drives the render (Task 3's
 /// `openvhost_conf::generate_my_cnf`) and calls this to persist it, exactly
 /// like `site::apply::commit` drives its own `GeneratedFile`s.
-pub fn write_generated_config(file: &openvhost_conf::GeneratedFile) -> Result<(), CoreError> {
+///
+/// THE CHOKEPOINT (post-live-run fix wave): every rendered my.cnf's
+/// `!includedir` points at `custom_confd`, and a REAL `mysqld` treats a
+/// missing `!includedir` target as FATAL to its defaults-file handling —
+/// confirmed live, against real 8.4: `mysqld` aborts with "Fatal error in
+/// defaults handling. Program aborted!" even for `--validate-config`, before
+/// it gets anywhere near config semantics. An earlier fix wave put the
+/// `create_dir_all` in the command layer's init Render step
+/// (`commands.rs::run_mysql_init`) instead of here — that covered ONLY
+/// app-driven init, missing (a) the live end-to-end test, which drives
+/// `generate_my_cnf`/this function directly without going through
+/// `run_mysql_init` at all, and (b) an already-initialized instance whose
+/// `custom_confd` is deleted later (user cleanup, accidental deletion):
+/// nothing re-renders/rewrites my.cnf for an instance already classified
+/// `Initialized` on disk, so a command-layer-only fix could never repair
+/// that case before the NEXT supervised start. This function is the ONE
+/// place every producer of a my.cnf — the init Render step, the live test,
+/// and any future caller — actually writes the file, so it is the one place
+/// that can guarantee `!includedir`'s target exists BEFORE that write, for
+/// every caller, permanently. See also `stack.rs::mysql_spec` (desktop
+/// crate) for the second half of case (b): re-ensuring the directory at
+/// service-registration time for an instance found ALREADY initialized on
+/// disk, which never calls this function at all.
+pub fn write_generated_config(
+    file: &openvhost_conf::GeneratedFile,
+    custom_confd: &Path,
+) -> Result<(), CoreError> {
+    std::fs::create_dir_all(custom_confd).map_err(|source| CoreError::Io {
+        op: "create_dir_all",
+        path: custom_confd.to_path_buf(),
+        source,
+    })?;
     Ok(crate::atomicfile::write_atomic(&file.path, &file.contents)?)
 }
 
@@ -410,8 +441,9 @@ mod tests {
             path: path.clone(),
             contents: "[mysqld]\ndatadir=/x\n".to_string(),
         };
+        let custom_confd = tmp.path().join("custom").join("mysql").join("8.4/conf.d");
 
-        write_generated_config(&file).unwrap();
+        write_generated_config(&file, &custom_confd).unwrap();
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), file.contents);
     }
@@ -424,16 +456,46 @@ mod tests {
             path: path.clone(),
             contents: "[mysqld]\n".to_string(),
         };
+        let custom_confd = tmp.path().join("custom_confd");
 
-        write_generated_config(&file).unwrap();
+        write_generated_config(&file, &custom_confd).unwrap();
 
         let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n != "my.cnf")
+            .filter(|n| n != "my.cnf" && n != "custom_confd")
             .collect();
         assert!(leftovers.is_empty(), "got {leftovers:?}");
+    }
+
+    /// THE post-live-run regression test: a REAL `mysqld` aborts with "Fatal
+    /// error in defaults handling. Program aborted!" when `!includedir`
+    /// names a directory that does not exist — confirmed live, against real
+    /// 8.4, even for `--validate-config`. This is the ONE chokepoint every
+    /// producer of a my.cnf writes through, so it is the one place that can
+    /// guarantee the directory exists before ANY caller's write, not just
+    /// the command layer's own init sequence.
+    #[test]
+    fn write_generated_config_creates_a_missing_custom_confd_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("my.cnf");
+        let file = openvhost_conf::GeneratedFile {
+            path,
+            contents: "[mysqld]\n!includedir /whatever/conf.d\n".to_string(),
+        };
+        let custom_confd = tmp.path().join("config/custom/mysql/8.4/conf.d");
+        assert!(
+            !custom_confd.exists(),
+            "must not exist before the call for this test to prove anything"
+        );
+
+        write_generated_config(&file, &custom_confd).unwrap();
+
+        assert!(
+            custom_confd.is_dir(),
+            "write_generated_config must create the !includedir target before writing"
+        );
     }
 
     // ---- staging_dir_path ----

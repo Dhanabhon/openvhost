@@ -131,8 +131,22 @@ const MYSQL_READY_DEADLINE: Duration = Duration::from_secs(15);
 /// first is a mysqld requirement; everything else lives in the file so the
 /// spec is stable") — built via `OsString`, not `format!` + `.display()`, for
 /// the same non-lossy-path reason `MysqlValidator::validate` gives.
+///
+/// Post-live-run finding: also ensures `custom_confd` exists before
+/// returning. A real mysqld aborts with "Fatal error in defaults handling.
+/// Program aborted!" when the rendered my.cnf's `!includedir` names a
+/// missing directory — `write_generated_config` (the my.cnf chokepoint)
+/// guarantees this for a FRESH init, but every caller of `mysql_spec`
+/// (`macos_stack`'s startup registration, `rescan_mysql_into_state`, and
+/// `initialize_mysql`'s own post-init registration) builds a `ServiceSpec`
+/// for an instance whose my.cnf was rendered at some point IN THE PAST —
+/// possibly a past app version, possibly before the user deleted
+/// `custom_confd` by hand. Nothing else re-renders/rewrites that my.cnf for
+/// an already-`Initialized` datadir, so this is the one remaining place
+/// that can repair the directory before the next supervised start.
 pub fn mysql_spec(home: &Path, rt: &MysqlRuntime) -> ServiceSpec {
     let paths = mysql_paths(home, &rt.major);
+    ensure_custom_confd(&paths.custom_confd);
     let mut defaults_file_arg = OsString::from("--defaults-file=");
     defaults_file_arg.push(paths.my_cnf.as_os_str());
     ServiceSpec {
@@ -150,6 +164,23 @@ pub fn mysql_spec(home: &Path, rt: &MysqlRuntime) -> ServiceSpec {
             deadline: MYSQL_READY_DEADLINE,
         },
         grace: MYSQL_GRACE,
+    }
+}
+
+/// Best-effort, log-don't-fail (mirrors `provision_home`'s own error
+/// handling at every call site in this file): a failure to create
+/// `custom_confd` must never stop a `ServiceSpec` from being built and
+/// registered — the spec itself is just data, and refusing to hand back a
+/// spec because of THIS side effect would take away the honest `Failed`
+/// state a real spawn failure already provides. `create_dir_all` is a no-op
+/// when the directory already exists, so this costs nothing on the (normal,
+/// expected) path where nothing was ever deleted.
+fn ensure_custom_confd(custom_confd: &Path) {
+    if let Err(e) = std::fs::create_dir_all(custom_confd) {
+        eprintln!(
+            "mysql: failed to ensure the custom conf.d directory {}: {e}",
+            custom_confd.display()
+        );
     }
 }
 
@@ -364,6 +395,43 @@ pub fn macos_stack() -> MacosStack {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// Post-live-run finding: a REAL mysqld aborts with "Fatal error in
+    /// defaults handling. Program aborted!" when `!includedir` names a
+    /// missing directory. `write_generated_config` (the my.cnf chokepoint)
+    /// covers a FRESH init, but nothing re-renders my.cnf for an instance
+    /// this app finds ALREADY initialized on disk — if the user deletes
+    /// `custom_confd` after init, the very next supervised start would hit
+    /// that fatal error with no code path left to repair it. `mysql_spec` is
+    /// the one function every registration path (startup, rescan, a fresh
+    /// init's own registration) builds a `ServiceSpec` through, so ensuring
+    /// the directory here, before the spec is ever handed to the supervisor,
+    /// closes that gap for all three callers at once.
+    #[test]
+    fn mysql_spec_ensures_the_custom_confd_directory_exists() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        let major = openvhost_core::mysql::MysqlMajor::parse("8.4").expect("valid major");
+        let rt = MysqlRuntime {
+            major: major.clone(),
+            mysqld: PathBuf::from("/opt/homebrew/opt/mysql@8.4/bin/mysqld"),
+            mysql: PathBuf::from("/opt/homebrew/opt/mysql@8.4/bin/mysql"),
+            mysqladmin: PathBuf::from("/opt/homebrew/opt/mysql@8.4/bin/mysqladmin"),
+        };
+        let custom_confd = mysql_paths(home, &major).custom_confd;
+        assert!(
+            !custom_confd.exists(),
+            "must not exist before the call for this test to prove anything"
+        );
+
+        let _spec = mysql_spec(home, &rt);
+
+        assert!(
+            custom_confd.is_dir(),
+            "mysql_spec must ensure the custom conf.d directory exists before its \
+             ServiceSpec is ever handed to the supervisor"
+        );
+    }
 
     /// The paths handed to the UI must be the SAME ones baked into the specs.
     /// A second `find_brew_binaries()` call could disagree with the first (it

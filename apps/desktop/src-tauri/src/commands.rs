@@ -3291,25 +3291,19 @@ async fn run_mysql_init(
         Ok(f) => f,
         Err(e) => fail!(Step::Render, e.to_string()),
     };
-    if let Err(e) = openvhost_core::mysql::write_generated_config(&generated) {
+    // Review fix wave (Important 2), corrected post-live-run: the
+    // `custom_confd` directory `!includedir` points at is now ensured INSIDE
+    // `write_generated_config` itself (the chokepoint every producer of a
+    // my.cnf writes through — see its doc comment), not by a separate call
+    // here. A standalone `create_dir_all` at this call site alone covered
+    // only THIS init sequence — it missed the live end-to-end test (which
+    // calls `generate_my_cnf`/`write_generated_config` directly, never this
+    // function) and an already-initialized instance whose directory is
+    // deleted later (see `stack.rs::mysql_spec`'s own ensure for that case).
+    if let Err(e) =
+        openvhost_core::mysql::write_generated_config(&generated, &ctx.paths.custom_confd)
+    {
         fail!(Step::Render, e.to_string());
-    }
-    // Review fix wave, Important 2: the rendered my.cnf's `!includedir`
-    // points at `custom_confd`, but nothing created that directory — a
-    // banner telling the user to "add files under <custom_confd>" would be
-    // unfollowable, and D5 caveat (i) leaves open whether a REAL mysqld
-    // tolerates `!includedir` naming a directory that does not exist at all
-    // (as opposed to merely being empty) at validate/start time. Creating it
-    // here, before Validate, means neither validate-config nor a later
-    // supervised start ever meets a missing directory.
-    if let Err(e) = std::fs::create_dir_all(&ctx.paths.custom_confd) {
-        fail!(
-            Step::Render,
-            format!(
-                "failed to create the custom config directory {}: {e}",
-                ctx.paths.custom_confd.display()
-            )
-        );
     }
 
     // ---- Validate ----
