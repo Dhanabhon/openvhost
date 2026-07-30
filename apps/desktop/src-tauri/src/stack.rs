@@ -119,6 +119,13 @@ pub fn php_fpm_spec(home: &Path, rt: &PhpRuntime) -> ServiceSpec {
 /// this same directory gets created, as part of an actual Apply) for a
 /// freshly discovered major.
 ///
+/// A narrow, targeted fix, not the general mechanism — mirrors
+/// `openvhost_core::site::apply::plan::ApplyPlan::php_fpm_log_dirs`'s own
+/// doc comment: the P1 design (spec D2) plans a fuller `log_dirs` mechanism
+/// covering the NEW per-site directories too (`logs/sites/<domain>/`,
+/// `0700`, `provision_home` seeding), and this function is expected to be
+/// folded into (or replaced by) that fuller mechanism when it lands.
+///
 /// A `PhpVersion::parse` failure is swallowed the same best-effort way:
 /// `major` is a raw probed string here, not yet validated, and a malformed
 /// one must not stop the row from registering — it fails loudly later, at

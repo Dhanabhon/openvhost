@@ -3,7 +3,7 @@
 //! php-fpm.conf has no Windows analog — `generate_pool_config` returns
 //! `Option`, `None` on Windows (php-cgi pool membership is pure Rust state).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 
@@ -11,6 +11,31 @@ use crate::ctx::{PhpUpstream, RenderCtx, to_config_path};
 use crate::engine::render;
 use crate::error::ConfError;
 use crate::{GeneratedFile, ValidationReport};
+
+/// The ONE derivation of php-fpm's per-major log DIRECTORY this crate uses —
+/// both `generate_pool_config`'s rendered `error_log` and `validate()`'s own
+/// pre-creation of that directory go through this, rather than each hand-
+/// typing its own copy of the same formula inside this file.
+///
+/// The crate-dependency direction already forces exactly one independent
+/// copy of this value to exist OUTSIDE `openvhost-core`'s
+/// `LogPaths::php_fpm_error` (conf cannot depend on core — see
+/// `generate_pool_config`'s comment below for why); this helper is what
+/// stops that single forced copy from ALSO existing twice inside this one
+/// file. Kept in sync with `LogPaths` by
+/// `openvhost_core::logs::paths::tests::php_fpm_error_matches_the_confs_independent_render`,
+/// and the two call sites below are kept in sync with EACH OTHER by
+/// `tests::validate_creates_exactly_the_directory_generate_pool_config_points_at`.
+///
+/// `home` is the config-path-safe string `to_config_path` already produces —
+/// the same shape of value every other line in this file inserts into a
+/// template — so callers that only need a directory to create on disk
+/// (`validate()`) wrap the result in `PathBuf::from`, rather than this
+/// helper returning a `PathBuf` that would need re-stringifying for the
+/// template-insertion call site.
+fn php_fpm_log_dir(home: &str, major: &str) -> String {
+    format!("{home}/logs/services/php-fpm-{major}")
+}
 
 #[async_trait]
 pub trait PhpRuntimeAdapter: Send + Sync {
@@ -55,14 +80,15 @@ impl PhpRuntimeAdapter for PhpFpmRuntime {
         // `logs/php-fpm.log`, so a line in it could never be attributed to a
         // pool (P1 live-log-viewer design, spec D1). This crate cannot
         // depend on `openvhost-core` (core depends on conf), so this value
-        // is derived independently here rather than via
+        // is derived independently here (via `php_fpm_log_dir`, shared with
+        // `validate()` below) rather than via
         // `openvhost_core::logs::LogPaths::php_fpm_error` — the two are kept
         // in sync by that module's own
         // `php_fpm_error_matches_the_confs_independent_render` test, which
         // renders through this exact function and compares.
         tc.insert(
             "error_log",
-            &format!("{home_str}/logs/services/php-fpm-{major}/error.log"),
+            &format!("{}/error.log", php_fpm_log_dir(&home_str, major)),
         );
         tc.insert("socket", &socket);
         tc.insert(
@@ -98,12 +124,12 @@ impl PhpRuntimeAdapter for PhpFpmRuntime {
         };
         crate::validate::materialize(std::slice::from_ref(&pool))?;
         // php-fpm -t only needs the per-major log directory to pre-exist
-        // (for error_log) — mirrors `generate_pool_config`'s own comment on
-        // why this crate derives the path independently rather than via
-        // `openvhost_core::logs::LogPaths::php_fpm_error`.
-        let logs = ctx
-            .home
-            .join(format!("logs/services/php-fpm-{}", ctx.php_major));
+        // (for error_log) — via the SAME `php_fpm_log_dir` helper
+        // `generate_pool_config` used just above, so this directory and
+        // that rendered `error_log` can never drift apart. `to_config_path`
+        // is guaranteed to succeed here: `generate_pool_config` already
+        // called it on this exact `ctx.home` to build `pool`, above.
+        let logs = PathBuf::from(php_fpm_log_dir(&to_config_path(&ctx.home)?, &ctx.php_major));
         std::fs::create_dir_all(&logs).map_err(|e| ConfError::Io {
             op: "create_dir",
             path: logs,
@@ -244,6 +270,60 @@ mod tests {
         assert!(
             dir.is_dir(),
             "{dir:?} must exist — php-fpm creates the error_log FILE but not its directory"
+        );
+    }
+
+    /// Review finding: `generate_pool_config` and `validate()` each derived
+    /// this directory independently inside this same file — dormant today
+    /// (no production caller of `validate()`), but a future edit to one copy
+    /// silently reintroduces the startup bug. Driving BOTH and comparing —
+    /// rather than asserting each against its own hardcoded literal — is
+    /// what actually pins that they agree.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn validate_creates_exactly_the_directory_generate_pool_config_points_at() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().to_path_buf();
+        let ctx = RenderCtx::new(
+            home.clone(),
+            "myapp.localhost",
+            home.join("www"),
+            "127.0.0.1:8080".parse().unwrap(),
+            "8.4",
+            PhpUpstream::UnixSocket(home.join("run/php-fpm.sock")),
+            "php_myapp",
+        )
+        .unwrap();
+
+        // Drive generate_pool_config to learn where IT thinks the log
+        // lives — not a hardcoded literal.
+        let rendered = PhpFpmRuntime
+            .generate_pool_config(&ctx.home, &ctx.php_major, &ctx.php_upstream)
+            .unwrap()
+            .unwrap()
+            .contents;
+        let error_log_line = rendered
+            .lines()
+            .find(|l| l.starts_with("error_log"))
+            .unwrap_or_else(|| panic!("no error_log line in:\n{rendered}"));
+        let rendered_path = error_log_line
+            .strip_prefix("error_log = ")
+            .unwrap_or_else(|| panic!("unexpected error_log line shape: {error_log_line:?}"));
+        let rendered_dir = Path::new(rendered_path).parent().unwrap().to_path_buf();
+
+        let bin = home.join("fake-php-fpm");
+        std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        PhpFpmRuntime.validate(&bin, &ctx).await.unwrap();
+
+        assert!(
+            rendered_dir.is_dir(),
+            "validate() must create EXACTLY the directory generate_pool_config's rendered \
+             error_log points at ({rendered_dir:?}) — the two must derive from one shared \
+             helper, not two independently hand-typed copies"
         );
     }
 }
