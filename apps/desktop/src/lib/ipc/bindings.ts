@@ -273,6 +273,30 @@ export const commands = {
 	 *  defaults-file (spec D7's "it works" moment for the Databases page).
 	 */
 	verifyMysqlConnection: (major: string) => typedError<MysqlConnectionProofDto, IpcError>(__TAURI_INVOKE("verify_mysql_connection", { major })),
+	/**
+	 *  The full log-source catalogue: nginx's two globals (always listed), one
+	 *  row per INSTALLED php-fpm major, two rows (access + error) per site in
+	 *  `state.db`, and one ring row per service the supervisor knows about
+	 *  (spec D7).
+	 */
+	listLogSources: () => typedError<LogSourceRowDto[], IpcError>(__TAURI_INVOKE("list_log_sources")),
+	/**
+	 *  A bounded, filtered window of one log source (spec D3/D4/D7). The
+	 *  catalogue check (spec D5) happens inside `resolve_log_path`, before any
+	 *  path is derived or any filesystem call is made.
+	 */
+	readLogWindow: (input: LogWindowQuery) => typedError<LogWindowDto, IpcError>(__TAURI_INVOKE("read_log_window", { input })),
+	/**
+	 *  Open the folder containing `source`'s log file(s) in the OS file manager
+	 *  — "Open log folder" (spec D8), the user's one recourse against unbounded
+	 *  on-disk growth this slice ships without rotation. The path is derived
+	 *  entirely in Rust (`reveal_log_folder_target` → `resolve_log_path`, spec
+	 *  D5); the caller only ever names a `LogSourceDto`. No `capabilities/`
+	 *  grant is needed — this calls the opener plugin's Rust API directly
+	 *  rather than its JS-invoked command, exactly like
+	 *  `open_site`/`open_homebrew_site` above.
+	 */
+	revealLogFolder: (source: LogSourceDto) => typedError<null, IpcError>(__TAURI_INVOKE("reveal_log_folder", { source })),
 };
 
 /** Events */
@@ -394,6 +418,119 @@ export type LogLine = {
 	tsMs: number,
 	level: LogLevel,
 	line: string,
+};
+
+/**
+ *  Mirrors `openvhost_core::LogReset` 1:1 as a wire-safe copy (that type
+ *  carries no `serde`/`specta`, since `openvhost-core`'s logs module is
+ *  kept serde/specta-free by design).
+ */
+export type LogResetDto = "rotated" | "truncated";
+
+/**
+ *  One line of `read_log_window`'s returned window. `level` reuses
+ *  `openvhost_proc::LogLevel` directly (already specta-typed and already
+ *  crossing IPC via `ServiceLogEvent`/`ServiceStatus`) rather than a
+ *  duplicate wire enum — see `openvhost_core::logs::read`'s own doc comment
+ *  on why this is the ONE classifier for file lines, deliberately distinct
+ *  from the ring's own classifier.
+ */
+export type LogRowDto = {
+	level: LogLevel,
+	text: string,
+};
+
+/**
+ *  The ONLY way a log's identity crosses IPC (spec D5): a CLOSED, tagged
+ *  enum — never a path, a filename, or any string the renderer gets to pick
+ *  unconstrained. `domain`/`major` arrive as plain strings and are parsed
+ *  into the existing `Domain`/`PhpVersion` newtypes at ingress
+ *  (`TryFrom<LogSourceDto> for LogSource`, below) before anything else
+ *  touches them — the same "parse, don't validate" discipline as
+ *  `SiteInput`'s own `TryFrom`. `ServiceRing`'s `id` stays a bare `String`:
+ *  it never becomes a filesystem path (see `derive_path`), only a
+ *  `Supervisor` registry lookup, exactly like `service_log_tail`'s existing
+ *  `id` parameter.
+ * 
+ *  Mirrors `WebServerBrand::parse` → `live_config_path`'s shape (a closed
+ *  set, parsed before anything is derived from it), which this project's
+ *  auditor has already accepted for the identical class of problem.
+ */
+export type LogSourceDto = { kind: "nginxError" } | { kind: "nginxAccess" } | { kind: "phpFpm"; major: string } | { kind: "siteAccess"; domain: string } | { kind: "siteError"; domain: string } | { kind: "serviceRing"; id: string };
+
+/**
+ *  `"file"` | `"ring"` — spec D7's two-mechanism seam: a `"file"` row is
+ *  read via `read_log_window`; a `"ring"` row is read via the EXISTING
+ *  `service_log_tail` command + `service-log` event push, never through
+ *  `read_log_window` (see `derive_path`'s doc comment for why this is
+ *  deliberately not unified).
+ */
+export type LogSourceKindDto = "file" | "ring";
+
+/**  One row of `list_log_sources`'s catalogue (spec D7). */
+export type LogSourceRowDto = {
+	source: LogSourceDto,
+	label: string,
+	kind: LogSourceKindDto,
+	exists: boolean,
+	/**
+	 *  `None` for a `"ring"` row (a ring buffer has no on-disk byte size)
+	 *  and for a `"file"` row whose file does not exist yet. Same
+	 *  `.dangerously_cast_bigints_to_number()` note as
+	 *  `LogWindowDto::size_bytes` when present.
+	 */
+	sizeBytes: number | null,
+	/**
+	 *  The supervisor id to drive `serviceLogTail`/`onServiceLog` with, for
+	 *  a `"ring"` row. `None` for a `"file"` row.
+	 */
+	serviceId: string | null,
+};
+
+/**  `read_log_window`'s output (spec D7). */
+export type LogWindowDto = {
+	/**  Matching, classified, possibly-truncated lines, oldest first. */
+	rows: LogRowDto[],
+	/**
+	 *  Opaque JSON, round-tripped verbatim through `decode_cursor`/
+	 *  `encode_cursor`. `None` only when `exists` is `false`.
+	 */
+	cursor: string | null,
+	/**
+	 *  `false` when the source's file does not exist right now — a normal,
+	 *  pollable state (a service that has not started yet, a site whose
+	 *  Apply has not run), never an error.
+	 */
+	exists: boolean,
+	reset: LogResetDto | null,
+	hasMore: boolean,
+	/**
+	 *  The file's total size, in bytes. `u64` crossing the
+	 *  `.dangerously_cast_bigints_to_number()` boundary — see `lib.rs`'s
+	 *  standing warning. A log file is nowhere near 2^53 bytes.
+	 */
+	sizeBytes: number,
+	/**
+	 *  How many bytes of the file THIS call actually read (always bounded —
+	 *  see `openvhost_core::logs::read`'s own doc comment). Same bigint
+	 *  note as `size_bytes`.
+	 */
+	scannedBytes: number,
+	truncatedLines: number,
+	scanBoundReached: boolean,
+};
+
+/**  `read_log_window`'s input. */
+export type LogWindowQuery = {
+	source: LogSourceDto,
+	cursor: string | null,
+	/**
+	 *  Capped at `LOG_NEEDLE_MAX_BYTES` bytes by `LogNeedle::parse` (spec
+	 *  D3) — the reader itself applies no bound.
+	 */
+	needle: string | null,
+	caseSensitive: boolean,
+	minLevel: LogLevel | null,
 };
 
 /**

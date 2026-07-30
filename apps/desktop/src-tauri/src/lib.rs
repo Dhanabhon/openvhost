@@ -64,6 +64,9 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::mysql_root_password,
             commands::reset_mysql_root_password,
             commands::verify_mysql_connection,
+            commands::list_log_sources,
+            commands::read_log_window,
+            commands::reveal_log_folder,
         ])
         .events(collect_events![
             commands::ServiceStateEvent,

@@ -6541,3 +6541,1047 @@ mod web_server_settings_ipc_tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Live log viewer (Logs page)
+// spec docs/superpowers/specs/2026-07-30-p1-log-viewer-design.md
+// ---------------------------------------------------------------------------
+
+/// The ONLY way a log's identity crosses IPC (spec D5): a CLOSED, tagged
+/// enum — never a path, a filename, or any string the renderer gets to pick
+/// unconstrained. `domain`/`major` arrive as plain strings and are parsed
+/// into the existing `Domain`/`PhpVersion` newtypes at ingress
+/// (`TryFrom<LogSourceDto> for LogSource`, below) before anything else
+/// touches them — the same "parse, don't validate" discipline as
+/// `SiteInput`'s own `TryFrom`. `ServiceRing`'s `id` stays a bare `String`:
+/// it never becomes a filesystem path (see `derive_path`), only a
+/// `Supervisor` registry lookup, exactly like `service_log_tail`'s existing
+/// `id` parameter.
+///
+/// Mirrors `WebServerBrand::parse` → `live_config_path`'s shape (a closed
+/// set, parsed before anything is derived from it), which this project's
+/// auditor has already accepted for the identical class of problem.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, specta::Type)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum LogSourceDto {
+    NginxError,
+    NginxAccess,
+    PhpFpm { major: String },
+    SiteAccess { domain: String },
+    SiteError { domain: String },
+    ServiceRing { id: String },
+}
+
+/// `LogSourceDto` after ingress parsing: every `domain`/`major` is now a
+/// validated newtype, so `LogPaths` (via `derive_path`, below) can turn one
+/// into a path without re-checking a charset. Deliberately does NOT cross
+/// IPC (no `specta::Type`, no serde derive) — this is the internal shape
+/// the catalogue check and the path derivation both consume.
+#[derive(Debug, Clone)]
+enum LogSource {
+    NginxError,
+    NginxAccess,
+    PhpFpm(PhpVersion),
+    SiteAccess(Domain),
+    SiteError(Domain),
+    ServiceRing(String),
+}
+
+impl TryFrom<LogSourceDto> for LogSource {
+    type Error = IpcError;
+
+    fn try_from(dto: LogSourceDto) -> Result<Self, IpcError> {
+        Ok(match dto {
+            LogSourceDto::NginxError => LogSource::NginxError,
+            LogSourceDto::NginxAccess => LogSource::NginxAccess,
+            LogSourceDto::PhpFpm { major } => LogSource::PhpFpm(PhpVersion::parse(&major)?),
+            LogSourceDto::SiteAccess { domain } => LogSource::SiteAccess(Domain::parse(&domain)?),
+            LogSourceDto::SiteError { domain } => LogSource::SiteError(Domain::parse(&domain)?),
+            LogSourceDto::ServiceRing { id } => LogSource::ServiceRing(id),
+        })
+    }
+}
+
+/// Spec D5's live-catalogue check: verify `source` names something that
+/// genuinely exists RIGHT NOW — BEFORE any path is derived or any
+/// filesystem call is made. A deleted site or an uninstalled PHP major is
+/// rejected HERE, so the rejection is provably filesystem-free rather than
+/// merely a missing-file read three lines later (which `read_window` would
+/// also handle safely, via `exists: false` — but that is not the same
+/// property: it would still touch the filesystem for something that should
+/// never have been looked up at all).
+///
+/// `NginxError`/`NginxAccess` have no catalogue to check against — nginx's
+/// globals are not tied to any one site or runtime. `ServiceRing` passes
+/// through unconditionally too: it is rejected later, structurally, by
+/// `derive_path` (it has no on-disk path at all), not by a catalogue rule
+/// here.
+async fn check_catalogue(
+    source: &LogSource,
+    db: &Db,
+    runtimes: &RwLock<Option<InstalledRuntimes>>,
+) -> Result<(), IpcError> {
+    match source {
+        LogSource::NginxError | LogSource::NginxAccess | LogSource::ServiceRing(_) => Ok(()),
+        LogSource::PhpFpm(major) => {
+            let installed = runtimes
+                .read()
+                .map_err(|_| IpcError::Core {
+                    message: "runtime list is poisoned".into(),
+                })?
+                .as_ref()
+                .is_some_and(|r| r.php.iter().any(|rt| rt.major == major.as_str()));
+            if installed {
+                Ok(())
+            } else {
+                Err(IpcError::Validation {
+                    field: "php_version".into(),
+                    message: format!("PHP {} is not installed", major.as_str()),
+                })
+            }
+        }
+        LogSource::SiteAccess(domain) | LogSource::SiteError(domain) => {
+            let repo = SqliteSiteRepository::new(db);
+            let known = repo
+                .list()
+                .await?
+                .iter()
+                .any(|s| s.domain.as_str() == domain.as_str());
+            if known {
+                Ok(())
+            } else {
+                Err(IpcError::Validation {
+                    field: "domain".into(),
+                    message: format!("no site named {} exists", domain.as_str()),
+                })
+            }
+        }
+    }
+}
+
+/// Spec D5's `starts_with(<home>/logs)` post-condition: the one-line
+/// assertion a reviewer can verify at a glance, right at the IPC boundary —
+/// not merely documented in `LogPaths`'s own module doc, three files away.
+/// `LogPaths`'s construction already makes this provably true for every
+/// path it derives (its charset-validated newtypes cannot contain `..` or
+/// `/`), so this can never actually fail in production. It degrades to an
+/// honest error instead of a panic if it ever did — the same "must never
+/// crash on an invariant a type already guarantees" discipline as
+/// `WebServerBrand::live_config_path`'s unreachable `Apache` arm.
+fn confined(path: PathBuf, root: &Path) -> Result<PathBuf, IpcError> {
+    if path.starts_with(root) {
+        Ok(path)
+    } else {
+        Err(IpcError::Core {
+            message: format!(
+                "internal error: derived log path {} escaped {}",
+                path.display(),
+                root.display()
+            ),
+        })
+    }
+}
+
+/// The ONLY place a `LogSource` becomes a filesystem path (spec D5),
+/// confined by `confined` above. `ServiceRing` has no on-disk path: ring
+/// output is read through the EXISTING `service_log_tail` command +
+/// `service-log` event push, not through `read_log_window` — spec D7's
+/// two-mechanism seam, deliberately NOT unified here (unifying it behind
+/// the poll would add 500ms to output that is instant today). Rejected as a
+/// validation error rather than silently routed through, so a caller that
+/// sends a ring source to `read_log_window`/`reveal_log_folder` gets an
+/// honest "wrong command" message instead of a confusing "not found".
+fn derive_path(source: &LogSource, paths: &openvhost_core::LogPaths) -> Result<PathBuf, IpcError> {
+    let path = match source {
+        LogSource::NginxError => paths.nginx_error(),
+        LogSource::NginxAccess => paths.nginx_access(),
+        LogSource::PhpFpm(major) => paths.php_fpm_error(major),
+        LogSource::SiteAccess(domain) => paths.site_access(domain),
+        LogSource::SiteError(domain) => paths.site_error(domain),
+        LogSource::ServiceRing(id) => {
+            return Err(IpcError::Validation {
+                field: "source".into(),
+                message: format!(
+                    "ring source {id:?} is read through service_log_tail, not this command"
+                ),
+            });
+        }
+    };
+    confined(path, &paths.root())
+}
+
+/// Ingress parse → live-catalogue check → `LogPaths` derivation →
+/// confinement post-condition, in that order (spec D5) — the ONE place
+/// `read_log_window` and `reveal_log_folder` both turn a wire
+/// `LogSourceDto` into a path they may actually touch. The catalogue check
+/// runs BEFORE `derive_path`, so an unknown/deleted site or an uninstalled
+/// PHP major is rejected without a single filesystem call.
+async fn resolve_log_path(
+    dto: LogSourceDto,
+    db: &Db,
+    runtimes: &RwLock<Option<InstalledRuntimes>>,
+    paths: &openvhost_core::LogPaths,
+) -> Result<PathBuf, IpcError> {
+    let source: LogSource = dto.try_into()?;
+    check_catalogue(&source, db, runtimes).await?;
+    derive_path(&source, paths)
+}
+
+/// Spec D3's 256-byte cap on a log filter query, enforced HERE at IPC
+/// ingress: `openvhost_core::LogQuery::needle` accepts whatever `String` it
+/// is given and applies no length bound of its own (see that module's own
+/// doc comment, which explicitly defers this cap to this command layer).
+/// Parse-don't-validate, mirroring `Domain`/`Docroot`: constructible only
+/// via `parse`, so an oversized needle can never reach the reader from this
+/// command surface.
+const LOG_NEEDLE_MAX_BYTES: usize = 256;
+
+struct LogNeedle(String);
+
+impl LogNeedle {
+    fn parse(s: &str) -> Result<Self, IpcError> {
+        if s.len() > LOG_NEEDLE_MAX_BYTES {
+            return Err(IpcError::Validation {
+                field: "needle".into(),
+                message: format!("must be at most {LOG_NEEDLE_MAX_BYTES} bytes"),
+            });
+        }
+        Ok(Self(s.to_string()))
+    }
+
+    fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+/// `read_log_window`'s opaque cursor, decoded from the wire string a
+/// previous call handed back. See `openvhost_core::LogCursor`'s own doc
+/// comment for why accepting whatever JSON the caller sends is safe rather
+/// than a confinement bypass: a forged identity or offset can only ever
+/// move the resume point WITHIN whatever file `source` (independently
+/// parsed, catalogue-checked and derived above) already resolves to. A
+/// shape that does not even decode is a genuine ingress error, not a
+/// silently-tolerated forgery.
+fn decode_cursor(raw: Option<String>) -> Result<Option<openvhost_core::LogCursor>, IpcError> {
+    raw.map(|s| {
+        serde_json::from_str::<openvhost_core::LogCursor>(&s).map_err(|e| IpcError::Validation {
+            field: "cursor".into(),
+            message: format!("invalid cursor: {e}"),
+        })
+    })
+    .transpose()
+}
+
+/// The other half of `decode_cursor`: `LogCursor` derives `Serialize`, so
+/// this is a plain, lossless round-trip — see that type's doc comment for
+/// why handing it back to the caller unmodified is deliberate
+/// ("transport-transparent, not opaque").
+fn encode_cursor(cursor: Option<openvhost_core::LogCursor>) -> Result<Option<String>, IpcError> {
+    cursor
+        .map(|c| {
+            serde_json::to_string(&c).map_err(|e| IpcError::Core {
+                message: format!("failed to encode log cursor: {e}"),
+            })
+        })
+        .transpose()
+}
+
+/// One line of `read_log_window`'s returned window. `level` reuses
+/// `openvhost_proc::LogLevel` directly (already specta-typed and already
+/// crossing IPC via `ServiceLogEvent`/`ServiceStatus`) rather than a
+/// duplicate wire enum — see `openvhost_core::logs::read`'s own doc comment
+/// on why this is the ONE classifier for file lines, deliberately distinct
+/// from the ring's own classifier.
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LogRowDto {
+    pub level: LogLevel,
+    pub text: String,
+}
+
+/// Mirrors `openvhost_core::LogReset` 1:1 as a wire-safe copy (that type
+/// carries no `serde`/`specta`, since `openvhost-core`'s logs module is
+/// kept serde/specta-free by design).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub enum LogResetDto {
+    Rotated,
+    Truncated,
+}
+
+impl From<openvhost_core::LogReset> for LogResetDto {
+    fn from(r: openvhost_core::LogReset) -> Self {
+        match r {
+            openvhost_core::LogReset::Rotated => LogResetDto::Rotated,
+            openvhost_core::LogReset::Truncated => LogResetDto::Truncated,
+        }
+    }
+}
+
+/// `read_log_window`'s output (spec D7).
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LogWindowDto {
+    /// Matching, classified, possibly-truncated lines, oldest first.
+    pub rows: Vec<LogRowDto>,
+    /// Opaque JSON, round-tripped verbatim through `decode_cursor`/
+    /// `encode_cursor`. `None` only when `exists` is `false`.
+    pub cursor: Option<String>,
+    /// `false` when the source's file does not exist right now — a normal,
+    /// pollable state (a service that has not started yet, a site whose
+    /// Apply has not run), never an error.
+    pub exists: bool,
+    pub reset: Option<LogResetDto>,
+    pub has_more: bool,
+    /// The file's total size, in bytes. `u64` crossing the
+    /// `.dangerously_cast_bigints_to_number()` boundary — see `lib.rs`'s
+    /// standing warning. A log file is nowhere near 2^53 bytes.
+    pub size_bytes: u64,
+    /// How many bytes of the file THIS call actually read (always bounded —
+    /// see `openvhost_core::logs::read`'s own doc comment). Same bigint
+    /// note as `size_bytes`.
+    pub scanned_bytes: u64,
+    pub truncated_lines: u32,
+    pub scan_bound_reached: bool,
+}
+
+/// `read_log_window`'s input.
+#[derive(Debug, Clone, serde::Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LogWindowQuery {
+    pub source: LogSourceDto,
+    pub cursor: Option<String>,
+    /// Capped at `LOG_NEEDLE_MAX_BYTES` bytes by `LogNeedle::parse` (spec
+    /// D3) — the reader itself applies no bound.
+    pub needle: Option<String>,
+    pub case_sensitive: bool,
+    pub min_level: Option<LogLevel>,
+}
+
+fn log_window_dto(w: openvhost_core::LogWindow) -> Result<LogWindowDto, IpcError> {
+    Ok(LogWindowDto {
+        rows: w
+            .rows
+            .into_iter()
+            .map(|r| LogRowDto {
+                level: r.level,
+                text: r.text,
+            })
+            .collect(),
+        cursor: encode_cursor(w.cursor)?,
+        exists: w.exists,
+        reset: w.reset.map(LogResetDto::from),
+        has_more: w.has_more,
+        size_bytes: w.size_bytes,
+        scanned_bytes: w.scanned_bytes,
+        truncated_lines: w.truncated_lines,
+        scan_bound_reached: w.scan_bound_reached,
+    })
+}
+
+/// `"file"` | `"ring"` — spec D7's two-mechanism seam: a `"file"` row is
+/// read via `read_log_window`; a `"ring"` row is read via the EXISTING
+/// `service_log_tail` command + `service-log` event push, never through
+/// `read_log_window` (see `derive_path`'s doc comment for why this is
+/// deliberately not unified).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(rename_all = "lowercase")]
+pub enum LogSourceKindDto {
+    File,
+    Ring,
+}
+
+/// One row of `list_log_sources`'s catalogue (spec D7).
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LogSourceRowDto {
+    pub source: LogSourceDto,
+    pub label: String,
+    pub kind: LogSourceKindDto,
+    pub exists: bool,
+    /// `None` for a `"ring"` row (a ring buffer has no on-disk byte size)
+    /// and for a `"file"` row whose file does not exist yet. Same
+    /// `.dangerously_cast_bigints_to_number()` note as
+    /// `LogWindowDto::size_bytes` when present.
+    pub size_bytes: Option<u64>,
+    /// The supervisor id to drive `serviceLogTail`/`onServiceLog` with, for
+    /// a `"ring"` row. `None` for a `"file"` row.
+    pub service_id: Option<String>,
+}
+
+/// Build one `"file"`-kind row: stat the path via `symlink_metadata` (never
+/// following — mirroring `read_window`'s own refusal) and report
+/// `exists`/`sizeBytes` from a REGULAR FILE only. A symlink planted at a log
+/// path would make `read_log_window` refuse it anyway (spec D5); listing it
+/// as existing here would invite a click that goes nowhere. `tokio::fs`,
+/// not `std::fs`: a stalled `OPENVHOST_HOME` mount must not pin a tokio
+/// worker while this enumerates every source (mirrors `list_web_servers`'s
+/// own reasoning for its config-file stat).
+async fn file_row(
+    source: LogSourceDto,
+    label: impl Into<String>,
+    path: PathBuf,
+) -> LogSourceRowDto {
+    let meta = tokio::fs::symlink_metadata(&path).await.ok();
+    let size_bytes = meta.as_ref().filter(|m| m.is_file()).map(|m| m.len());
+    LogSourceRowDto {
+        source,
+        label: label.into(),
+        kind: LogSourceKindDto::File,
+        exists: size_bytes.is_some(),
+        size_bytes,
+        service_id: None,
+    }
+}
+
+/// The full log-source catalogue: nginx's two globals (always listed), one
+/// row per INSTALLED php-fpm major, two rows (access + error) per site in
+/// `state.db`, and one ring row per service the supervisor knows about
+/// (spec D7).
+#[tauri::command]
+#[specta::specta]
+pub async fn list_log_sources(
+    db: tauri::State<'_, Db>,
+    runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
+    stack: tauri::State<'_, Option<StackPaths>>,
+    sup: tauri::State<'_, Arc<Supervisor>>,
+) -> Result<Vec<LogSourceRowDto>, IpcError> {
+    let p = stack_paths(&stack)?;
+    let log_paths = openvhost_core::LogPaths::new(&p.home);
+
+    let mut rows = vec![
+        file_row(
+            LogSourceDto::NginxError,
+            "nginx error log",
+            log_paths.nginx_error(),
+        )
+        .await,
+        file_row(
+            LogSourceDto::NginxAccess,
+            "nginx access log",
+            log_paths.nginx_access(),
+        )
+        .await,
+    ];
+
+    // Owned clone, guard dropped immediately — never held across an
+    // `.await` (mirrors `php_environment`'s identical pattern).
+    let installed_php: Vec<openvhost_core::PhpRuntime> = runtimes
+        .read()
+        .map_err(|_| IpcError::Core {
+            message: "runtime list is poisoned".into(),
+        })?
+        .as_ref()
+        .map(|r| r.php.clone())
+        .unwrap_or_default();
+    for rt in &installed_php {
+        // Skip silently rather than fail the whole listing: a malformed
+        // major here would mean the PHP discovery probe produced something
+        // `PhpVersion::parse` rejects, which should not happen in practice
+        // and has no user-facing error channel on a listing row.
+        if let Ok(major) = PhpVersion::parse(&rt.major) {
+            let label = format!("PHP {} pool log", major.as_str());
+            let path = log_paths.php_fpm_error(&major);
+            rows.push(
+                file_row(
+                    LogSourceDto::PhpFpm {
+                        major: rt.major.clone(),
+                    },
+                    label,
+                    path,
+                )
+                .await,
+            );
+        }
+    }
+
+    let repo = SqliteSiteRepository::new(db.inner());
+    for site in repo.list().await? {
+        let domain = site.domain.as_str().to_string();
+        rows.push(
+            file_row(
+                LogSourceDto::SiteAccess {
+                    domain: domain.clone(),
+                },
+                format!("{domain} access log"),
+                log_paths.site_access(&site.domain),
+            )
+            .await,
+        );
+        rows.push(
+            file_row(
+                LogSourceDto::SiteError {
+                    domain: domain.clone(),
+                },
+                format!("{domain} error log"),
+                log_paths.site_error(&site.domain),
+            )
+            .await,
+        );
+    }
+
+    for status in sup.snapshot() {
+        rows.push(LogSourceRowDto {
+            source: LogSourceDto::ServiceRing {
+                id: status.id.clone(),
+            },
+            label: format!("{} output", status.display_name),
+            kind: LogSourceKindDto::Ring,
+            exists: true,
+            size_bytes: None,
+            service_id: Some(status.id),
+        });
+    }
+
+    Ok(rows)
+}
+
+/// A bounded, filtered window of one log source (spec D3/D4/D7). The
+/// catalogue check (spec D5) happens inside `resolve_log_path`, before any
+/// path is derived or any filesystem call is made.
+#[tauri::command]
+#[specta::specta]
+pub async fn read_log_window(
+    db: tauri::State<'_, Db>,
+    runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
+    stack: tauri::State<'_, Option<StackPaths>>,
+    input: LogWindowQuery,
+) -> Result<LogWindowDto, IpcError> {
+    let p = stack_paths(&stack)?;
+    let log_paths = openvhost_core::LogPaths::new(&p.home);
+    let path = resolve_log_path(input.source, db.inner(), runtimes.inner(), &log_paths).await?;
+
+    let cursor = decode_cursor(input.cursor)?;
+    let needle = input
+        .needle
+        .map(|n| LogNeedle::parse(&n))
+        .transpose()?
+        .map(LogNeedle::into_inner);
+    let query = openvhost_core::LogQuery {
+        needle,
+        case_sensitive: input.case_sensitive,
+        min_level: input.min_level,
+    };
+    let limits = openvhost_core::LogLimits::default();
+
+    // `read_window` is synchronous std::fs I/O, up to `limits.scan` (16 MiB)
+    // per call — run on the blocking pool so a stalled `OPENVHOST_HOME`
+    // mount cannot pin a tokio worker (same reasoning as
+    // `read_web_server_config`'s doc comment and `home_disk_usage`'s
+    // identical `spawn_blocking` use).
+    let window = tauri::async_runtime::spawn_blocking(move || {
+        openvhost_core::read_window(&path, cursor, &query, &limits)
+    })
+    .await
+    .map_err(|e| IpcError::Core {
+        message: format!("the log-read task failed to run: {e}"),
+    })?
+    .map_err(IpcError::from)?;
+
+    log_window_dto(window)
+}
+
+/// The folder `reveal_log_folder` should open for `source`: everything the
+/// command needs EXCEPT the actual OS call.
+///
+/// Split out for the same reason `initialize_mysql_gate` is (see its doc
+/// comment): `tauri::test::mock_builder()` only ever produces an
+/// `AppHandle<MockRuntime>`, a DIFFERENT concrete type than the
+/// `AppHandle<Wry>` `reveal_log_folder`'s signature needs to call
+/// `OpenerExt::opener()`, so the full command cannot be invoked directly
+/// from a test at all. This function needs no `AppHandle`, so the
+/// catalogue-check-then-derive logic it shares with `read_log_window` (via
+/// `resolve_log_path`) — plus the one bit unique to this command, taking
+/// the derived path's parent — stays directly testable.
+async fn reveal_log_folder_target(
+    source: LogSourceDto,
+    db: &Db,
+    runtimes: &RwLock<Option<InstalledRuntimes>>,
+    paths: &openvhost_core::LogPaths,
+) -> Result<PathBuf, IpcError> {
+    let path = resolve_log_path(source, db, runtimes, paths).await?;
+    path.parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| IpcError::Core {
+            message: format!("{} has no parent directory", path.display()),
+        })
+}
+
+/// Open the folder containing `source`'s log file(s) in the OS file manager
+/// — "Open log folder" (spec D8), the user's one recourse against unbounded
+/// on-disk growth this slice ships without rotation. The path is derived
+/// entirely in Rust (`reveal_log_folder_target` → `resolve_log_path`, spec
+/// D5); the caller only ever names a `LogSourceDto`. No `capabilities/`
+/// grant is needed — this calls the opener plugin's Rust API directly
+/// rather than its JS-invoked command, exactly like
+/// `open_site`/`open_homebrew_site` above.
+#[tauri::command]
+#[specta::specta]
+pub async fn reveal_log_folder(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, Db>,
+    runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
+    stack: tauri::State<'_, Option<StackPaths>>,
+    source: LogSourceDto,
+) -> Result<(), IpcError> {
+    use tauri_plugin_opener::OpenerExt;
+    let p = stack_paths(&stack)?;
+    let log_paths = openvhost_core::LogPaths::new(&p.home);
+    let folder = reveal_log_folder_target(source, db.inner(), runtimes.inner(), &log_paths).await?;
+    app.opener()
+        .open_path(folder.display().to_string(), None::<&str>)
+        .map_err(|e| IpcError::Core {
+            message: e.to_string(),
+        })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod log_ipc_tests {
+    use tauri::Manager;
+
+    use super::*;
+
+    fn stack(home: &Path) -> Option<StackPaths> {
+        Some(StackPaths {
+            home: home.to_path_buf(),
+            nginx_bin: home.join("nginx"),
+            nginx_conf: home.join("nginx.conf"),
+        })
+    }
+
+    async fn site_in(db: &Db, domain: &str) {
+        let repo = SqliteSiteRepository::new(db);
+        let new: NewSite = SiteInput {
+            name: domain.split('.').next().unwrap().to_string(),
+            domain: domain.to_string(),
+            docroot: "/tmp/does-not-matter".into(),
+            web_server: "nginx".into(),
+            php_version: "8.3".into(),
+            enabled: true,
+        }
+        .try_into()
+        .unwrap();
+        repo.create(new).await.unwrap();
+    }
+
+    fn query(source: LogSourceDto, cursor: Option<String>) -> LogWindowQuery {
+        LogWindowQuery {
+            source,
+            cursor,
+            needle: None,
+            case_sensitive: false,
+            min_level: None,
+        }
+    }
+
+    // ---- catalogue: unknown/deleted site, out-of-catalogue major --------
+    //
+    // Vacuity method: WITHOUT `check_catalogue`, both calls below would
+    // resolve straight to a `LogPaths`-derived path, and `read_window` would
+    // report `exists: false` (a missing file is not an error — spec D3), so
+    // the call would return `Ok`, not `Err`. Asserting `Err(Validation)` is
+    // therefore a genuine red/green distinction, not a tautology.
+
+    #[tokio::test]
+    async fn unknown_site_is_rejected_without_touching_the_filesystem() {
+        let home = tempfile::tempdir().unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(Db::open_in_memory().await.unwrap());
+        app.manage(stack(home.path()));
+        app.manage(RwLock::new(None::<InstalledRuntimes>));
+
+        let err = read_log_window(
+            app.state::<Db>(),
+            app.state::<RwLock<Option<InstalledRuntimes>>>(),
+            app.state::<Option<StackPaths>>(),
+            query(
+                LogSourceDto::SiteAccess {
+                    domain: "ghost.localhost".into(),
+                },
+                None,
+            ),
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            IpcError::Validation { field, .. } => assert_eq!(field, "domain"),
+            other => panic!("expected Validation on domain, got {other:?}"),
+        }
+        assert!(
+            !home.path().join("logs").exists(),
+            "a rejected catalogue check must never create or touch <home>/logs"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deleted_sites_domain_is_rejected_the_same_way() {
+        let home = tempfile::tempdir().unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let db = Db::open_in_memory().await.unwrap();
+        site_in(&db, "shop.localhost").await;
+        let repo = SqliteSiteRepository::new(&db);
+        let id = repo.list().await.unwrap()[0].id.clone();
+        assert!(repo.delete(&id).await.unwrap());
+        app.manage(db);
+        app.manage(stack(home.path()));
+        app.manage(RwLock::new(None::<InstalledRuntimes>));
+
+        let err = read_log_window(
+            app.state::<Db>(),
+            app.state::<RwLock<Option<InstalledRuntimes>>>(),
+            app.state::<Option<StackPaths>>(),
+            query(
+                LogSourceDto::SiteError {
+                    domain: "shop.localhost".into(),
+                },
+                None,
+            ),
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            IpcError::Validation { field, .. } => assert_eq!(field, "domain"),
+            other => panic!("expected Validation on domain, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn uninstalled_php_major_is_rejected_without_touching_the_filesystem() {
+        let home = tempfile::tempdir().unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(Db::open_in_memory().await.unwrap());
+        app.manage(stack(home.path()));
+        app.manage(RwLock::new(Some(InstalledRuntimes {
+            nginx_bin: home.path().join("nginx"),
+            php: vec![],
+        })));
+
+        let err = read_log_window(
+            app.state::<Db>(),
+            app.state::<RwLock<Option<InstalledRuntimes>>>(),
+            app.state::<Option<StackPaths>>(),
+            query(
+                LogSourceDto::PhpFpm {
+                    major: "9.9".into(),
+                },
+                None,
+            ),
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            IpcError::Validation { field, .. } => assert_eq!(field, "php_version"),
+            other => panic!("expected Validation on php_version, got {other:?}"),
+        }
+        assert!(!home.path().join("logs").exists());
+    }
+
+    // ---- confinement: a symlink at a derived log path is refused --------
+    //
+    // Exercises the REAL reader end to end: the catalogue check PASSES (the
+    // site genuinely exists), a path is genuinely derived, and only THEN
+    // does `read_window`'s own `symlink_metadata` refusal fire.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_planted_at_a_derived_log_path_is_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let db = Db::open_in_memory().await.unwrap();
+        site_in(&db, "shop.localhost").await;
+        app.manage(db);
+        app.manage(stack(home.path()));
+        app.manage(RwLock::new(None::<InstalledRuntimes>));
+
+        let site_dir = home.path().join("logs/sites/shop.localhost");
+        std::fs::create_dir_all(&site_dir).unwrap();
+        let victim = home.path().join("victim.txt");
+        std::fs::write(&victim, b"secret").unwrap();
+        std::os::unix::fs::symlink(&victim, site_dir.join("access.log")).unwrap();
+
+        let err = read_log_window(
+            app.state::<Db>(),
+            app.state::<RwLock<Option<InstalledRuntimes>>>(),
+            app.state::<Option<StackPaths>>(),
+            query(
+                LogSourceDto::SiteAccess {
+                    domain: "shop.localhost".into(),
+                },
+                None,
+            ),
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            IpcError::Core { message } => {
+                assert!(message.contains("not a plain file"), "got {message:?}")
+            }
+            other => panic!("expected Core (NotAPlainFile), got {other:?}"),
+        }
+    }
+
+    // ---- ingress: the 256-byte query cap ---------------------------------
+    //
+    // Vacuity method: `NginxError` needs no catalogue check and its file need
+    // not exist (a missing file is `exists: false`, not an error), so
+    // WITHOUT `LogNeedle`'s cap this exact call would succeed — the same
+    // red/green distinction as the catalogue tests above.
+
+    #[tokio::test]
+    async fn an_over_long_query_is_rejected_at_ingress() {
+        let home = tempfile::tempdir().unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(Db::open_in_memory().await.unwrap());
+        app.manage(stack(home.path()));
+        app.manage(RwLock::new(None::<InstalledRuntimes>));
+
+        let err = read_log_window(
+            app.state::<Db>(),
+            app.state::<RwLock<Option<InstalledRuntimes>>>(),
+            app.state::<Option<StackPaths>>(),
+            LogWindowQuery {
+                source: LogSourceDto::NginxError,
+                cursor: None,
+                needle: Some("a".repeat(LOG_NEEDLE_MAX_BYTES + 1)),
+                case_sensitive: false,
+                min_level: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            IpcError::Validation { field, .. } => assert_eq!(field, "needle"),
+            other => panic!("expected Validation on needle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_query_at_exactly_the_cap_is_accepted() {
+        assert!(LogNeedle::parse(&"a".repeat(LOG_NEEDLE_MAX_BYTES)).is_ok());
+    }
+
+    #[test]
+    fn a_query_one_byte_over_the_cap_is_rejected() {
+        assert!(LogNeedle::parse(&"a".repeat(LOG_NEEDLE_MAX_BYTES + 1)).is_err());
+    }
+
+    // ---- the starts_with post-condition itself ---------------------------
+    //
+    // Neuter-proof: `LogPaths` can never actually PRODUCE a violation (its
+    // own test suite pins that), so this exercises `confined` directly with
+    // a synthetic one — replacing its real body with `Ok(path)`
+    // unconditionally would make the first case here fail.
+
+    #[test]
+    fn confined_rejects_a_path_outside_the_given_root() {
+        let root = Path::new("/home/x/logs");
+        let outside = PathBuf::from("/etc/passwd");
+        assert!(confined(outside, root).is_err());
+    }
+
+    #[test]
+    fn confined_accepts_a_path_under_the_given_root() {
+        let root = Path::new("/home/x/logs");
+        let inside = root.join("nginx.error.log");
+        assert_eq!(confined(inside.clone(), root).unwrap(), inside);
+    }
+
+    // ---- list_log_sources: shape for a fixture home ----------------------
+
+    #[tokio::test]
+    async fn list_log_sources_enumerates_every_kind_for_a_fixture_home() {
+        let home = tempfile::tempdir().unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let db = Db::open_in_memory().await.unwrap();
+        site_in(&db, "shop.localhost").await;
+        app.manage(db);
+        app.manage(stack(home.path()));
+        app.manage(RwLock::new(Some(InstalledRuntimes {
+            nginx_bin: home.path().join("nginx"),
+            php: vec![openvhost_core::PhpRuntime {
+                major: "8.3".into(),
+                fpm_bin: home.path().join("php-fpm"),
+            }],
+        })));
+        let sup = Arc::new(Supervisor::new(openvhost_proc::default_driver()));
+        sup.register(openvhost_proc::ServiceSpec {
+            id: "nginx".into(),
+            display_name: "nginx".into(),
+            endpoint: None,
+            spawn: openvhost_proc::SpawnSpec {
+                program: PathBuf::from("/usr/bin/true"),
+                args: vec![],
+                cwd: None,
+                env: vec![],
+            },
+            readiness: openvhost_proc::ReadinessProbe::default(),
+            grace: openvhost_proc::DEFAULT_GRACE,
+        });
+        app.manage(sup);
+
+        let rows = list_log_sources(
+            app.state::<Db>(),
+            app.state::<RwLock<Option<InstalledRuntimes>>>(),
+            app.state::<Option<StackPaths>>(),
+            app.state::<Arc<Supervisor>>(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            rows.iter()
+                .any(|r| r.source == LogSourceDto::NginxError && r.kind == LogSourceKindDto::File)
+        );
+        assert!(rows.iter().any(|r| r.source == LogSourceDto::NginxAccess));
+        assert!(rows.iter().any(
+            |r| matches!(&r.source, LogSourceDto::PhpFpm { major } if major.as_str() == "8.3")
+        ));
+        assert!(rows.iter().any(|r| matches!(
+            &r.source,
+            LogSourceDto::SiteAccess { domain } if domain.as_str() == "shop.localhost"
+        )));
+        assert!(rows.iter().any(|r| matches!(
+            &r.source,
+            LogSourceDto::SiteError { domain } if domain.as_str() == "shop.localhost"
+        )));
+        assert!(rows.iter().any(|r| matches!(
+            &r.source,
+            LogSourceDto::ServiceRing { id } if id.as_str() == "nginx"
+        ) && r.kind == LogSourceKindDto::Ring
+            && r.service_id.as_deref() == Some("nginx")));
+
+        for r in rows.iter().filter(|r| r.kind == LogSourceKindDto::File) {
+            assert!(
+                !r.exists,
+                "expected {:?} to not exist in a fresh fixture home",
+                r.source
+            );
+            assert_eq!(r.size_bytes, None);
+        }
+    }
+
+    // ---- read_log_window: cursor round-trip ------------------------------
+
+    #[tokio::test]
+    async fn read_log_window_round_trips_a_cursor() {
+        let home = tempfile::tempdir().unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(Db::open_in_memory().await.unwrap());
+        app.manage(stack(home.path()));
+        app.manage(RwLock::new(None::<InstalledRuntimes>));
+
+        let log_dir = home.path().join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(log_dir.join("nginx.error.log"), b"line one\n").unwrap();
+
+        let first = read_log_window(
+            app.state::<Db>(),
+            app.state::<RwLock<Option<InstalledRuntimes>>>(),
+            app.state::<Option<StackPaths>>(),
+            query(LogSourceDto::NginxError, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.rows.len(), 1);
+        assert_eq!(first.rows[0].text, "line one");
+        let cursor = first.cursor.expect("a cursor after a successful read");
+
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(log_dir.join("nginx.error.log"))
+            .unwrap();
+        std::io::Write::write_all(&mut f, b"line two\n").unwrap();
+        drop(f);
+
+        let second = read_log_window(
+            app.state::<Db>(),
+            app.state::<RwLock<Option<InstalledRuntimes>>>(),
+            app.state::<Option<StackPaths>>(),
+            query(LogSourceDto::NginxError, Some(cursor)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            second.rows.len(),
+            1,
+            "resuming from the round-tripped cursor must return ONLY the new \
+             line, not re-scan from the tail"
+        );
+        assert_eq!(second.rows[0].text, "line two");
+        assert!(second.reset.is_none());
+    }
+
+    // ---- reveal_log_folder's AppHandle-free half --------------------------
+    //
+    // `reveal_log_folder` itself cannot be called directly from this harness
+    // (see `reveal_log_folder_target`'s own doc comment) — this exercises
+    // the shared catalogue check plus the one bit unique to this command,
+    // taking the derived path's parent.
+
+    #[tokio::test]
+    async fn reveal_log_folder_target_rejects_an_unknown_site_without_touching_the_filesystem() {
+        let home = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().await.unwrap();
+        let runtimes = RwLock::new(None::<InstalledRuntimes>);
+        let log_paths = openvhost_core::LogPaths::new(home.path());
+
+        let err = reveal_log_folder_target(
+            LogSourceDto::SiteError {
+                domain: "ghost.localhost".into(),
+            },
+            &db,
+            &runtimes,
+            &log_paths,
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            IpcError::Validation { field, .. } => assert_eq!(field, "domain"),
+            other => panic!("expected Validation on domain, got {other:?}"),
+        }
+        assert!(!home.path().join("logs").exists());
+    }
+
+    #[tokio::test]
+    async fn reveal_log_folder_target_is_the_sites_log_directory_not_the_file() {
+        let home = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().await.unwrap();
+        site_in(&db, "shop.localhost").await;
+        let runtimes = RwLock::new(None::<InstalledRuntimes>);
+        let log_paths = openvhost_core::LogPaths::new(home.path());
+
+        let folder = reveal_log_folder_target(
+            LogSourceDto::SiteAccess {
+                domain: "shop.localhost".into(),
+            },
+            &db,
+            &runtimes,
+            &log_paths,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(folder, home.path().join("logs/sites/shop.localhost"));
+    }
+}
