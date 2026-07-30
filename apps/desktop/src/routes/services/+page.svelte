@@ -58,7 +58,7 @@
 		onStart={(id) => void store.start(id)}
 		onStop={(id) => void store.stop(id)}
 	/>
-	<LogPane logs={store.logs} />
+	<LogPane logs={store.logs} firstServiceId={store.services[0]?.id ?? null} />
 	{#if info}
 		<p class="coreinfo mono">
 			OpenVHost {info.appVersion} · {info.os}/{info.arch} · {info.openvhostHome}

@@ -1,7 +1,9 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <script lang="ts">
+	import { resolve } from '$app/paths';
 	import type { SiteDto } from '$lib/ipc';
 	import { enabledPill, phpVersionMissing } from '$lib/sites.derive';
+	import { logSourceQuery } from '$lib/logs.derive';
 	import Button from './Button.svelte';
 
 	let {
@@ -36,6 +38,13 @@
 
 	const pill = $derived(enabledPill(site.enabled));
 	const phpMissing = $derived(phpVersionMissing(site, installed));
+	// The site's ERROR log, not access — spec D6's deep-link entry point
+	// matches the live-proof narrative ("the site's error log shows the PHP
+	// fatal"). The `/logs` page's own toolbar lets the user switch to the
+	// access stream for the same domain once there. Built inline at the
+	// `href` site below (not as a `$derived` here) so the eslint
+	// block-disable comment there can sit right next to what it excuses.
+	const viewLogsQuery = $derived(logSourceQuery({ kind: 'siteError', domain: site.domain }));
 
 	/**
 	 * Two-step delete confirm, held LOCALLY on purpose.
@@ -115,7 +124,48 @@
 		</div>
 	{:else}
 		<div class="row-actions">
-			<!-- Icon-only, and first in the group. The row already carries three text
+			<!-- "View logs" — spec D6's deep link, first of the two icon-only "look at this
+			     site" actions. A real `<a href>`, not a `Button`: this is NAVIGATION (to
+			     `/logs?source=…`), never an IPC action, so `Button.svelte`'s `onclick` shape
+			     does not fit — same reasoning ServiceRow.svelte's own new "View logs" link
+			     uses. Hand-rolled `.icon-link` styling below reproduces `Button`'s quiet/sm
+			     look locally, mirroring how this file ALREADY hand-rolls a `.btn` subset for
+			     the danger-confirm button below (Button has no danger variant either) — same
+			     precedent, applied to "not a button" this time instead of "no matching
+			     variant". Never disabled (unlike Open): a disabled site's PAST logs are still
+			     worth reading, arguably more so, while it cannot serve a live page to open.
+
+			     eslint-plugin-svelte's `no-navigation-without-resolve` cannot see THROUGH a
+			     template literal that combines a genuine `resolve(...)` call with a second
+			     interpolated expression (checked against the rule's own source — its
+			     `expressionIsResolveCall` only recognises a BARE `resolve(...)` call or an
+			     aliasing variable) — a block disable/enable, not `-next-line`, since prettier is
+			     free to re-wrap this element and `-next-line` would then silently stop covering
+			     the `href` line. -->
+			<!-- eslint-disable svelte/no-navigation-without-resolve -->
+			<a
+				class="icon-link"
+				href={`${resolve('/logs')}${viewLogsQuery}`}
+				aria-label="View logs for {site.name}"
+			>
+				<span class="icon" title="View logs for {site.domain}" aria-hidden="true">
+					<svg
+						viewBox="0 0 18 18"
+						width="13"
+						height="13"
+						fill="none"
+						stroke="currentColor"
+						stroke-width="1.6"
+						stroke-linecap="round"
+					>
+						<!-- Same three-line glyph as the rail's own Logs destination
+						     (Rail.svelte) — one mark for "logs" across the app. -->
+						<path d="M3 4.5h12M3 9h12M3 13.5h7" />
+					</svg>
+				</span>
+			</a>
+			<!-- eslint-enable svelte/no-navigation-without-resolve -->
+			<!-- Icon-only, and second in the group. The row already carries three text
 			     buttons; a fourth word would crowd the strip and push Delete further from
 			     the eye's landing point. `ariaLabel` names the site because an icon has no
 			     text at all — without it a screen reader announces nothing usable, and
@@ -308,16 +358,45 @@
 		   visibly jolted three columns left. This floor is wider than all three states, so
 		   the track is constant and only the buttons themselves change.
 
-		   232px is measured, not derived — it is the confirm state (the widest) plus a little
-		   air at this font and size. If a fallback font renders wider, the states differ by a
-		   constant rather than by the site's name length, which was the variance that
-		   mattered. Verified against a 964px content width (1180px window minus the rail). */
-		min-width: 232px;
+		   268px = the original 232px (measured, not derived — the confirm state plus a
+		   little air) PLUS one icon-only button's width (View logs, spec D6 — a second icon
+		   button alongside Open, ~30px including its `gap: 4px` neighbour). Verified against
+		   a 964px content width (1180px window minus the rail). */
+		min-width: 268px;
 		display: flex;
 		gap: 4px;
 		justify-content: flex-end;
 		align-items: center;
 		opacity: 0.85;
+	}
+	/* Reproduces Button.svelte's `.btn`/`.btn-quiet`/`.btn-sm` recipe locally for an `<a>` —
+	   Button always renders a `<button>`, which is wrong for NAVIGATION (this is a real link
+	   to `/logs?source=…`, not an onclick action). Same "hand-roll a `.btn` subset outside
+	   Button.svelte" precedent this file already uses for `.btn-danger` below. */
+	.icon-link {
+		display: inline-flex;
+		align-items: center;
+		padding: 4px 10px;
+		border-radius: var(--vh-radius-control);
+		border: 1px solid transparent;
+		color: var(--vh-text);
+		text-decoration: none;
+		cursor: pointer;
+		transition:
+			background var(--vh-dur-fast) var(--vh-ease-out),
+			border-color var(--vh-dur-fast) var(--vh-ease-out);
+	}
+	.icon-link:hover {
+		background: color-mix(in oklab, var(--vh-text) 6%, transparent);
+	}
+	/* Same doubled-frame fix as `.btn-quiet:focus-visible` (Button.svelte) — this control has
+	   no border of its own in the ordinary state (transparent), but a focus RING alone would
+	   still look inconsistent with every other icon-only control in this row group once
+	   `Button`'s OWN `.btn-quiet:focus-visible` rule is accounted for; matching it exactly
+	   keeps the whole row-actions group looking like one family of controls. */
+	.icon-link:focus-visible {
+		border-color: var(--vh-focus-ring);
+		outline-offset: 0;
 	}
 	/* The name cell must clip, not push. `min-width: 0` overrides the grid item's `auto`
 	   minimum (which refuses to shrink below min-content) and the children ellipsize, so a
