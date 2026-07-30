@@ -2899,6 +2899,16 @@ impl EphemeralDefaultsFile {
     /// misinterpret — the same "hex charset makes this safe today" caveat
     /// `alter_user_sql` documents, for the identical deferred future
     /// (user-chosen passwords, spec D3).
+    ///
+    /// Audit finding M2: `protocol=SOCKET` pins the client to the unix
+    /// socket regardless of the `socket=` line above. Without it, a missing
+    /// or stale socket path is not a hard failure — the `mysql`/`mysqladmin`
+    /// CLI silently falls back to TCP `127.0.0.1:3306`, which may be a
+    /// DIFFERENT mysqld already listening there (spec Owner Caveat 1:
+    /// Homebrew's own `brew services mysql@8.4` unit binds the identical
+    /// port with no root password) — handing that unrelated server this
+    /// app's stored credential over the wire instead of cleanly failing to
+    /// connect.
     fn write(
         socket: &Path,
         password: &openvhost_core::mysql::RootPassword,
@@ -2908,7 +2918,7 @@ impl EphemeralDefaultsFile {
         let name = format!(".mysql-defaults-{}", uuid::Uuid::new_v4().simple());
         let path = run_dir.join(name);
         let contents = format!(
-            "[client]\nuser=root\npassword={}\nsocket={}\n",
+            "[client]\nuser=root\npassword={}\nsocket={}\nprotocol=SOCKET\n",
             password.expose(),
             socket.display()
         );
@@ -3808,6 +3818,23 @@ pub async fn initialize_mysql(
 /// The stored root password for `major` (spec D3's outbound reveal — the
 /// ONE place this crosses IPC, deliberately, for the masked field's
 /// Reveal/Copy affordance).
+///
+/// SECURITY (audit H2): this command is the SOLE place in the entire
+/// codebase sanctioned to de-redact a `RootPassword` into a plain `String`
+/// for a RETURN value. Every other command that touches a stored or
+/// freshly generated credential (`initialize_mysql`,
+/// `reset_mysql_root_password`, `verify_mysql_connection`) sends it only to
+/// a child's stdin or an ephemeral 0600 defaults-file
+/// (`EphemeralDefaultsFile`), never back across IPC — see `RootPassword::expose`'s
+/// own doc comment for that discipline. This command's `Result` must NEVER
+/// be logged: verified today by grep — no Tauri command-result logging
+/// exists anywhere in this codebase (nothing wraps
+/// `specta_builder.invoke_handler()`/`tauri::Builder::invoke_handler` with a
+/// tracing/logging layer of any kind, and neither `log`/`tracing` nor any
+/// equivalent crate is even a dependency of this crate). This comment is the
+/// tripwire for the day someone adds one: such a layer MUST special-case
+/// this command (or, better, generically redact every `String`-typed
+/// command result) before it ships.
 #[tauri::command]
 #[specta::specta]
 pub async fn mysql_root_password(
@@ -4047,6 +4074,29 @@ mod mysql_ipc_tests {
         assert!(
             !path.exists(),
             "the partially-written file must be removed when the write fails"
+        );
+    }
+
+    // ---- EphemeralDefaultsFile (audit finding M2) ----
+
+    /// Audit finding M2: without an explicit `protocol=SOCKET`, a missing or
+    /// wrong `socket=` line lets the `mysql`/`mysqladmin` CLI silently fall
+    /// back to TCP `127.0.0.1:3306` — which may be a DIFFERENT mysqld (e.g.
+    /// Homebrew's own `brew services` instance, spec Owner Caveat 1) — and
+    /// hand it this app's stored root credential. Pinning the protocol
+    /// closes that fallback: the client refuses to try TCP at all.
+    #[test]
+    fn ephemeral_defaults_file_pins_the_client_to_the_unix_socket_protocol() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("run").join("mysql-8.4.sock");
+        let password = openvhost_core::mysql::generate_root_password();
+
+        let file = EphemeralDefaultsFile::write(&socket, &password).unwrap();
+
+        let contents = std::fs::read_to_string(&file.path).unwrap();
+        assert!(
+            contents.lines().any(|l| l == "protocol=SOCKET"),
+            "got {contents:?}"
         );
     }
 

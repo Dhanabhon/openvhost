@@ -111,7 +111,7 @@ impl EphemeralDefaultsFile {
         let name = format!(".mysql-defaults-{}", uuid::Uuid::new_v4().simple());
         let path = run_dir.join(name);
         let contents = format!(
-            "[client]\nuser=root\npassword={}\nsocket={}\n",
+            "[client]\nuser=root\npassword={}\nsocket={}\nprotocol=SOCKET\n",
             password.expose(),
             socket.display()
         );
