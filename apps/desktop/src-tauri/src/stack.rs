@@ -77,6 +77,7 @@ pub struct StackPaths {
 /// (`macos_stack`) is platform-specific today; this row-shape function is
 /// not.
 pub fn php_fpm_spec(home: &Path, rt: &PhpRuntime) -> ServiceSpec {
+    ensure_php_fpm_log_dir(home, &rt.major);
     ServiceSpec {
         id: format!("php-fpm-{}", rt.major),
         display_name: format!("PHP-FPM {}", rt.major),
@@ -99,6 +100,42 @@ pub fn php_fpm_spec(home: &Path, rt: &PhpRuntime) -> ServiceSpec {
         // byte-for-byte unchanged.
         readiness: ReadinessProbe::default(),
         grace: DEFAULT_GRACE,
+    }
+}
+
+/// Best-effort, log-don't-fail (mirrors `provision_home`'s own error
+/// handling at every call site in this file, and `mysql_spec`'s
+/// `ensure_custom_confd` below): a failure to create this directory must
+/// never stop a `ServiceSpec` from being built and registered — the spec
+/// itself is just data, and refusing to hand one back because of THIS side
+/// effect would take away the honest `Failed` state a real spawn failure
+/// already provides. `create_dir_all` is a no-op when the directory already
+/// exists, so this costs nothing on the normal path.
+///
+/// Needed because php-fpm creates its `error_log` FILE but not the
+/// directory containing it (P1 live-log-viewer design, spec D1/D2): this
+/// function runs at cold-start registration and PHP-install/rescan time,
+/// which can precede `openvhost_core::site::apply::commit` (the OTHER place
+/// this same directory gets created, as part of an actual Apply) for a
+/// freshly discovered major.
+///
+/// A `PhpVersion::parse` failure is swallowed the same best-effort way:
+/// `major` is a raw probed string here, not yet validated, and a malformed
+/// one must not stop the row from registering — it fails loudly later, at
+/// spawn, exactly as it would have before this function existed.
+fn ensure_php_fpm_log_dir(home: &Path, major: &str) {
+    let Ok(major) = openvhost_core::PhpVersion::parse(major) else {
+        return;
+    };
+    let error_log = openvhost_core::LogPaths::new(home).php_fpm_error(&major);
+    let Some(dir) = error_log.parent() else {
+        return; // structurally unreachable — see `LogPaths::php_fpm_error`
+    };
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        eprintln!(
+            "php-fpm: failed to ensure the log directory {} exists: {e}",
+            dir.display()
+        );
     }
 }
 
@@ -365,7 +402,9 @@ pub fn macos_stack() -> MacosStack {
             program: brew.nginx.clone(),
             args: vec![
                 OsString::from("-e"),
-                home.join("logs/nginx.error.log").into_os_string(),
+                openvhost_core::LogPaths::new(&home)
+                    .nginx_error()
+                    .into_os_string(),
                 OsString::from("-c"),
                 nginx_conf.clone().into_os_string(),
             ],
@@ -431,6 +470,41 @@ mod tests {
             custom_confd.is_dir(),
             "mysql_spec must ensure the custom conf.d directory exists before its \
              ServiceSpec is ever handed to the supervisor"
+        );
+    }
+
+    /// Mirrors `mysql_spec_ensures_the_custom_confd_directory_exists`.
+    /// Without this, the P1 live-log-viewer bug fix (php-fpm's `error_log`
+    /// moving to a per-major directory) means every existing install's
+    /// php-fpm refuses to start the moment it ships:
+    /// `openvhost_core::site::apply::commit` only creates this directory as
+    /// part of an actual Apply, but `php_fpm_spec` also runs at cold-start
+    /// registration and PHP-install/rescan time, which can precede any
+    /// Apply for a freshly discovered major.
+    #[test]
+    fn php_fpm_spec_ensures_the_log_directory_exists() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        let rt = PhpRuntime {
+            major: "8.4".to_string(),
+            fpm_bin: PathBuf::from("/opt/homebrew/opt/php@8.4/sbin/php-fpm"),
+        };
+        let dir = openvhost_core::LogPaths::new(home)
+            .php_fpm_error(&openvhost_core::PhpVersion::parse("8.4").expect("valid major"))
+            .parent()
+            .expect("php_fpm_error always has a parent")
+            .to_path_buf();
+        assert!(
+            !dir.exists(),
+            "must not exist before the call for this test to prove anything"
+        );
+
+        let _spec = php_fpm_spec(home, &rt);
+
+        assert!(
+            dir.is_dir(),
+            "php_fpm_spec must ensure the log directory exists before its ServiceSpec is \
+             ever handed to the supervisor"
         );
     }
 

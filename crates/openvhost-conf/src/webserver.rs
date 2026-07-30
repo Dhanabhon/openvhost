@@ -130,6 +130,14 @@ impl WebServerAdapter for NginxAdapter {
             &format!("{home_str}/config/custom/sites"),
         );
         tc.insert("pid_path", &format!("{home_str}/run/nginx.pid"));
+        // UNCHANGED values (P1 live-log-viewer design, spec D1: nginx's
+        // globals are deliberately NOT relocated). This crate cannot depend
+        // on `openvhost-core` (core depends on conf), so
+        // `openvhost_core::logs::LogPaths::nginx_error`/`nginx_access`
+        // derive these same two strings independently for the core/desktop
+        // side; kept in sync by that module's own
+        // `nginx_log_values_match_the_confs_independent_render` test, which
+        // renders through this exact function and compares.
         tc.insert("error_log", &format!("{home_str}/logs/nginx.error.log"));
         tc.insert("access_log", &format!("{home_str}/logs/nginx.access.log"));
         tc.insert("temp_dir", &format!("{home_str}/run/nginx"));
@@ -257,6 +265,10 @@ impl WebServerAdapter for NginxAdapter {
                 source: e,
             })?;
         }
+        // `ctx.home` here is the THROWAWAY validation home this fn's own doc
+        // comment requires — scratch plumbing for `nginx -t`, not the live
+        // log path `openvhost_core::logs::LogPaths` owns, so it is not
+        // routed through it.
         let err_log = ctx.home.join("logs/nginx.error.log");
         let out = tokio::process::Command::new(bin)
             .arg("-e")

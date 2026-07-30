@@ -814,7 +814,7 @@ pub async fn apply_config(
 
     let validator = openvhost_core::NginxValidator {
         bin: stack.nginx_bin.clone(),
-        err_log: stack.home.join("logs/nginx.error.log"),
+        err_log: openvhost_core::LogPaths::new(&stack.home).nginx_error(),
     };
     let outcome = openvhost_core::apply(&p, &validator).await?;
 
@@ -1065,10 +1065,7 @@ impl WebServerBrand {
             Self::Nginx => Ok(ValidationTarget::NginxT {
                 bin: &paths.nginx_bin,
                 conf: &paths.nginx_conf,
-                // Third occurrence of this literal in the crate; folding the three
-                // behind a `StackPaths::nginx_error_log()` accessor is a recorded
-                // follow-up rather than part of this wave.
-                err_log: paths.home.join("logs/nginx.error.log"),
+                err_log: openvhost_core::LogPaths::new(&paths.home).nginx_error(),
             }),
             // Unreachable while `Nginx` is the only `supported()` brand: the gate
             // above already returned. Deliberately an error and not
@@ -1231,7 +1228,7 @@ pub async fn list_web_servers(
     // `-e` is mandatory on EVERY nginx invocation, `-v` included, so that nothing
     // this app runs can write into nginx's compiled-in prefix instead of our home
     // — see `openvhost_conf::probe_nginx_version`'s own doc comment.
-    let err_log = p.home.join("logs/nginx.error.log");
+    let err_log = openvhost_core::LogPaths::new(&p.home).nginx_error();
     let version = openvhost_conf::probe_nginx_version(&p.nginx_bin, &err_log).await;
     // `tokio::fs`, not `Path::exists()`: a sync stat pins a tokio WORKER, and an
     // OPENVHOST_HOME on a stalled network mount would take the supervisor event

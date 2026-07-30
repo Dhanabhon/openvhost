@@ -51,7 +51,19 @@ impl PhpRuntimeAdapter for PhpFpmRuntime {
             "custom_pool_dir",
             &format!("{home_str}/config/custom/php/{major}/pool.d"),
         );
-        tc.insert("error_log", &format!("{home_str}/logs/php-fpm.log"));
+        // Per-major, not shared: every major used to point at one
+        // `logs/php-fpm.log`, so a line in it could never be attributed to a
+        // pool (P1 live-log-viewer design, spec D1). This crate cannot
+        // depend on `openvhost-core` (core depends on conf), so this value
+        // is derived independently here rather than via
+        // `openvhost_core::logs::LogPaths::php_fpm_error` — the two are kept
+        // in sync by that module's own
+        // `php_fpm_error_matches_the_confs_independent_render` test, which
+        // renders through this exact function and compares.
+        tc.insert(
+            "error_log",
+            &format!("{home_str}/logs/services/php-fpm-{major}/error.log"),
+        );
         tc.insert("socket", &socket);
         tc.insert(
             "custom_pool_glob",
@@ -85,8 +97,13 @@ impl PhpRuntimeAdapter for PhpFpmRuntime {
             });
         };
         crate::validate::materialize(std::slice::from_ref(&pool))?;
-        // php-fpm -t only needs logs/ to pre-exist (for error_log).
-        let logs = ctx.home.join("logs");
+        // php-fpm -t only needs the per-major log directory to pre-exist
+        // (for error_log) — mirrors `generate_pool_config`'s own comment on
+        // why this crate derives the path independently rather than via
+        // `openvhost_core::logs::LogPaths::php_fpm_error`.
+        let logs = ctx
+            .home
+            .join(format!("logs/services/php-fpm-{}", ctx.php_major));
         std::fs::create_dir_all(&logs).map_err(|e| ConfError::Io {
             op: "create_dir",
             path: logs,
@@ -144,7 +161,7 @@ mod tests {
         let c = &f.contents;
         assert!(c.starts_with("; "), "php-fpm banner MUST be ;-style, not #");
         assert!(c.contains("DO NOT EDIT"));
-        assert!(c.contains("error_log = /tmp/ovh/logs/php-fpm.log"));
+        assert!(c.contains("error_log = /tmp/ovh/logs/services/php-fpm-8.4/error.log"));
         assert!(c.contains("listen = /tmp/ovh/run/php-fpm.sock"));
         assert!(c.contains("pm.max_children = 4"));
         // Stated explicitly rather than relied on as php-fpm's own default —
@@ -159,5 +176,74 @@ mod tests {
         // shell exports) would be visible to every script the pool runs.
         assert!(c.contains("clear_env = yes"));
         assert!(c.contains("include=/tmp/ovh/config/custom/php/8.4/pool.d/*.conf"));
+    }
+
+    /// The bug this task fixes: every php-fpm major used to point at ONE
+    /// shared `logs/php-fpm.log`, so a line in it could never be attributed
+    /// to a pool. Rendering the same upstream for two different majors must
+    /// produce two different `error_log` lines.
+    #[test]
+    fn pool_config_error_log_differs_per_major() {
+        let upstream = PhpUpstream::UnixSocket(PathBuf::from("/tmp/ovh/run/php-fpm.sock"));
+        let render = |major: &str| {
+            PhpFpmRuntime
+                .generate_pool_config(&PathBuf::from("/tmp/ovh"), major, &upstream)
+                .unwrap()
+                .unwrap()
+                .contents
+        };
+        let a = render("8.3");
+        let b = render("8.4");
+        let error_log_line = |c: &str| {
+            c.lines()
+                .find(|l| l.starts_with("error_log"))
+                .unwrap_or_else(|| panic!("no error_log line in:\n{c}"))
+                .to_string()
+        };
+        let (line_a, line_b) = (error_log_line(&a), error_log_line(&b));
+        assert_ne!(
+            line_a, line_b,
+            "both majors rendered the same error_log line"
+        );
+        assert!(line_a.contains("php-fpm-8.3"), "got {line_a:?}");
+        assert!(line_b.contains("php-fpm-8.4"), "got {line_b:?}");
+    }
+
+    /// P1 live-log-viewer bug fix: `validate()` used to only ensure the FLAT
+    /// `logs/` directory existed, which sufficed while `error_log` lived
+    /// directly under it. Now that it is per-major, a real `php-fpm -t`
+    /// fails before it ever reaches whatever the pool config says: "failed
+    /// to open error_log ... No such file or directory". A fake binary is
+    /// enough to prove `validate()` creates the directory itself — its exit
+    /// code is irrelevant to what this test checks.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn validate_creates_the_per_major_log_directory_before_invoking_the_binary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().to_path_buf();
+        let ctx = RenderCtx::new(
+            home.clone(),
+            "myapp.localhost",
+            home.join("www"),
+            "127.0.0.1:8080".parse().unwrap(),
+            "8.4",
+            PhpUpstream::UnixSocket(home.join("run/php-fpm.sock")),
+            "php_myapp",
+        )
+        .unwrap();
+
+        let bin = home.join("fake-php-fpm");
+        std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        PhpFpmRuntime.validate(&bin, &ctx).await.unwrap();
+
+        let dir = home.join("logs/services/php-fpm-8.4");
+        assert!(
+            dir.is_dir(),
+            "{dir:?} must exist — php-fpm creates the error_log FILE but not its directory"
+        );
     }
 }

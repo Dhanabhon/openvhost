@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 
 use openvhost_conf::GeneratedFile;
 
-use super::{ApplyError, ApplyInput, render_set};
+use crate::{LogPaths, PhpVersion};
+
+use super::{ApplyError, ApplyInput, PhpRuntime, render_set};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeKind {
@@ -33,9 +35,57 @@ pub struct FileChange {
 pub struct ApplyPlan {
     pub gen_root: PathBuf,
     pub main_conf: PathBuf,
+    /// The php-fpm per-major log directory for every INSTALLED PHP runtime
+    /// (`render_set` renders a pool config for each one regardless of
+    /// whether any site currently uses it), so `commit()` can create it
+    /// before that config ever points a php-fpm process at a file inside it.
+    ///
+    /// A narrow, targeted fix, not the general mechanism: this crate's P1
+    /// live-log-viewer bug fix moved php-fpm's `error_log` from a flat
+    /// `<home>/logs/php-fpm.log` (whose parent, `logs/`, `provision_home`
+    /// already creates) to `<home>/logs/services/php-fpm-<major>/error.log`
+    /// — one directory LEVEL DEEPER, per major, which nothing else yet
+    /// creates. Without this, every existing install breaks the moment that
+    /// fix ships: php-fpm refuses to start at all ("failed to open
+    /// error_log ... No such file or directory"). The P1 design (spec D2)
+    /// plans a fuller `log_dirs` mechanism covering the NEW per-site
+    /// directories too (`logs/sites/<domain>/`, `0700`, `provision_home`
+    /// seeding) — this field covers only what THIS fix requires, computed
+    /// the same read-only way `plan()` computes everything else, and is
+    /// expected to be folded into that fuller mechanism when it lands.
+    pub php_fpm_log_dirs: Vec<PathBuf>,
     /// Sorted by path. EMPTY means the disk already matches the sites — that
     /// is exactly the condition the banner hides on.
     pub changes: Vec<FileChange>,
+}
+
+/// See [`ApplyPlan::php_fpm_log_dirs`]. Pure path arithmetic — no I/O — so
+/// `plan()` stays read-only. `PhpVersion::parse` is not expected to fail for
+/// an already-probed, already-installed runtime major; if it somehow does,
+/// this fails the whole plan rather than silently dropping that major's
+/// directory (and therefore its ability to start).
+fn php_fpm_log_dirs(home: &Path, php: &[PhpRuntime]) -> Result<Vec<PathBuf>, ApplyError> {
+    let paths = LogPaths::new(home);
+    php.iter()
+        .map(|rt| {
+            let major = PhpVersion::parse(&rt.major)?;
+            let error_log = paths.php_fpm_error(&major);
+            error_log.parent().map(Path::to_path_buf).ok_or_else(|| {
+                // Structurally unreachable — `php_fpm_error` always nests at
+                // least `services/php-fpm-<major>/error.log` below `root`,
+                // so it always has a parent — but an honest error beats
+                // `unwrap`/`expect` for a case the compiler cannot itself
+                // rule out.
+                ApplyError::Io {
+                    op: "parent",
+                    path: error_log.clone(),
+                    source: std::io::Error::other(
+                        "LogPaths::php_fpm_error returned a path with no parent directory",
+                    ),
+                }
+            })
+        })
+        .collect()
 }
 
 /// Read a generated-config path if it exists, refusing anything that is not a
@@ -255,6 +305,7 @@ pub fn plan(input: &ApplyInput) -> Result<ApplyPlan, ApplyError> {
     Ok(ApplyPlan {
         main_conf: gen_root.join("nginx/nginx.conf"),
         gen_root,
+        php_fpm_log_dirs: php_fpm_log_dirs(&input.home, &input.runtimes.php)?,
         changes,
     })
 }
@@ -508,6 +559,40 @@ mod tests {
         }
         // The file outside the generated tree must be completely untouched.
         assert!(outside.join("victim.conf").exists());
+    }
+
+    /// P1 live-log-viewer bug fix (Task 1): moving php-fpm's `error_log` to a
+    /// per-major directory means `plan()` must now also report that
+    /// directory per installed major — see `ApplyPlan::php_fpm_log_dirs`'s
+    /// doc comment for why. `plan()` must stay read-only, so neither
+    /// directory may exist on disk merely from calling it.
+    #[test]
+    fn php_fpm_log_dirs_cover_every_installed_major_and_touch_no_disk() {
+        let home = tempfile::tempdir().unwrap();
+        let i = input_with_home(
+            home.path(),
+            vec![site("app", "app.localhost", "8.4", true)],
+            &["8.3", "8.4"],
+        );
+        let p = plan(&i).unwrap();
+
+        let paths = crate::LogPaths::new(home.path());
+        let expected_dir = |major: &str| {
+            paths
+                .php_fpm_error(&crate::PhpVersion::parse(major).unwrap())
+                .parent()
+                .unwrap()
+                .to_path_buf()
+        };
+        let mut want = vec![expected_dir("8.3"), expected_dir("8.4")];
+        want.sort();
+        let mut got = p.php_fpm_log_dirs.clone();
+        got.sort();
+        assert_eq!(got, want);
+
+        for dir in &p.php_fpm_log_dirs {
+            assert!(!dir.exists(), "{dir:?} must not be created by plan() alone");
+        }
     }
 
     #[test]

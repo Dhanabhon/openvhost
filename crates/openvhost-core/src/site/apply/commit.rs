@@ -72,6 +72,15 @@ fn remove_if_exists(path: &Path) -> Result<(), ApplyError> {
 }
 
 pub fn commit(plan: &ApplyPlan) -> Result<(), ApplyError> {
+    // Ahead of writing any pool config: see `ApplyPlan::php_fpm_log_dirs`'s
+    // doc comment for why php-fpm cannot start at all without this.
+    for dir in &plan.php_fpm_log_dirs {
+        std::fs::create_dir_all(dir).map_err(|source| ApplyError::Io {
+            op: "create_dir_all",
+            path: dir.clone(),
+            source,
+        })?;
+    }
     for c in &plan.changes {
         match c.kind {
             ChangeKind::Added | ChangeKind::Modified => {
@@ -309,6 +318,7 @@ mod tests {
         let plan = ApplyPlan {
             gen_root: home.path().join("config/generated"),
             main_conf: home.path().join("config/generated/nginx/nginx.conf"),
+            php_fpm_log_dirs: vec![],
             changes: vec![FileChange {
                 path: path.clone(),
                 kind: ChangeKind::Removed,
@@ -347,6 +357,25 @@ mod tests {
             leftovers.is_empty(),
             "temp files must not survive: {leftovers:?}"
         );
+    }
+
+    /// P1 live-log-viewer bug fix (Task 1): without this, every install
+    /// breaks the moment php-fpm's `error_log` moves to a per-major
+    /// directory — see `ApplyPlan::php_fpm_log_dirs`'s doc comment. No site
+    /// is needed to reproduce it: the pool config is rendered for every
+    /// INSTALLED runtime regardless of whether a site uses it yet
+    /// (`render_set`), so an empty site list still exercises this.
+    #[test]
+    fn commit_creates_the_php_fpm_log_directory_before_anything_needs_it() {
+        let home = tempfile::tempdir().unwrap();
+        let i = input_with_home(home.path(), vec![], &["8.4"]);
+        commit(&make_plan(&i).unwrap()).unwrap();
+        let dir = crate::LogPaths::new(home.path())
+            .php_fpm_error(&crate::PhpVersion::parse("8.4").unwrap())
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        assert!(dir.is_dir(), "{dir:?} must exist after commit()");
     }
 
     #[cfg(unix)]
