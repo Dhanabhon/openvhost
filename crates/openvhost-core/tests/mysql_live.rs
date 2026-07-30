@@ -87,6 +87,11 @@ const TEMP_SERVER_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const SUPERVISOR_READY_DEADLINE: Duration = Duration::from_secs(15);
 /// Spec D4's stop grace (SIGTERM must succeed well inside this).
 const SUPERVISOR_GRACE: Duration = Duration::from_secs(15);
+/// How many of a captured child's most recent output lines a failure message
+/// embeds (live-run finding #2's failure-reporting fix): enough to show a
+/// real mysqld's own fatal-error banner without dumping an unbounded startup
+/// log into a panic message.
+const OUTPUT_TAIL_LINES: usize = 20;
 
 // ---------------------------------------------------------------------------
 // RAII guards — never leak a real child on an early return or a panic.
@@ -224,15 +229,22 @@ fn mysqladmin_ping_argv(mysqladmin: &Path, socket: &Path) -> Vec<String> {
     ]
 }
 
-/// `mysqld --defaults-file=<my_cnf> --initialize-insecure --datadir=<staging>`
-/// (spec D2 step 1). Mirrors `commands.rs::mysqld_init_spec`.
-fn mysqld_init_spec(mysqld: &Path, my_cnf: &Path, staging: &Path) -> SpawnSpec {
+/// `mysqld --no-defaults --initialize-insecure --datadir=<staging>` (spec D2
+/// step 1). Mirrors `commands.rs::mysqld_init_spec`.
+///
+/// Live-run finding #2 (bisected against real mysqld 8.4.11): this used to
+/// pass `--defaults-file=<my_cnf>` (whose `datadir` names the FINAL datadir)
+/// ALONGSIDE argv `--datadir=<staging>` — mysqld resolved the two
+/// inconsistently across init/start, corrupting InnoDB's undo-tablespace
+/// bookkeeping. `--no-defaults` plus fully explicit argv removes the
+/// ambiguity: nothing pre-`finalize_staging` ever reads `my.cnf`'s `datadir`.
+fn mysqld_init_spec(mysqld: &Path, staging: &Path) -> SpawnSpec {
     let mut datadir_arg = OsString::from("--datadir=");
     datadir_arg.push(staging.as_os_str());
     SpawnSpec {
         program: mysqld.to_path_buf(),
         args: vec![
-            defaults_file_arg(my_cnf),
+            OsString::from("--no-defaults"),
             OsString::from("--initialize-insecure"),
             datadir_arg,
         ],
@@ -241,21 +253,20 @@ fn mysqld_init_spec(mysqld: &Path, my_cnf: &Path, staging: &Path) -> SpawnSpec {
     }
 }
 
-/// `mysqld --defaults-file=<my_cnf> --datadir=<staging> --skip-networking
+/// `mysqld --no-defaults --datadir=<staging> --skip-networking
 /// --socket=<init_socket>` (spec D2 step 2). Mirrors
-/// `commands.rs::mysqld_temp_server_spec`.
-fn mysqld_temp_server_spec(
-    mysqld: &Path,
-    my_cnf: &Path,
-    staging: &Path,
-    init_socket: &Path,
-) -> SpawnSpec {
+/// `commands.rs::mysqld_temp_server_spec`. Same no-`--defaults-file`
+/// reasoning as [`mysqld_init_spec`] above — this is the step whose
+/// datadir/argv mismatch was actually OBSERVED failing live (InnoDB
+/// undo-tablespace error at StartTempServer, "Can't create UNDO tablespace
+/// innodb_undo_001 since './undo_001' already exists").
+fn mysqld_temp_server_spec(mysqld: &Path, staging: &Path, init_socket: &Path) -> SpawnSpec {
     let mut datadir_arg = OsString::from("--datadir=");
     datadir_arg.push(staging.as_os_str());
     SpawnSpec {
         program: mysqld.to_path_buf(),
         args: vec![
-            defaults_file_arg(my_cnf),
+            OsString::from("--no-defaults"),
             datadir_arg,
             OsString::from("--skip-networking"),
             socket_arg(init_socket),
@@ -316,6 +327,17 @@ fn port_in_use(port: u16) -> bool {
         Duration::from_millis(200),
     )
     .is_ok()
+}
+
+/// The last `n` lines of `lines`, joined — bounds how much captured child
+/// output a failure message embeds. Live-run finding #2's failure-reporting
+/// fix: every step's panic now calls this rather than omitting captured
+/// output entirely (the StartTempServer failure that motivated this cost a
+/// blind debugging round precisely because its panic had nothing captured
+/// to show).
+fn tail(lines: &[String], n: usize) -> String {
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
 }
 
 /// Mirrors `openvhost-proc/tests/readiness.rs::pid_is_alive`.
@@ -379,7 +401,18 @@ async fn discover_target_runtime() -> Option<MysqlRuntime> {
 /// `run_bounded`'s fixed 5s `PROBE_TIMEOUT` (meant for short admin-CLI
 /// calls), `mysqld --initialize-insecure` can legitimately take a few
 /// seconds, so this accepts its own, more generous bound.
-async fn run_to_completion(spec: SpawnSpec, timeout: Duration) -> Result<Option<i32>, String> {
+///
+/// Returns the exit code (or `None` if killed by a signal) ALONGSIDE every
+/// captured stdout/stderr line — live-run finding #2's failure-reporting
+/// fix: the OLD version only surfaced captured output on a TIMEOUT, so a
+/// real mysqld's own fatal-error banner on a non-zero exit (exactly what
+/// `--initialize-insecure` would print) was silently dropped, leaving the
+/// caller's own exit-code assertion with nothing to show. The caller decides
+/// how much of `lines` to embed (via `tail`) in its own message.
+async fn run_to_completion(
+    spec: SpawnSpec,
+    timeout: Duration,
+) -> Result<(Option<i32>, Vec<String>), String> {
     let program = spec.program.display().to_string();
     let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
     let drain = tokio::spawn(async move {
@@ -394,11 +427,11 @@ async fn run_to_completion(spec: SpawnSpec, timeout: Duration) -> Result<Option<
     let result = tokio::time::timeout(timeout, run_task(default_driver(), spec, tx)).await;
     let lines = drain.await.unwrap_or_default();
     match result {
-        Ok(Ok(code)) => Ok(code),
+        Ok(Ok(code)) => Ok((code, lines)),
         Ok(Err(e)) => Err(format!("{program} failed to run: {e}")),
         Err(_) => Err(format!(
             "{program} did not finish within {timeout:?}; last output:\n{}",
-            lines.join("\n")
+            tail(&lines, OUTPUT_TAIL_LINES)
         )),
     }
 }
@@ -442,15 +475,28 @@ async fn poll_until_ready(
     }
 }
 
-/// Drains a pipe to completion, discarding its content — this test only
-/// needs the temp server's EXIT CODE and the ping/ALTER/shutdown call
-/// results, never its own stdout/stderr. Without draining, a chatty startup
-/// could fill the pipe and stall the child (mirrors
+/// Drains a pipe to completion, appending each line to `into` (shared with
+/// the OTHER stream of the same child, so stdout and stderr interleave into
+/// one chronological-ish tail). Without draining, a chatty startup could
+/// fill the pipe and stall the child (mirrors
 /// `service_task::spawn_reader`'s hands-off drain).
-async fn drain_silently(stream: OutputStream) {
+///
+/// Live-run finding #2's failure-reporting fix: this REPLACES a previous
+/// `drain_silently`, which discarded everything on the theory that the temp
+/// server's own stdout/stderr was never needed — the StartTempServer
+/// failure that motivated this fix proved that theory wrong: mysqld's own
+/// fatal-error banner (the InnoDB undo-tablespace error) landed on this
+/// EXACT stream, and discarding it meant the failing panic had nothing to
+/// show, costing a blind debugging round. The caller bounds how much of
+/// `into` it embeds in a panic message via `tail`.
+async fn drain_capturing(stream: OutputStream, into: Arc<std::sync::Mutex<Vec<String>>>) {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let mut lines = BufReader::new(stream).lines();
-    while let Ok(Some(_line)) = lines.next_line().await {}
+    while let Ok(Some(line)) = lines.next_line().await {
+        into.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(line);
+    }
 }
 
 /// Mirrors `mysql_admin.rs::mysql_exec_with_defaults_file`:
@@ -553,21 +599,21 @@ async fn run_staged_init(
     }
 
     // ---- Initialize (step 1) ----
-    let init_spec = mysqld_init_spec(&runtime.mysqld, &paths.my_cnf, &staging);
-    let init_code = run_to_completion(init_spec, INITIALIZE_TIMEOUT)
+    let init_spec = mysqld_init_spec(&runtime.mysqld, &staging);
+    let (init_code, init_output) = run_to_completion(init_spec, INITIALIZE_TIMEOUT)
         .await
         .unwrap_or_else(|e| panic!("Initialize: {e}"));
     assert_eq!(
         init_code,
         Some(0),
-        "Initialize: mysqld --initialize-insecure must exit 0, got {init_code:?}"
+        "Initialize: mysqld --initialize-insecure must exit 0, got {init_code:?}; last output:\n{}",
+        tail(&init_output, OUTPUT_TAIL_LINES)
     );
 
     // ---- StartTempServer (step 2) ----
     let run_dir = paths.init_socket.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(run_dir).expect("failed to create the run directory");
-    let temp_spec =
-        mysqld_temp_server_spec(&runtime.mysqld, &paths.my_cnf, &staging, &paths.init_socket);
+    let temp_spec = mysqld_temp_server_spec(&runtime.mysqld, &staging, &paths.init_socket);
     let driver = default_driver();
     let mut server = TempServerGuard {
         driver: Arc::clone(&driver),
@@ -576,12 +622,25 @@ async fn run_staged_init(
             .expect("StartTempServer: failed to spawn the temp server"),
         finished: false,
     };
+    // Shared, captured (not discarded — live-run finding #2's
+    // failure-reporting fix): a real mysqld's own fatal-error banner (the
+    // InnoDB undo-tablespace error that motivated this fix) lands on THESE
+    // exact streams, so every panic below that could plausibly be caused by
+    // the temp server itself embeds a tail of this buffer.
+    let temp_server_output: Arc<std::sync::Mutex<Vec<String>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
     if let Some(out) = server.child.take_stdout() {
-        tokio::spawn(drain_silently(out));
+        tokio::spawn(drain_capturing(out, Arc::clone(&temp_server_output)));
     }
     if let Some(err) = server.child.take_stderr() {
-        tokio::spawn(drain_silently(err));
+        tokio::spawn(drain_capturing(err, Arc::clone(&temp_server_output)));
     }
+    let temp_server_tail = || {
+        let captured = temp_server_output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tail(&captured, OUTPUT_TAIL_LINES)
+    };
 
     let ready = poll_until_ready(
         &runtime.mysqladmin,
@@ -595,7 +654,9 @@ async fn run_staged_init(
         let _ = server.child.wait().await;
         server.finished = true;
         panic!(
-            "StartTempServer: the temp server never answered mysqladmin ping within {TEMP_SERVER_READY_TIMEOUT:?}"
+            "StartTempServer: the temp server never answered mysqladmin ping within \
+             {TEMP_SERVER_READY_TIMEOUT:?}; last output:\n{}",
+            temp_server_tail()
         );
     }
 
@@ -681,7 +742,11 @@ async fn run_staged_init(
             let _ = driver.kill(&mut server.child);
             let _ = server.child.wait().await;
             server.finished = true;
-            panic!("Shutdown: the temp server did not exit after mysqladmin shutdown succeeded");
+            panic!(
+                "Shutdown: the temp server did not exit after mysqladmin shutdown succeeded; \
+                 last output:\n{}",
+                temp_server_tail()
+            );
         }
     }
 
