@@ -1936,28 +1936,58 @@ pub struct InstallLock {
 }
 
 /// Which of the commands sharing [`InstallLock`] currently occupies its
-/// slot. Exists purely so `pending_php_install` — the pre-existing "is a PHP
-/// install running" signal the quit-confirmation dialog reads
-/// (`+layout.svelte`'s `installingMajor`, rendered by `QuitDialog.svelte` as
-/// literally `PHP {value} is still installing.`) — can keep answering the
-/// EXACT question its name promises now that the slot is shared with
-/// MySQL's install/init runs too: a MySQL label occupying the slot must
-/// never be handed to that PHP-specific sentence. Generalizing the dialog's
-/// own copy to a kind-agnostic sentence is left to the Databases UI slice
-/// (Task 6), which is the one that actually adds a user-visible "MySQL
-/// install/initialize in progress" affordance; until then, this keeps the
-/// pre-existing PHP-only copy correct BY CONSTRUCTION rather than by
-/// convention.
+/// slot.
+///
+/// Review fix wave, Important 1: this used to gate only a PHP-specific
+/// query (`pending_php_install`/`running_php_major`, both replaced by
+/// [`InstallLock::running_install`]/`pending_install` below) whose own doc
+/// comment deferred generalizing the quit dialog's copy to "the Databases UI
+/// slice (Task 6)" — until this fix, a MySQL install or initialization in
+/// flight was therefore invisible to the quit-confirmation dialog entirely
+/// (`+layout.svelte`'s `pendingInstall`, rendered by `QuitDialog.svelte` as
+/// either `PHP {label} is still installing.` or
+/// `MySQL {label} is still installing.`), the same class of bug as a
+/// service quitting mid-work with no warning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InstallKind {
     Php,
     Mysql,
 }
 
+/// Wire-safe copy of [`InstallKind`] for [`PendingInstallDto`] — `InstallKind`
+/// itself carries no `specta::Type`/`Serialize`; it is purely an internal
+/// discriminator for `InstallLock`'s slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub enum InstallKindDto {
+    Php,
+    Mysql,
+}
+
+impl From<InstallKind> for InstallKindDto {
+    fn from(kind: InstallKind) -> Self {
+        match kind {
+            InstallKind::Php => Self::Php,
+            InstallKind::Mysql => Self::Mysql,
+        }
+    }
+}
+
+/// What [`pending_install`] reports: which kind of install/init occupies
+/// `InstallLock`'s shared slot, and its label — e.g. `"8.4"` for a PHP
+/// install, `"MySQL 8.4"` for a MySQL install, `"MySQL 8.4 initialization"`
+/// for an init run (see `install_php`/`install_mysql`/`initialize_mysql`'s
+/// own `set_running` calls for the exact shapes).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, specta::Type)]
+pub struct PendingInstallDto {
+    pub kind: InstallKindDto,
+    pub label: String,
+}
+
 /// The kind, label, and abort handle of the one install/init run
 /// `InstallLock` may have in flight, so `perform_quit` can abort it and
-/// `pending_php_install` can tell the user what PHP major they are about to
-/// lose (never a MySQL label — see [`InstallKind`]).
+/// `pending_install` can tell the user what they are about to lose,
+/// regardless of kind.
 struct RunningInstall {
     kind: InstallKind,
     label: String,
@@ -1989,29 +2019,26 @@ impl InstallLock {
         *slot = None;
     }
 
-    /// The PHP major currently installing, if the slot's occupant is a PHP
-    /// install — `None` both when nothing is running AND when a MySQL
-    /// install/init occupies the slot instead. The quit dialog's copy reads
-    /// this through the `pending_php_install` command; see [`InstallKind`]'s
-    /// doc comment for why this filters by kind rather than returning
-    /// whatever label happens to be running.
-    pub(crate) fn running_php_major(&self) -> Option<String> {
+    /// The kind and label of whatever install/init run currently occupies
+    /// the slot, if any — `None` only when nothing is running. The
+    /// generalization (review fix wave Important 1) of the old PHP-only
+    /// `running_php_major`, which used to `.filter(|r| r.kind == InstallKind::Php)`
+    /// here and silently returned `None` for a MySQL occupant. The quit
+    /// dialog's copy reads this through the [`pending_install`] command.
+    pub(crate) fn running_install(&self) -> Option<(InstallKind, String)> {
         self.running
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-            .filter(|r| r.kind == InstallKind::Php)
-            .map(|r| r.label.clone())
+            .map(|r| (r.kind, r.label.clone()))
     }
 
     /// A clone of the in-flight run's abort handle, if any, REGARDLESS of
     /// kind — `perform_quit` must abort a MySQL install/init exactly as
-    /// eagerly as a PHP one, even though (per [`Self::running_php_major`])
-    /// the quit dialog's PHP-specific sentence cannot yet name it.
-    /// `AbortHandle` is cheap to clone (it is a handle, not the task), so
-    /// `perform_quit` can hold its own copy and call
-    /// `.abort()`/`.is_finished()` on it without disturbing whatever the
-    /// owning command itself is doing with the run.
+    /// eagerly as a PHP one. `AbortHandle` is cheap to clone (it is a
+    /// handle, not the task), so `perform_quit` can hold its own copy and
+    /// call `.abort()`/`.is_finished()` on it without disturbing whatever
+    /// the owning command itself is doing with the run.
     pub(crate) fn running_abort_handle(&self) -> Option<tokio::task::AbortHandle> {
         self.running
             .lock()
@@ -2058,17 +2085,24 @@ impl Drop for RunningInstallGuard<'_> {
     }
 }
 
-/// The PHP major currently installing, if any — for the quit dialog: a build
-/// in progress is invisible to `pending_service_ids` (it is not a supervised
-/// service), so without this the confirmation would silently discard it.
-/// `None` when a MySQL install/init occupies `InstallLock`'s shared slot
-/// instead — see `InstallKind`'s doc comment.
+/// Whatever is currently installing or initializing, if anything — for the
+/// quit dialog: a build/init in progress is invisible to
+/// `pending_service_ids` (it is not a supervised service), so without this
+/// the confirmation would silently discard it. Kind-agnostic (review fix
+/// wave Important 1 — see `InstallKind`'s doc comment): PHP and MySQL both
+/// surface here, and `QuitDialog` renders the sentence matching `kind`.
 #[tauri::command]
 #[specta::specta]
-pub async fn pending_php_install(
+pub async fn pending_install(
     lock: tauri::State<'_, InstallLock>,
-) -> Result<Option<String>, IpcError> {
-    Ok(lock.inner().running_php_major())
+) -> Result<Option<PendingInstallDto>, IpcError> {
+    Ok(lock
+        .inner()
+        .running_install()
+        .map(|(kind, label)| PendingInstallDto {
+            kind: kind.into(),
+            label,
+        }))
 }
 
 /// Install a PHP major via Homebrew, streaming its output live, then rescan
@@ -2442,7 +2476,7 @@ mod php_ipc_tests {
             }
         }
         assert!(
-            lock.running_php_major().is_none(),
+            lock.running_install().is_none(),
             "expected the guard's Drop impl to also clear the running slot"
         );
     }
@@ -2472,9 +2506,14 @@ mod php_ipc_tests {
             lock.guard.try_lock().is_err(),
             "install_php's try_lock must fail while a MySQL install holds the guard"
         );
-        // The PHP-specific quit-dialog signal must not see the MySQL label.
-        assert!(lock.running_php_major().is_none());
-        // But the kind-agnostic abort handle (what `perform_quit` uses) must
+        // The kind-agnostic quit-dialog signal must see the MySQL occupant,
+        // correctly tagged (review fix wave Important 1 — the old PHP-only
+        // filter hid a MySQL label entirely instead of tagging it).
+        assert_eq!(
+            lock.running_install(),
+            Some((InstallKind::Mysql, "MySQL 8.4".to_string()))
+        );
+        // The kind-agnostic abort handle (what `perform_quit` uses) must
         // still find something to abort.
         assert!(lock.running_abort_handle().is_some());
 
@@ -2497,9 +2536,55 @@ mod php_ipc_tests {
             lock.guard.try_lock().is_err(),
             "install_mysql's try_lock must fail while a PHP install holds the guard"
         );
-        assert_eq!(lock.running_php_major().as_deref(), Some("8.4"));
+        assert_eq!(
+            lock.running_install(),
+            Some((InstallKind::Php, "8.4".to_string()))
+        );
 
         drop(held);
+    }
+
+    // -------------------------------------------------------------------
+    // pending_install (review fix wave, Important 1): the kind-agnostic
+    // quit-dialog query that replaced pending_php_install.
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn pending_install_reports_a_mysql_occupant_with_its_kind() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let lock = InstallLock::default();
+        lock.set_running(
+            InstallKind::Mysql,
+            "MySQL 8.4 initialization".to_string(),
+            tokio::spawn(std::future::pending::<()>()).abort_handle(),
+        );
+        app.manage(lock);
+
+        let pending = pending_install(app.state::<InstallLock>()).await.unwrap();
+
+        assert_eq!(
+            pending,
+            Some(PendingInstallDto {
+                kind: InstallKindDto::Mysql,
+                label: "MySQL 8.4 initialization".to_string(),
+            }),
+            "a MySQL occupant must be visible, correctly tagged — the whole \
+             point of the generalization"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_install_is_none_when_nothing_is_running() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(InstallLock::default());
+
+        let pending = pending_install(app.state::<InstallLock>()).await.unwrap();
+
+        assert!(pending.is_none());
     }
 }
 
@@ -3208,6 +3293,23 @@ async fn run_mysql_init(
     };
     if let Err(e) = openvhost_core::mysql::write_generated_config(&generated) {
         fail!(Step::Render, e.to_string());
+    }
+    // Review fix wave, Important 2: the rendered my.cnf's `!includedir`
+    // points at `custom_confd`, but nothing created that directory — a
+    // banner telling the user to "add files under <custom_confd>" would be
+    // unfollowable, and D5 caveat (i) leaves open whether a REAL mysqld
+    // tolerates `!includedir` naming a directory that does not exist at all
+    // (as opposed to merely being empty) at validate/start time. Creating it
+    // here, before Validate, means neither validate-config nor a later
+    // supervised start ever meets a missing directory.
+    if let Err(e) = std::fs::create_dir_all(&ctx.paths.custom_confd) {
+        fail!(
+            Step::Render,
+            format!(
+                "failed to create the custom config directory {}: {e}",
+                ctx.paths.custom_confd.display()
+            )
+        );
     }
 
     // ---- Validate ----
@@ -3940,8 +4042,28 @@ pub async fn verify_mysql_connection(
 
     let repo = openvhost_core::mysql::MysqlInstanceRepo::new(db.inner());
     let Some(instance) = repo.get(&major).await? else {
+        // Review fix wave, minor 4: the old wording ("has never been
+        // initialized") was true for only ONE of the two ways this branch is
+        // reached. The second: `initialize_mysql` finished
+        // `MysqlInitOutcome::Initialized` (the datadir is genuinely on disk)
+        // but its OWN `repo.upsert(...).await?` call failed right after —
+        // that `?` propagates out of `initialize_mysql` before
+        // `sup.register` ever runs, leaving a real, initialized datadir with
+        // no stored credential and no service row. Rewording to cover both
+        // honestly rather than asserting the (possibly false) stronger claim.
+        // `STALE_CREDENTIAL_RECOVERY` (`databases.derive.ts`) is deliberately
+        // NOT attached here: that copy ends with "use Reset here once you're
+        // back in", but `reset_mysql_root_password` itself requires an
+        // EXISTING stored credential to authenticate with (see its own
+        // `.ok_or_else` a few lines above) — there is nothing for Reset to
+        // authenticate with in EITHER case this branch covers, so pairing it
+        // with that copy would just trade one dishonest sentence for another.
         return Ok(MysqlConnectionProofDto::Failed {
-            detail: format!("MySQL {} has never been initialized", major.as_str()),
+            detail: format!(
+                "no stored root password for MySQL {} — initialize it, or reset the \
+                 password if the folder is already initialized",
+                major.as_str()
+            ),
         });
     };
     // Scrubbed from every diagnostic string built below, on the same
@@ -4452,6 +4574,44 @@ esac
             entries.len(),
             1,
             "no staging directory should ever have been created"
+        );
+    }
+
+    // ---- custom conf.d directory (review fix wave, Important 2) ----
+
+    /// The rendered my.cnf's `!includedir` points at `custom_confd`, but
+    /// nothing used to create it — the Render step must create it BEFORE
+    /// Validate ever runs, so neither validate-config nor a real supervised
+    /// start ever meets a missing `!includedir` target.
+    #[tokio::test]
+    async fn render_step_creates_the_custom_confd_directory_before_validation() {
+        let home = tempfile::tempdir().unwrap();
+        let major = openvhost_core::mysql::MysqlMajor::parse("8.4").unwrap();
+        let runtime = fake_runtime_with_mysql(home.path(), &major, "exit 0");
+        let paths = openvhost_core::mysql::mysql_paths(home.path(), &major);
+        let custom_confd = paths.custom_confd.clone();
+        assert!(
+            !custom_confd.exists(),
+            "must not exist before init for this test to prove anything"
+        );
+
+        let ctx = MysqlInitCtx {
+            major: major.clone(),
+            runtime,
+            paths,
+        };
+        let log: InitLogSink = Arc::new(|_stream, _line| {});
+        let (outcome, _password) = run_mysql_init(ctx, log).await;
+
+        assert_eq!(
+            outcome,
+            openvhost_core::mysql::MysqlInitOutcome::Initialized,
+            "the fake-binary sequence must reach full success for this test to prove anything"
+        );
+        assert!(
+            custom_confd.is_dir(),
+            "the Render step must create the custom conf.d directory the rendered \
+             my.cnf's !includedir points at"
         );
     }
 

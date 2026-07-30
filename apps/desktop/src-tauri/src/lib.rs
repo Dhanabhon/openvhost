@@ -56,7 +56,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::php_environment,
             commands::rescan_php_runtimes,
             commands::install_php,
-            commands::pending_php_install,
+            commands::pending_install,
             commands::mysql_environment,
             commands::rescan_mysql,
             commands::install_mysql,

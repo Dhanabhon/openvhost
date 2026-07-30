@@ -203,6 +203,22 @@ fn discover_installed_mysql(
     openvhost_core::mysql::discover_mysql(prefixes, probe)
 }
 
+/// Sweep abandoned MySQL staging directories (spec D2: "swept on rescan")
+/// once at startup too, not only when the Databases page later triggers
+/// `rescan_mysql_into_state` (`commands.rs`) — a crash or force-quit
+/// mid-init otherwise leaves a `.<major>.init-<uuid>` directory sitting
+/// under `<home>/data/mysql` until a user happens to open that page. Same
+/// log-don't-fail posture as `provision_home` immediately above this call:
+/// a sweep failure must never block the supervisor from starting.
+#[cfg(target_os = "macos")]
+fn sweep_stale_mysql_staging_at_startup(home: &Path) {
+    if let Err(e) =
+        openvhost_core::mysql::sweep_stale_staging(&openvhost_core::mysql::mysql_data_root(home))
+    {
+        eprintln!("stack: failed to sweep abandoned MySQL staging directories: {e}");
+    }
+}
+
 /// Specs to register, the paths they were built from, and the runtimes probed
 /// while building them. `paths` is `None` exactly when the home could not be
 /// resolved — the same condition that already produces zero specs.
@@ -246,6 +262,7 @@ pub fn macos_stack() -> MacosStack {
     if let Err(e) = provision_home(&home) {
         eprintln!("stack: provisioning failed (rows registered anyway): {e}");
     }
+    sweep_stale_mysql_staging_at_startup(&home);
     // nginx is unaffected by the C2 fix below: `find_brew_binaries` (or the
     // Apple Silicon fallback) is still what locates it.
     let brew = find_brew_binaries().unwrap_or_else(fallback_brew);
@@ -415,5 +432,30 @@ mod tests {
         let found = discover_installed_php(&[dir.path()], &probe);
         let majors: Vec<&str> = found.iter().map(|r| r.major.as_str()).collect();
         assert_eq!(majors, vec!["8.1", "8.3"], "got {found:?}");
+    }
+
+    /// Review fix wave, minor 3: a crash or force-quit mid-init leaves a
+    /// `.<major>.init-<uuid>` staging directory behind, and before this fix
+    /// nothing swept it until a user happened to open the Databases page
+    /// (which triggers `rescan_mysql_into_state`, the only existing call
+    /// site). `sweep_stale_mysql_staging_at_startup` is exercised directly
+    /// here — not through `macos_stack()` itself, which resolves the REAL
+    /// `OPENVHOST_HOME` internally and has no injectable home parameter, so
+    /// driving it from a test would mean mutating process-wide env or
+    /// touching the actual user's home directory.
+    #[test]
+    fn sweep_stale_mysql_staging_at_startup_removes_an_abandoned_staging_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        let staging =
+            openvhost_core::mysql::mysql_data_root(home).join(".8.4.init-deadbeef00000000");
+        std::fs::create_dir_all(&staging).expect("create staging dir");
+
+        sweep_stale_mysql_staging_at_startup(home);
+
+        assert!(
+            !staging.exists(),
+            "an abandoned staging directory must be swept at startup, not only on a later rescan"
+        );
     }
 }

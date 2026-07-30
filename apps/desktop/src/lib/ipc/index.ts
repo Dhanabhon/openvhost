@@ -21,6 +21,7 @@ import type {
 	MysqlInstallOutcomeDto,
 	MysqlInstanceDto,
 	MysqlResetOutcomeDto,
+	PendingInstallDto,
 	PhpEnvironmentDto,
 	PhpInstallLogEvent,
 	PhpRuntimeDto,
@@ -58,6 +59,7 @@ export type {
 	MysqlInstallOutcomeDto,
 	MysqlInstanceDto,
 	MysqlResetOutcomeDto,
+	PendingInstallDto,
 	PhpEnvironmentDto,
 	PhpInstallLogEvent,
 	PhpRuntimeDto,
@@ -333,14 +335,16 @@ export async function onPhpInstallLog(cb: (ev: PhpInstallLogEvent) => void): Pro
 }
 
 /**
- * The major currently installing, if any. Read by the quit dialog: a build in
- * progress is invisible to the services list (it is not a supervised
- * service), so without this a quit would silently discard it. `null` both
- * when nothing is installing AND when a MySQL install/init is in flight
- * instead — see this command's own Rust doc comment (`InstallKind`).
+ * Whatever is currently installing or initializing, if anything — PHP or
+ * MySQL alike (review fix wave, Important 1). Read by the quit dialog: a
+ * build/init in progress is invisible to the services list (it is not a
+ * supervised service), so without this a quit would silently discard it.
+ * `null` only when nothing is running. Replaces the old PHP-only
+ * `pendingPhpInstall`, which returned `null` for a MySQL occupant too,
+ * leaving the quit dialog blind to it entirely.
  */
-export async function pendingPhpInstall(): Promise<string | null> {
-	return unwrap(commands.pendingPhpInstall());
+export async function pendingInstall(): Promise<PendingInstallDto | null> {
+	return unwrap(commands.pendingInstall());
 }
 
 /**

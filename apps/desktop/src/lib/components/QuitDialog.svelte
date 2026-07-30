@@ -6,7 +6,7 @@
 
 	let {
 		pending,
-		installingMajor = null,
+		pendingInstall = null,
 		quitting = false,
 		error = '',
 		onCancel,
@@ -14,10 +14,19 @@
 	}: {
 		/** Display names of services a quit would stop. Empty = nothing to lose. */
 		pending: readonly string[];
-		/** The PHP major currently installing via Homebrew, if any. A build in
-		 *  progress is invisible to `pending` — it is not a supervised service —
-		 *  so without this a quit would silently discard it mid-build. */
-		installingMajor?: string | null;
+		/** The install/init currently in flight via Homebrew, if any — PHP or
+		 *  MySQL alike (review fix wave, Important 1). A build/init in progress
+		 *  is invisible to `pending` — it is not a supervised service — so
+		 *  without this a quit would silently discard it mid-work.
+		 *
+		 *  `label`'s shape differs deliberately by kind, mirroring exactly what
+		 *  the Rust side already tracks (`InstallLock`'s `set_running` call
+		 *  sites): a PHP install's label is the BARE major (`"8.4"`), because
+		 *  this component itself supplies the leading "PHP" word below; a
+		 *  MySQL install's or init's label ALREADY reads as a complete phrase
+		 *  (`"MySQL 8.4"`, `"MySQL 8.4 initialization"`), so rendering it
+		 *  verbatim is correct and prepending another "MySQL" would double it. */
+		pendingInstall?: { kind: 'php' | 'mysql'; label: string } | null;
 		/** True while `confirmQuit` is in flight — services are being stopped. */
 		quitting?: boolean;
 		/** A failed quit attempt, rendered in place rather than as a page banner:
@@ -28,7 +37,7 @@
 	} = $props();
 
 	const hasPending = $derived(pending.length > 0);
-	const hasInstall = $derived(installingMajor !== null);
+	const hasInstall = $derived(pendingInstall !== null);
 	/** "Stop and quit" whenever there is something to stop — a running service
 	 *  OR an install in flight — otherwise a button promising to stop nothing
 	 *  is a small lie the user notices. */
@@ -132,11 +141,19 @@
 			<span class="mono">{formatNameList(pending)}</span>
 			{pending.length === 1 ? 'is' : 'are'} running. Quitting stops
 			{pending.length === 1 ? 'it' : 'them'} first, so nothing is left serving in the background.
-		{:else if !hasInstall}
+		{:else if !pendingInstall}
 			No services are running. Nothing will be interrupted.
 		{/if}
-		{#if hasInstall}
-			{hasPending ? ' ' : ''}PHP <span class="mono">{installingMajor}</span> is still installing. Quitting
+		{#if pendingInstall}
+			<!-- PHP's label is bare (e.g. "8.4"), so this component supplies the
+			     leading word itself; MySQL's label already reads as a complete
+			     phrase ("MySQL 8.4", "MySQL 8.4 initialization"), so prepending
+			     another "MySQL" here would double it — see the prop's own doc
+			     comment. The PHP branch is byte-identical to the copy this
+			     dialog has always rendered. -->
+			{hasPending ? ' ' : ''}{pendingInstall.kind === 'php'
+				? 'PHP '
+				: ''}<span class="mono">{pendingInstall.label}</span> is still installing. Quitting
 			stops it immediately and discards the download/build in progress — there is no resuming it, only
 			starting over.
 		{/if}

@@ -20,6 +20,7 @@ import {
 	listServices,
 	onPhpInstallLog,
 	onServiceState,
+	pendingInstall,
 	phpEnvironment,
 	planConfigApply,
 	rescanPhpRuntimes,
@@ -270,6 +271,37 @@ describe('rescanPhpRuntimes', () => {
 			kind: 'core',
 			message: 'runtime list is poisoned'
 		});
+	});
+});
+
+// Review fix wave, Important 1: replaces the old PHP-only `pendingPhpInstall`
+// (which had no test coverage of its own), so the quit dialog's kind-agnostic
+// signal is proven at the IPC boundary too, not only in the Rust command
+// tests and QuitDialog's own SSR tests.
+describe('pendingInstall', () => {
+	beforeEach(() => invokeMock.mockReset());
+
+	it('returns null when nothing is installing', async () => {
+		invokeMock.mockResolvedValueOnce(null);
+		await expect(pendingInstall()).resolves.toBeNull();
+		expect(invokeMock).toHaveBeenCalledWith('pending_install');
+	});
+
+	it('returns the kind and label of a PHP install in flight', async () => {
+		const info = { kind: 'php', label: '8.4' };
+		invokeMock.mockResolvedValueOnce(info);
+		await expect(pendingInstall()).resolves.toEqual(info);
+	});
+
+	it('returns the kind and label of a MySQL install in flight', async () => {
+		const info = { kind: 'mysql', label: 'MySQL 8.4' };
+		invokeMock.mockResolvedValueOnce(info);
+		await expect(pendingInstall()).resolves.toEqual(info);
+	});
+
+	it('throws the normalized IpcError on failure', async () => {
+		invokeMock.mockRejectedValueOnce({ kind: 'core', message: 'poisoned' });
+		await expect(pendingInstall()).rejects.toEqual({ kind: 'core', message: 'poisoned' });
 	});
 });
 

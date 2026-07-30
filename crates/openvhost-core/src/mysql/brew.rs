@@ -88,11 +88,16 @@ fn is_major_minor_shape(s: &str) -> bool {
 ///   catalogue guarantee is enforced at that boundary, never assumed from
 ///   provenance.
 /// - `MysqlMajor::from_probe` is `pub(crate)`: shape only, no catalogue
-///   check. Its only caller is [`crate::mysql::discover_mysql`], which
-///   sources the string from this crate's own bounded `mysqld --version`
-///   probe — never from external input. This is what lets a discovered
-///   9.x install still render as a row (spec D1: "honest display, no
-///   support burden").
+///   check. Originally callable only from [`crate::mysql::discover_mysql`]
+///   (this crate's own bounded `mysqld --version` probe — never external
+///   input); two more `pub(crate)` callers have since joined it for the
+///   IDENTICAL reason (a value this process itself produced or wrote, never
+///   untrusted input): `datadir::is_stale_staging_name` (recognizing a
+///   staging directory abandoned by a build this crate no longer offers)
+///   and `repo::MysqlInstanceRow`'s `TryFrom` (re-validating a row this
+///   process itself wrote to state.db). This is what lets a discovered 9.x
+///   install still render as a row (spec D1: "honest display, no support
+///   burden").
 ///
 /// Both constructors apply the IDENTICAL shape check, so path derivation
 /// (`mysql_paths`) is safe to call with a value from EITHER constructor: a

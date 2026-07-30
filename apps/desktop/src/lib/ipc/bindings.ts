@@ -190,13 +190,17 @@ export const commands = {
 	 */
 	installPhp: (major: string) => typedError<InstallOutcomeDto, IpcError>(__TAURI_INVOKE("install_php", { major })),
 	/**
-	 *  The PHP major currently installing, if any — for the quit dialog: a build
-	 *  in progress is invisible to `pending_service_ids` (it is not a supervised
-	 *  service), so without this the confirmation would silently discard it.
-	 *  `None` when a MySQL install/init occupies `InstallLock`'s shared slot
-	 *  instead — see `InstallKind`'s doc comment.
+	 *  Whatever is currently installing or initializing, if anything — for the
+	 *  quit dialog: a build/init in progress is invisible to
+	 *  `pending_service_ids` (it is not a supervised service), so without this
+	 *  the confirmation would silently discard it. Kind-agnostic (review fix
+	 *  wave Important 1 — see `InstallKind`'s doc comment): PHP and MySQL both
+	 *  surface here, and `QuitDialog` renders the sentence matching `kind`.
 	 */
-	pendingPhpInstall: () => typedError<string | null, IpcError>(__TAURI_INVOKE("pending_php_install")),
+	pendingInstall: () => typedError<{
+	kind: InstallKindDto,
+	label: string,
+} | null, IpcError>(__TAURI_INVOKE("pending_install")),
 	/**
 	 *  Read-only environment summary for the Databases page: whether Homebrew
 	 *  was found, where it looked, and one row per MySQL major (spec D7).
@@ -234,6 +238,23 @@ export const commands = {
 	 *  The stored root password for `major` (spec D3's outbound reveal — the
 	 *  ONE place this crosses IPC, deliberately, for the masked field's
 	 *  Reveal/Copy affordance).
+	 * 
+	 *  SECURITY (audit H2): this command is the SOLE place in the entire
+	 *  codebase sanctioned to de-redact a `RootPassword` into a plain `String`
+	 *  for a RETURN value. Every other command that touches a stored or
+	 *  freshly generated credential (`initialize_mysql`,
+	 *  `reset_mysql_root_password`, `verify_mysql_connection`) sends it only to
+	 *  a child's stdin or an ephemeral 0600 defaults-file
+	 *  (`EphemeralDefaultsFile`), never back across IPC — see `RootPassword::expose`'s
+	 *  own doc comment for that discipline. This command's `Result` must NEVER
+	 *  be logged: verified today by grep — no Tauri command-result logging
+	 *  exists anywhere in this codebase (nothing wraps
+	 *  `specta_builder.invoke_handler()`/`tauri::Builder::invoke_handler` with a
+	 *  tracing/logging layer of any kind, and neither `log`/`tracing` nor any
+	 *  equivalent crate is even a dependency of this crate). This comment is the
+	 *  tripwire for the day someone adds one: such a layer MUST special-case
+	 *  this command (or, better, generically redact every `String`-typed
+	 *  command result) before it ships.
 	 */
 	mysqlRootPassword: (major: string) => typedError<string, IpcError>(__TAURI_INVOKE("mysql_root_password", { major })),
 	/**
@@ -329,6 +350,13 @@ export type FileChangeDto = {
 export type HomeUsageDto = {
 	bytes: number,
 };
+
+/**
+ *  Wire-safe copy of [`InstallKind`] for [`PendingInstallDto`] — `InstallKind`
+ *  itself carries no `specta::Type`/`Serialize`; it is purely an internal
+ *  discriminator for `InstallLock`'s slot.
+ */
+export type InstallKindDto = "php" | "mysql";
 
 /**
  *  The outcome of an `install_php` call. `detected: false` alongside
@@ -470,6 +498,18 @@ export type MysqlInstanceDto = {
  *  never thrown as an `IpcError`; a spawn/other failure still is.
  */
 export type MysqlResetOutcomeDto = { kind: "reset" } | { kind: "authFailed"; detail: string };
+
+/**
+ *  What [`pending_install`] reports: which kind of install/init occupies
+ *  `InstallLock`'s shared slot, and its label — e.g. `"8.4"` for a PHP
+ *  install, `"MySQL 8.4"` for a MySQL install, `"MySQL 8.4 initialization"`
+ *  for an init run (see `install_php`/`install_mysql`/`initialize_mysql`'s
+ *  own `set_running` calls for the exact shapes).
+ */
+export type PendingInstallDto = {
+	kind: InstallKindDto,
+	label: string,
+};
 
 /**
  *  What the Languages page needs to decide which of the three states to show

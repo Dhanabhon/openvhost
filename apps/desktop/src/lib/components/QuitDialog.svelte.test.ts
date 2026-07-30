@@ -16,14 +16,14 @@ import QuitDialog from './QuitDialog.svelte';
 
 function html(props: {
 	pending?: string[];
-	installingMajor?: string | null;
+	pendingInstall?: { kind: 'php' | 'mysql'; label: string } | null;
 	quitting?: boolean;
 	error?: string;
 }): string {
 	return render(QuitDialog, {
 		props: {
 			pending: props.pending ?? [],
-			installingMajor: props.installingMajor ?? null,
+			pendingInstall: props.pendingInstall ?? null,
 			quitting: props.quitting ?? false,
 			error: props.error ?? '',
 			onCancel: () => {},
@@ -120,29 +120,56 @@ describe('QuitDialog', () => {
 	// "nothing will be interrupted" while a twenty-minute build was about to be
 	// silently discarded.
 	it('names an in-flight PHP install and warns it will be discarded', () => {
-		const t = text(html({ pending: [], installingMajor: '8.4' }));
+		const t = text(html({ pending: [], pendingInstall: { kind: 'php', label: '8.4' } }));
 		expect(t).toContain('PHP 8.4');
 		expect(t).toContain('is still installing');
 		expect(t).not.toContain('No services are running');
 	});
 
 	it('offers Stop and quit when only an install is in flight, no services', () => {
-		const m = html({ pending: [], installingMajor: '8.4' });
+		const m = html({ pending: [], pendingInstall: { kind: 'php', label: '8.4' } });
 		expect(m).toContain('Stop and quit');
 		expect(m).not.toContain('>Quit<');
 	});
 
 	it('combines a running service and an in-flight install in one sentence', () => {
-		const t = text(html({ pending: ['nginx'], installingMajor: '8.4' }));
+		const t = text(html({ pending: ['nginx'], pendingInstall: { kind: 'php', label: '8.4' } }));
 		expect(t).toContain('nginx is running');
 		expect(t).toContain('PHP 8.4');
 		expect(t).toContain('is still installing');
 	});
 
 	it('says nothing is running and mentions no install when both are idle', () => {
-		const t = text(html({ pending: [], installingMajor: null }));
+		const t = text(html({ pending: [], pendingInstall: null }));
 		expect(t).toContain('No services are running');
 		expect(t).not.toContain('PHP');
+	});
+
+	// Review fix wave, Important 1: the quit dialog used to be blind to a
+	// MySQL install/init in flight entirely (the old query was PHP-only).
+	// The label already reads as a complete phrase ("MySQL 8.4"), so the
+	// rendered sentence must not double the word "MySQL".
+	it('names an in-flight MySQL install and warns it will be discarded, without doubling the word MySQL', () => {
+		const t = text(html({ pending: [], pendingInstall: { kind: 'mysql', label: 'MySQL 8.4' } }));
+		expect(t).toContain('MySQL 8.4 is still installing');
+		expect(t).not.toContain('MySQL MySQL');
+		expect(t).not.toContain('No services are running');
+	});
+
+	it('names an in-flight MySQL initialization using its own complete label', () => {
+		const t = text(
+			html({
+				pending: [],
+				pendingInstall: { kind: 'mysql', label: 'MySQL 8.4 initialization' }
+			})
+		);
+		expect(t).toContain('MySQL 8.4 initialization is still installing');
+	});
+
+	it('offers Stop and quit when only a MySQL install is in flight, no services', () => {
+		const m = html({ pending: [], pendingInstall: { kind: 'mysql', label: 'MySQL 8.4' } });
+		expect(m).toContain('Stop and quit');
+		expect(m).not.toContain('>Quit<');
 	});
 
 	// Both buttons disabled: the confirm because stopping is already underway, and
