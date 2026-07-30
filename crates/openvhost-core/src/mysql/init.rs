@@ -205,7 +205,7 @@ pub enum MysqlInitOutcome {
 }
 
 /// Generate a fresh staging directory PATH for one init attempt (spec D2):
-/// `<staging_parent>/.init-<major-dashed>-<uuid>`. Pure — never touches the
+/// `<staging_parent>/init-<major-dashed>-<uuid>`. Pure — never touches the
 /// filesystem; the command layer creates a directory there before invoking
 /// `mysqld --initialize-insecure --datadir=<staging>` (spec D2 step 1).
 /// The returned name is always recognized by [`sweep_stale_staging`] and
@@ -213,25 +213,28 @@ pub enum MysqlInitOutcome {
 /// satisfies), so an attempt abandoned mid-init is always cleanable up
 /// later.
 ///
-/// Live-run finding #3 (isolated with a clean single-variable matrix against
-/// real mysqld 8.4.11): the ORIGINAL shape, `.<major>.init-<uuid>` (e.g.
-/// `.8.4.init-<hex>`), has THREE dots — the leading one, the one inside
-/// `major` ("8.4"), and the one `.init-` itself starts with — and a datadir
-/// basename with any interior dot beyond the leading one cannot restart
-/// after `--initialize`: the same InnoDB undo-tablespace error as landmine
-/// #1 ("Can't create UNDO tablespace innodb_undo_001 since './undo_001'
-/// already exists"), independent of that bug and reproduced regardless of
-/// `--no-defaults` or pre-creation. This shape dash-encodes `major`'s own dot
-/// (`"8.4"` → `"8-4"`) and drops the leading dot on `init-` itself, leaving
-/// EXACTLY ONE dot in the whole basename — the leading one, proven fine by
-/// the matrix (`.stg` = OK). No back-compat sweep for the old dotted shape:
-/// the feature never shipped.
+/// Live-run finding, corrected (decisive single-variable matrix against real
+/// mysqld 8.4.11 — two earlier, WRONG diagnoses in this doc comment's history
+/// are retracted; see spec D2's dated correction note for the full story): a
+/// datadir whose basename starts with a DOT cannot restart after
+/// `--initialize` — `.stg`, `.a`, `.aaaa`, `.init8`, `.aaaaaaaa`, `.aaa-aaa`
+/// all FAIL; `stg`, `aaa-aaa`, `init-8-4-abc`, and a 24-character all-`a`
+/// name all PASS. Hyphens, digits, and length are not factors — only the
+/// leading dot. This shape therefore has NO leading dot at all (unlike two
+/// earlier, incorrect attempts at this fix); `major`'s own dot is
+/// dash-encoded (`"8.4"` → `"8-4"`) purely so the name stays a single,
+/// readable path component. The staging directory is consequently VISIBLE
+/// under `<staging_parent>` (not hidden) — verified nothing in this codebase
+/// enumerates that directory's children assuming they are exclusively
+/// major-shaped final datadirs; the one place that does list it
+/// ([`sweep_stale_staging`]) already filters by shape rather than assuming.
+/// No back-compat sweep for the old dotted shape: the feature never shipped.
 ///
 /// [`sweep_stale_staging`]: super::sweep_stale_staging
 pub fn staging_dir_path(staging_parent: &Path, major: &MysqlMajor) -> PathBuf {
     let major_dashed = major.as_str().replace('.', "-");
     let suffix = uuid_v4_simple_hex();
-    staging_parent.join(format!(".init-{major_dashed}-{suffix}"))
+    staging_parent.join(format!("init-{major_dashed}-{suffix}"))
 }
 
 /// Remove exactly the ONE staging directory a failed init attempt was
@@ -239,9 +242,10 @@ pub fn staging_dir_path(staging_parent: &Path, major: &MysqlMajor) -> PathBuf {
 /// handling ("only the marked staging dir is removed"). Reuses the
 /// identical name-shape guard `sweep_stale_staging` applies before removing
 /// anything, rather than trusting the caller blindly: if `staging` is not
-/// shaped like `.init-{major-dashed}-{suffix}`, NOTHING is removed and an
-/// error is returned — this must never become a general-purpose `rm -rf`. A
-/// missing directory is not an error: there is nothing to clean up.
+/// shaped like `init-{major-dashed}-{suffix}` (no leading dot), NOTHING is
+/// removed and an error is returned — this must never become a
+/// general-purpose `rm -rf`. A missing directory is not an error: there is
+/// nothing to clean up.
 pub fn remove_staging_dir(staging: &Path) -> io::Result<()> {
     let is_staging_shaped = staging
         .file_name()
@@ -516,12 +520,12 @@ mod tests {
     // ---- staging_dir_path ----
 
     #[test]
-    fn staging_dir_path_is_hidden_major_shaped_and_under_the_given_parent() {
+    fn staging_dir_path_is_major_shaped_and_under_the_given_parent() {
         let parent = PathBuf::from("/tmp/ovh/data/mysql");
         let major = MysqlMajor::parse("8.4").unwrap();
         let path = staging_dir_path(&parent, &major);
         let name = path.file_name().unwrap().to_str().unwrap();
-        assert!(name.starts_with(".init-8-4-"), "got {name:?}");
+        assert!(name.starts_with("init-8-4-"), "got {name:?}");
         assert_eq!(path.parent(), Some(parent.as_path()));
     }
 
@@ -550,29 +554,26 @@ mod tests {
         assert_eq!(removed, vec![staging]);
     }
 
-    /// Live-run finding #3 (isolated with a clean single-variable matrix
-    /// against real mysqld 8.4.11): a datadir basename with interior dots
-    /// beyond the leading one (our OLD `.8.4.init-<uuid>` shape) cannot
-    /// restart after `--initialize` — the same InnoDB undo-tablespace error
-    /// as landmine #1 ("Can't create UNDO tablespace innodb_undo_001 since
-    /// './undo_001' already exists"), independent of the defaults/argv
-    /// mismatch already fixed, and reproduced regardless of `--no-defaults`
-    /// or pre-creation. Matrix: `.stg` (leading dot only) = OK; `stg8`
-    /// (plain) = OK; `.8.4.init-<hex>` (dots after the leading one) = FAIL.
-    /// Pins the class the way the no-defaults-argv test pins landmine #1:
-    /// the staging basename must contain EXACTLY ONE dot, the leading one.
+    /// Decisive single-variable matrix against real mysqld 8.4.11 (two
+    /// earlier diagnoses in this crate's history — "interior dots", "datadir
+    /// mismatch" — were WRONG and are retracted; see spec D2's dated
+    /// correction note): a datadir basename that STARTS WITH A DOT cannot
+    /// restart after `--initialize` — `.stg`, `.a`, `.aaaa`, `.init8`,
+    /// `.aaaaaaaa`, `.aaa-aaa` all FAIL; `stg`, `aaa-aaa`, `init-8-4-abc`,
+    /// and a 24-character all-`a` name all PASS. Hyphens, digits, and length
+    /// are not factors — only the leading dot. Pins the class: the staging
+    /// basename must never start with `.`.
     #[test]
-    fn staging_dir_path_basename_contains_exactly_one_dot() {
+    fn staging_dir_path_basename_does_not_start_with_a_dot() {
         let parent = PathBuf::from("/tmp/ovh/data/mysql");
         let major = MysqlMajor::parse("8.4").unwrap();
         let path = staging_dir_path(&parent, &major);
         let name = path.file_name().unwrap().to_str().unwrap();
-        assert_eq!(
-            name.matches('.').count(),
-            1,
-            "got {name:?} — must contain exactly the leading dot, no others"
+        assert!(
+            !name.starts_with('.'),
+            "got {name:?} — a leading dot on the datadir basename is fatal to \
+             mysqld restarting on it"
         );
-        assert!(name.starts_with('.'), "got {name:?}");
     }
 
     // ---- remove_staging_dir ----
@@ -580,7 +581,7 @@ mod tests {
     #[test]
     fn remove_staging_dir_removes_a_staging_shaped_directory() {
         let tmp = tempfile::tempdir().unwrap();
-        let staging = tmp.path().join(".init-8-4-deadbeef");
+        let staging = tmp.path().join("init-8-4-deadbeef");
         std::fs::create_dir(&staging).unwrap();
         std::fs::write(staging.join("partial"), b"x").unwrap();
 
@@ -609,7 +610,7 @@ mod tests {
     #[test]
     fn remove_staging_dir_on_an_already_missing_dir_is_not_an_error() {
         let tmp = tempfile::tempdir().unwrap();
-        let staging = tmp.path().join(".init-8-4-neverexisted");
+        let staging = tmp.path().join("init-8-4-neverexisted");
         remove_staging_dir(&staging).unwrap();
     }
 

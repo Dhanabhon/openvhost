@@ -215,32 +215,39 @@ pub fn classify_datadir(dir: &Path) -> io::Result<DatadirState> {
     })
 }
 
-/// Staging directories look like `.init-<major-dashed>-<uuid>` (spec D2) — a
-/// leading dot (hidden), the literal `init-`, a major-shaped prefix with its
-/// own dot dash-encoded (e.g. `8-4` for major `8.4`), a dash, then a
-/// non-empty suffix. Reuses [`MysqlMajor::from_probe`] for the
-/// "major-shaped" half of that check (after re-inserting the dot the
-/// generator dashed out) rather than re-implementing the shape regex a
-/// second time — and deliberately does NOT go through [`MysqlMajor::parse`]:
-/// a stale leftover for a major this build no longer offers must still be
-/// recognized and swept.
+/// Staging directories look like `init-<major-dashed>-<uuid>` (spec D2) — no
+/// leading dot, the literal `init-`, a major-shaped prefix with its own dot
+/// dash-encoded (e.g. `8-4` for major `8.4`), a dash, then a non-empty
+/// suffix. Reuses [`MysqlMajor::from_probe`] for the "major-shaped" half of
+/// that check (after re-inserting the dot the generator dashed out) rather
+/// than re-implementing the shape regex a second time — and deliberately
+/// does NOT go through [`MysqlMajor::parse`]: a stale leftover for a major
+/// this build no longer offers must still be recognized and swept.
 ///
-/// Live-run finding #3: this shape replaced `.<major>.init-<uuid>` (e.g.
-/// `.8.4.init-<hex>`), which put THREE dots in the basename (the leading
-/// one, the one inside `major`, and the one `.init-` itself started with) —
-/// a real mysqld cannot restart on a datadir whose basename has any interior
-/// dot beyond the leading one (isolated with a clean single-variable matrix
-/// against real mysqld 8.4.11: `.stg` = OK, `stg8` = OK, `.8.4.init-<hex>` =
-/// FAIL, mysqld-created or pre-created either way). No back-compat sweep for
-/// the old dotted shape — the feature never shipped, so no installed datadir
-/// anywhere can have a staging leftover in that shape.
+/// Live-run finding, corrected — decisive single-variable matrix against
+/// real mysqld 8.4.11 (two earlier diagnoses recorded against this shape in
+/// this crate's history, "interior dots" and "datadir mismatch", were WRONG
+/// and are retracted; see spec D2's dated correction note for the full
+/// story): a datadir basename that STARTS WITH A DOT cannot restart after
+/// `--initialize` — `.stg`, `.a`, `.aaaa`, `.init8`, `.aaaaaaaa`, `.aaa-aaa`
+/// all FAIL; `stg`, `aaa-aaa`, `init-8-4-abc`, and a 24-character all-`a`
+/// name all PASS. Hyphens, digits, and length are not factors — only the
+/// leading dot. This shape therefore has NO leading dot, unlike the two
+/// earlier (incorrect) fix attempts. The staging directory is consequently
+/// VISIBLE under its parent, not hidden — verified nothing else in this
+/// codebase lists that parent's children assuming they are exclusively
+/// major-shaped final datadirs (this function, and `sweep_stale_staging`
+/// below which calls it, are the only code that enumerates it at all). No
+/// back-compat sweep for the old dotted shape — the feature never shipped,
+/// so no installed datadir anywhere can have a staging leftover in that
+/// shape.
 ///
 /// `pub(crate)`, not private: `crate::mysql::remove_staging_dir` (init.rs)
 /// reuses this exact shape check before deleting a specific staging
 /// directory, rather than re-implementing it — the two call sites must
 /// never be able to drift to different definitions of "staging-shaped".
 pub(crate) fn is_stale_staging_name(name: &str) -> bool {
-    let Some(rest) = name.strip_prefix(".init-") else {
+    let Some(rest) = name.strip_prefix("init-") else {
         return false;
     };
     let mut parts = rest.splitn(3, '-');
@@ -252,14 +259,14 @@ pub(crate) fn is_stale_staging_name(name: &str) -> bool {
 }
 
 /// Remove abandoned staging directories directly under `parent` (spec D2:
-/// `.init-<major-dashed>-<uuid>`), returning what was removed. Meant to run on
+/// `init-<major-dashed>-<uuid>`), returning what was removed. Meant to run on
 /// rescan — a crash or force-quit mid-init leaves one of these behind. The
-/// FINAL datadir (bare `<major>`, no leading dot) is a completely different
-/// name shape and is never touched here.
+/// FINAL datadir (bare `<major>`, e.g. `8.4` — no `init-` prefix) is a
+/// completely different name shape and is never touched here.
 ///
 /// Only removes entries that are BOTH (a) directories and (b) name-shaped
 /// like a staging directory (see `is_stale_staging_name`); anything else
-/// in `parent` — an unrelated hidden directory, a final datadir, or even a
+/// in `parent` — an unrelated directory, a final datadir, or even a
 /// symlink that happens to share the name shape — is left exactly alone.
 /// `entry.file_type()` does not follow symlinks (unlike `entry.metadata()`
 /// on some platforms), so a symlink squatting on the pattern is reported as
@@ -419,7 +426,7 @@ mod tests {
     #[test]
     fn removes_a_stale_staging_directory_and_reports_it() {
         let tmp = tempfile::tempdir().unwrap();
-        let staging = tmp.path().join(".init-8-4-a1b2c3d4e5f6");
+        let staging = tmp.path().join("init-8-4-a1b2c3d4e5f6");
         std::fs::create_dir(&staging).unwrap();
         std::fs::write(staging.join("leftover"), b"x").unwrap();
 
@@ -450,9 +457,9 @@ mod tests {
     }
 
     #[test]
-    fn a_finished_datadir_without_the_leading_dot_is_never_removed() {
-        // The FINAL datadir is named bare `<major>` (no leading dot) — must
-        // never be mistaken for a staging leftover.
+    fn a_finished_datadir_is_never_removed() {
+        // The FINAL datadir is named bare `<major>` (e.g. `8.4`) — never
+        // `init-`-prefixed — must never be mistaken for a staging leftover.
         let tmp = tempfile::tempdir().unwrap();
         let finished = tmp.path().join("8.4");
         std::fs::create_dir(&finished).unwrap();
@@ -476,8 +483,8 @@ mod tests {
     #[test]
     fn several_stale_dirs_are_all_removed_and_returned_sorted() {
         let tmp = tempfile::tempdir().unwrap();
-        let a = tmp.path().join(".init-8-4-aaaa");
-        let b = tmp.path().join(".init-8-4-bbbb");
+        let a = tmp.path().join("init-8-4-aaaa");
+        let b = tmp.path().join("init-8-4-bbbb");
         std::fs::create_dir(&a).unwrap();
         std::fs::create_dir(&b).unwrap();
 
@@ -495,7 +502,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let real_dir = tmp.path().join("real-target");
         std::fs::create_dir(&real_dir).unwrap();
-        let squatter = tmp.path().join(".init-8-4-deadbeef");
+        let squatter = tmp.path().join("init-8-4-deadbeef");
         std::os::unix::fs::symlink(&real_dir, &squatter).unwrap();
 
         let removed = sweep_stale_staging(tmp.path()).unwrap();

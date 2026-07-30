@@ -88,9 +88,9 @@ const SUPERVISOR_READY_DEADLINE: Duration = Duration::from_secs(15);
 /// Spec D4's stop grace (SIGTERM must succeed well inside this).
 const SUPERVISOR_GRACE: Duration = Duration::from_secs(15);
 /// How many of a captured child's most recent output lines a failure message
-/// embeds (live-run finding #2's failure-reporting fix): enough to show a
-/// real mysqld's own fatal-error banner without dumping an unbounded startup
-/// log into a panic message.
+/// embeds (the failure-reporting fix): enough to show a real mysqld's own
+/// fatal-error banner without dumping an unbounded startup log into a panic
+/// message.
 const OUTPUT_TAIL_LINES: usize = 20;
 
 // ---------------------------------------------------------------------------
@@ -232,12 +232,16 @@ fn mysqladmin_ping_argv(mysqladmin: &Path, socket: &Path) -> Vec<String> {
 /// `mysqld --no-defaults --initialize-insecure --datadir=<staging>` (spec D2
 /// step 1). Mirrors `commands.rs::mysqld_init_spec`.
 ///
-/// Live-run finding #2 (bisected against real mysqld 8.4.11): this used to
-/// pass `--defaults-file=<my_cnf>` (whose `datadir` names the FINAL datadir)
-/// ALONGSIDE argv `--datadir=<staging>` — mysqld resolved the two
-/// inconsistently across init/start, corrupting InnoDB's undo-tablespace
-/// bookkeeping. `--no-defaults` plus fully explicit argv removes the
-/// ambiguity: nothing pre-`finalize_staging` ever reads `my.cnf`'s `datadir`.
+/// `--no-defaults` is deliberate containment, kept on its own merits — NOT a
+/// fix for a datadir-mismatch bug, which does not exist (an earlier fix
+/// wave claimed combining `--defaults-file=<my_cnf>` with argv
+/// `--datadir=<staging>` corrupted InnoDB's undo-tablespace bookkeeping;
+/// that diagnosis was WRONG, a misdiagnosis of the leading-dot
+/// staging-basename bug, and is retracted — see spec D2's dated correction
+/// note for the corrected history). This step needs no my.cnf setting at
+/// all, since every path is already explicit argv; `--no-defaults`
+/// additionally makes it ignore any machine-wide option file (e.g.
+/// `/etc/my.cnf`), which is worth keeping regardless.
 fn mysqld_init_spec(mysqld: &Path, staging: &Path) -> SpawnSpec {
     let mut datadir_arg = OsString::from("--datadir=");
     datadir_arg.push(staging.as_os_str());
@@ -255,11 +259,13 @@ fn mysqld_init_spec(mysqld: &Path, staging: &Path) -> SpawnSpec {
 
 /// `mysqld --no-defaults --datadir=<staging> --skip-networking
 /// --socket=<init_socket>` (spec D2 step 2). Mirrors
-/// `commands.rs::mysqld_temp_server_spec`. Same no-`--defaults-file`
-/// reasoning as [`mysqld_init_spec`] above — this is the step whose
-/// datadir/argv mismatch was actually OBSERVED failing live (InnoDB
-/// undo-tablespace error at StartTempServer, "Can't create UNDO tablespace
-/// innodb_undo_001 since './undo_001' already exists").
+/// `commands.rs::mysqld_temp_server_spec`. Same deliberate-containment
+/// reasoning as [`mysqld_init_spec`] above — this step's REAL failure mode,
+/// confirmed live and unrelated to `--defaults-file`, was a datadir
+/// basename starting with a dot (the fatal InnoDB undo-tablespace error,
+/// "Can't create UNDO tablespace innodb_undo_001 since './undo_001' already
+/// exists", is genuinely what a real mysqld prints for that cause too — see
+/// `staging_dir_path`'s doc comment and spec D2's dated correction note).
 fn mysqld_temp_server_spec(mysqld: &Path, staging: &Path, init_socket: &Path) -> SpawnSpec {
     let mut datadir_arg = OsString::from("--datadir=");
     datadir_arg.push(staging.as_os_str());
@@ -330,11 +336,10 @@ fn port_in_use(port: u16) -> bool {
 }
 
 /// The last `n` lines of `lines`, joined — bounds how much captured child
-/// output a failure message embeds. Live-run finding #2's failure-reporting
-/// fix: every step's panic now calls this rather than omitting captured
-/// output entirely (the StartTempServer failure that motivated this cost a
-/// blind debugging round precisely because its panic had nothing captured
-/// to show).
+/// output a failure message embeds. Failure-reporting fix: every step's
+/// panic now calls this rather than omitting captured output entirely (a
+/// real StartTempServer failure once cost a blind debugging round precisely
+/// because its panic had nothing captured to show).
 fn tail(lines: &[String], n: usize) -> String {
     let start = lines.len().saturating_sub(n);
     lines[start..].join("\n")
@@ -403,9 +408,9 @@ async fn discover_target_runtime() -> Option<MysqlRuntime> {
 /// seconds, so this accepts its own, more generous bound.
 ///
 /// Returns the exit code (or `None` if killed by a signal) ALONGSIDE every
-/// captured stdout/stderr line — live-run finding #2's failure-reporting
-/// fix: the OLD version only surfaced captured output on a TIMEOUT, so a
-/// real mysqld's own fatal-error banner on a non-zero exit (exactly what
+/// captured stdout/stderr line — failure-reporting fix: the OLD version
+/// only surfaced captured output on a TIMEOUT, so a real mysqld's own
+/// fatal-error banner on a non-zero exit (exactly what
 /// `--initialize-insecure` would print) was silently dropped, leaving the
 /// caller's own exit-code assertion with nothing to show. The caller decides
 /// how much of `lines` to embed (via `tail`) in its own message.
@@ -481,14 +486,14 @@ async fn poll_until_ready(
 /// fill the pipe and stall the child (mirrors
 /// `service_task::spawn_reader`'s hands-off drain).
 ///
-/// Live-run finding #2's failure-reporting fix: this REPLACES a previous
-/// `drain_silently`, which discarded everything on the theory that the temp
-/// server's own stdout/stderr was never needed — the StartTempServer
-/// failure that motivated this fix proved that theory wrong: mysqld's own
-/// fatal-error banner (the InnoDB undo-tablespace error) landed on this
-/// EXACT stream, and discarding it meant the failing panic had nothing to
-/// show, costing a blind debugging round. The caller bounds how much of
-/// `into` it embeds in a panic message via `tail`.
+/// Failure-reporting fix: this REPLACES a previous `drain_silently`, which
+/// discarded everything on the theory that the temp server's own
+/// stdout/stderr was never needed — a real StartTempServer failure proved
+/// that theory wrong: mysqld's own fatal-error banner (e.g. the InnoDB
+/// undo-tablespace error) landed on this EXACT stream, and discarding it
+/// meant the failing panic had nothing to show, costing a blind debugging
+/// round. The caller bounds how much of `into` it embeds in a panic message
+/// via `tail`.
 async fn drain_capturing(stream: OutputStream, into: Arc<std::sync::Mutex<Vec<String>>>) {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let mut lines = BufReader::new(stream).lines();
@@ -622,11 +627,10 @@ async fn run_staged_init(
             .expect("StartTempServer: failed to spawn the temp server"),
         finished: false,
     };
-    // Shared, captured (not discarded — live-run finding #2's
-    // failure-reporting fix): a real mysqld's own fatal-error banner (the
-    // InnoDB undo-tablespace error that motivated this fix) lands on THESE
-    // exact streams, so every panic below that could plausibly be caused by
-    // the temp server itself embeds a tail of this buffer.
+    // Shared, captured (not discarded — the failure-reporting fix): a real
+    // mysqld's own fatal-error banner lands on THESE exact streams, so every
+    // panic below that could plausibly be caused by the temp server itself
+    // embeds a tail of this buffer.
     let temp_server_output: Arc<std::sync::Mutex<Vec<String>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
     if let Some(out) = server.child.take_stdout() {

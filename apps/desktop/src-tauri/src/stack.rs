@@ -237,10 +237,11 @@ fn discover_installed_mysql(
 /// Sweep abandoned MySQL staging directories (spec D2: "swept on rescan")
 /// once at startup too, not only when the Databases page later triggers
 /// `rescan_mysql_into_state` (`commands.rs`) — a crash or force-quit
-/// mid-init otherwise leaves a `.<major>.init-<uuid>` directory sitting
-/// under `<home>/data/mysql` until a user happens to open that page. Same
-/// log-don't-fail posture as `provision_home` immediately above this call:
-/// a sweep failure must never block the supervisor from starting.
+/// mid-init otherwise leaves an `init-<major-dashed>-<uuid>` directory
+/// sitting under `<home>/data/mysql` until a user happens to open that
+/// page. Same log-don't-fail posture as `provision_home` immediately above
+/// this call: a sweep failure must never block the supervisor from
+/// starting.
 #[cfg(target_os = "macos")]
 fn sweep_stale_mysql_staging_at_startup(home: &Path) {
     if let Err(e) =
@@ -502,8 +503,8 @@ mod tests {
         assert_eq!(majors, vec!["8.1", "8.3"], "got {found:?}");
     }
 
-    /// Review fix wave, minor 3: a crash or force-quit mid-init leaves a
-    /// `.init-<major-dashed>-<uuid>` staging directory behind, and before
+    /// Review fix wave, minor 3: a crash or force-quit mid-init leaves an
+    /// `init-<major-dashed>-<uuid>` staging directory behind, and before
     /// this fix nothing swept it until a user happened to open the
     /// Databases page (which triggers `rescan_mysql_into_state`, the only
     /// existing call site). `sweep_stale_mysql_staging_at_startup` is
@@ -516,7 +517,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tmp.path();
         let staging =
-            openvhost_core::mysql::mysql_data_root(home).join(".init-8-4-deadbeef00000000");
+            openvhost_core::mysql::mysql_data_root(home).join("init-8-4-deadbeef00000000");
         std::fs::create_dir_all(&staging).expect("create staging dir");
 
         sweep_stale_mysql_staging_at_startup(home);

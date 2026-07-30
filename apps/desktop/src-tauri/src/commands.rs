@@ -3121,20 +3121,16 @@ async fn drain_and_forward(stream: openvhost_proc::OutputStream, log: InitLogSin
 /// step 1) — built via `OsString`, not `format!` + `.display()`, for the
 /// same non-lossy-path reason `MysqlValidator::validate` gives.
 ///
-/// Live-run finding #2 (bisected against real mysqld 8.4.11, reproduced
-/// deterministically): this step used to pass BOTH `--defaults-file=<my_cnf>`
-/// (whose `datadir` setting names the FINAL datadir) AND argv
-/// `--datadir=<staging>` — mysqld resolved the two datadir settings
-/// INCONSISTENTLY across init/start, corrupting InnoDB's undo-tablespace
-/// bookkeeping ("Can't create UNDO tablespace innodb_undo_001 since
-/// './undo_001' already exists"). `--no-defaults` (which also makes this
-/// step ignore any machine-wide option file, e.g. `/etc/my.cnf` — a
-/// containment bonus, not just a correctness fix) plus fully explicit argv
-/// removes the ambiguity entirely: nothing before `finalize_staging` renames
-/// staging into the final datadir ever reads `my.cnf`'s `datadir` setting.
-/// The empirical matrix that led here: no-defaults both phases = OK; my.cnf
-/// `datadir` matching staging = OK; this (the ORIGINAL, mismatched) shape =
-/// FAIL; the corrected sequence below, validated end to end = fully green.
+/// `--no-defaults` is deliberate containment, kept on its own merits — NOT a
+/// fix for a datadir-mismatch bug, which does not exist (an earlier fix wave
+/// claimed combining `--defaults-file=<my_cnf>` with argv `--datadir=<staging>`
+/// corrupted InnoDB's undo-tablespace bookkeeping; that diagnosis was WRONG,
+/// a misdiagnosis of the leading-dot bug below, and is retracted — see spec
+/// D2's dated correction note for the full, corrected history). This step
+/// needs no my.cnf setting at all, since every path it cares about is
+/// already explicit argv; `--no-defaults` additionally makes it ignore any
+/// machine-wide option file (e.g. `/etc/my.cnf`) during the insecure init
+/// window, which is worth keeping regardless.
 fn mysqld_init_spec(mysqld: &Path, staging: &Path) -> openvhost_proc::SpawnSpec {
     let mut datadir_arg = OsString::from("--datadir=");
     datadir_arg.push(staging.as_os_str());
@@ -3152,10 +3148,12 @@ fn mysqld_init_spec(mysqld: &Path, staging: &Path) -> openvhost_proc::SpawnSpec 
 
 /// `mysqld --no-defaults --datadir=<staging> --skip-networking
 /// --socket=<init_socket>` (spec D2 step 2) — the network-less temp server.
-/// Same no-`--defaults-file` reasoning as [`mysqld_init_spec`]'s doc comment
-/// above (live-run finding #2): this is the step whose datadir/argv mismatch
-/// was actually OBSERVED failing live (InnoDB undo-tablespace error at
-/// StartTempServer).
+/// Same deliberate-containment reasoning as [`mysqld_init_spec`]'s doc
+/// comment above — `--no-defaults` is kept on its own merits, not as a fix
+/// for the retracted datadir-mismatch misdiagnosis (see spec D2's dated
+/// correction note). This step's real failure mode, confirmed live and
+/// unrelated to `--defaults-file`, was a datadir basename starting with a
+/// dot — fixed in `openvhost_core::mysql::staging_dir_path`.
 fn mysqld_temp_server_spec(
     mysqld: &Path,
     staging: &Path,
@@ -4148,25 +4146,25 @@ mod mysql_ipc_tests {
         p
     }
 
-    // ---- argv shape: no --defaults-file pre-finalize (live-run finding #2) ----
+    // ---- argv shape: no --defaults-file pre-finalize ----
     //
-    // Bisected against real mysqld 8.4.11, reproduced deterministically:
-    // combining `--defaults-file=<my.cnf with datadir=FINAL>` with argv
-    // `--datadir=<STAGING>` makes mysqld resolve the two datadir settings
-    // INCONSISTENTLY across init/start, corrupting InnoDB's undo-tablespace
-    // bookkeeping — "Can't create UNDO tablespace innodb_undo_001 since
-    // './undo_001' already exists". Empirical matrix: no-defaults both
-    // phases = OK; my.cnf datadir matching staging = OK; the production
-    // mismatch shape (defaults-file's datadir=final + argv datadir=staging)
-    // = FAIL. Neither pre-finalize spec may carry `--defaults-file` (or any
-    // machine-wide option file `--no-defaults` also excludes) at all — these
-    // two tests pin the whole class, not just today's argv literal.
+    // `--no-defaults` is deliberate containment on its own merits (ignores
+    // any machine-wide option file, e.g. `/etc/my.cnf`; neither pre-finalize
+    // step needs a my.cnf setting at all, since every path is already
+    // explicit argv) — NOT a fix for a datadir-mismatch bug, which does not
+    // exist. An earlier fix wave claimed combining `--defaults-file=<my.cnf>`
+    // with argv `--datadir=<staging>` corrupted InnoDB's undo-tablespace
+    // bookkeeping; that diagnosis was WRONG (a misdiagnosis of the
+    // leading-dot staging-basename bug, decisively isolated afterward — see
+    // spec D2's dated correction note) and is retracted. These two tests
+    // still pin the argv SHAPE (worth keeping regardless of the retraction),
+    // just not for the reason originally recorded here.
 
     #[test]
     fn mysqld_init_spec_carries_no_defaults_file_and_no_defaults_first() {
         let spec = mysqld_init_spec(
             Path::new("/opt/homebrew/opt/mysql@8.4/bin/mysqld"),
-            Path::new("/tmp/ovh/data/mysql/.init-8-4-deadbeef"),
+            Path::new("/tmp/ovh/data/mysql/init-8-4-deadbeef"),
         );
         let args: Vec<String> = spec
             .args
@@ -4187,7 +4185,7 @@ mod mysql_ipc_tests {
             "got {args:?}"
         );
         assert!(
-            args.contains(&"--datadir=/tmp/ovh/data/mysql/.init-8-4-deadbeef".to_string()),
+            args.contains(&"--datadir=/tmp/ovh/data/mysql/init-8-4-deadbeef".to_string()),
             "got {args:?}"
         );
     }
@@ -4196,7 +4194,7 @@ mod mysql_ipc_tests {
     fn mysqld_temp_server_spec_carries_no_defaults_file_and_no_defaults_first() {
         let spec = mysqld_temp_server_spec(
             Path::new("/opt/homebrew/opt/mysql@8.4/bin/mysqld"),
-            Path::new("/tmp/ovh/data/mysql/.init-8-4-deadbeef"),
+            Path::new("/tmp/ovh/data/mysql/init-8-4-deadbeef"),
             Path::new("/tmp/ovh/run/mysql-8.4-init.sock"),
         );
         let args: Vec<String> = spec
@@ -4214,7 +4212,7 @@ mod mysql_ipc_tests {
             "--no-defaults must be first (mysqld requirement), got {args:?}"
         );
         assert!(
-            args.contains(&"--datadir=/tmp/ovh/data/mysql/.init-8-4-deadbeef".to_string()),
+            args.contains(&"--datadir=/tmp/ovh/data/mysql/init-8-4-deadbeef".to_string()),
             "got {args:?}"
         );
         assert!(
