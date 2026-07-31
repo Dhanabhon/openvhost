@@ -13,6 +13,9 @@ function row(
 	return {
 		major,
 		installed,
+		// A row this build manages, which is what nearly every test here means.
+		// Pass `cataloged: false` to exercise the hand-installed case.
+		cataloged: true,
 		recommended: false,
 		fullVersion: null,
 		path: installed ? `/opt/homebrew/opt/php@${major}/sbin/php-fpm` : null,

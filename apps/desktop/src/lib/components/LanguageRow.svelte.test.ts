@@ -20,6 +20,9 @@ function r(
 	return {
 		major,
 		installed,
+		// See `row()` in languages.svelte.test.ts — catalogued is the default;
+		// `cataloged: false` is the hand-installed row that gets no Uninstall.
+		cataloged: true,
 		recommended: false,
 		fullVersion: null,
 		path: installed ? `/opt/homebrew/opt/php@${major}/sbin/php-fpm` : null,
