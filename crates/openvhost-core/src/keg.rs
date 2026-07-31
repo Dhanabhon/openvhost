@@ -137,6 +137,27 @@ pub fn keg_provenance(prefixes: &[&Path], formula: &str) -> KegProvenance {
         let Some(keg) = resolve_keg(&link) else {
             continue;
         };
+        // `resolve_keg` proves the SHAPE (`…/Cellar/<owner>/<version>`); this
+        // proves the LOCATION. Without it any path on the machine whose last
+        // three components spell `Cellar/<formula>/<version>` reads as our own
+        // keg, and a link escaping the prefix — absolute, or `../../elsewhere`
+        // in brew's own relative style — turns a ForeignKeg refusal into
+        // "proceed". Reaching that needs write access to `<prefix>/opt`, which
+        // already subsumes the harm, so this is depth rather than a boundary;
+        // it is here so the doc above does not outrun the code.
+        //
+        // The prefix is canonicalized first and that is load-bearing, not
+        // padding: on macOS `/var` resolves to `/private/var`, so comparing
+        // against an uncanonicalized prefix fails for every tempdir and would
+        // look like a broken check rather than a strict one. A Cellar
+        // relocated to another volume already fails closed to `Unresolved` via
+        // the shape check, so this refuses nothing that used to work.
+        let contained = std::fs::canonicalize(prefix)
+            .ok()
+            .is_some_and(|real_prefix| keg.path.starts_with(&real_prefix));
+        if !contained {
+            continue;
+        }
         // Case-insensitive for the same reason `CELLAR` is: on a
         // case-insensitive volume `Cellar/PHP` and `Cellar/php` are one
         // directory, and treating them as different owners would report a
@@ -173,6 +194,62 @@ mod tests {
             opt.join(formula),
         )
         .unwrap();
+    }
+
+    /// A keg-shaped tree OUTSIDE the prefix must never read as our own, by
+    /// either escape route. Both were working bypasses before the containment
+    /// check: `resolve_keg` proves the shape, and a shape check alone accepts
+    /// `Cellar/<formula>/<version>` wherever it sits.
+    #[cfg(unix)]
+    #[test]
+    fn a_keg_outside_the_prefix_is_never_our_own() {
+        for (name, target) in [
+            // absolute, pointing at another tree entirely
+            ("absolute", None),
+            // brew's own relative style, walking back out of the prefix
+            (
+                "relative",
+                Some(PathBuf::from("..").join("..").join("evil")),
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let prefix = dir.path().join("prefix");
+            let outside = dir.path().join("evil");
+            let keg = outside.join("Cellar").join("php@8.5").join("8.5.9");
+            std::fs::create_dir_all(&keg).unwrap();
+            let opt = prefix.join("opt");
+            std::fs::create_dir_all(&opt).unwrap();
+            let link_target = match &target {
+                Some(rel) => rel.join("Cellar").join("php@8.5").join("8.5.9"),
+                None => keg.clone(),
+            };
+            std::os::unix::fs::symlink(link_target, opt.join("php@8.5")).unwrap();
+
+            match keg_provenance(&[&prefix], "php@8.5") {
+                KegProvenance::Unresolved { .. } => {}
+                other => panic!("{name} escape must not resolve, got {other:?}"),
+            }
+        }
+    }
+
+    /// The containment check must not reject the real thing. On macOS a
+    /// tempdir lives under `/var`, which canonicalizes to `/private/var` — so
+    /// comparing against an uncanonicalized prefix would fail here and make a
+    /// strict check look like a broken one.
+    #[cfg(unix)]
+    #[test]
+    fn containment_still_accepts_a_prefix_reached_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        brew_layout(&real, "php@8.4", "php@8.4", "8.4.13");
+        let via_link = dir.path().join("via-link");
+        std::os::unix::fs::symlink(&real, &via_link).unwrap();
+
+        match keg_provenance(&[&via_link], "php@8.4") {
+            KegProvenance::OwnKeg { .. } => {}
+            other => panic!("a symlinked prefix must still own its keg, got {other:?}"),
+        }
     }
 
     #[cfg(unix)]
