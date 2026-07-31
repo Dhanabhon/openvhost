@@ -20,12 +20,19 @@ mod stack;
 // menu-event router — see its own module docs for the breakdown.
 mod tray;
 
+// Demo-ticker only (spec D8) — see `demo_ticker_spec`'s own `#[cfg(debug_assertions)]`
+// gate for why this whole import is gated identically: a release build never
+// constructs a `ServiceSpec` for it at all, so these would otherwise be
+// unused-import errors under `-D warnings` in exactly the profile this gate
+// targets.
+#[cfg(debug_assertions)]
 use std::ffi::OsString;
 use std::sync::Arc;
 
+#[cfg(debug_assertions)]
+use openvhost_proc::{DEFAULT_GRACE, ReadinessProbe, ServiceSpec, SpawnSpec};
 use openvhost_proc::{
-    DEFAULT_GRACE, FileRegistry, InstanceLock, ReadinessProbe, ServiceSpec, SpawnSpec, Supervisor,
-    SupervisorEvent, default_driver, default_reaper,
+    FileRegistry, InstanceLock, Supervisor, SupervisorEvent, default_driver, default_reaper,
 };
 use tauri::Manager;
 use tauri_specta::{Builder, Event, collect_commands, collect_events};
@@ -100,6 +107,18 @@ fn specta_builder() -> Builder<tauri::Wry> {
 /// Dev convenience: the demo ticker runs the openvhost CLI sitting next to
 /// this executable in target/. A missing binary is an HONEST Failed state
 /// in the UI (the spawn-failure log names the path), not a crash.
+///
+/// `#[cfg(debug_assertions)]` (P1 tray design, spec D8): this service
+/// deliberately fails after 45 ticks to exercise the `Failed` UI path in
+/// development. Registering it unconditionally — as this crate did before
+/// this gate — meant a RELEASE build shipped it too, so every real user's
+/// tray (and Services page) would show "demo-ticker — Failed" once the
+/// counter ran out. `debug_assertions`, not `cfg(test)`: `cargo test`
+/// itself compiles with `debug_assertions` on (dev/test profiles share it),
+/// so this stays registered for tests and ordinary `cargo run`/`tauri dev`
+/// and disappears ONLY from a `--release` build — exactly the one profile
+/// real users run.
+#[cfg(debug_assertions)]
 fn demo_ticker_spec() -> ServiceSpec {
     let cli = std::env::current_exe()
         .ok()
@@ -221,6 +240,20 @@ pub fn run() {
             // invoke the command.
             app.manage(commands::InstallLock::default());
 
+            // Bulk Start-all/Stop-all admission guard (P1 tray design, spec
+            // D7) and the tray-initiated-failure tracking set (spec D4).
+            // Managed unconditionally and up front, same reasoning as
+            // `UiReady`/`ApplyLock`/`InstallLock` above: both are only ever
+            // READ by `tray::handle_tray_menu_id`'s Start-all/Stop-all/
+            // per-service branches, which in practice are only ever reached
+            // via a real tray click (macOS-only, built further down) — but
+            // managing them here rather than inside that `#[cfg(target_os =
+            // "macos")]` block keeps every `try_state` read in this app
+            // failing closed the same way, and keeps them reachable from a
+            // test's own `mock_builder` setup without needing a real tray.
+            app.manage(tray::BulkLock::default());
+            app.manage(tray::TrayInitiated::default());
+
             // Single-instance lock (design spec §7): reap MUST run only
             // while this is held, otherwise a second live instance would
             // reap the first's HEALTHY services (identity matches — it
@@ -255,6 +288,7 @@ pub fn run() {
                                 registry,
                                 default_reaper(),
                             ));
+                            #[cfg(debug_assertions)]
                             supervisor.register(demo_ticker_spec());
                             #[cfg(target_os = "macos")]
                             let (stack_paths, stack_runtimes, mysql_runtimes) = {

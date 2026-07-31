@@ -26,16 +26,23 @@
 
 pub mod apply;
 pub mod model;
+// Bulk start/stop primitives and the failure-dialog's pure decision logic
+// (Task 5 of this slice, spec D4/D6/D7) — private: only `handle_tray_menu_id`
+// and the event-subscriber loop below ever call into it, so nothing outside
+// this module needs the path.
+mod service_control;
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use apply::{TraySink, apply};
 use model::{Action, BulkState, IconState, TrayModel, toggle_action, tray_model};
-use openvhost_proc::{Supervisor, SupervisorEvent};
+use openvhost_proc::{ServiceState, ServiceStatus, Supervisor, SupervisorEvent};
 use tauri::image::Image;
 use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Manager, Runtime};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 /// "Open OpenVHost" row's menu-item id (spec D2's menu layout; also the
 /// action `RunEvent::Reopen`/a Dock click perform — see `lib.rs`'s
@@ -46,18 +53,71 @@ pub const OPEN_MENU_ITEM_ID: &str = "openvhost:tray:open";
 /// something namespaced to assign rather than an auto-generated id.
 pub const SUMMARY_MENU_ITEM_ID: &str = "openvhost:tray:summary";
 /// "Start all" row's id. Recognized by [`build`] (so the row exists and its
-/// enabled state tracks [`TrayModel::start_all_enabled`]) but NOT yet
-/// dispatched by [`handle_tray_menu_id`] — bulk start (`BulkLock`, spec D7)
-/// is a later task in this same slice's plan; see that function's doc
-/// comment.
+/// enabled state tracks [`TrayModel::start_all_enabled`]) and dispatched by
+/// [`handle_tray_menu_id`] via [`dispatch_start_all`] (spec D6/D7).
 pub const START_ALL_MENU_ITEM_ID: &str = "openvhost:tray:start-all";
-/// "Stop all" row's id. Same status as [`START_ALL_MENU_ITEM_ID`].
+/// "Stop all" row's id. Dispatched via [`dispatch_stop_all`] — otherwise
+/// the same status as [`START_ALL_MENU_ITEM_ID`].
 pub const STOP_ALL_MENU_ITEM_ID: &str = "openvhost:tray:stop-all";
 
 /// Index the per-service rows are inserted/removed at: Open (0), summary
 /// (1), Start all (2), Stop all (3), a leading separator (4) — rows begin
 /// at 5, followed by a trailing separator and Quit.
 const ROWS_START_INDEX: usize = 5;
+
+/// Guards a Start-all/Stop-all bulk action end to end (spec D7): reject a
+/// SECOND bulk action while one is in flight — never queue it. `try_lock`
+/// only; nothing in this app ever calls `.lock().await` on this mutex, which
+/// is what makes "reject" possible at all — a blocking acquire would wait
+/// instead.
+///
+/// Managed as its own app state (`lib.rs`), NOT a field on the real
+/// [`TrayHandle`]: spec D9 forbids constructing a real tray/menu in a test,
+/// so the reject-not-queue admission check ([`service_control::try_acquire_bulk`],
+/// dispatched from [`handle_tray_menu_id`]) has to be reachable under
+/// `tauri::test::mock_builder` WITHOUT one — see this module's own test
+/// module for exactly that.
+#[derive(Default)]
+pub(crate) struct BulkLock(tokio::sync::Mutex<()>);
+
+/// The ids currently in a start attempt DISPATCHED FROM THE TRAY (spec D4):
+/// a single row's `Start`/`Retry` click, or a [`dispatch_start_all`] sweep.
+/// An id is [`mark`](TrayInitiated::mark)ed right before the corresponding
+/// `Supervisor::start` call and [`resolve`](TrayInitiated::resolve)d the
+/// moment that attempt's outcome is known (`Running`, `Stopped`, or
+/// `Failed` — see [`service_control::dialog_for_transition`]), so a MUCH
+/// LATER failure of a long-since-`Running` service (e.g. killed externally,
+/// or crashed after running fine for an hour) is never mistaken for the
+/// failure of the start attempt itself.
+///
+/// Bounded by construction, not by any eviction policy: the only way an id
+/// enters this set is a tray dispatch, and every entry is removed on that
+/// SAME service's very next `StateChanged` — an id can therefore only ever
+/// be a member between being marked and the next event for it, never
+/// longer, so this cannot accumulate faster than the (small, fixed) number
+/// of services a machine has registered.
+///
+/// Same "own app state, not a `TrayHandle` field" reasoning as [`BulkLock`]
+/// — see its doc comment.
+#[derive(Default)]
+pub(crate) struct TrayInitiated(Mutex<HashSet<String>>);
+
+impl TrayInitiated {
+    fn mark(&self, id: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string());
+    }
+
+    /// Remove `id` unconditionally (its start attempt has resolved, one way
+    /// or another) and report whether it had actually been tracked — the
+    /// caller uses that to decide whether a `Failed` resolution owes a
+    /// dialog.
+    fn resolve(&self, id: &str) -> bool {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).remove(id)
+    }
+}
 
 /// The tray icon's glyph for `state`, embedded at compile time (spec D5).
 ///
@@ -116,11 +176,14 @@ fn icon_for_state(state: IconState) -> Image<'static> {
 /// reactor running" the first time a tray click landed outside of any
 /// already-async context.
 ///
-/// An id that matches no known service — this includes the reserved
-/// [`START_ALL_MENU_ITEM_ID`]/[`STOP_ALL_MENU_ITEM_ID`]/
-/// [`SUMMARY_MENU_ITEM_ID`] strings, whose bulk/no-op dispatch is a later
-/// task in this slice's plan — is a deliberate no-op: an unrecognized id
-/// must never panic or guess at an action.
+/// [`START_ALL_MENU_ITEM_ID`]/[`STOP_ALL_MENU_ITEM_ID`] are handled next
+/// (spec D6/D7), each delegating to its own dispatch function — see
+/// [`dispatch_start_all`]/[`dispatch_stop_all`]'s own doc comments for the
+/// admission check (both the tray's own [`BulkLock`] and the existing
+/// `ApplyLock` must be free) and the failure-tracking side effect.
+/// [`SUMMARY_MENU_ITEM_ID`] and an id that matches no known service are both
+/// deliberate no-ops: an unrecognized id must never panic or guess at an
+/// action.
 pub fn handle_tray_menu_id<R: Runtime>(app: &AppHandle<R>, id: &str) {
     if id == crate::quit::QUIT_MENU_ITEM_ID {
         if !crate::quit::request_quit(app) {
@@ -143,6 +206,16 @@ pub fn handle_tray_menu_id<R: Runtime>(app: &AppHandle<R>, id: &str) {
         return;
     }
 
+    if id == START_ALL_MENU_ITEM_ID {
+        dispatch_start_all(app);
+        return;
+    }
+
+    if id == STOP_ALL_MENU_ITEM_ID {
+        dispatch_stop_all(app);
+        return;
+    }
+
     let Some(sup) = app.try_state::<Arc<Supervisor>>().map(|s| Arc::clone(&s)) else {
         return;
     };
@@ -151,6 +224,12 @@ pub fn handle_tray_menu_id<R: Runtime>(app: &AppHandle<R>, id: &str) {
     };
     match toggle_action(&status.id, &status.state) {
         Action::Start(sid) | Action::Retry(sid) => {
+            // Mark BEFORE dispatch (spec D4): `sid` must already be tracked
+            // by the time `sup.start` could possibly broadcast a `Failed`
+            // for it, however fast — see `TrayInitiated`'s own doc comment.
+            if let Some(tracked) = app.try_state::<TrayInitiated>() {
+                tracked.mark(&sid);
+            }
             tauri::async_runtime::spawn(async move {
                 let _ = sup.start(&sid);
             });
@@ -162,6 +241,268 @@ pub fn handle_tray_menu_id<R: Runtime>(app: &AppHandle<R>, id: &str) {
         }
         Action::None => {}
     }
+}
+
+/// Dispatch "Start all" (spec D6/D7/D8): rejects — does nothing at all — if
+/// EITHER the tray's own [`BulkLock`] or the existing
+/// `crate::commands::ApplyLock` is already held (spec D7's "reject, never
+/// queue"; see [`service_control::try_acquire_bulk`]'s own doc comment for
+/// why the SAME mutex `apply_config` uses is part of this check).
+/// Otherwise marks every id [`model::bulk_start_ids`] selects as
+/// tray-initiated (spec D4) strictly BEFORE calling [`Supervisor::start`] on
+/// it, so even a start that fails instantly is still caught by the failure
+/// dialog.
+///
+/// Forces a menu recompute the INSTANT the locks are acquired
+/// (`BulkState::Busy`) and again the instant they are released, rather than
+/// waiting for the next unrelated `StateChanged` to happen to recompute
+/// anyway — see [`refresh_tray_if_built`]'s own doc comment for why that
+/// matters.
+///
+/// Requires `Arc<Supervisor>`/[`BulkLock`]/`ApplyLock`/[`TrayInitiated`] all
+/// to be managed; missing ANY of them is a silent no-op (mirrors every other
+/// `try_state` read in this app) rather than a partial action — there is no
+/// safe partial version of "start some services but track none of them".
+fn dispatch_start_all<R: Runtime>(app: &AppHandle<R>) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let Some(sup) = app.try_state::<Arc<Supervisor>>().map(|s| Arc::clone(&s)) else {
+            return;
+        };
+        let Some(bulk_lock) = app.try_state::<BulkLock>() else {
+            return;
+        };
+        let Some(apply_lock) = app.try_state::<crate::commands::ApplyLock>() else {
+            return;
+        };
+        let Some(tracked) = app.try_state::<TrayInitiated>() else {
+            return;
+        };
+
+        let bulk_mutex = &bulk_lock.inner().0;
+        let apply_mutex = &apply_lock.inner().0;
+        let Some(_guards) = service_control::try_acquire_bulk(bulk_mutex, apply_mutex) else {
+            return;
+        };
+
+        let snapshot = sup.snapshot();
+        refresh_tray_if_built(&app, snapshot.clone(), BulkState::Busy);
+        service_control::start_all_with(&snapshot, |id| {
+            tracked.mark(id);
+            let _ = sup.start(id);
+        });
+
+        drop(_guards);
+        let bulk = probe_bulk_state(&app);
+        refresh_tray_if_built(&app, sup.snapshot(), bulk);
+    });
+}
+
+/// Dispatch "Stop all" (spec D6/D7): the same reject-not-queue admission
+/// check as [`dispatch_start_all`], then delegates the actual stop to
+/// [`crate::quit::stop_all`] — the LITERAL function [`crate::quit::perform_quit`]
+/// uses, not a copy (spec D6: forking it is how Quit and tray Stop-all
+/// would silently drift apart), including its 18s budget already covering
+/// MySQL's own 15s shutdown grace.
+///
+/// Does not touch [`TrayInitiated`] — stopping is never itself a "start
+/// failed" event. If a service the tray started is still `Starting` when
+/// this runs (spec D7: "Stop-all during MySQL's 15s grace needs no
+/// change") and its stop resolves to `Failed` rather than `Stopped` (a
+/// real, if rare, classification — see `openvhost_proc`'s
+/// `service_task::finish_never_ready`), the EXISTING event-subscriber loop
+/// in [`build`] still raises the dialog for it via
+/// [`maybe_show_failure_dialog`]; nothing here needs to special-case that.
+fn dispatch_stop_all<R: Runtime>(app: &AppHandle<R>) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let Some(sup) = app.try_state::<Arc<Supervisor>>().map(|s| Arc::clone(&s)) else {
+            return;
+        };
+        let Some(bulk_lock) = app.try_state::<BulkLock>() else {
+            return;
+        };
+        let Some(apply_lock) = app.try_state::<crate::commands::ApplyLock>() else {
+            return;
+        };
+
+        let bulk_mutex = &bulk_lock.inner().0;
+        let apply_mutex = &apply_lock.inner().0;
+        let Some(_guards) = service_control::try_acquire_bulk(bulk_mutex, apply_mutex) else {
+            return;
+        };
+
+        refresh_tray_if_built(&app, sup.snapshot(), BulkState::Busy);
+        let stragglers = crate::quit::stop_all(Arc::clone(&sup)).await;
+        if !stragglers.is_empty() {
+            eprintln!(
+                "openvhost: tray Stop all left {} service(s) still not stopped: {}",
+                stragglers.len(),
+                stragglers.join(", ")
+            );
+        }
+
+        drop(_guards);
+        let bulk = probe_bulk_state(&app);
+        refresh_tray_if_built(&app, sup.snapshot(), bulk);
+    });
+}
+
+/// Recompute a [`TrayModel`] from `snapshot`/`bulk`, diff it against the
+/// last-applied model, and apply the result — all inside ONE
+/// `run_on_main_thread` dispatch (see [`build`]'s own doc comment, "critical
+/// mechanic"). A no-op, not a panic, when no real tray was built (non-macOS,
+/// spec D10 — or `build` itself failed and logged; see `lib.rs`'s
+/// `#[cfg(target_os = "macos")]` call site) — mirrors every other
+/// `try_state` read in this app.
+///
+/// Shared by the live event-subscriber loop in [`build`] and the bulk-action
+/// dispatch functions above (spec D7): a bulk action must show
+/// `Busy`/`Idle` the INSTANT it acquires/releases [`BulkLock`], not only
+/// whenever the next unrelated `StateChanged` happens to recompute anyway —
+/// MySQL's own stop sequence, for one, emits no intermediate event across
+/// its whole 15s grace, so without this a Stop-all click would leave the
+/// menu looking idle-and-clickable for up to 15s before anything visibly
+/// changed.
+fn refresh_tray_if_built<R: Runtime>(
+    app: &AppHandle<R>,
+    snapshot: Vec<ServiceStatus>,
+    bulk: BulkState,
+) {
+    let Some(tray) = app
+        .try_state::<Arc<TrayHandle<R>>>()
+        .map(|t| Arc::clone(&t))
+    else {
+        return;
+    };
+    let _ = app.run_on_main_thread(move || {
+        let new_model = tray_model(&snapshot, bulk);
+        let mut last = tray.last_model.lock().unwrap_or_else(|e| e.into_inner());
+        apply(&last, &new_model, tray.as_ref());
+        *last = new_model;
+    });
+}
+
+/// Whether a bulk action currently holds [`BulkLock`] — a non-blocking
+/// PROBE (`try_lock`, immediately dropped on success), never an actual
+/// acquisition: this is ONLY for deciding what the menu should currently
+/// render. The real admission check bulk actions gate on is
+/// [`service_control::try_acquire_bulk`], called separately by
+/// [`dispatch_start_all`]/[`dispatch_stop_all`] — this function has no
+/// bearing on it either way.
+///
+/// `Idle` when [`BulkLock`] is not even managed — mirrors every other
+/// `try_state` absent-state fallback in this app; there is nothing that
+/// could be holding a lock that was never created.
+fn probe_bulk_state<R: Runtime>(app: &AppHandle<R>) -> BulkState {
+    match app.try_state::<BulkLock>() {
+        Some(lock) if lock.inner().0.try_lock().is_ok() => BulkState::Idle,
+        Some(_) => BulkState::Busy,
+        None => BulkState::Idle,
+    }
+}
+
+/// If `state` is a `Failed` transition for an id [`TrayInitiated`] is
+/// tracking (spec D4 — dispatched from THIS tray, never e.g. the Services
+/// page's own `start_service` command), show the native error dialog with
+/// the exit status and `stderr_tail` VERBATIM; any other transition just
+/// resolves the tracking without a dialog — see
+/// [`service_control::dialog_for_transition`]'s own doc comment for exactly
+/// which transitions count.
+fn maybe_show_failure_dialog<R: Runtime>(
+    app: &AppHandle<R>,
+    supervisor: &Supervisor,
+    id: &str,
+    state: &ServiceState,
+) {
+    maybe_show_failure_dialog_with(app, supervisor, id, state, show_failure_dialog);
+}
+
+/// [`maybe_show_failure_dialog`], parameterized over the actual
+/// dialog-showing call so the DECISION (fetch [`TrayInitiated`], look up a
+/// display name, defer to [`service_control::dialog_for_transition`]) is
+/// testable under `tauri::test::mock_builder` with a recording closure
+/// instead of a real `rfd` alert (spec D9 rules out the latter, not the
+/// former) — same closure-injection reasoning as `quit::stop_all`/
+/// `stop_all_with`.
+///
+/// No-op, not a panic, when [`TrayInitiated`] is not managed (mirrors every
+/// other `try_state` read in this app) or `id` no longer names a registered
+/// service (defensive; nothing in this app unregisters one today — falls
+/// back to `id` itself as the display name rather than skipping the dialog
+/// outright).
+fn maybe_show_failure_dialog_with<R: Runtime>(
+    app: &AppHandle<R>,
+    supervisor: &Supervisor,
+    id: &str,
+    state: &ServiceState,
+    show: impl FnOnce(&AppHandle<R>, String, String),
+) {
+    let Some(tracked) = app.try_state::<TrayInitiated>() else {
+        return;
+    };
+    let display_name = supervisor
+        .snapshot()
+        .into_iter()
+        .find(|s| s.id == id)
+        .map(|s| s.display_name)
+        .unwrap_or_else(|| id.to_string());
+    let Some((title, body)) =
+        service_control::dialog_for_transition(&tracked, id, &display_name, state)
+    else {
+        return;
+    };
+    show(app, title, body);
+}
+
+/// The actual native dialog call (spec D4) — the one piece of this feature
+/// spec D9 rules out testing directly (no `NSAlert` in a test process).
+/// Kept as small and untested-by-necessity as possible: every DECISION that
+/// feeds it (whether to show one at all, and its exact text) is
+/// [`maybe_show_failure_dialog_with`] and
+/// [`service_control::dialog_for_transition`]/[`service_control::failure_dialog_text`],
+/// all of which have full test coverage without this function ever running.
+///
+/// Calling the Rust `tauri_plugin_dialog::DialogExt` API directly, rather
+/// than a new Tauri command the frontend would invoke, means this never
+/// touches the IPC/ACL layer at all (spec D6's "zero new Tauri commands")
+/// — the same reasoning that already applies to every other tray action in
+/// this module.
+///
+/// *Open OpenVHost* shows, un-minimizes, and focuses the main window — the
+/// SAME three calls [`OPEN_MENU_ITEM_ID`]'s own handler performs, so the
+/// button and the tray's "Open OpenVHost" row are indistinguishable in
+/// effect. *Dismiss* does nothing further: the tray icon and the row
+/// already stayed in the `Failed` state on their own (spec D4 — the dialog
+/// is transient, the tray state is durable), so there is nothing left for
+/// this button to do. Deliberately does NOT show/focus the window on a bare
+/// dismiss, and does NOT show it before the dialog appears either — spec
+/// D4, "auto-opening the window is rejected": the dialog already makes the
+/// failure unmissable, so raising the window on top of it would only be
+/// focus-stealing.
+///
+/// `.show(..)`, never `.blocking_show(..)`: the latter's own documentation
+/// says it must not run on the main thread, and blocking a tokio worker
+/// thread (this runs from inside the event-subscriber task) until the user
+/// gets around to dismissing a dialog would starve that worker of every
+/// other pending task for as long as the dialog stays open.
+fn show_failure_dialog<R: Runtime>(app: &AppHandle<R>, title: String, body: String) {
+    let app_for_open = app.clone();
+    app.dialog()
+        .message(body)
+        .title(title)
+        .kind(MessageDialogKind::Error)
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Open OpenVHost".to_string(),
+            "Dismiss".to_string(),
+        ))
+        .show(move |opened| {
+            if opened && let Some(window) = app_for_open.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        });
 }
 
 /// The real [`TraySink`]: holds every native handle a diff might need to
@@ -287,6 +628,10 @@ impl<R: Runtime> TraySink for TrayHandle<R> {
 /// what makes this immune to the broadcast channel's `Lagged` arm (spec
 /// D2) — a dropped batch of events just means the next recompute catches
 /// up to current reality, rather than needing to replay what was missed.
+/// [`BulkState`] is likewise re-PROBED (`probe_bulk_state`) on every
+/// recompute rather than cached, and every `StateChanged` is separately
+/// checked against [`TrayInitiated`] for a spec D4 failure dialog
+/// ([`maybe_show_failure_dialog`]) before the recompute even runs.
 ///
 /// **Critical mechanic:** `MenuItem::set_text`/`set_enabled` (and
 /// `Menu::insert`/`remove`) are each their own blocking main-thread
@@ -394,12 +739,12 @@ pub fn build<R: Runtime>(app: &AppHandle<R>, supervisor: Arc<Supervisor>) -> tau
         rows: Mutex::new(rows),
         last_model: Mutex::new(initial),
     });
-    // A second strong reference, tying the tray's lifetime to the App's own
-    // managed-state lifetime in addition to the subscriber task below —
-    // belt-and-suspenders: the task's infinite loop already keeps `handle`
-    // alive for the app's lifetime today, but pinning it to managed state
-    // too means a future refactor of that loop cannot silently shorten the
-    // tray's lifetime without also touching this line.
+    // The SOLE strong reference kept beyond this function: both the
+    // subscriber loop below and the bulk-action dispatch functions
+    // (`dispatch_start_all`/`dispatch_stop_all` in this module) reach the
+    // tray only via `refresh_tray_if_built`'s own `app.try_state::<Arc<TrayHandle<R>>>()`
+    // lookup, never a directly captured clone — so managed state is what
+    // keeps this alive for the app's whole lifetime, not a loop closure.
     app.manage(Arc::clone(&handle));
 
     let mut rx = supervisor.subscribe();
@@ -407,9 +752,15 @@ pub fn build<R: Runtime>(app: &AppHandle<R>, supervisor: Arc<Supervisor>) -> tau
     tauri::async_runtime::spawn(async move {
         loop {
             let refresh = match rx.recv().await {
-                Ok(SupervisorEvent::StateChanged { .. } | SupervisorEvent::Registered { .. }) => {
+                Ok(SupervisorEvent::StateChanged { id, state, .. }) => {
+                    // Spec D4: check this BEFORE the (possibly skipped, see
+                    // below) menu recompute — a failure dialog is owed
+                    // regardless of whether the aggregate model actually
+                    // changed shape.
+                    maybe_show_failure_dialog(&app_for_task, &supervisor, &id, &state);
                     true
                 }
+                Ok(SupervisorEvent::Registered { .. }) => true,
                 // A log line never changes a ServiceStatus's id/display_name/
                 // endpoint/pid/state — the only fields `tray_model` reads —
                 // so recomputing here would be a guaranteed-no-op diff at
@@ -430,21 +781,8 @@ pub fn build<R: Runtime>(app: &AppHandle<R>, supervisor: Arc<Supervisor>) -> tau
                 continue;
             }
             let snapshot = supervisor.snapshot();
-            let handle = Arc::clone(&handle);
-            // See this function's own doc comment ("critical mechanic") for
-            // why the WHOLE diff-and-apply below lives inside this one
-            // `run_on_main_thread` closure rather than being called from
-            // this async task directly.
-            let _ = app_for_task.run_on_main_thread(move || {
-                // `BulkState::Idle` unconditionally: the real `BulkLock` this
-                // should read from is a later task in this slice's plan
-                // (spec D7) — until it lands, nothing can hold the lock, so
-                // `Idle` is the only truthful answer, not a stand-in.
-                let new_model = tray_model(&snapshot, BulkState::Idle);
-                let mut last = handle.last_model.lock().unwrap_or_else(|e| e.into_inner());
-                apply(&last, &new_model, handle.as_ref());
-                *last = new_model;
-            });
+            let bulk = probe_bulk_state(&app_for_task);
+            refresh_tray_if_built(&app_for_task, snapshot, bulk);
         }
     });
 
@@ -485,6 +823,27 @@ mod tests {
             spawn: SpawnSpec {
                 program: PathBuf::from("/bin/sh"),
                 args: vec![OsString::from("-c"), OsString::from("exec sleep 30")],
+                cwd: None,
+                env: vec![],
+            },
+            readiness: ReadinessProbe::default(),
+            grace: DEFAULT_GRACE,
+        }
+    }
+
+    /// A [`ServiceSpec`] that is never actually spawned — the bulk-dispatch
+    /// rejection tests below only `register` it (so `sup.snapshot()` has a
+    /// real row to leave untouched) and never `start` it, so unlike
+    /// `sleepy_spec` above this needs no real shell and is not
+    /// `#[cfg(unix)]`-gated.
+    fn registered_only_spec(id: &str) -> ServiceSpec {
+        ServiceSpec {
+            id: id.to_string(),
+            display_name: id.to_string(),
+            endpoint: Some(format!("endpoint-{id}")),
+            spawn: SpawnSpec {
+                program: PathBuf::from("/does/not/exist"),
+                args: vec![],
                 cwd: None,
                 env: vec![],
             },
@@ -698,5 +1057,256 @@ mod tests {
         // must be a silent best-effort no-op, not a panic, mirroring
         // `request_quit`'s own "no window" handling.
         handle_tray_menu_id(app.handle(), OPEN_MENU_ITEM_ID);
+    }
+
+    // -----------------------------------------------------------------
+    // handle_tray_menu_id: Start all / Stop all (spec D6/D7) — happy path.
+    // -----------------------------------------------------------------
+
+    /// Two `Stopped` services, both with NO endpoint (so `bulk_start_ids`'s
+    /// one-per-endpoint rule never excludes either — see `model.rs`'s own
+    /// `two_services_with_no_endpoint_do_not_collide_with_each_other`):
+    /// Start-all through the router must bring BOTH to `Running`.
+    ///
+    /// VACUITY (neuter-and-watch-it-fail): temporarily made
+    /// `dispatch_start_all` call `sup.start` on every registered id directly
+    /// (skipping `service_control::start_all_with`/`bulk_start_ids`
+    /// entirely) — this test still passed (nothing here distinguishes that
+    /// from the real selection with only terminal, endpoint-distinct rows),
+    /// so it does NOT by itself prove the real selection rule is wired in —
+    /// that proof lives in `service_control.rs`'s own
+    /// `starts_only_the_ids_bulk_start_ids_selects_in_order`. This test's
+    /// actual job, confirmed separately, is that clicking Start-all reaches
+    /// a REAL `Supervisor::start` through the REAL managed `BulkLock`/
+    /// `ApplyLock`/`TrayInitiated` chain at all — reverting
+    /// `service_control::start_all_with`'s own `bulk_start_ids` call to
+    /// `Vec::new()` (start nothing) DOES fail this test (both services stay
+    /// `Stopped`), which is the failure mode this test exists to catch.
+    #[cfg(unix)]
+    #[test]
+    fn start_all_through_the_router_starts_every_stopped_service() {
+        let (app, sup) = app_with_supervisor();
+        app.manage(BulkLock::default());
+        app.manage(crate::commands::ApplyLock::default());
+        app.manage(TrayInitiated::default());
+        sup.register(sleepy_spec("nginx"));
+        sup.register(sleepy_spec("php-fpm-8.4"));
+
+        handle_tray_menu_id(app.handle(), START_ALL_MENU_ITEM_ID);
+
+        wait_until(
+            || {
+                sup.snapshot()
+                    .iter()
+                    .all(|s| s.state == ServiceState::Running)
+            },
+            Duration::from_secs(5),
+            "start-all did not bring every service to Running",
+        );
+    }
+
+    /// Mirrors the Start-all test above for Stop all: a `Running` service
+    /// must reach `Stopped`. `#[tokio::test(flavor = "multi_thread", ...)]`
+    /// for the SAME reason as `a_starting_service_is_not_stopped_by_the_router`
+    /// above — the setup's own direct `sup.start` call needs an ambient
+    /// tokio runtime, and the service task's readiness timer plus this
+    /// test's blocking `wait_until` polls both need to make progress on the
+    /// same runtime without starving each other.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_all_through_the_router_stops_a_running_service() {
+        let (app, sup) = app_with_supervisor();
+        app.manage(BulkLock::default());
+        app.manage(crate::commands::ApplyLock::default());
+        app.manage(TrayInitiated::default());
+        sup.register(sleepy_spec("nginx"));
+        sup.start("nginx").expect("start failed");
+        wait_until(
+            || {
+                sup.snapshot()
+                    .iter()
+                    .any(|s| s.id == "nginx" && s.state == ServiceState::Running)
+            },
+            Duration::from_secs(5),
+            "setup: nginx never reached Running",
+        );
+
+        handle_tray_menu_id(app.handle(), STOP_ALL_MENU_ITEM_ID);
+
+        wait_until(
+            || {
+                sup.snapshot()
+                    .iter()
+                    .any(|s| s.id == "nginx" && s.state == ServiceState::Stopped)
+            },
+            Duration::from_secs(5),
+            "stop-all did not bring nginx to Stopped",
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // handle_tray_menu_id: Start all / Stop all — reject, never queue
+    // (spec D7), proven against the REAL managed BulkLock/ApplyLock (the
+    // pure admission-check primitive itself is proven independently in
+    // `service_control.rs`'s own `try_acquire_bulk` tests).
+    // -----------------------------------------------------------------
+
+    /// VACUITY (neuter-and-watch-it-fail): temporarily replaced
+    /// `dispatch_start_all`'s `service_control::try_acquire_bulk(...)` call
+    /// with an unconditional `Some((..))` stand-in (i.e. never actually
+    /// checked either lock) — this test failed, `nginx` reached `Running`
+    /// even with `BulkLock` pre-held. Restoring the real acquisition check
+    /// made it pass again.
+    #[test]
+    fn start_all_through_the_router_is_rejected_while_the_bulk_lock_is_already_held() {
+        let (app, sup) = app_with_supervisor();
+        app.manage(BulkLock::default());
+        app.manage(crate::commands::ApplyLock::default());
+        app.manage(TrayInitiated::default());
+        sup.register(registered_only_spec("nginx"));
+        let before = sup.snapshot();
+
+        let bulk_lock = app.state::<BulkLock>();
+        let _held = bulk_lock
+            .inner()
+            .0
+            .try_lock()
+            .expect("test setup: lock must be free");
+
+        handle_tray_menu_id(app.handle(), START_ALL_MENU_ITEM_ID);
+        // Give a wrongly-dispatching implementation a real chance to have
+        // acted before asserting nothing changed — same style as
+        // `unknown_id_changes_nothing_and_does_not_panic`.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            sup.snapshot(),
+            before,
+            "a bulk dispatch must not touch anything while BulkLock is already held"
+        );
+    }
+
+    /// The OTHER half of spec D7's admission check: a bulk dispatch must
+    /// ALSO reject while the EXISTING `crate::commands::ApplyLock` is held
+    /// — not a second, unrelated lock, but the literal mutex `apply_config`
+    /// itself locks.
+    #[test]
+    fn start_all_through_the_router_is_rejected_while_the_apply_lock_is_already_held() {
+        let (app, sup) = app_with_supervisor();
+        app.manage(BulkLock::default());
+        app.manage(crate::commands::ApplyLock::default());
+        app.manage(TrayInitiated::default());
+        sup.register(registered_only_spec("nginx"));
+        let before = sup.snapshot();
+
+        let apply_lock = app.state::<crate::commands::ApplyLock>();
+        let _held = apply_lock
+            .inner()
+            .0
+            .try_lock()
+            .expect("test setup: lock must be free");
+
+        handle_tray_menu_id(app.handle(), START_ALL_MENU_ITEM_ID);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            sup.snapshot(),
+            before,
+            "a bulk dispatch must not touch anything while ApplyLock is already held"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // maybe_show_failure_dialog_with (spec D4) — the WIRING half; the pure
+    // DECISION (which transitions/ids owe a dialog) is proven independently
+    // in `service_control.rs`'s own `dialog_for_transition` tests.
+    // -----------------------------------------------------------------
+
+    /// VACUITY (neuter-and-watch-it-fail): temporarily hardcoded
+    /// `display_name` to `String::new()` instead of looking it up from
+    /// `supervisor.snapshot()` — this test still passed (it only asserts
+    /// the STDERR TAIL appears verbatim, not the display name), which is
+    /// why the second assertion below checks the title contains the real
+    /// registered display name too: reverting the lookup to a hardcoded
+    /// value fails THAT assertion specifically.
+    #[test]
+    fn a_tracked_failure_shows_the_dialog_with_the_stderr_tail_verbatim() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let tracked = TrayInitiated::default();
+        tracked.mark("nginx");
+        app.manage(tracked);
+
+        let sup = Supervisor::new(default_driver());
+        sup.register(registered_only_spec("nginx"));
+
+        let shown: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+        maybe_show_failure_dialog_with(
+            app.handle(),
+            &sup,
+            "nginx",
+            &ServiceState::Failed {
+                exit: Some(1),
+                stderr_tail: vec!["boom: could not bind port".to_string()],
+            },
+            |_app, title, body| {
+                shown.lock().unwrap().push((title, body));
+            },
+        );
+
+        let recorded = shown.into_inner().unwrap();
+        assert_eq!(recorded.len(), 1, "expected exactly one dialog call");
+        assert!(recorded[0].0.contains("nginx"));
+        assert!(recorded[0].1.contains("boom: could not bind port"));
+    }
+
+    #[test]
+    fn an_untracked_failure_never_calls_show() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        // Managed, but nothing marked — the id below was never dispatched
+        // from the tray.
+        app.manage(TrayInitiated::default());
+
+        let sup = Supervisor::new(default_driver());
+        sup.register(registered_only_spec("nginx"));
+
+        let shown: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+        maybe_show_failure_dialog_with(
+            app.handle(),
+            &sup,
+            "nginx",
+            &ServiceState::Failed {
+                exit: Some(1),
+                stderr_tail: vec!["boom".to_string()],
+            },
+            |_app, title, body| {
+                shown.lock().unwrap().push((title, body));
+            },
+        );
+
+        assert!(shown.into_inner().unwrap().is_empty());
+    }
+
+    #[test]
+    fn maybe_show_failure_dialog_with_does_not_panic_when_tray_initiated_is_not_managed() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let sup = Supervisor::new(default_driver());
+        sup.register(registered_only_spec("nginx"));
+
+        maybe_show_failure_dialog_with(
+            app.handle(),
+            &sup,
+            "nginx",
+            &ServiceState::Failed {
+                exit: Some(1),
+                stderr_tail: vec!["boom".to_string()],
+            },
+            |_app, _title, _body| {
+                panic!("must not be called with no TrayInitiated managed");
+            },
+        );
     }
 }

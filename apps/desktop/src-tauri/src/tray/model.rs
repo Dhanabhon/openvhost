@@ -63,22 +63,14 @@ pub enum Action {
 ///
 /// Spec D7: bulk actions take a lock and reject a second call rather than
 /// queuing it, and the menu must render that — both rows disable while
-/// [`BulkState::Busy`]. The real lock (a `BulkLock`, Phase B) is what
-/// produces this value via a `try_lock` probe; this module stays ignorant
-/// of `tokio::sync::Mutex` entirely and only renders the yes/no answer.
+/// [`BulkState::Busy`]. The real lock (`tray::BulkLock`, spec D7's Task 5)
+/// is what produces this value via a `try_lock` probe
+/// (`tray::probe_bulk_state`); this module stays ignorant of
+/// `tokio::sync::Mutex` entirely and only renders the yes/no answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BulkState {
     #[default]
     Idle,
-    // Only ever constructed by this module's own tests today: `tray::build`
-    // (Phase B) always passes `Idle` because the real `BulkLock` that would
-    // ever observe `Busy` is a later task in this slice's plan (spec D7) —
-    // until it lands, nothing in production can hold the lock, so `Idle` is
-    // the only truthful value a real caller can pass, and rustc's dead-code
-    // analysis (correctly) sees no production path constructing this
-    // variant yet. Drop this `allow` the moment `BulkLock`'s `try_lock`
-    // probe lands and maps its "held" case to `Busy`.
-    #[allow(dead_code)]
     Busy,
 }
 

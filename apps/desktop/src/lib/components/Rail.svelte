@@ -200,17 +200,15 @@
 
 	<div class="rail-foot">
 		<span class="num">v0.1.0</span>
-		<!-- No wired action yet — a real, natively-disabled control rather than a fake href="#" link. -->
-		<button type="button" class="stop-all" disabled>Stop all</button>
 	</div>
 </nav>
 
 <style>
-	/* Ported from docs/design/mock.css (.rail, .rail-brand, .nav-item, .rail-foot). Two
-	   additions beyond the mockup: an [aria-disabled='true'] muted variant for the Sites/Logs/
-	   Settings placeholders, and a .stop-all button reset (the mockup's "Stop all" is a plain
-	   `.link` anchor; here it is a real disabled <button>, so it needs its own un-anchor styling
-	   rather than the `.link` rule from mock.css). */
+	/* Ported from docs/design/mock.css (.rail, .rail-brand, .nav-item, .rail-foot). One
+	   addition beyond the mockup: an [aria-disabled='true'] muted variant for the Sites/Logs/
+	   Settings placeholders. (This file used to also carry a permanently-disabled "Stop all"
+	   button + its own .stop-all reset here — removed once the P1 tray design shipped a real,
+	   working bulk-control equivalent in the menu-bar tray; see apps/desktop/src-tauri/src/tray/.) */
 	.rail {
 		background: var(--vh-surface-2);
 		border-right: 1px solid var(--vh-border);
@@ -274,23 +272,5 @@
 		justify-content: space-between;
 		color: var(--vh-text-2);
 		font-size: var(--vh-text-caption);
-	}
-	.stop-all {
-		font-family: inherit;
-		font-size: var(--vh-text-caption);
-		font-weight: 500;
-		color: var(--vh-link);
-		background: none;
-		border: 0;
-		padding: 0;
-		cursor: pointer;
-	}
-	.stop-all:hover {
-		text-decoration: underline;
-	}
-	.stop-all:disabled {
-		color: var(--vh-text-disabled);
-		cursor: not-allowed;
-		text-decoration: none;
 	}
 </style>
