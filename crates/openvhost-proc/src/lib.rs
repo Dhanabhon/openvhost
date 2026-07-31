@@ -6,6 +6,7 @@
 //! log capture, and a broadcast event stream. MUST stay tauri-free.
 //! v0 scope per spec 2026-07-21-p03-supervisor-design.md.
 
+pub mod control;
 mod error;
 pub mod events;
 mod log;
@@ -21,7 +22,7 @@ pub use error::ProcError;
 pub use events::{LogLevel, LogLine, ServiceState, ServiceStatus, StreamSource, SupervisorEvent};
 pub use orphan::{
     BootId, FileRegistry, InstanceLock, OrphanReaper, ProcIdentity, ProcStartTime, ProcessRegistry,
-    RegistrySnapshot, SupervisedRecord,
+    RegistrySnapshot, SupervisedRecord, SupervisorPresence,
 };
 pub use platform::{
     OutputStream, ProcessDriver, SpawnSpec, SpawnedChild, default_driver, default_reaper,

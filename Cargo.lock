@@ -2787,6 +2787,7 @@ dependencies = [
 name = "openvhost-proc"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "libc",
  "serde",
  "serde_json",

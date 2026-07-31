@@ -130,7 +130,7 @@ pub(crate) mod reap;
 pub use reap::reap_orphans;
 
 pub(crate) mod lock;
-pub use lock::InstanceLock;
+pub use lock::{InstanceLock, SupervisorPresence};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
