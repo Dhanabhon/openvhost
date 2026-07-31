@@ -23,6 +23,20 @@ use crate::error::CoreError;
 /// fails loudly at install time rather than silently.
 pub const CATALOGUE: [&str; 5] = ["8.1", "8.2", "8.3", "8.4", "8.5"];
 
+/// The shared "well-formed but not offered by this build" error — used by both
+/// [`PhpMajor::parse`]'s layer-2 check and [`cataloged`]'s guard, so the two
+/// call sites can never drift to different wording for the identical condition.
+/// Mirrors `mysql::brew::not_cataloged_error` exactly.
+fn not_cataloged_error(version: &str) -> CoreError {
+    CoreError::Validation {
+        field: "php_version",
+        reason: format!(
+            "PHP {version} is not offered by this build (offered: {})",
+            CATALOGUE.join(", ")
+        ),
+    }
+}
+
 /// A PHP `major.minor` this build offers. Parsing enforces the shape;
 /// membership of [`CATALOGUE`] enforces the policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,19 +64,54 @@ impl PhpMajor {
         // Layer 2: policy. Shape alone would still let a flag-shaped-but-numeric
         // value, or a version we have never tested, reach `brew install`.
         if !CATALOGUE.contains(&s) {
-            return Err(CoreError::Validation {
-                field: "php_version",
-                reason: format!(
-                    "PHP {s} is not offered by this build (offered: {})",
-                    CATALOGUE.join(", ")
-                ),
-            });
+            return Err(not_cataloged_error(s));
         }
         Ok(Self(s.to_string()))
     }
 
+    /// The ONLY way to obtain an out-of-catalogue `PhpMajor`, and it exists
+    /// solely so [`cataloged`]'s guard can be proven to fire.
+    ///
+    /// `#[cfg(test)]` deliberately: production has exactly one constructor
+    /// today, and this must never become a second, more permissive path into a
+    /// child process's argv (which is precisely the hole
+    /// `MysqlMajor::from_probe` opened on the MySQL side — see that type's doc
+    /// comment). Widening this to `pub(crate)` for a discovery path is exactly
+    /// the refactor the guard is defending against; if that day comes, the
+    /// guard is already there and this test hook can go.
+    #[cfg(test)]
+    fn out_of_catalogue(s: &str) -> Self {
+        Self(s.to_string())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Whether this major is one [`CATALOGUE`] offers. Mirrors
+    /// `MysqlMajor::is_cataloged`.
+    pub fn is_cataloged(&self) -> bool {
+        CATALOGUE.contains(&self.0.as_str())
+    }
+}
+
+/// The catalogue gate both spec builders share.
+///
+/// Re-checks membership rather than trusting the caller to have obtained
+/// `major` via [`PhpMajor::parse`]. Today `parse` IS the only production
+/// constructor, so this cannot fire — and that is exactly the argument the
+/// MySQL side made before it turned out to be false: `MysqlMajor` grew a
+/// discovery-only `from_probe`, `MysqlRuntime.major` is a `pub` field, and an
+/// out-of-catalogue major could reach `brew`'s argv without ever passing
+/// `parse`. `PhpRuntime.major` is an untyped `String` today, so the symmetry
+/// refactor that types it — and adds `PhpMajor::from_probe` alongside — would
+/// reopen the identical hole here. Provenance is never assumed; the guarantee
+/// is enforced at the boundary that needs it.
+fn cataloged(major: &PhpMajor) -> Result<(), CoreError> {
+    if major.is_cataloged() {
+        Ok(())
+    } else {
+        Err(not_cataloged_error(major.as_str()))
     }
 }
 
@@ -88,6 +137,7 @@ pub fn brew_formula(major: &PhpMajor) -> String {
 /// [`crate::brew_cmd::brew_spec`] — see that module for the absolute-`brew`
 /// invariant and the composed `PATH` this used to spell out inline.
 pub fn brew_install_spec(brew: &Path, major: &PhpMajor) -> Result<SpawnSpec, CoreError> {
+    cataloged(major)?;
     brew_spec(brew, BrewVerb::Install, &brew_formula(major))
 }
 
@@ -100,7 +150,12 @@ pub fn brew_install_spec(brew: &Path, major: &PhpMajor) -> Result<SpawnSpec, Cor
 /// verbatim. Nothing here checks that the formula is currently installed —
 /// `brew uninstall` on a keg that is already gone fails loudly by itself, which
 /// is more honest than this crate second-guessing brew's own state.
+///
+/// Catalogue-gated by [`cataloged`], like the install spec — see that
+/// function for why the "`PhpMajor` has exactly one constructor" argument is
+/// not load-bearing enough to rest on.
 pub fn brew_uninstall_spec(brew: &Path, major: &PhpMajor) -> Result<SpawnSpec, CoreError> {
+    cataloged(major)?;
     brew_spec(brew, BrewVerb::Uninstall, &brew_formula(major))
 }
 
@@ -222,6 +277,80 @@ mod tests {
                 "accepted {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn is_cataloged_distinguishes_offered_from_merely_shape_valid() {
+        assert!(PhpMajor::parse("8.4").unwrap().is_cataloged());
+        assert!(!PhpMajor::out_of_catalogue("7.4").is_cataloged());
+    }
+
+    #[test]
+    fn refuses_to_compose_an_install_spec_for_an_out_of_catalogue_major() {
+        // The guard `mysql::brew::cataloged` already carries, carried across.
+        // `PhpMajor::parse` is the only PRODUCTION constructor today, so this
+        // value can only be built by the `#[cfg(test)]` hook — which is the
+        // point: the day a symmetry refactor adds `PhpMajor::from_probe` (as
+        // the MySQL side did), an out-of-catalogue formula would otherwise
+        // reach `brew`'s argv with nothing in between.
+        //
+        // VACUITY: deleting `cataloged(major)?;` from `brew_install_spec` makes
+        // this test fail with a composed `["install", "php@7.4"]` spec.
+        let err = brew_install_spec(
+            Path::new("/opt/homebrew/bin/brew"),
+            &PhpMajor::out_of_catalogue("7.4"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CoreError::Validation {
+                    field: "php_version",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn refuses_to_compose_an_uninstall_spec_for_an_out_of_catalogue_major() {
+        // The half that matters most: an uninstall names a formula that is
+        // about to be DELETED. `php@7.4` here would be a `brew uninstall` of a
+        // formula this build never installed and has never tested removing.
+        //
+        // VACUITY: deleting `cataloged(major)?;` from `brew_uninstall_spec`
+        // makes this test fail with a composed `["uninstall", "php@7.4"]`.
+        let err = brew_uninstall_spec(
+            Path::new("/opt/homebrew/bin/brew"),
+            &PhpMajor::out_of_catalogue("7.4"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CoreError::Validation {
+                    field: "php_version",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn the_catalogue_refusal_is_worded_identically_wherever_it_is_raised() {
+        // One `not_cataloged_error`, three call sites (parse's layer 2 and the
+        // two spec guards). Pinned so a future edit cannot leave a user reading
+        // two different sentences for one condition.
+        let from_parse = PhpMajor::parse("7.4").unwrap_err().to_string();
+        let from_guard = brew_uninstall_spec(
+            Path::new("/opt/homebrew/bin/brew"),
+            &PhpMajor::out_of_catalogue("7.4"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(from_parse, from_guard);
     }
 
     #[test]

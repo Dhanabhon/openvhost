@@ -424,6 +424,7 @@ async fn discover_target_runtime() -> Option<MysqlRuntime> {
     .expect("mysql discovery timed out")
     .expect("the discovery blocking task panicked");
     found
+        .runtimes
         .into_iter()
         .find(|rt| rt.major.as_str() == TARGET_MAJOR)
 }

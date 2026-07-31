@@ -339,11 +339,11 @@ mod tests {
             std::fs::write(bin_dir.join(name), b"#!/bin/sh\n").unwrap();
         }
         let found = crate::mysql::discover_mysql(&[dir.path()], &|_| Some("9.7".to_string()));
-        assert_eq!(found.len(), 1, "got {found:?}");
+        assert_eq!(found.runtimes.len(), 1, "got {found:?}");
 
         let err = mysql_brew_uninstall_spec(
             std::path::Path::new("/opt/homebrew/bin/brew"),
-            &found[0].major,
+            &found.runtimes[0].major,
         )
         .unwrap_err();
         assert!(
@@ -471,12 +471,12 @@ mod tests {
             std::fs::write(bin_dir.join(name), b"#!/bin/sh\n").unwrap();
         }
         let found = crate::mysql::discover_mysql(&[dir.path()], &|_| Some("9.7".to_string()));
-        assert_eq!(found.len(), 1, "got {found:?}");
-        assert!(!found[0].major.is_cataloged());
+        assert_eq!(found.runtimes.len(), 1, "got {found:?}");
+        assert!(!found.runtimes[0].major.is_cataloged());
 
         let err = mysql_brew_install_spec(
             std::path::Path::new("/opt/homebrew/bin/brew"),
-            &found[0].major,
+            &found.runtimes[0].major,
         )
         .unwrap_err();
         assert!(

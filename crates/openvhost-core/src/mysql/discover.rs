@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use super::MysqlMajor;
+use crate::discovery::Discovery;
 
 /// A formula directory holds a usable runtime only when all three of these
 /// exist under it. `mysqld` is the server this app supervises; `mysql` and
@@ -24,6 +25,45 @@ const MYSQLADMIN_REL: &str = "bin/mysqladmin";
 /// `mysql` (the alias for the current version) and `mysql@<major>`.
 fn is_mysql_formula(name: &str) -> bool {
     name == "mysql" || name.starts_with("mysql@")
+}
+
+/// The `major.minor` a candidate formula directory provides — Homebrew's own
+/// keg path first, the version probe only as a fallback. The mirror of
+/// `crate::php::discover::version_of`; see that function for the measurement
+/// (a freshly extracted 55 MB `mysqld` takes ~11.5 s to run for the first time
+/// under Gatekeeper, against a 5 s probe bound) that makes the keg path the
+/// primary source rather than an optimisation.
+fn version_of(dir: &Path, bin: &Path, probe: &dyn Fn(&Path) -> Option<String>) -> Option<String> {
+    crate::keg::resolve_keg(dir)
+        .and_then(|keg| keg.major_minor())
+        .or_else(|| probe(bin))
+}
+
+/// The runtime a CATALOGUE major's own formula directory provides, located by
+/// path alone: no process is spawned. The mirror of
+/// `crate::php::php_runtime_for_major` — see it for why the code path that has
+/// just run `brew install mysql@<major>` itself must not then interrogate the
+/// binary it asked for.
+///
+/// All three binaries are required, exactly as [`discover_mysql`] requires
+/// them: a formula that cannot support this app's lifecycle is not a runtime,
+/// however it was found.
+pub fn mysql_runtime_for_major(prefixes: &[&Path], major: &MysqlMajor) -> Option<MysqlRuntime> {
+    let formula = super::mysql_brew_formula(major);
+    prefixes.iter().find_map(|prefix| {
+        let dir = prefix.join("opt").join(&formula);
+        let mysqld = dir.join(MYSQLD_REL);
+        let mysql = dir.join(MYSQL_REL);
+        let mysqladmin = dir.join(MYSQLADMIN_REL);
+        // `then` and not `then_some`: the struct must not be built when the
+        // guard is false.
+        (mysqld.is_file() && mysql.is_file() && mysqladmin.is_file()).then(|| MysqlRuntime {
+            major: major.clone(),
+            mysqld,
+            mysql,
+            mysqladmin,
+        })
+    })
 }
 
 /// One discovered MySQL installation: a [`MysqlMajor`] plus the three
@@ -65,16 +105,22 @@ pub struct MysqlRuntime {
 /// string, exactly like `discover_php_in`'s probe does for `php-fpm`.
 /// Production code supplies a bounded `mysqld --version` probe (mirroring
 /// `openvhost_conf::probe_php_fpm_version`); tests supply a tempdir-backed
-/// fake — this crate spawns no process here. A probed string that is not
-/// `major.minor` shaped (see `MysqlMajor::from_probe`) is treated the same
-/// as no match: skipped.
+/// fake — this crate spawns no process here. It is consulted only when
+/// [`version_of`]'s keg-path read cannot answer. A version that is not
+/// `major.minor` shaped (see `MysqlMajor::from_probe`) is treated the same as
+/// no answer.
+///
+/// Returns a [`Discovery`], not a bare `Vec`: a candidate whose version cannot
+/// be established is reported as UNIDENTIFIED rather than dropped, so an empty
+/// `runtimes` still means "nothing is installed" and never "I could not tell".
 pub fn discover_mysql(
     prefixes: &[&Path],
     probe: &dyn Fn(&Path) -> Option<String>,
-) -> Vec<MysqlRuntime> {
+) -> Discovery<MysqlRuntime> {
     // Track which prefix (by index into `prefixes`) produced each entry so
     // the alias override below can check "same prefix" before firing.
     let mut found: Vec<(usize, MysqlRuntime)> = Vec::new();
+    let mut unidentified: Vec<PathBuf> = Vec::new();
 
     for (prefix_idx, prefix) in prefixes.iter().enumerate() {
         let opt = prefix.join("opt");
@@ -95,7 +141,11 @@ pub fn discover_mysql(
             if !mysqld.is_file() || !mysql.is_file() || !mysqladmin.is_file() {
                 continue; // all three or the runtime isn't listed
             }
-            let Some(major) = probe(&mysqld).and_then(MysqlMajor::from_probe) else {
+            let Some(major) = version_of(&dir, &mysqld, probe).and_then(MysqlMajor::from_probe)
+            else {
+                // Binaries present, version unreadable. NOT the same as
+                // "no MySQL here" — see `Discovery`.
+                unidentified.push(dir);
                 continue;
             };
             match found.iter_mut().find(|(_, r)| r.major == major) {
@@ -132,9 +182,12 @@ pub fn discover_mysql(
         }
     }
 
-    let mut found: Vec<MysqlRuntime> = found.into_iter().map(|(_, runtime)| runtime).collect();
-    found.sort_by(|a, b| a.major.cmp(&b.major));
-    found
+    let mut runtimes: Vec<MysqlRuntime> = found.into_iter().map(|(_, runtime)| runtime).collect();
+    runtimes.sort_by(|a, b| a.major.cmp(&b.major));
+    Discovery {
+        runtimes,
+        unidentified,
+    }
 }
 
 #[cfg(test)]
@@ -176,12 +229,16 @@ mod tests {
     fn finds_a_versioned_formula() {
         let (dir, versions) = fake_prefix(&[("mysql@8.4", "8.4")], &ALL_THREE);
         let found = discover_mysql(&[dir.path()], &probe_from(versions));
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].major.as_str(), "8.4");
-        assert!(found[0].mysqld.ends_with("opt/mysql@8.4/bin/mysqld"));
-        assert!(found[0].mysql.ends_with("opt/mysql@8.4/bin/mysql"));
+        assert_eq!(found.runtimes.len(), 1);
+        assert_eq!(found.runtimes[0].major.as_str(), "8.4");
         assert!(
-            found[0]
+            found.runtimes[0]
+                .mysqld
+                .ends_with("opt/mysql@8.4/bin/mysqld")
+        );
+        assert!(found.runtimes[0].mysql.ends_with("opt/mysql@8.4/bin/mysql"));
+        assert!(
+            found.runtimes[0]
                 .mysqladmin
                 .ends_with("opt/mysql@8.4/bin/mysqladmin")
         );
@@ -191,12 +248,15 @@ mod tests {
     fn the_unversioned_alias_does_not_double_count_its_own_version() {
         let (dir, versions) = fake_prefix(&[("mysql", "8.4"), ("mysql@8.4", "8.4")], &ALL_THREE);
         let found = discover_mysql(&[dir.path()], &probe_from(versions));
-        assert_eq!(found.len(), 1, "got {found:?}");
-        assert_eq!(found[0].major.as_str(), "8.4");
+        assert_eq!(found.runtimes.len(), 1, "got {found:?}");
+        assert_eq!(found.runtimes[0].major.as_str(), "8.4");
         assert!(
-            found[0].mysqld.to_string_lossy().contains("mysql@8.4"),
+            found.runtimes[0]
+                .mysqld
+                .to_string_lossy()
+                .contains("mysql@8.4"),
             "the versioned path should win: {:?}",
-            found[0].mysqld
+            found.runtimes[0].mysqld
         );
     }
 
@@ -214,42 +274,109 @@ mod tests {
             &ALL_THREE,
         );
         let found = discover_mysql(&[dir.path()], &probe_from(versions));
-        let majors: Vec<&str> = found.iter().map(|r| r.major.as_str()).collect();
+        let majors: Vec<&str> = found.runtimes.iter().map(|r| r.major.as_str()).collect();
         assert_eq!(majors, vec!["8.0", "8.4", "9.7"]);
     }
 
     #[test]
     fn a_prefix_that_does_not_exist_is_not_an_error() {
         let found = discover_mysql(&[Path::new("/nonexistent/openvhost-prefix")], &|_| None);
-        assert!(found.is_empty());
+        assert!(found.runtimes.is_empty());
+        // Nothing was seen at all, so nothing is outstanding.
+        assert!(found.is_complete());
     }
 
     #[test]
-    fn a_formula_whose_probe_does_not_recognize_it_is_skipped() {
+    fn a_formula_whose_version_no_source_can_answer_is_reported_unidentified() {
+        // THE R2 collapse, on the MySQL side where it was reproduced: the three
+        // binaries are right there, and a killed `mysqld --version` probe used
+        // to make the whole install read as "not detected". Excluded from
+        // `runtimes` still — nothing may be started on a version we cannot
+        // name — but no longer indistinguishable from an empty machine.
+        //
+        // VACUITY: replacing `unidentified.push(dir)` with a bare `continue`
+        // makes the second assertion fail while the first still passes.
         let (dir, _) = fake_prefix(&[("mysql@8.4", "8.4")], &ALL_THREE);
         let found = discover_mysql(&[dir.path()], &|_| None);
-        assert!(found.is_empty(), "got {found:?}");
+        assert!(found.runtimes.is_empty(), "got {found:?}");
+        assert_eq!(found.unidentified, vec![dir.path().join("opt/mysql@8.4")]);
+        assert!(!found.is_complete());
+    }
+
+    /// A probe that fails the test if it is ever called.
+    fn no_probe(_: &Path) -> Option<String> {
+        panic!("the version probe must not be consulted when the keg path answers");
+    }
+
+    /// A real brew layout: `Cellar/<owner>/<version>/bin/{mysqld,mysql,
+    /// mysqladmin}` with `opt/<formula>` symlinked at the keg through brew's
+    /// own RELATIVE target.
+    #[cfg(unix)]
+    fn brew_prefix(entries: &[(&str, &str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (formula, owner, version) in entries {
+            let keg = dir.path().join("Cellar").join(owner).join(version);
+            std::fs::create_dir_all(keg.join("bin")).unwrap();
+            for name in ALL_THREE {
+                std::fs::write(keg.join("bin").join(name), b"#!/bin/sh\n").unwrap();
+            }
+            let opt = dir.path().join("opt");
+            std::fs::create_dir_all(&opt).unwrap();
+            std::os::unix::fs::symlink(
+                PathBuf::from("..").join("Cellar").join(owner).join(version),
+                opt.join(formula),
+            )
+            .unwrap();
+        }
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_real_brew_layout_is_identified_without_spawning_the_probe() {
+        // The measured failure: the first execution of a freshly extracted
+        // 55 MB `mysqld` took 11.53 s under Gatekeeper's scan, against a 5 s
+        // probe bound that group-kills the child — so every retry restarted a
+        // scan that could never finish inside the bound. The keg path states
+        // the version and costs a readlink.
+        //
+        // VACUITY: replacing `version_of`'s body with a bare `probe(bin)`
+        // makes this panic inside `no_probe`.
+        let dir = brew_prefix(&[("mysql@8.4", "mysql@8.4", "8.4.11")]);
+        let found = discover_mysql(&[dir.path()], &no_probe);
+        assert_eq!(found.runtimes.len(), 1, "got {found:?}");
+        assert_eq!(found.runtimes[0].major.as_str(), "8.4");
+        assert!(found.is_complete());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_keg_whose_name_is_not_a_version_falls_back_to_the_probe() {
+        let dir = brew_prefix(&[("mysql@8.4", "mysql@8.4", "HEAD-abc1234")]);
+        let found = discover_mysql(&[dir.path()], &|_| Some("8.4".to_string()));
+        assert_eq!(found.runtimes.len(), 1, "got {found:?}");
+        assert_eq!(found.runtimes[0].major.as_str(), "8.4");
     }
 
     #[test]
     fn missing_mysqladmin_means_the_runtime_is_not_listed() {
         let (dir, versions) = fake_prefix(&[("mysql@8.4", "8.4")], &["mysqld", "mysql"]);
         let found = discover_mysql(&[dir.path()], &probe_from(versions));
-        assert!(found.is_empty(), "got {found:?}");
+        assert!(found.runtimes.is_empty(), "got {found:?}");
     }
 
     #[test]
     fn missing_mysql_client_means_the_runtime_is_not_listed() {
         let (dir, versions) = fake_prefix(&[("mysql@8.4", "8.4")], &["mysqld", "mysqladmin"]);
         let found = discover_mysql(&[dir.path()], &probe_from(versions));
-        assert!(found.is_empty(), "got {found:?}");
+        assert!(found.runtimes.is_empty(), "got {found:?}");
     }
 
     #[test]
     fn missing_mysqld_means_the_runtime_is_not_listed() {
         let (dir, versions) = fake_prefix(&[("mysql@8.4", "8.4")], &["mysql", "mysqladmin"]);
         let found = discover_mysql(&[dir.path()], &probe_from(versions));
-        assert!(found.is_empty(), "got {found:?}");
+        assert!(found.runtimes.is_empty(), "got {found:?}");
     }
 
     #[test]
@@ -259,8 +386,8 @@ mod tests {
         let mut merged = va.clone();
         merged.extend(vb);
         let found = discover_mysql(&[a.path(), b.path()], &probe_from(merged));
-        assert_eq!(found.len(), 1);
-        assert!(found[0].mysqld.starts_with(a.path()));
+        assert_eq!(found.runtimes.len(), 1);
+        assert!(found.runtimes[0].mysqld.starts_with(a.path()));
     }
 
     #[test]
@@ -271,11 +398,11 @@ mod tests {
         merged.extend(v2);
 
         let found = discover_mysql(&[silicon.path(), intel.path()], &probe_from(merged));
-        assert_eq!(found.len(), 1);
+        assert_eq!(found.runtimes.len(), 1);
         assert!(
-            found[0].mysqld.starts_with(silicon.path()),
+            found.runtimes[0].mysqld.starts_with(silicon.path()),
             "a later prefix replaced an earlier one: {:?}",
-            found[0].mysqld
+            found.runtimes[0].mysqld
         );
     }
 
@@ -283,11 +410,14 @@ mod tests {
     fn within_one_prefix_the_versioned_path_still_beats_the_alias() {
         let (dir, versions) = fake_prefix(&[("mysql", "8.4"), ("mysql@8.4", "8.4")], &ALL_THREE);
         let found = discover_mysql(&[dir.path()], &probe_from(versions));
-        assert_eq!(found.len(), 1);
+        assert_eq!(found.runtimes.len(), 1);
         assert!(
-            found[0].mysqld.to_string_lossy().contains("mysql@8.4"),
+            found.runtimes[0]
+                .mysqld
+                .to_string_lossy()
+                .contains("mysql@8.4"),
             "the versioned path should still win inside one prefix: {:?}",
-            found[0].mysqld
+            found.runtimes[0].mysqld
         );
     }
 
@@ -297,8 +427,49 @@ mod tests {
         // discovery must not silently drop it.
         let (dir, versions) = fake_prefix(&[("mysql@9.7", "9.7")], &ALL_THREE);
         let found = discover_mysql(&[dir.path()], &probe_from(versions));
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].major.as_str(), "9.7");
-        assert!(!found[0].major.is_cataloged());
+        assert_eq!(found.runtimes.len(), 1);
+        assert_eq!(found.runtimes[0].major.as_str(), "9.7");
+        assert!(!found.runtimes[0].major.is_cataloged());
+    }
+
+    // ---- the install path's path-only resolver ----------------------------
+
+    #[test]
+    fn a_major_we_just_installed_is_found_by_path_with_no_probe_at_all() {
+        let (dir, _) = fake_prefix(&[("mysql@8.4", "8.4")], &ALL_THREE);
+        let rt = mysql_runtime_for_major(&[dir.path()], &MysqlMajor::parse("8.4").unwrap())
+            .expect("the formula directory brew just created must be found");
+        assert_eq!(rt.major.as_str(), "8.4");
+        assert!(rt.mysqld.ends_with("opt/mysql@8.4/bin/mysqld"));
+        assert!(rt.mysql.ends_with("opt/mysql@8.4/bin/mysql"));
+        assert!(rt.mysqladmin.ends_with("opt/mysql@8.4/bin/mysqladmin"));
+    }
+
+    #[test]
+    fn a_major_that_was_not_installed_is_simply_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            mysql_runtime_for_major(&[dir.path()], &MysqlMajor::parse("8.4").unwrap()).is_none()
+        );
+    }
+
+    #[test]
+    fn a_partial_formula_directory_is_not_a_runtime_here_either() {
+        // The all-three rule is not `discover_mysql`'s alone: an install that
+        // left `mysqld` without `mysqladmin` cannot support this app's
+        // lifecycle, and reporting it as installed would put a row on the page
+        // that can never shut down cleanly.
+        let (dir, _) = fake_prefix(&[("mysql@8.4", "8.4")], &["mysqld", "mysql"]);
+        assert!(
+            mysql_runtime_for_major(&[dir.path()], &MysqlMajor::parse("8.4").unwrap()).is_none()
+        );
+    }
+
+    #[test]
+    fn the_unversioned_alias_directory_never_answers_for_a_versioned_major() {
+        let (dir, _) = fake_prefix(&[("mysql", "8.4")], &ALL_THREE);
+        assert!(
+            mysql_runtime_for_major(&[dir.path()], &MysqlMajor::parse("8.4").unwrap()).is_none()
+        );
     }
 }

@@ -310,7 +310,10 @@ fn discover_installed_php(
     prefixes: &[&Path],
     probe: &dyn Fn(&Path) -> Option<String>,
 ) -> Vec<PhpRuntime> {
-    openvhost_core::discover_php_in(prefixes, probe)
+    // `.runtimes`: startup only needs what was positively identified.
+    // `Discovery::unidentified` is reported by the rescan path, which is the
+    // one a user can act on (`report_unidentified` in `commands.rs`).
+    openvhost_core::discover_php_in(prefixes, probe).runtimes
 }
 
 /// The MySQL discovery walk `macos_stack` performs at startup, factored out
@@ -324,7 +327,8 @@ fn discover_installed_mysql(
     prefixes: &[&Path],
     probe: &dyn Fn(&Path) -> Option<String>,
 ) -> Vec<MysqlRuntime> {
-    openvhost_core::mysql::discover_mysql(prefixes, probe)
+    // `.runtimes` — see `discover_installed_php`.
+    openvhost_core::mysql::discover_mysql(prefixes, probe).runtimes
 }
 
 /// Sweep abandoned MySQL staging directories (spec D2: "swept on rescan")

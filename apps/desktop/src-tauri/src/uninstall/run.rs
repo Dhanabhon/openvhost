@@ -8,11 +8,26 @@
 //! brew failure therefore changes no local state at all, which is what makes
 //! "nothing was destroyed" checkable rather than merely intended.
 //!
-//! The ONLY filesystem call an uninstall makes is `remove_file` on a path
-//! `inventory` produced under `config/generated/`. Nothing recurses, nothing
-//! follows a symlink to its target, and nothing touches `<home>/data`,
-//! `<home>/logs` or state.db's credential rows on ANY path, including error
-//! paths.
+//! The only filesystem call [`perform_uninstall`] itself makes is `remove_file`
+//! on a path `inventory` produced under `config/generated/`. Nothing there
+//! recurses, nothing follows a symlink to its target, and nothing touches
+//! `<home>/data`, `<home>/logs` or state.db's credential rows on ANY path,
+//! including error paths.
+//!
+//! That is a statement about the EXECUTOR, not about this file, and the
+//! difference matters when you audit it. The command wrapper
+//! [`uninstall_package`] also runs the kind-appropriate rescan afterwards
+//! (design D5's reconciliation), which reaches two more filesystem effects
+//! neither of which is the executor's:
+//!
+//! * `rescan_mysql_into_state` calls `sweep_stale_staging`, a `remove_dir_all`
+//!   under `<home>/data/mysql/`. It cannot reach a live datadir: a staging
+//!   directory's name must match `init-<digits>-<digits>-`, a live datadir is a
+//!   bare major (`8.4`), and the sweep's `file_type()` does not follow symlinks
+//!   — so `<home>/data/mysql/8.4` is unreachable from it. (Verified by the
+//!   security auditor; the property holds, the old wording did not.)
+//! * `rescan_into_state` can `create_dir_all` under `<home>/logs/` while
+//!   registering a pool — a creation, never a removal.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -92,6 +107,13 @@ pub(crate) struct UninstallRun<'a> {
     /// Read fresh by the caller, immediately before this runs — see
     /// [`perform_uninstall`]'s re-check.
     pub(crate) sites: Vec<Site>,
+    /// What `<prefix>/opt/<formula>` actually resolves to, read fresh by the
+    /// caller for the same reason `sites` is. Passed in rather than read here
+    /// so [`perform_uninstall`] stays a function of its inputs — otherwise
+    /// every test of the executor would consult the developer's own
+    /// `/opt/homebrew` and refuse or proceed depending on what is installed
+    /// there.
+    pub(crate) keg: openvhost_core::KegProvenance,
     pub(crate) runner: Arc<dyn BrewRunner>,
     pub(crate) log: UninstallLogSink,
 }
@@ -120,7 +142,7 @@ pub(crate) enum UninstallOutcome {
 /// repointed. The plan is a view; this is the decision.
 pub(crate) async fn perform_uninstall(run: UninstallRun<'_>) -> Result<UninstallOutcome, IpcError> {
     // ---- Refusals, before anything is spawned (D3) ----------------------
-    let blockers = super::blockers(&run.target, &run.sup.snapshot(), &run.sites);
+    let blockers = super::blockers(&run.target, &run.sup.snapshot(), &run.sites, &run.keg);
     if !blockers.is_empty() {
         return Err(refusal(&run.target, &blockers));
     }
@@ -318,9 +340,13 @@ fn brew_failure_message(headline: &str, tail: &VecDeque<String>) -> String {
 /// What an uninstall of `major` would remove, keep, and refuse to do.
 ///
 /// A PURE QUERY: it spawns nothing and changes nothing. It reads the
-/// supervisor's snapshot and the site list and derives paths — that is all —
-/// so the Languages/Databases pages can call it on mount to decide a disabled
-/// state as cheaply as they call it to fill a confirmation dialog.
+/// supervisor's snapshot, the site list and Homebrew's `opt` links, and derives
+/// paths — that is all — so the Languages/Databases pages can call it on mount
+/// to decide a disabled state as cheaply as they call it to fill a confirmation
+/// dialog. `Target::keg_provenance` is a `canonicalize`, not a process: cheap
+/// enough for a mount, which is why the aliased-keg refusal can be a BLOCKER
+/// (the action is disabled with an explanation) rather than a surprise at
+/// confirm time.
 #[tauri::command]
 #[specta::specta]
 pub async fn uninstall_plan(
@@ -333,7 +359,13 @@ pub async fn uninstall_plan(
     let target = Target::parse(kind, &major)?;
     let p = stack_paths(&paths)?;
     let sites = SqliteSiteRepository::new(db.inner()).list().await?;
-    Ok(build_plan(&target, &p.home, &sup.snapshot(), &sites))
+    Ok(build_plan(
+        &target,
+        &p.home,
+        &sup.snapshot(),
+        &sites,
+        &target.keg_provenance(),
+    ))
 }
 
 /// Remove `major`: refuse if anything depends on it, otherwise
@@ -399,6 +431,10 @@ pub async fn uninstall_package(
         sup: sup.inner(),
         lock: lock.inner(),
         sites: SqliteSiteRepository::new(db.inner()).list().await?,
+        // Re-read here, not carried over from whatever plan the dialog was
+        // built from: `brew upgrade php` in another terminal can turn a
+        // versioned keg into an alias between the two.
+        keg: target.keg_provenance(),
         runner: Arc::new(ProcBrewRunner),
         log,
     })
@@ -410,11 +446,13 @@ pub async fn uninstall_package(
     // decide which versions exist. Refreshing it also re-runs the D5
     // reconciliation, which is the belt to the explicit `unregister`'s braces.
     match target.kind() {
+        // No install seed on either arm: nothing was installed here, and a
+        // seed is only ever a record of what THIS app just asked brew for.
         PackageKind::Php => {
-            rescan_into_state(runtimes.inner(), sup.inner(), p).await?;
+            rescan_into_state(runtimes.inner(), sup.inner(), p, None).await?;
         }
         PackageKind::Mysql => {
-            rescan_mysql_into_state(mysql_runtimes.inner(), sup.inner(), &p.home).await?;
+            rescan_mysql_into_state(mysql_runtimes.inner(), sup.inner(), &p.home, None).await?;
         }
     }
 
@@ -472,7 +510,7 @@ mod tests {
         DEFAULT_GRACE, ReadinessProbe, ServiceSpec, ServiceState, Supervisor, default_driver,
     };
 
-    use super::super::tests::{php, site};
+    use super::super::tests::{own_keg, php, site};
     use super::*;
 
     /// Records every spawn it is asked for and answers with a scripted exit
@@ -606,6 +644,22 @@ mod tests {
         runner: Arc<dyn BrewRunner>,
         sites: Vec<Site>,
     ) -> UninstallRun<'a> {
+        run_for_keg(target, home, sup, lock, runner, sites, own_keg())
+    }
+
+    /// [`run_for`] with the keg provenance spelled out — only the aliased-keg
+    /// tests need to vary it; everything else is about something other than
+    /// Homebrew's aliasing and takes the ordinary `OwnKeg`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_for_keg<'a>(
+        target: Target,
+        home: &std::path::Path,
+        sup: &'a Supervisor,
+        lock: &'a InstallLock,
+        runner: Arc<dyn BrewRunner>,
+        sites: Vec<Site>,
+        keg: openvhost_core::KegProvenance,
+    ) -> UninstallRun<'a> {
         UninstallRun {
             target,
             home: home.to_path_buf(),
@@ -613,6 +667,7 @@ mod tests {
             sup,
             lock,
             sites,
+            keg,
             runner,
             log: silent(),
         }
@@ -744,6 +799,107 @@ mod tests {
                 "uninstall".to_string(),
                 "php@8.4".to_string(),
             ]]
+        );
+    }
+
+    /// THE R1 refusal, at the executor: an aliased `php@8.5` must not reach
+    /// `brew`. `brew uninstall php@8.5` would resolve the alias and remove
+    /// `php 8.5.9` — the user's linked PHP — while every string this app shows
+    /// says `php@8.5`.
+    ///
+    /// VACUITY: the positive control is inside the test — the SAME recording
+    /// runner is driven a second time with the keg owning itself, and must then
+    /// record exactly one spawn. "Nothing happened" therefore cannot pass
+    /// because the instrument is broken. Additionally neutered: deleting the
+    /// `keg_blocker` push from `blockers` made the first assertion fail with
+    /// one recorded spawn of `["...brew", "uninstall", "php@8.5"]`.
+    #[tokio::test]
+    async fn an_aliased_keg_refuses_the_uninstall_and_spawns_no_process() {
+        let home = provisioned_home();
+        let sup = Supervisor::new(default_driver());
+        let lock = InstallLock::default();
+        let runner = RecordingRunner::ok();
+
+        let refused = run_for_keg(
+            php("8.5"),
+            home.path(),
+            &sup,
+            &lock,
+            runner.clone(),
+            vec![],
+            openvhost_core::KegProvenance::ForeignKeg {
+                owner: "php".to_string(),
+                keg: PathBuf::from("/opt/homebrew/Cellar/php/8.5.9"),
+            },
+        );
+        let err = perform_uninstall(refused).await.unwrap_err();
+        let text = format!("{err}");
+        assert!(
+            text.contains("php@8.5") && text.contains("/opt/homebrew/Cellar/php/8.5.9"),
+            "the refusal must name both the formula and the keg that would go: {text}"
+        );
+        assert!(
+            runner.spawns().is_empty(),
+            "brew must NEVER be spawned for an aliased keg, recorded {:?}",
+            runner.spawns()
+        );
+
+        // POSITIVE CONTROL, same runner: with the keg owning itself there is no
+        // blocker and exactly one spawn must be recorded — so the empty
+        // assertion above cannot have passed because the recorder is broken.
+        let allowed = run_for_keg(
+            php("8.5"),
+            home.path(),
+            &sup,
+            &lock,
+            runner.clone(),
+            vec![],
+            openvhost_core::KegProvenance::OwnKeg {
+                keg: PathBuf::from("/opt/homebrew/Cellar/php@8.5/8.5.9"),
+            },
+        );
+        perform_uninstall(allowed).await.unwrap();
+        assert_eq!(
+            runner.spawns(),
+            vec![vec![
+                "/opt/homebrew/bin/brew".to_string(),
+                "uninstall".to_string(),
+                "php@8.5".to_string(),
+            ]]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unresolvable_keg_refuses_the_uninstall_and_spawns_no_process() {
+        // The state that must not collapse back into "fine, proceed".
+        let home = provisioned_home();
+        let sup = Supervisor::new(default_driver());
+        let lock = InstallLock::default();
+        let runner = RecordingRunner::ok();
+
+        let err = perform_uninstall(run_for_keg(
+            php("8.4"),
+            home.path(),
+            &sup,
+            &lock,
+            runner.clone(),
+            vec![],
+            openvhost_core::KegProvenance::Unresolved {
+                searched: vec![PathBuf::from("/opt/homebrew/opt/php@8.4")],
+            },
+        ))
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("could not work out which Homebrew keg"),
+            "got {err}"
+        );
+        assert!(runner.spawns().is_empty(), "recorded {:?}", runner.spawns());
+        // And nothing local moved either.
+        assert!(
+            home.path()
+                .join("config/generated/php/8.4/php-fpm.conf")
+                .exists()
         );
     }
 

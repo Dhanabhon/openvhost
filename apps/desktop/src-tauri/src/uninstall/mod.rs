@@ -24,7 +24,7 @@ pub(crate) mod run;
 use std::path::{Path, PathBuf};
 
 use openvhost_core::mysql::MysqlMajor;
-use openvhost_core::{PhpMajor, Site};
+use openvhost_core::{KegProvenance, PhpMajor, Site};
 use openvhost_proc::{ServiceState, ServiceStatus, SpawnSpec};
 
 use crate::commands::{InstallKind, IpcError};
@@ -55,6 +55,18 @@ pub enum PackageKind {
 pub struct KeptItem {
     pub what: String,
     pub path: Option<String>,
+    /// The one item the confirmation's headline sentence is ABOUT — "Your
+    /// databases are not touched — they stay in `<path>`". Exactly one entry
+    /// per plan carries it.
+    ///
+    /// An explicit flag rather than "whichever entry happens to come first
+    /// with a path", which is what the UI used to do. Under that rule a
+    /// reorder of this list silently changed which directory a destructive
+    /// dialog reassures the user about, and the only thing that would fail was
+    /// a full-vector `assert_eq!` whose natural fix — update the expected
+    /// vector — carries no signal at all that the dialog just started naming
+    /// `my.cnf` as the place the user's databases live.
+    pub headline: bool,
 }
 
 /// Why an uninstall is refused (design D3). Both are refusals, not warnings,
@@ -74,6 +86,50 @@ pub enum Blocker {
     /// site onto a PHP version its code does not run on.
     #[serde(rename_all = "camelCase")]
     SitesPinned { domains: Vec<String> },
+    /// The keg `brew uninstall <formula>` would remove belongs to a DIFFERENT
+    /// formula — brew has aliased this version's name onto another one.
+    ///
+    /// Not hypothetical, and the reason this variant exists: on a machine where
+    /// Homebrew's unversioned `php` is 8.5.9, `brew info php@8.5` reports
+    /// `Aliases: php@8.5` and `/opt/homebrew/opt/php@8.5` resolves to
+    /// `Cellar/php/8.5.9`. This app would discover 8.5, offer Uninstall, say it
+    /// removes "the `php@8.5` formula" — and `brew uninstall php@8.5` would
+    /// resolve the alias and remove the user's **linked `php`**, breaking `php`
+    /// system-wide. The string shown and the keg removed are not the same
+    /// thing.
+    ///
+    /// A refusal, like every other blocker (D3), extending "never destroy user
+    /// data" to "never destroy the user's environment". A user who does mean it
+    /// runs `brew uninstall <owner>` themselves, where the consequence is
+    /// visible.
+    #[serde(rename_all = "camelCase")]
+    ForeignKeg {
+        /// What this app would have passed to `brew uninstall`, e.g. `php@8.5`.
+        formula: String,
+        /// The formula that actually owns the keg, e.g. `php` — what would be
+        /// removed.
+        owner: String,
+        /// The keg itself, e.g. `/opt/homebrew/Cellar/php/8.5.9`.
+        keg: String,
+    },
+    /// Nothing under any known Homebrew prefix resolved to a keg for this
+    /// formula, so this app cannot say what `brew uninstall <formula>` would
+    /// remove.
+    ///
+    /// Deliberately NOT folded into "fine, proceed". An absent or unreadable
+    /// `opt` link is no evidence that the name is safe to hand to brew — brew
+    /// resolves its own aliases from its taps whether or not a link exists
+    /// here, so the [`ForeignKeg`](Blocker::ForeignKeg) danger is fully present
+    /// in this case too, just unprovable. Refusing fails visibly and leaves the
+    /// user a manual path; proceeding would fail quietly and take their `php`
+    /// with it.
+    #[serde(rename_all = "camelCase")]
+    UnknownKeg {
+        formula: String,
+        /// Every `opt` path that was looked at, so the refusal is diagnosable
+        /// rather than merely discouraging.
+        searched: Vec<String>,
+    },
 }
 
 impl Blocker {
@@ -90,6 +146,22 @@ impl Blocker {
                 "these sites are still set to this PHP version: {}. Change them first, \
                  then try again.",
                 domains.join(", ")
+            ),
+            Blocker::ForeignKeg {
+                formula,
+                owner,
+                keg,
+            } => format!(
+                "Homebrew treats {formula} as an alias for its unversioned {owner} formula — \
+                 it resolves to {keg}. Removing it would remove your linked {owner}, not just \
+                 this version, so OpenVHost will not do it. Run `brew uninstall {owner}` \
+                 yourself if that is what you mean."
+            ),
+            Blocker::UnknownKeg { formula, searched } => format!(
+                "OpenVHost could not work out which Homebrew keg {formula} refers to (looked \
+                 at: {}), and will not run `brew uninstall {formula}` without knowing what \
+                 that would remove. Run it yourself if you are sure.",
+                searched.join(", ")
             ),
         }
     }
@@ -185,6 +257,32 @@ impl Target {
         }
     }
 
+    /// The Homebrew formula this version's uninstall would name — THE
+    /// definition, read from `openvhost-core` so the string a dialog shows, the
+    /// string a refusal quotes and the string that reaches `brew`'s argv are
+    /// one expression rather than three that can drift.
+    pub(crate) fn formula(&self) -> String {
+        match self {
+            Target::Php(m) => openvhost_core::brew_formula(m),
+            Target::Mysql(m) => openvhost_core::mysql_brew_formula(m),
+        }
+    }
+
+    /// What [`Self::formula`]'s `opt` link actually resolves to on THIS machine.
+    ///
+    /// A filesystem read (a `canonicalize`), so it lives here rather than
+    /// inside the pure [`blockers`] — the caller performs it and passes the
+    /// answer in, exactly as it does for the supervisor snapshot and the site
+    /// list. That keeps `blockers` a pure function of its inputs and keeps the
+    /// executor's tests off the developer's own `/opt/homebrew`.
+    pub(crate) fn keg_provenance(&self) -> KegProvenance {
+        let prefixes: Vec<&Path> = openvhost_core::BREW_PREFIXES
+            .iter()
+            .map(Path::new)
+            .collect();
+        openvhost_core::keg_provenance(&prefixes, &self.formula())
+    }
+
     /// `brew uninstall <formula>`, composed entirely inside `openvhost-core`.
     pub(crate) fn uninstall_spec(&self, brew: &Path) -> Result<SpawnSpec, IpcError> {
         Ok(match self {
@@ -212,7 +310,25 @@ pub(crate) enum Removal {
 impl Removal {
     pub(crate) fn describe(&self) -> String {
         match self {
-            Removal::BrewFormula { formula, what } => format!("{what} (the {formula} formula)"),
+            // The second sentence is design D6's promise ("the confirmation
+            // states what is removed") meeting an observed fact: `brew
+            // uninstall php@8.3` also removed `aspell` (768 files, 338 MB), and
+            // `brew uninstall mysql@8.4` also removed `abseil`, `protobuf` and
+            // `zlib-ng-compat`. Naming one formula while brew quietly takes
+            // four is not "stating what is removed".
+            //
+            // It is attached to the brew step rather than added as a separate
+            // list entry on purpose: `removes` is the executor's own list, one
+            // entry per step, and this caveat is a property of THIS step. It
+            // deliberately does NOT try to predict the set — `brew uninstall
+            // --dry-run` is another child process and another failure mode on a
+            // path that must stay a pure query, and a prediction that went
+            // stale between the dialog and the run would be worse than an
+            // honest "watch the output".
+            Removal::BrewFormula { formula, what } => format!(
+                "{what} (the {formula} formula). Homebrew may also remove dependencies it \
+                 believes nothing else needs; its output names any it takes."
+            ),
             Removal::GeneratedFile { path, what } => format!("{what} at {}", path.display()),
             Removal::ServiceRow { id } => format!("The {id} entry in Services"),
         }
@@ -231,6 +347,17 @@ fn kept(what: &str, path: Option<PathBuf>) -> KeptItem {
     KeptItem {
         what: what.to_string(),
         path: path.map(|p| p.display().to_string()),
+        headline: false,
+    }
+}
+
+/// The one kept item the confirmation's headline sentence is about — see
+/// [`KeptItem::headline`]. Exactly one per inventory arm, pinned by
+/// `exactly_one_kept_item_is_the_headline_for_every_kind`.
+fn kept_headline(what: &str, path: Option<PathBuf>) -> KeptItem {
+    KeptItem {
+        headline: true,
+        ..kept(what, path)
     }
 }
 
@@ -265,7 +392,7 @@ pub(crate) fn inventory(target: &Target, home: &Path) -> Inventory {
             Inventory {
                 removes: vec![
                     Removal::BrewFormula {
-                        formula: openvhost_core::brew_formula(major),
+                        formula: target.formula(),
                         what: format!("The PHP {m} program files"),
                     },
                     Removal::GeneratedFile {
@@ -279,8 +406,9 @@ pub(crate) fn inventory(target: &Target, home: &Path) -> Inventory {
                 keeps: vec![
                     // D2: a user often uninstalls a version BECAUSE it failed,
                     // and removing the evidence at the moment it becomes
-                    // relevant is backwards.
-                    kept(&format!("Your PHP {m} logs"), log_dir),
+                    // relevant is backwards. THE headline: the confirmation
+                    // says "Your logs are not touched — they stay in <path>".
+                    kept_headline(&format!("Your PHP {m} logs"), log_dir),
                     kept(
                         "Your own php-fpm pool overrides",
                         Some(home.join("config/custom/php").join(m).join("pool.d")),
@@ -303,7 +431,7 @@ pub(crate) fn inventory(target: &Target, home: &Path) -> Inventory {
             Inventory {
                 removes: vec![
                     Removal::BrewFormula {
-                        formula: openvhost_core::mysql_brew_formula(major),
+                        formula: target.formula(),
                         what: format!("The MySQL {m} program files"),
                     },
                     // NO GeneratedFile here, and that is load-bearing rather
@@ -318,8 +446,12 @@ pub(crate) fn inventory(target: &Target, home: &Path) -> Inventory {
                     },
                 ],
                 keeps: vec![
-                    // THE reason this slice exists (plan principle 2).
-                    kept("Your databases", Some(paths.datadir.clone())),
+                    // THE reason this slice exists (plan principle 2), and THE
+                    // headline: the confirmation says "Your databases are not
+                    // touched — they stay in <path>". That sentence must name
+                    // the datadir and nothing else; naming `my.cnf` there would
+                    // tell a user their databases live in a config file.
+                    kept_headline("Your databases", Some(paths.datadir.clone())),
                     // D2: keeping the data and throwing away the key is the
                     // same as destroying it.
                     kept("The stored root password", None),
@@ -357,18 +489,49 @@ pub(crate) fn service_blocker(id: &str, state: &ServiceState) -> Option<Blocker>
     }
 }
 
+/// Whether the keg `brew uninstall <formula>` would remove is this version's
+/// own, and the refusal when it is not.
+///
+/// Exhaustive over [`KegProvenance`] with **no wildcard arm**: the difference
+/// between these three is the difference between removing one PHP version and
+/// removing the user's linked `php`, which is not a decision a `_` should make.
+pub(crate) fn keg_blocker(target: &Target, keg: &KegProvenance) -> Option<Blocker> {
+    match keg {
+        KegProvenance::OwnKeg { .. } => None,
+        KegProvenance::ForeignKeg { owner, keg } => Some(Blocker::ForeignKeg {
+            formula: target.formula(),
+            owner: owner.clone(),
+            keg: keg.display().to_string(),
+        }),
+        KegProvenance::Unresolved { searched } => Some(Blocker::UnknownKeg {
+            formula: target.formula(),
+            searched: searched.iter().map(|p| p.display().to_string()).collect(),
+        }),
+    }
+}
+
 /// Everything standing in the way of removing `target`, in the order a user
 /// should read them (design D3).
 ///
 /// Pure, and re-run by the executor rather than trusted from the plan: between
 /// a dialog opening and its confirm button being pressed, a service can be
-/// started from the tray and a site can be repointed.
+/// started from the tray and a site can be repointed. `keg` is read from the
+/// filesystem by the caller for the same reason `services` and `sites` are —
+/// see [`Target::keg_provenance`].
+///
+/// The keg check comes FIRST because it is categorically different from the
+/// other two: those say "do this, then retry", and this one says OpenVHost will
+/// never do it.
 pub(crate) fn blockers(
     target: &Target,
     services: &[ServiceStatus],
     sites: &[Site],
+    keg: &KegProvenance,
 ) -> Vec<Blocker> {
     let mut out = Vec::new();
+    if let Some(blocker) = keg_blocker(target, keg) {
+        out.push(blocker);
+    }
     let id = target.service_id();
     if let Some(status) = services.iter().find(|s| s.id == id)
         && let Some(blocker) = service_blocker(&id, &status.state)
@@ -406,6 +569,7 @@ pub(crate) fn build_plan(
     home: &Path,
     services: &[ServiceStatus],
     sites: &[Site],
+    keg: &KegProvenance,
 ) -> UninstallPlan {
     let inv = inventory(target, home);
     UninstallPlan {
@@ -413,7 +577,7 @@ pub(crate) fn build_plan(
         major: target.major().to_string(),
         removes: inv.removes.iter().map(Removal::describe).collect(),
         keeps: inv.keeps,
-        blockers: blockers(target, services, sites),
+        blockers: blockers(target, services, sites, keg),
     }
 }
 
@@ -428,6 +592,15 @@ mod tests {
 
     pub(super) fn mysql(major: &str) -> Target {
         Target::parse(PackageKind::Mysql, major).expect("catalogue major")
+    }
+
+    /// The ordinary case: the formula owns its own keg, so nothing about
+    /// Homebrew's aliasing stands in the way. Used everywhere a test is about
+    /// something else.
+    pub(super) fn own_keg() -> KegProvenance {
+        KegProvenance::OwnKeg {
+            keg: PathBuf::from("/opt/homebrew/Cellar/php@8.4/8.4.13"),
+        }
     }
 
     fn status(id: &str, state: ServiceState) -> ServiceStatus {
@@ -529,21 +702,90 @@ mod tests {
                 KeptItem {
                     what: "Your databases".to_string(),
                     path: Some("/tmp/ovh/data/mysql/8.4".to_string()),
+                    headline: true,
                 },
                 KeptItem {
                     what: "The stored root password".to_string(),
                     path: None,
+                    headline: false,
                 },
                 KeptItem {
                     what: "This instance's my.cnf".to_string(),
                     path: Some("/tmp/ovh/config/generated/mysql/8.4/my.cnf".to_string()),
+                    headline: false,
                 },
                 KeptItem {
                     what: "Your own MySQL overrides".to_string(),
                     path: Some("/tmp/ovh/config/custom/mysql/8.4/conf.d".to_string()),
+                    headline: false,
                 },
             ]
         );
+    }
+
+    // ---- the headline kept item (fix R4) ---------------------------------
+
+    #[test]
+    fn exactly_one_kept_item_is_the_headline_for_every_kind() {
+        // The invariant the UI codes against: `keeps.find(k => k.headline)`
+        // must find exactly one thing, whatever a future kind adds. Checked
+        // against the list itself rather than a pinned vector, so this cannot
+        // be "fixed" by updating an expectation.
+        //
+        // VACUITY: changing either `kept_headline` call to `kept` makes the
+        // count 0 and this fails; adding a second `kept_headline` makes it 2
+        // and it fails the other way.
+        for target in [php("8.1"), php("8.4"), mysql("8.4")] {
+            let keeps = inventory(&target, Path::new("/tmp/ovh")).keeps;
+            let headlines: Vec<KeptItem> = keeps.into_iter().filter(|k| k.headline).collect();
+            assert_eq!(
+                headlines.len(),
+                1,
+                "{} must have exactly one headline kept item, got {headlines:?}",
+                target.display()
+            );
+        }
+    }
+
+    #[test]
+    fn the_headline_is_the_item_the_confirmations_sentence_names() {
+        // A count alone would pass with the flag on the wrong row. The MySQL
+        // sentence is "Your databases are not touched — they stay in <path>",
+        // so the flagged item must be the DATADIR: `my.cnf` also carries a
+        // path, and naming it there would tell a user their databases live in
+        // a config file. The PHP sentence is about the logs.
+        let mysql_headline = inventory(&mysql("8.4"), Path::new("/tmp/ovh"))
+            .keeps
+            .into_iter()
+            .find(|k| k.headline)
+            .expect("a headline");
+        assert_eq!(mysql_headline.what, "Your databases");
+        assert_eq!(
+            mysql_headline.path.as_deref(),
+            Some("/tmp/ovh/data/mysql/8.4")
+        );
+
+        let php_headline = inventory(&php("8.4"), Path::new("/tmp/ovh"))
+            .keeps
+            .into_iter()
+            .find(|k| k.headline)
+            .expect("a headline");
+        assert_eq!(php_headline.what, "Your PHP 8.4 logs");
+        assert_eq!(
+            php_headline.path.as_deref(),
+            Some("/tmp/ovh/logs/services/php-fpm-8.4")
+        );
+    }
+
+    #[test]
+    fn the_headline_survives_reaching_the_wire() {
+        // The flag exists for a UI in another language; a serde attribute typo
+        // would only show up as a dialog quietly picking the wrong path again.
+        let plan = build_plan(&mysql("8.4"), Path::new("/tmp/ovh"), &[], &[], &own_keg());
+        let v = serde_json::to_value(&plan).unwrap();
+        assert_eq!(v["keeps"][0]["headline"], true);
+        assert_eq!(v["keeps"][1]["headline"], false);
+        assert_eq!(v["keeps"][0]["what"], "Your databases");
     }
 
     #[test]
@@ -562,6 +804,35 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn the_brew_line_warns_that_dependencies_may_go_too() {
+        // Observed in the live proof: `brew uninstall php@8.3` also removed
+        // `aspell` (768 files, 338 MB), and `brew uninstall mysql@8.4` also
+        // removed `abseil`, `protobuf` and `zlib-ng-compat`. D6 promises the
+        // confirmation states what is removed; naming one formula while brew
+        // quietly takes four does not.
+        //
+        // Asserted on the PLAN (what the dialog renders), not on `describe`
+        // directly, so deleting the sentence from either end fails here.
+        //
+        // VACUITY: removing the second sentence from `Removal::BrewFormula`'s
+        // arm makes both assertions fail for both kinds.
+        for target in [php("8.4"), mysql("8.4")] {
+            let plan = build_plan(&target, Path::new("/tmp/ovh"), &[], &[], &own_keg());
+            let brew_line = plan.removes.first().expect("the formula is removal #1");
+            assert!(
+                brew_line.contains("may also remove dependencies"),
+                "got {brew_line:?}"
+            );
+            // And it must point at where the names will appear, rather than
+            // leaving the user to guess which ones.
+            assert!(
+                brew_line.contains("output names any it takes"),
+                "got {brew_line:?}"
+            );
         }
     }
 
@@ -654,6 +925,151 @@ mod tests {
         }
     }
 
+    // ---- the aliased-keg refusal (fix R1) --------------------------------
+    //
+    // VACUITY (neuter-and-watch-it-fail): deleting the `keg_blocker` push from
+    // `blockers` makes `an_aliased_php_major_is_refused_...` and
+    // `an_unresolvable_keg_is_refused_...` both report an empty blocker list.
+    // Making `keg_blocker`'s `Unresolved` arm return `None` fails the second
+    // alone, which is what keeps the two states from collapsing back together.
+
+    #[test]
+    fn an_aliased_php_major_is_refused_and_the_refusal_names_what_would_go() {
+        // This machine's actual shape: `php@8.5` is one of brew's aliases for
+        // the unversioned `php`, so `brew uninstall php@8.5` removes the user's
+        // linked PHP.
+        let keg = KegProvenance::ForeignKeg {
+            owner: "php".to_string(),
+            keg: PathBuf::from("/opt/homebrew/Cellar/php/8.5.9"),
+        };
+        assert_eq!(
+            blockers(&php("8.5"), &[], &[], &keg),
+            vec![Blocker::ForeignKeg {
+                formula: "php@8.5".to_string(),
+                owner: "php".to_string(),
+                keg: "/opt/homebrew/Cellar/php/8.5.9".to_string(),
+            }]
+        );
+        // The prose has to name BOTH the formula the user would have clicked
+        // and the thing that would actually be removed — a refusal that says
+        // only "can't do that" teaches nothing.
+        let text = blockers(&php("8.5"), &[], &[], &keg)[0].describe();
+        assert!(text.contains("php@8.5"), "{text}");
+        assert!(text.contains("/opt/homebrew/Cellar/php/8.5.9"), "{text}");
+        assert!(text.contains("brew uninstall php"), "{text}");
+    }
+
+    #[test]
+    fn the_same_refusal_covers_mysql() {
+        // Homebrew applies the identical aliasing rule to every
+        // versioned-formula family, and one code path serves both — so this is
+        // the same branch, not a dead one.
+        let keg = KegProvenance::ForeignKeg {
+            owner: "mysql".to_string(),
+            keg: PathBuf::from("/opt/homebrew/Cellar/mysql/8.4.11"),
+        };
+        assert_eq!(
+            blockers(&mysql("8.4"), &[], &[], &keg),
+            vec![Blocker::ForeignKeg {
+                formula: "mysql@8.4".to_string(),
+                owner: "mysql".to_string(),
+                keg: "/opt/homebrew/Cellar/mysql/8.4.11".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_keg_is_refused_rather_than_assumed_safe() {
+        // "I could not tell" is not "it is fine". brew resolves its own aliases
+        // from its taps with or without an `opt` link, so the alias danger is
+        // fully present here — just unprovable.
+        let keg = KegProvenance::Unresolved {
+            searched: vec![
+                PathBuf::from("/opt/homebrew/opt/php@8.4"),
+                PathBuf::from("/usr/local/opt/php@8.4"),
+            ],
+        };
+        assert_eq!(
+            blockers(&php("8.4"), &[], &[], &keg),
+            vec![Blocker::UnknownKeg {
+                formula: "php@8.4".to_string(),
+                searched: vec![
+                    "/opt/homebrew/opt/php@8.4".to_string(),
+                    "/usr/local/opt/php@8.4".to_string(),
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn a_formula_that_owns_its_keg_is_not_blocked_by_the_keg_check() {
+        // The other side of the refusal — without this the check would be
+        // indistinguishable from "uninstall never works".
+        assert!(keg_blocker(&php("8.4"), &own_keg()).is_none());
+        assert!(blockers(&php("8.4"), &[], &[], &own_keg()).is_empty());
+    }
+
+    #[test]
+    fn the_keg_refusal_is_reported_first_and_alongside_the_others() {
+        // Categorically different from the other two: those say "do this, then
+        // retry", this one says OpenVHost will never do it. It must be the
+        // first thing read — and it must not SUPPRESS the others, or a user
+        // clears one obstacle at a time.
+        let services = vec![status("php-fpm-8.5", ServiceState::Running)];
+        let sites = vec![site("shop", "shop.localhost", "8.5")];
+        let keg = KegProvenance::ForeignKeg {
+            owner: "php".to_string(),
+            keg: PathBuf::from("/opt/homebrew/Cellar/php/8.5.9"),
+        };
+        let found = blockers(&php("8.5"), &services, &sites, &keg);
+        assert_eq!(found.len(), 3, "got {found:?}");
+        assert!(matches!(found[0], Blocker::ForeignKeg { .. }));
+        assert!(matches!(found[1], Blocker::ServiceNotTerminal { .. }));
+        assert!(matches!(found[2], Blocker::SitesPinned { .. }));
+    }
+
+    #[test]
+    fn the_refused_formula_is_the_one_that_would_have_reached_brews_argv() {
+        // The whole bug was a mismatch between the string shown and the keg
+        // removed. Pin the refusal's `formula` against the REAL spec builder so
+        // a refusal can never name something other than what it prevented.
+        for target in [php("8.4"), mysql("8.4")] {
+            let keg = KegProvenance::ForeignKeg {
+                owner: "other".to_string(),
+                keg: PathBuf::from("/opt/homebrew/Cellar/other/1.0"),
+            };
+            let Some(Blocker::ForeignKeg { formula, .. }) = keg_blocker(&target, &keg) else {
+                panic!("expected a ForeignKeg refusal");
+            };
+            let spec = target
+                .uninstall_spec(Path::new("/opt/homebrew/bin/brew"))
+                .unwrap();
+            assert_eq!(spec.args[1].to_string_lossy(), formula);
+        }
+    }
+
+    #[test]
+    fn the_new_refusals_reach_the_wire_as_tagged_unions() {
+        let v = serde_json::to_value(Blocker::ForeignKeg {
+            formula: "php@8.5".into(),
+            owner: "php".into(),
+            keg: "/opt/homebrew/Cellar/php/8.5.9".into(),
+        })
+        .unwrap();
+        assert_eq!(v["kind"], "foreignKeg");
+        assert_eq!(v["formula"], "php@8.5");
+        assert_eq!(v["owner"], "php");
+        assert_eq!(v["keg"], "/opt/homebrew/Cellar/php/8.5.9");
+
+        let v = serde_json::to_value(Blocker::UnknownKeg {
+            formula: "php@8.4".into(),
+            searched: vec!["/opt/homebrew/opt/php@8.4".into()],
+        })
+        .unwrap();
+        assert_eq!(v["kind"], "unknownKeg");
+        assert_eq!(v["searched"][0], "/opt/homebrew/opt/php@8.4");
+    }
+
     #[test]
     fn a_php_major_a_site_still_uses_is_refused_and_the_site_is_named() {
         let sites = vec![
@@ -661,7 +1077,7 @@ mod tests {
             site("blog", "blog.localhost", "8.1"),
             site("wiki", "wiki.localhost", "8.4"),
         ];
-        let found = blockers(&php("8.4"), &[], &sites);
+        let found = blockers(&php("8.4"), &[], &sites, &own_keg());
         assert_eq!(
             found,
             vec![Blocker::SitesPinned {
@@ -673,7 +1089,7 @@ mod tests {
     #[test]
     fn a_php_major_no_site_uses_has_no_site_blocker() {
         let sites = vec![site("blog", "blog.localhost", "8.1")];
-        assert!(blockers(&php("8.4"), &[], &sites).is_empty());
+        assert!(blockers(&php("8.4"), &[], &sites, &own_keg()).is_empty());
     }
 
     #[test]
@@ -684,7 +1100,7 @@ mod tests {
         let mut s = site("shop", "shop.localhost", "8.4");
         s.enabled = false;
         assert_eq!(
-            blockers(&php("8.4"), &[], &[s]),
+            blockers(&php("8.4"), &[], &[s], &own_keg()),
             vec![Blocker::SitesPinned {
                 domains: vec!["shop.localhost".to_string()],
             }]
@@ -698,7 +1114,7 @@ mod tests {
         // edit that "helpfully" blocked on an initialized datadir would break
         // D2's whole round trip, so pin it.
         let sites = vec![site("shop", "shop.localhost", "8.4")];
-        assert!(blockers(&mysql("8.4"), &[], &sites).is_empty());
+        assert!(blockers(&mysql("8.4"), &[], &sites, &own_keg()).is_empty());
     }
 
     #[test]
@@ -707,7 +1123,7 @@ mod tests {
         // told about the sites has been made to guess twice.
         let services = vec![status("php-fpm-8.4", ServiceState::Running)];
         let sites = vec![site("shop", "shop.localhost", "8.4")];
-        let found = blockers(&php("8.4"), &services, &sites);
+        let found = blockers(&php("8.4"), &services, &sites, &own_keg());
         assert_eq!(found.len(), 2, "got {found:?}");
         assert!(matches!(found[0], Blocker::ServiceNotTerminal { .. }));
         assert!(matches!(found[1], Blocker::SitesPinned { .. }));
@@ -722,12 +1138,12 @@ mod tests {
             status("nginx", ServiceState::Running),
             status("mysql-8.4", ServiceState::Running),
         ];
-        assert!(blockers(&php("8.4"), &services, &[]).is_empty());
+        assert!(blockers(&php("8.4"), &services, &[], &own_keg()).is_empty());
     }
 
     #[test]
     fn a_plan_with_no_blockers_may_proceed_and_lists_both_halves() {
-        let plan = build_plan(&mysql("8.4"), Path::new("/tmp/ovh"), &[], &[]);
+        let plan = build_plan(&mysql("8.4"), Path::new("/tmp/ovh"), &[], &[], &own_keg());
         assert!(plan.blockers.is_empty());
         assert_eq!(plan.kind, PackageKind::Mysql);
         assert_eq!(plan.major, "8.4");
@@ -745,7 +1161,7 @@ mod tests {
         // cannot re-order or filter one side only.
         let target = php("8.4");
         let home = Path::new("/tmp/ovh");
-        let plan = build_plan(&target, home, &[], &[]);
+        let plan = build_plan(&target, home, &[], &[], &own_keg());
         let expected: Vec<String> = inventory(&target, home)
             .removes
             .iter()
@@ -802,8 +1218,14 @@ mod tests {
         .unwrap();
         assert_eq!(v["kind"], "sitesPinned");
         assert_eq!(v["domains"][0], "a.localhost");
-        let v =
-            serde_json::to_value(build_plan(&php("8.4"), Path::new("/tmp/ovh"), &[], &[])).unwrap();
+        let v = serde_json::to_value(build_plan(
+            &php("8.4"),
+            Path::new("/tmp/ovh"),
+            &[],
+            &[],
+            &own_keg(),
+        ))
+        .unwrap();
         assert_eq!(v["kind"], "php");
         assert_eq!(v["major"], "8.4");
         assert!(v["keeps"][0]["what"].is_string());
