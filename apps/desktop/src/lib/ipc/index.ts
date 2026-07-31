@@ -37,6 +37,7 @@ import type {
 	ScaffoldStepDto,
 	ServiceLogEvent,
 	ServiceProblemDto,
+	ServiceRegisteredEvent,
 	ServicesMemoryDto,
 	ServiceStateEvent,
 	ServiceStatus,
@@ -83,6 +84,7 @@ export type {
 	ScaffoldStepDto,
 	ServiceLogEvent,
 	ServiceProblemDto,
+	ServiceRegisteredEvent,
 	ServicesMemoryDto,
 	ServiceStateEvent,
 	ServiceStatus,
@@ -175,6 +177,23 @@ export async function onServiceState(cb: (ev: ServiceStateEvent) => void): Promi
 export async function onServiceLog(cb: (ev: ServiceLogEvent) => void): Promise<() => void> {
 	try {
 		return await events.serviceLogEvent.listen((e) => cb(e.payload));
+	} catch (e) {
+		throw normalizeError(e);
+	}
+}
+
+/**
+ * Subscribe to `service-registered`, emitted when the supervisor adds a row
+ * — including after startup (a PHP major installed at runtime, a freshly
+ * initialized MySQL major). Carries the full {@link ServiceStatus}, not a
+ * delta, since the id may be new to every caller. Same `IpcError` contract
+ * as {@link onServiceState}.
+ */
+export async function onServiceRegistered(
+	cb: (ev: ServiceRegisteredEvent) => void
+): Promise<() => void> {
+	try {
+		return await events.serviceRegisteredEvent.listen((e) => cb(e.payload));
 	} catch (e) {
 		throw normalizeError(e);
 	}

@@ -135,6 +135,42 @@ describe('ServicesStore actions', () => {
 	});
 });
 
+// Task 1 of the tray slice (`SupervisorEvent::Registered`): unlike
+// `applyState` above, a `Registered` event is allowed to GROW the list — it
+// is the fix for the exact gap `applyState`'s drop test just pinned. This is
+// the "the frontend store actually reacts" half of the fix; the Rust event
+// alone would be silent without it.
+describe('ServicesStore.applyRegistered', () => {
+	it('appends a service this store has never seen, in id order', async () => {
+		const store = new ServicesStore(api());
+		await store.loadServices(); // seeds ['demo-ticker']
+		store.applyRegistered(svc('php-fpm-8.4', 'stopped'));
+		expect(store.services.map((s) => s.id)).toEqual(['demo-ticker', 'php-fpm-8.4']);
+	});
+
+	it('inserts in sorted-by-id position, matching Supervisor::snapshot() order', async () => {
+		const store = new ServicesStore(api());
+		await store.loadServices(); // seeds ['demo-ticker']
+		store.applyRegistered(svc('a-earlier', 'stopped'));
+		expect(store.services.map((s) => s.id)).toEqual(['a-earlier', 'demo-ticker']);
+	});
+
+	it('replaces rather than duplicates an already-known id', async () => {
+		const store = new ServicesStore(api());
+		await store.loadServices(); // seeds ['demo-ticker']
+		store.applyRegistered(svc('demo-ticker', 'stopped'));
+		expect(store.services.map((s) => s.id)).toEqual(['demo-ticker']);
+	});
+
+	it('a service registered before any snapshot still appears without a restart', () => {
+		// No loadServices() at all — mirrors a Registered event arriving while
+		// the very first snapshot is still in flight.
+		const store = new ServicesStore(api());
+		store.applyRegistered(svc('mysql-8.4', 'stopped'));
+		expect(store.services.map((s) => s.id)).toEqual(['mysql-8.4']);
+	});
+});
+
 describe('ServicesStore.reload', () => {
 	// I1's cheap fix: `reload()` is the escape hatch a caller (the Languages
 	// page, after a successful install/rescan) uses to see a newly-registered

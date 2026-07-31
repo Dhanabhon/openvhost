@@ -58,6 +58,21 @@ pub enum SupervisorEvent {
         level: LogLevel,
         line: String,
     },
+    /// A service row was added — including after startup (tray/menu-bar
+    /// design `2026-07-31-p1-tray-design.md` D2). Before this variant
+    /// existed, `Supervisor::register` emitted nothing at all, so a service
+    /// registered after launch (a PHP major installed at runtime, a freshly
+    /// initialized MySQL major) never reached any observer — the Services
+    /// page carried the same gap, worked around there by an explicit
+    /// `reload()` rather than a fix at the source.
+    ///
+    /// Carries the full [`ServiceStatus`], not a delta: the observer may be
+    /// seeing this id for the very first time, so there is no prior row to
+    /// merge a partial update into. `register`'s own no-op guard for an
+    /// already `Starting`/`Running` id means this is never emitted for a
+    /// service that was already live — only for a genuinely fresh or
+    /// currently-idle (`Stopped`) row.
+    Registered { status: ServiceStatus },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

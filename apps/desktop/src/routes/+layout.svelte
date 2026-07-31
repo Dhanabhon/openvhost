@@ -6,6 +6,7 @@
 	import {
 		confirmQuit,
 		onQuitRequested,
+		onServiceRegistered,
 		onServiceState,
 		pendingInstall,
 		quitDialogReady,
@@ -69,35 +70,59 @@
 	// up as the user moves between Sites and Services. Page-specific log wiring
 	// (`onServiceLog` + the log tail seed, which only the Services page renders)
 	// deliberately stays on that page.
+	//
+	// `onServiceRegistered` is wired alongside `onServiceState` for the same
+	// reason: a service registered after launch (a PHP major installed at
+	// runtime, a freshly initialized MySQL major) must reach `servicesStore`
+	// without a relaunch, on every route — not just the Languages/Databases
+	// page that happened to trigger the install (see `ServicesStore.
+	// applyRegistered`'s doc comment for why `reload()` is still kept there
+	// too, as a synchronous guarantee independent of event-delivery timing).
 	onMount(() => {
-		let unlisten: (() => void) | null = null;
+		let unlistenState: (() => void) | null = null;
+		let unlistenRegistered: (() => void) | null = null;
 		let disposed = false;
 
 		void (async () => {
+			// Tracked outside the try so a failure registering the SECOND listener
+			// can still tear down the first rather than leaking it.
+			let stopState: (() => void) | null = null;
 			try {
 				// Subscribe BEFORE the snapshot, keeping the ordering the Services page used:
-				// a state change landing mid-fetch at least reaches the listener.
-				const stop = await onServiceState((ev) => servicesStore.applyState(ev));
+				// a state change (or a registration) landing mid-fetch at least reaches the
+				// listener.
+				stopState = await onServiceState((ev) => servicesStore.applyState(ev));
+				const stopRegistered = await onServiceRegistered((ev) =>
+					servicesStore.applyRegistered(ev.status)
+				);
 				// `await` means teardown may already have run (dev HMR disposes this layout).
-				// Drop the listener immediately rather than leaking it past the cleanup.
+				// Drop both listeners immediately rather than leaking them past the cleanup.
 				if (disposed) {
-					stop();
+					stopState();
+					stopRegistered();
 					return;
 				}
-				unlisten = stop;
+				unlistenState = stopState;
+				unlistenRegistered = stopRegistered;
 				// Resolves rather than rejects — the store captures load failures on
 				// `error`, which the Services page's banner renders.
 				await servicesStore.loadServices();
 			} catch (e) {
-				// Only `onServiceState` can land here, and the ipc barrel normalizes it.
+				// Only `onServiceState`/`onServiceRegistered` can land here, and the ipc
+				// barrel normalizes it. Tear down whichever listener DID register so a
+				// partial failure (state subscribed, registered-subscribe threw) cannot
+				// leak one past this closure.
+				stopState?.();
 				servicesStore.fail(e as IpcError);
 			}
 		})();
 
 		return () => {
 			disposed = true;
-			unlisten?.();
-			unlisten = null;
+			unlistenState?.();
+			unlistenRegistered?.();
+			unlistenState = null;
+			unlistenRegistered = null;
 		};
 	});
 

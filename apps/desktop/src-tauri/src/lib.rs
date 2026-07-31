@@ -71,6 +71,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
         .events(collect_events![
             commands::ServiceStateEvent,
             commands::ServiceLogEvent,
+            commands::ServiceRegisteredEvent,
             commands::PhpInstallLogEvent,
             commands::MysqlInstallLogEvent,
             commands::MysqlInitLogEvent,
@@ -325,6 +326,10 @@ pub fn run() {
                                                 line,
                                             }
                                             .emit(&handle);
+                                        }
+                                        Ok(SupervisorEvent::Registered { status }) => {
+                                            let _ = commands::ServiceRegisteredEvent { status }
+                                                .emit(&handle);
                                         }
                                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                                             continue;

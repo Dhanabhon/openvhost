@@ -306,6 +306,7 @@ export const events = {
 	phpInstallLogEvent: makeEvent<PhpInstallLogEvent>("php-install-log-event"),
 	quitRequestedEvent: makeEvent<QuitRequestedEvent>("quit-requested-event"),
 	serviceLogEvent: makeEvent<ServiceLogEvent>("service-log-event"),
+	serviceRegisteredEvent: makeEvent<ServiceRegisteredEvent>("service-registered-event"),
 	serviceStateEvent: makeEvent<ServiceStateEvent>("service-state-event"),
 };
 
@@ -737,6 +738,20 @@ export type ServiceProblemDto = {
 	 *  what is left for them to do.
 	 */
 	reason: string,
+};
+
+/**
+ *  Emitted when [`openvhost_proc::SupervisorEvent::Registered`] fires — a
+ *  service row was added, including after startup (tray/menu-bar design
+ *  `2026-07-31-p1-tray-design.md` D2: a PHP major installed at runtime, or a
+ *  freshly initialized MySQL major, used to reach no observer at all until
+ *  the next full [`list_services`] round trip). Carries the full
+ *  [`ServiceStatus`] rather than a delta, unlike [`ServiceStateEvent`]: the
+ *  receiving side may be seeing this id for the first time, so there is no
+ *  existing row to patch.
+ */
+export type ServiceRegisteredEvent = {
+	status: ServiceStatus,
 };
 
 export type ServiceState = { kind: "stopped" } | { kind: "starting" } | { kind: "running" } | { kind: "failed"; exit: number | null; stderrTail: string[] };

@@ -28,22 +28,22 @@
 		lastAttempted = major;
 		const installed = await store.install(major);
 		if (installed) {
-			// I1 audit finding: `Supervisor::register` emits no event, and
+			// I1 audit finding: `Supervisor::register` used to emit no event, and
 			// `ServicesStore.loadServices()` memoizes its first successful
-			// fetch — so a major installed AFTER launch registers a real
-			// supervisor row that the services store never learns about. The
+			// fetch — so a major installed AFTER launch registered a real
+			// supervisor row that the services store never learned about. The
 			// row would offer Start, the click would genuinely start the
 			// pool, and the row would keep saying Start forever (the Services
 			// page would not list it either) until the app relaunched.
 			//
-			// This is the cheap, contained fix: force a fresh fetch right
-			// after a successful install, since that is the one moment this
-			// page KNOWS the registered-service set may have changed. The
-			// more durable fix — `Supervisor::register` emitting an event and
-			// `ServicesStore.applyState` appending an unknown id instead of
-			// silently dropping its `StateChanged` (see that method) — is a
-			// larger cross-crate change (Rust event + IPC + this store) and is
-			// recorded as a follow-up rather than part of this fix.
+			// The durable fix has since shipped (tray slice, Task 1): `register`
+			// now emits `SupervisorEvent::Registered`, and the layout's
+			// `onServiceRegistered` subscription calls
+			// `ServicesStore.applyRegistered` on every route — so the row now
+			// arrives here on its own. `reload()` stays anyway as a synchronous
+			// guarantee right at the one moment this page KNOWS the
+			// registered-service set may have changed, rather than depending on
+			// how long the event takes to round-trip.
 			await servicesStore.reload();
 		}
 	}
