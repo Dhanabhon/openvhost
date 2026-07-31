@@ -3,6 +3,14 @@
 //! and events. The supervisor lives here as managed state; openvhost-proc
 //! stays tauri-free and this crate owns the bridge.
 
+// Putting the `openvhost` CLI on the user's PATH (P1 CLI-install design):
+// resolve the sibling binary, classify what is already at
+// `<candidate>/openvhost`, and install a symlink atomically. `pub` because
+// nothing calls it yet — the menu item that will is a later task, and a
+// private module of unreachable `pub fn`s would be dead code under
+// `-D warnings`. No Tauri command, no capability change: the menu handler
+// calls it directly, exactly as the tray's handlers do.
+pub mod clitool;
 mod commands;
 // Desktop-side policy for the local control socket the `openvhost` CLI talks
 // to (P1 CLI design). Transport/authorization live in
