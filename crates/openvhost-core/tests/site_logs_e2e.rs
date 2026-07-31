@@ -31,7 +31,7 @@
 //! pool config sent zero STDERR bytes for an uncaught fatal, and its own
 //! `error_log` file stayed empty; only the raw HTTP response body (via
 //! `display_errors`, On by default) showed anything. `pool.conf.tera` now
-//! sets `php_admin_value[log_errors] = On` and `php_value[display_errors] =
+//! sets `php_admin_flag[log_errors] = On` and `php_flag[display_errors] =
 //! Off` (see that file's own comment and `phpruntime.rs`'s
 //! `pool_config_captures_fatals_instead_of_only_disclosing_them_in_the_response_body`
 //! /
@@ -40,8 +40,8 @@
 //! information-disclosure gap (full file-system paths and a stack trace,
 //! visible to any client on 127.0.0.1:8080) of the same class already
 //! treated as a security concern for the phpinfo() catch-all (security audit
-//! A1). `display_errors` deliberately stays `php_value`, not
-//! `php_admin_value` like `log_errors`: the security win is the *default*
+//! A1). `display_errors` deliberately stays `php_flag`, not
+//! `php_admin_flag` like `log_errors`: the security win is the *default*
 //! (Off), not making it unmodifiable, and locking it would silently break
 //! `ini_set('display_errors', 1)` — the single most common PHP debugging
 //! call — for every script that opts in (security audit M1). This template

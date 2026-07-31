@@ -34,10 +34,10 @@ security.limit_extensions = .php
 ; disclosure class this project already treats as a security concern for
 ; the phpinfo() catch-all (security audit A1).
 ;
-; Security audit M1: log_errors stays php_admin_value — a script must not be
+; Security audit M1: log_errors stays php_admin_flag — a script must not be
 ; able to call ini_set('log_errors', 0) to go dark, since the log viewer's
 ; usefulness depends on it. display_errors deliberately uses the WEAKER
-; php_value form instead: php_admin_value can only be set here (or in the
+; php_flag form instead: php_admin_flag can only be set here (or in the
 ; main php-fpm config) and can never be changed at runtime, so
 ; ini_set('display_errors', 1) — the single most common PHP debugging
 ; incantation — would silently return false and do nothing. The security
@@ -46,6 +46,12 @@ security.limit_extensions = .php
 ; ini_set() at all it has already executed arbitrary PHP as this user, so
 ; locking the directive buys nothing further and only costs debuggability.
 ; Do not "harmonize" this with log_errors above — they differ on purpose.
-php_admin_value[log_errors] = On
-php_value[display_errors] = Off
+;
+; Whole-branch review (canonical-form fix): php.net's documented directive
+; form for a boolean is php_admin_flag/php_flag, not php_admin_value/
+; php_value — FPM's string→bool coercion made the _value form work anyway
+; (proven live by site_logs_e2e.rs), but this is the form php.net's own
+; docs and every other php-fpm pool config actually use.
+php_admin_flag[log_errors] = On
+php_flag[display_errors] = Off
 include={{ custom_pool_glob }}

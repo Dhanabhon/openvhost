@@ -243,6 +243,79 @@ describe('LogsStore ring sources (spec D7: two mechanisms, deliberately)', () =>
 	});
 });
 
+describe('LogsStore ring subscription start/stop race (whole-branch review)', () => {
+	// The bug: `startRingSubscription` (A) begins awaiting registration.
+	// A blur→focus flicker runs `stopRingSubscription()` then
+	// `startRingSubscription()` (B) again before A's registration resolves.
+	// A resolves and commits `ringUnlisten = unlistenA` (nothing told it
+	// otherwise); B resolves and OVERWRITES `ringUnlisten = unlistenB`
+	// WITHOUT ever calling `unlistenA()`. A's real Tauri registration
+	// survives forever — even past unmount's own `stopRingSubscription()`,
+	// which now only ever reaches B — and BOTH fire `applyRingLog` for
+	// every future event, duplicating every ring row.
+	//
+	// Modelled with a shared "live listeners" set standing in for Tauri's
+	// real event bus (each mock registration adds itself once its
+	// controlled promise resolves; its own returned unlisten removes it),
+	// so "no row is duplicated" is asserted the same way it would be with
+	// two real, independently-firing listeners — not merely inferred from
+	// call counts on unrelated mock functions.
+	it('resolving two overlapping registrations out of order (a blur/focus flicker) leaves exactly one live listener and never duplicates a row', async () => {
+		const live = new Set<(ev: ServiceLogEvent) => void>();
+		function deliver(ev: ServiceLogEvent): void {
+			for (const cb of [...live]) cb(ev);
+		}
+
+		let resolveA: () => void = () => {};
+		let resolveB: () => void = () => {};
+		const pendingA = new Promise<void>((r) => {
+			resolveA = r;
+		});
+		const pendingB = new Promise<void>((r) => {
+			resolveB = r;
+		});
+
+		const onServiceLog = vi
+			.fn<(cb: (ev: ServiceLogEvent) => void) => Promise<() => void>>()
+			.mockImplementationOnce(async (cb) => {
+				await pendingA;
+				live.add(cb);
+				return () => live.delete(cb);
+			})
+			.mockImplementationOnce(async (cb) => {
+				await pendingB;
+				live.add(cb);
+				return () => live.delete(cb);
+			});
+
+		const store = new LogsStore(api({ onServiceLog }));
+		await store.selectSource({ kind: 'serviceRing', id: 'mysql' });
+
+		const startA = store.startRingSubscription(); // begins awaiting registration A
+		store.stopRingSubscription(); // blur — A has not resolved yet; nothing to unlisten
+		const startB = store.startRingSubscription(); // focus — begins awaiting registration B
+
+		// Resolve OUT OF ORDER relative to which call gets awaited first:
+		// A's registration completes only AFTER B has already been kicked
+		// off — the exact interleaving that duplicated rows before this fix.
+		resolveA();
+		await startA;
+		resolveB();
+		await startB;
+
+		expect(live.size).toBe(1); // exactly one listener survives
+
+		deliver({ id: 'mysql', tsMs: 1, level: 'info', line: 'ready' });
+		expect(store.ringLogs.map((l) => l.line)).toEqual(['ready']); // not duplicated
+
+		// A later stop (unmount) must reach the SURVIVING listener — proving
+		// the store is tracking the winner, not a stale reference to the
+		// orphan — and must leave nothing registered afterwards.
+		store.stopRingSubscription();
+		expect(live.size).toBe(0);
+	});
+});
+
 describe('LogsStore cursor / append / reset (spec D3: never double-print)', () => {
 	it('appends rows across polls using the cursor the server returned', async () => {
 		const readLogWindow = vi

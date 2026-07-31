@@ -258,11 +258,11 @@ mod tests {
             .unwrap()
             .contents;
         assert!(
-            c.contains("php_admin_value[log_errors] = On"),
+            c.contains("php_admin_flag[log_errors] = On"),
             "without this, a PHP fatal is captured in NO log — got:\n{c}"
         );
         assert!(
-            c.contains("php_value[display_errors] = Off"),
+            c.contains("php_flag[display_errors] = Off"),
             "without this, every uncaught error discloses full file-system paths and a stack \
              trace to any client on 127.0.0.1:8080 — got:\n{c}"
         );
@@ -271,14 +271,14 @@ mod tests {
     /// Security audit M1: `log_errors` and `display_errors` deliberately use
     /// DIFFERENT directive forms, and this pins that they stay different.
     ///
-    /// `php_admin_value` can only be set here (or in the main php-fpm
+    /// `php_admin_flag` can only be set here (or in the main php-fpm
     /// config) and can never be changed at runtime — not even by the script
     /// itself. `log_errors` needs exactly that: the log viewer's usefulness
     /// depends on a script not being able to call `ini_set('log_errors', 0)`
     /// to go dark.
     ///
     /// `display_errors` must NOT be locked the same way. If it were
-    /// `php_admin_value`, `ini_set('display_errors', 1)` — the single most
+    /// `php_admin_flag`, `ini_set('display_errors', 1)` — the single most
     /// common PHP debugging incantation — would silently return `false` and
     /// do nothing, with no error or indication why. The security value of
     /// defaulting `display_errors` to `Off` comes from it being the default
@@ -296,18 +296,18 @@ mod tests {
             .unwrap()
             .contents;
         assert!(
-            c.contains("php_admin_value[log_errors] = On"),
+            c.contains("php_admin_flag[log_errors] = On"),
             "log_errors must stay admin-locked so a script cannot disable the log viewer's \
              source of truth — got:\n{c}"
         );
         assert!(
-            c.contains("php_value[display_errors] = Off"),
+            c.contains("php_flag[display_errors] = Off"),
             "display_errors must use the overridable form (default Off, but ini_set() must \
              still work) — got:\n{c}"
         );
         assert!(
-            !c.contains("php_admin_value[display_errors]"),
-            "display_errors must not ALSO carry an admin_value line — got:\n{c}"
+            !c.contains("php_admin_flag[display_errors]"),
+            "display_errors must not ALSO carry an admin_flag line — got:\n{c}"
         );
     }
 

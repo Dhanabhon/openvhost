@@ -163,27 +163,42 @@ export class LogsStore {
 	private inFlightGeneration: number | null = null;
 
 	/** The live `service-log` subscription's unlisten function, or `null`
-	 *  when not subscribed. Distinct from `ringSubscriptionActive` below —
+	 *  when not subscribed. Distinct from `ringSubscriptionEpoch` below —
 	 *  the registration itself is async (`onServiceLog` returns a
 	 *  `Promise<() => void>`), so there is a window where a subscription is
 	 *  INTENDED but not yet actually registered. */
 	private ringUnlisten: (() => void) | null = null;
-	/** Whether the ring subscription should be active right now — set
-	 *  synchronously by `startRingSubscription()`/`stopRingSubscription()`,
-	 *  independent of whether the `await this.api.onServiceLog(...)` call
-	 *  inside `startRingSubscription()` has actually resolved yet. Serves
-	 *  two purposes: (1) idempotency — a second `startRingSubscription()`
-	 *  call while one is already active/activating is a no-op, mirroring
-	 *  `start()`'s own `if (this.timer !== null) return;` guard; (2) the
-	 *  "stop raced an in-flight start" case — if `stopRingSubscription()`
-	 *  runs while the registration promise is still pending, this flips to
-	 *  `false` immediately, and `startRingSubscription()`'s own `await`
-	 *  continuation checks it before committing `ringUnlisten` — unregistering
-	 *  immediately instead of leaving a zombie listener alive past teardown
-	 *  (the same "orphaned interval is a permanent battery wakeup" class of
-	 *  bug `start()`/`stop()`'s own teardown discipline exists to prevent,
-	 *  applied here to a Tauri event subscription instead of a timer). */
-	private ringSubscriptionActive = false;
+	/**
+	 * Re-entrancy guard for the ring subscription, keyed on an epoch —
+	 * the SAME idiom `inFlightGeneration`/`generation` already use for
+	 * `refresh()`'s guard, reused here rather than inventing a second one
+	 * (per review instruction: "one idiom in this file, not two").
+	 * Incremented on every `startRingSubscription()` ATTEMPT and on every
+	 * `stopRingSubscription()` call; a registration commits `ringUnlisten`
+	 * only if the epoch it captured before awaiting still matches when
+	 * `onServiceLog` resolves — otherwise something else (a stop, or
+	 * another start) has already superseded it, and it unregisters itself
+	 * immediately instead of leaving a zombie listener behind or silently
+	 * overwriting a newer, already-committed one.
+	 *
+	 * Without this (whole-branch review finding — a blur/focus flicker,
+	 * the window is one Tauri `listen()` registration wide):
+	 * `startRingSubscription` (A) begins awaiting registration; blur runs
+	 * `stopRingSubscription()` (nothing to unlisten yet — A has not
+	 * resolved); focus runs `startRingSubscription()` (B) again; A
+	 * resolves and commits `ringUnlisten = unlistenA` (a plain "am I still
+	 * meant to be active" boolean has no way to know A itself was
+	 * superseded, since B already flipped it back to true); B resolves and
+	 * OVERWRITES `ringUnlisten = unlistenB` WITHOUT ever calling
+	 * `unlistenA()`. A's real registration survives forever — even past
+	 * unmount's own `stopRingSubscription()`, which now only ever reaches
+	 * B — and BOTH fire `applyRingLog` for every future event, duplicating
+	 * every ring row. Keying on a monotonic epoch instead fixes this: A
+	 * and B capture DIFFERENT epoch values, so whichever one resolves
+	 * LAST is the only one that can still match `this.ringSubscriptionEpoch`
+	 * — the other recognizes itself as stale and cleans up on the spot,
+	 * regardless of resolution order. */
+	private ringSubscriptionEpoch = 0;
 
 	constructor(private api: LogsApi) {}
 
@@ -445,17 +460,19 @@ export class LogsStore {
 	 *  visibility gate) — kept as a SEPARATE method rather than folded into
 	 *  `start()` itself so the two mechanisms stay visibly distinct at
 	 *  their one call site too, not only inside this class (spec D7: "two
-	 *  mechanisms, deliberately, documented at the seam"). See
-	 *  `ringSubscriptionActive`'s doc comment for the idempotency and
-	 *  stop-raced-a-pending-start guarantees. */
+	 *  mechanisms, deliberately, documented at the seam"). Idempotent while
+	 *  already fully registered (`ringUnlisten !== null`); see
+	 *  `ringSubscriptionEpoch`'s doc comment for how a start racing a stop
+	 *  (or another start) is resolved. */
 	async startRingSubscription(): Promise<void> {
-		if (this.ringSubscriptionActive) return;
-		this.ringSubscriptionActive = true;
+		if (this.ringUnlisten !== null) return;
+		const epoch = ++this.ringSubscriptionEpoch;
 		const unlisten = await this.api.onServiceLog((ev) => this.applyRingLog(ev));
-		if (!this.ringSubscriptionActive) {
-			// `stopRingSubscription()` ran while the registration above was
-			// still in flight — unregister immediately rather than leaving a
-			// zombie listener alive past teardown.
+		if (epoch !== this.ringSubscriptionEpoch) {
+			// Superseded by a stop, or by another start, while this
+			// registration was in flight — unregister immediately rather
+			// than leaving a zombie listener alive past teardown, or
+			// silently overwriting a newer registration that already won.
 			unlisten();
 			return;
 		}
@@ -464,10 +481,11 @@ export class LogsStore {
 
 	/** Stop the ring seam's live half. Safe to call when not started, and
 	 *  safe to call while `startRingSubscription()` is still awaiting its
-	 *  own registration — see that method's handling of
-	 *  `ringSubscriptionActive` turning `false` mid-flight. */
+	 *  own registration — see `ringSubscriptionEpoch`'s doc comment for how
+	 *  that in-flight registration discovers it was superseded and cleans
+	 *  itself up rather than surviving as a zombie listener. */
 	stopRingSubscription(): void {
-		this.ringSubscriptionActive = false;
+		this.ringSubscriptionEpoch += 1;
 		this.ringUnlisten?.();
 		this.ringUnlisten = null;
 	}
