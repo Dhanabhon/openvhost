@@ -45,6 +45,18 @@ openvhost-conf = { path = "../../../crates/openvhost-conf" }
 # `uuid::Uuid::new_v4().simple()` — already a workspace dependency (core
 # depends on it too), so this adds no new crate to Cargo.lock.
 uuid.workspace = true
+# `clitool` resolves `~/.local/bin`, the second (and in practice the winning)
+# install candidate. `dirs::home_dir` rather than `$HOME` for the same reason
+# `openvhost_core::home` uses it: it falls back to the passwd entry when the
+# variable is missing, which a GUI process cannot assume it has. Already a
+# workspace dependency (core depends on it), so this adds no new crate.
+dirs.workspace = true
+# Promoted from `[dev-dependencies]`: the login-shell PATH probe in
+# `clitool::shell` group-kills a timed-out shell and any grandchild its
+# profile forked, mirroring `openvhost_conf::inspect::kill_process_group`.
+# `kill_on_drop` alone reaches only the tracked pid. Still available to tests,
+# which use `kill(pid, 0)` liveness checks in `quit.rs` and `clitool::shell`.
+libc = "0.2"
 specta = { version = "2.0.0-rc.25", features = ["derive"] }
 specta-typescript = "0.0.12"
 tauri-specta = { version = "2.0.0-rc.25", features = ["derive", "typescript"] }
@@ -70,12 +82,10 @@ tauri-specta = { version = "2.0.0-rc.25", features = ["derive", "typescript"] }
 # The `test` feature must be absent from that graph.
 tauri = { version = "2", features = ["test"] }
 tempfile = "3"
-# `test`-only, unix-gated: the C1 regression test in `quit.rs` polls a real
-# spawned child with `kill(pid, 0)`/`SIGKILL` the same way
-# `openvhost-proc`'s own `tests/task_group.rs` does, to prove
-# `abort_pending_install` genuinely drops the run's future rather than
-# merely returning `true`.
-libc = "0.2"
+# `libc` used to live here, test-only, for the `quit.rs` C1 regression test's
+# `kill(pid, 0)`/`SIGKILL` liveness polling. It is now a normal dependency
+# (see above) because `clitool::shell` needs it in shipped code; a normal
+# dependency is visible to tests too, so nothing was lost by the move.
 
 [lints]
 workspace = true
