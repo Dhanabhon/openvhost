@@ -43,6 +43,11 @@ Candidates, in order. The first that is **writable** wins:
 
 **Never** offered: `/bin`, `/usr/bin`, `/sbin` (SIP-protected), or anything requiring authorization. If neither candidate is writable, the action reports that and stops — it does not prompt for a password. That case cannot occur if `$HOME` is writable, so it is a defensive arm, not a user-facing path.
 
+Two consequences of "first writable wins", recorded so neither reads as an accident:
+
+- **The walk stops at the first writable candidate even when the answer there is `Refused`.** It does not fall through to the next directory. That is the safer behaviour: installing into a later directory while a foreign `openvhost` sits in an earlier one would put a binary on PATH that the foreign one shadows, and the user would be told it worked. This is the one place the install walk and `detect`'s "strongest finding across all candidates wins" deliberately disagree.
+- **`~/.local` may be created as a parent** when `~/.local/bin` is created. Inside `$HOME`, mode `0755` narrowed by umask.
+
 ### D3 — A symlink, and it never clobbers anything that is not ours
 
 Create a symlink at `<dir>/openvhost` pointing at the sibling binary. Symlink, not a copy: an app update then updates the CLI for free, and a stale copy silently speaking an old protocol version to a new socket is exactly the drift the shared `SCHEMA_VERSION` exists to prevent.
@@ -120,7 +125,9 @@ This closes the follow-up chip; it is in this slice because this slice is what m
 
 This is **the first thing the app writes outside `<home>`**, and it writes into a directory on the user's PATH — a location where replacing a file is code execution. **security-auditor review is a merge blocker** (golden rule 2; `packaging/**` also lists security-auditor as reviewer for signing/verification steps in plan §6.2).
 
-Claims to verify: nothing outside the two candidate directories is ever written; no path traversal is reachable from any input (there is no user-supplied path in this feature at all); the clobber rules cannot unlink a node we did not create; the temp-then-rename cannot leave a partial install; the login-shell probe is bounded, inherits no attacker-controlled environment, and its output is never executed or interpolated into a command; `__testchild` is genuinely absent from a release binary; and the symlink target is derived from `current_exe()` rather than anything a caller supplies.
+Claims to verify: nothing outside the two candidate directories is ever written (`~/.local` itself may be created as a parent of `~/.local/bin`); no path traversal is reachable from any input (there is no user-supplied path in this feature at all); the clobber rules cannot unlink a node we did not create; the temp-then-rename cannot leave a partial install; the login-shell probe is bounded and its output is never executed or interpolated into a command; `__testchild` is genuinely absent from a release binary; and the symlink target is derived from `current_exe()` rather than anything a caller supplies.
+
+**The probe inherits the full environment, deliberately — it does not clear it.** Stated here because an earlier draft of this section claimed the opposite, and an invariant that reads stronger than reality is exactly the drift that has produced merge-blocking findings on this project twice. Clearing the environment would drop `ZDOTDIR` and make the probe read profiles the user's real shell never reads — measuring a shell they do not have, and being confidently wrong about the one thing the probe exists to answer. `$SHELL` selects which program runs, so it is an input worth naming; but anyone who can set it in this app's launchd session already has code execution as the user, and the app already spawns `nginx`, `php-fpm` and `brew`. Not a new escalation. The mechanical protections are what carry this: the script is a `const` passed as a single argument with no string concatenation, `$SHELL` must be absolute, and the output is only compared and displayed.
 
 ## Verification owed to a human
 
@@ -129,3 +136,4 @@ Claims to verify: nothing outside the two candidate directories is ever written;
 3. Run the action again — reports already installed, changes nothing.
 4. Quit, move the app, relaunch: the item reads **Reinstall…**, and running it repairs the link.
 5. Put your own file at the chosen path; the action refuses and names it, and your file is untouched.
+6. Launch the app, move it to another directory **without quitting**, then use the menu item — the dialog must lead with *relaunch*, not *reinstall*. `current_exe()` does not track a move within a running process, so this is the one state where the app cannot find its own CLI, and it is the likeliest real trigger (dragging the app to `/Applications` while it runs).
