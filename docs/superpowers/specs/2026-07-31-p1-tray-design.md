@@ -107,7 +107,7 @@ Rust-testable, and the seams are chosen to maximise it:
 
 ## Owner calls
 
-1. **Brand guideline §7.3 vs macOS reality.** §7.3 specifies a system-tinted template bracket **with a colour-coded state dot** (green/amber/red/none) and says this is the one place the mark's dot changes colour. That is not achievable as written: `setTemplate(true)` draws the image as a **mask**, so all colour is discarded. The options are (a) amend §7.3 to shape-coding — **recommended**, ships now, adapts correctly to light/dark/tinted menu bars; or (b) fund native AppKit compositing (or ship non-template light/dark asset pairs) to keep the coloured dot, at the cost of contrast that no longer follows the menu bar's actual appearance. Shipping (a) unless told otherwise; nothing else in the slice depends on which is chosen.
+1. **Brand guideline §7.3 vs macOS reality — RESOLVED 2026-07-31: option (a), shape-coding.** §7.3 specified a system-tinted template bracket **with a colour-coded state dot** and called it the one place the mark's dot changes colour. Not achievable: `setTemplate(true)` draws the image as a **mask**, so all colour is discarded. The owner chose (a) — amend the guideline to shape-coding — over (b) funding native AppKit compositing at the cost of losing automatic menu-bar tinting. `docs/OPENVHOST_BRAND_GUIDELINES.md` §3.3 and §7.3 are amended on this branch with a dated note recording the constraint and the decision. Windows keeps the coloured dot (its tray icons are not template images).
 2. **Hide-on-close discoverability.** No first-run hint ships; the Dock icon is the macOS-conventional "still running" signal. If you want a one-time notice, it is a clean fast-follow (a flag in state.db).
 
 ## Verification owed to a human (click-list)
