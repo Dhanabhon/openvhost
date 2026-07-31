@@ -3,16 +3,16 @@
 	import { onMount } from 'svelte';
 	import {
 		listLogSources,
+		onServiceLog,
 		readLogWindow,
 		revealLogFolder,
+		serviceLogTail,
 		type LogLevel,
 		type LogSourceDto
 	} from '$lib/ipc';
 	import AppShell from '$lib/components/AppShell.svelte';
 	import LogSourcePicker from '$lib/components/LogSourcePicker.svelte';
-	import LogToolbar from '$lib/components/LogToolbar.svelte';
-	import LogBody from '$lib/components/LogBody.svelte';
-	import LogStatusLine from '$lib/components/LogStatusLine.svelte';
+	import LogSourceContent from '$lib/components/LogSourceContent.svelte';
 	import { runningCount } from '$lib/services.derive';
 	import { servicesStore } from '$lib/services.shared.svelte';
 	import {
@@ -29,7 +29,13 @@
 	// per mount, the same convention `routes/+page.svelte` uses for
 	// `SitesStore`. This is also what makes teardown simple — the store is
 	// gone the instant the component is, with nothing left to leak.
-	const store = new LogsStore({ listLogSources, readLogWindow, revealLogFolder });
+	const store = new LogsStore({
+		listLogSources,
+		readLogWindow,
+		revealLogFolder,
+		serviceLogTail,
+		onServiceLog
+	});
 
 	const running = $derived(runningCount(servicesStore.services));
 	const grouped = $derived(groupSources(store.sources));
@@ -109,24 +115,36 @@
 			}
 		})();
 
-		// Poll gate: mounted AND the window is visible — mirrors
-		// `+layout.svelte`'s identical `StatsStore` wiring exactly. See
-		// `logs.svelte.ts`'s file header for why `follow` (the auto-scroll
-		// toggle) is deliberately NOT a third gate here.
+		// Poll + ring-subscription gate: mounted AND the window is visible —
+		// mirrors `+layout.svelte`'s identical `StatsStore` wiring exactly.
+		// See `logs.svelte.ts`'s file header for why `follow` (the
+		// auto-scroll toggle) is deliberately NOT a third gate here, and for
+		// why the ring subscription is a SEPARATE call from `start()` rather
+		// than folded into it (spec D7's two mechanisms staying visibly
+		// distinct at this call site too). `startRingSubscription()` is
+		// async (it awaits the Tauri listener registration); fire-and-forget
+		// here is correct — `onVisibility` itself must stay synchronous so
+		// it can be used directly as the event listener.
 		const onVisibility = (): void => {
-			if (document.visibilityState === 'visible') store.start();
-			else store.stop();
+			if (document.visibilityState === 'visible') {
+				store.start();
+				void store.startRingSubscription();
+			} else {
+				store.stop();
+				store.stopRingSubscription();
+			}
 		};
 		onVisibility();
 		document.addEventListener('visibilitychange', onVisibility);
 
 		// The teardown spec D3 calls a "tested requirement": route change
 		// (this cleanup function, run on unmount) and blur (the listener
-		// above, via `onVisibility`) can never leave the interval running
-		// past either.
+		// above, via `onVisibility`) can never leave the interval — or the
+		// ring subscription — running past either.
 		return () => {
 			disposed = true;
 			document.removeEventListener('visibilitychange', onVisibility);
+			store.stopRingSubscription();
 			store.stop();
 		};
 	});
@@ -143,40 +161,31 @@
 		{failedServiceIds}
 		{onSelect}
 	/>
-	<LogToolbar
+	<LogSourceContent
+		selected={store.selected}
+		ringLogs={store.ringLogs}
 		needle={store.needle}
 		caseSensitive={store.caseSensitive}
 		minLevel={store.minLevel}
 		follow={store.follow}
 		newRowsWhilePaused={store.newRowsWhilePaused}
-		selected={store.selected}
-		{onNeedle}
-		{onCaseSensitive}
-		{onMinLevel}
-		onSetFollow={(v) => store.setFollow(v)}
-		{onJumpToLatest}
-		{onSelectStream}
-	/>
-	<LogBody
-		selected={store.selected}
 		requestedUnavailable={store.requestedUnavailable}
 		readError={store.readError}
 		exists={store.exists}
 		rows={store.rows}
 		{filtered}
 		reset={store.reset}
-		follow={store.follow}
-		{onRevealFolder}
-		{onScroll}
-	/>
-	<LogStatusLine
-		selected={store.selected}
-		requestedUnavailable={store.requestedUnavailable}
 		sizeBytes={store.sizeBytes}
 		truncatedLines={store.truncatedLines}
 		scanBoundReached={store.scanBoundReached}
-		follow={store.follow}
+		{onNeedle}
+		{onCaseSensitive}
+		{onMinLevel}
+		onSetFollow={(v) => store.setFollow(v)}
+		{onJumpToLatest}
+		{onSelectStream}
 		{onRevealFolder}
+		{onScroll}
 	/>
 </AppShell>
 

@@ -47,7 +47,9 @@ One query command with an opaque cursor. Server behavior:
 
 Limits (Codex's, adopted): **500 rows**, **512 KiB payload**, **16 KiB per line** (truncate + mark), **16 MiB scanned per request**, **256-byte query**. 500 rows is the safe number precisely because there is no virtualization (D6); 16 MiB bounds server-side filtering (D4).
 
-"Follow" = a 500 ms poll, alive only while the Logs route is mounted **and** Follow is on. Teardown on route change/blur is a tested requirement, not an assumption — an orphaned interval is a permanent battery wakeup.
+"Follow" = a 500 ms poll, alive while the Logs route is mounted **and** the window is visible. Teardown on route change/blur is a tested requirement, not an assumption — an orphaned interval is a permanent battery wakeup.
+
+**Amended post-implementation (whole-branch review, adjudicated in the implementer's favour):** the poll is deliberately NOT additionally gated on the Follow toggle itself — an earlier draft of this sentence said "and Follow is on," which is not what shipped. Gating the poll on Follow would make D6's "reveals 'Jump to latest' when new lines have arrived" either dishonest (the badge shown with nothing actually behind it) or permanently unreachable while paused, since nothing would still be polling in the background for it to report on. Follow instead governs two narrower things: viewport auto-scroll, and whether a poll result while paused sets the Jump-to-latest flag. The mount/visibility gate above is what the "tested requirement" teardown sentence is about, and that part shipped as designed.
 
 FSEvents/`notify` push lost in both designs, for the same three reasons: coalesced events still require a re-stat after rotation, a watcher session keyed to UI subscriptions is the most bug-prone thing available, and push has **no backpressure** — an access log under load would flood the webview, whereas polling is self-limiting.
 
@@ -74,6 +76,8 @@ Confinement, mirroring `plan.rs`'s established discipline:
 - Log directories `0700` explicitly (not merely inherited from the 0700 home), so a future change to the home's mode cannot silently open logs up. Log *files* are created by nginx/php-fpm under their own umask — we cannot control that without a race; stated, not papered over.
 
 **Privacy — access logs omit query strings.** `main.conf.tera` gains an explicit `log_format` built on `$uri` (plus method, protocol, status, bytes) instead of `$request`, so `?token=…` / `?api_key=…` never reach a file the UI renders and users screenshot. Default-closed, matching the MySQL slice's redaction discipline. **Owner call** — see below. No heuristic redaction is promised for error logs (PHP/nginx errors can carry anything); the UI carries a plain "these are local logs, they may contain credentials" note instead of a false guarantee.
+
+**Known consequence, surfaced for the record (whole-branch review):** `$uri` is nginx's POST-REWRITE path, not the requested one. Combined with the site template's `try_files $uri $uri/ /index.php$is_args$args`, a front-controller framework (Laravel, WordPress, Symfony, …) routes nearly every request through `index.php`, so its per-site access log fills with `GET /index.php` for almost everything instead of the path actually requested — degrading exactly the per-site attribution this slice exists to provide, for the most common class of PHP application it is meant to help debug. This was traded for the query-string privacy guarantee above without being stated explicitly at the time. A `map`-based fix (recovering the pre-rewrite request path into the log format without reintroducing the query string) is landing separately, in `crates/openvhost-conf`; not addressed by this document's own implementation commit.
 
 ### D6 — UI: one `/logs` page, grouped sources, deep links (both agreed; both rejected the mock's flat tabs)
 
@@ -112,7 +116,7 @@ Rotation/retention/clear · regex and whole-file search UI (paging, match positi
 
 ## Owner calls (shipping with a default; both reversible)
 
-1. **Access logs omit query strings** (`$uri`, not `$request`). Default-closed for privacy — a `?token=` in a log the UI renders is the largest new leak class this slice creates. Some developers expect to see query strings; if you want them back, it becomes a Web-server-page setting later and nothing else in this design changes.
+1. **Access logs omit query strings** (`$uri`, not `$request`). Default-closed for privacy — a `?token=` in a log the UI renders is the largest new leak class this slice creates. Some developers expect to see query strings; if you want them back, it becomes a Web-server-page setting later and nothing else in this design changes. **Consequence surfaced post-review, not caught at design time:** `$uri` is the POST-REWRITE path, so with `try_files $uri $uri/ /index.php$is_args$args` a front-controller site (Laravel/WordPress/Symfony) logs `GET /index.php` for nearly every request instead of the real routed path — the exact per-site attribution D1/D5 exist to provide, degraded for the most common class of app this feature helps debug. A `map`-based fix that recovers the pre-rewrite path without reintroducing the query string is landing separately (`crates/openvhost-conf`); this is a documentation-only note in the meantime, not yet fixed by this commit.
 2. **On-disk log growth is unbounded this slice**, with a 100 MiB warning and a folder shortcut instead of rotation. Recommended: accept for now, make rotation a pre-beta requirement. Say the word and rotation becomes a merge blocker instead — it is a separate slice's worth of work.
 
 ## Verification owed to a human (GUI click-list)

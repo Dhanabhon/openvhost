@@ -3,9 +3,9 @@
 // so every test in this file fails with a module-not-found error until the
 // store is implemented (see task-6-report.md for the run that proved it).
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { LogsStore, MAX_RENDERED_ROWS, POLL_INTERVAL_MS } from './logs.svelte';
+import { LogsStore, MAX_RENDERED_ROWS, POLL_INTERVAL_MS, RING_LOG_CAP } from './logs.svelte';
 import type { LogsApi } from './logs.svelte';
-import type { LogRowDto, LogSourceRowDto, LogWindowDto } from './ipc';
+import type { LogLine, LogRowDto, LogSourceRowDto, LogWindowDto, ServiceLogEvent } from './ipc';
 
 function sourceRow(
 	source: LogSourceRowDto['source'],
@@ -45,11 +45,26 @@ function windowOf(overrides: Partial<LogWindowDto> = {}): LogWindowDto {
 	};
 }
 
+const ringRow = sourceRow({ kind: 'serviceRing', id: 'mysql' }, 'mysql output', {
+	kind: 'ring',
+	sizeBytes: null
+});
+
+function ringLine(line: string, level: LogLine['level'] = 'info'): LogLine {
+	return { tsMs: 1, level, line };
+}
+
 function api(overrides: Partial<Record<string, unknown>> = {}): LogsApi {
 	return {
-		listLogSources: vi.fn(async () => [nginxErrorRow, phpRow]),
+		listLogSources: vi.fn(async () => [nginxErrorRow, phpRow, ringRow]),
 		readLogWindow: vi.fn(async () => windowOf()),
 		revealLogFolder: vi.fn(async () => {}),
+		// Registers and resolves with an unlisten function, mirroring
+		// `onServiceLog`'s real contract (`Promise<() => void>`) — a fake
+		// that never actually delivers an event unless a test captures and
+		// invokes the callback it was given.
+		serviceLogTail: vi.fn(async () => []),
+		onServiceLog: vi.fn(async () => () => {}),
 		...overrides
 	} as unknown as LogsApi;
 }
@@ -58,7 +73,7 @@ describe('LogsStore.loadSources', () => {
 	it('fills sources on success', async () => {
 		const store = new LogsStore(api());
 		await store.loadSources();
-		expect(store.sources).toEqual([nginxErrorRow, phpRow]);
+		expect(store.sources).toEqual([nginxErrorRow, phpRow, ringRow]);
 		expect(store.sourcesError).toBeNull();
 	});
 
@@ -137,6 +152,94 @@ describe('LogsStore.selectSource', () => {
 		expect(store.requestedUnavailable).not.toBeNull();
 		await store.selectSource({ kind: 'nginxError' });
 		expect(store.requestedUnavailable).toBeNull();
+	});
+});
+
+describe('LogsStore ring sources (spec D7: two mechanisms, deliberately)', () => {
+	// CRITICAL finding (whole-branch review): `readLogWindow`/`resolve_log_path`
+	// reject a `serviceRing` source BY DESIGN (spec D7) — ring output is read
+	// through the EXISTING `service_log_tail` + `service-log` push path,
+	// never through the poll. Before this fix, `selectSource` sent every
+	// selection through `refresh()` regardless of kind, so a ring deep link
+	// hit a rejected `readLogWindow` call immediately AND every 500ms
+	// afterward for as long as the poll was armed.
+	it('never calls readLogWindow for a ring source, even with the poll armed and ticking', async () => {
+		vi.useFakeTimers();
+		try {
+			const readLogWindow = vi.fn<() => Promise<LogWindowDto>>();
+			const serviceLogTail = vi.fn(async () => [ringLine('ready')]);
+			const store = new LogsStore(api({ readLogWindow, serviceLogTail }));
+
+			await store.selectSource({ kind: 'serviceRing', id: 'mysql' });
+			expect(readLogWindow).not.toHaveBeenCalled();
+			expect(serviceLogTail).toHaveBeenCalledWith('mysql', RING_LOG_CAP);
+
+			// Arm the poll exactly as the page's mount lifecycle would, then
+			// let it tick several times — this is "never arms the poll" made
+			// concrete: whether or not the JS interval itself exists, no
+			// `readLogWindow` call may ever result from it while a ring
+			// source is selected.
+			store.start();
+			await vi.advanceTimersByTimeAsync(POLL_INTERVAL_MS * 4);
+			expect(readLogWindow).not.toHaveBeenCalled();
+			store.stop();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it('loads the initial tail via serviceLogTail, tagged with the service id', async () => {
+		const serviceLogTail = vi.fn(async () => [ringLine('starting'), ringLine('ready')]);
+		const store = new LogsStore(api({ serviceLogTail }));
+		await store.selectSource({ kind: 'serviceRing', id: 'mysql' });
+
+		expect(store.ringLogs.map((l) => ({ id: l.id, line: l.line }))).toEqual([
+			{ id: 'mysql', line: 'starting' },
+			{ id: 'mysql', line: 'ready' }
+		]);
+		expect(store.readError).toBeNull();
+	});
+
+	it('appends a live service-log event for the currently-selected ring source', async () => {
+		let deliver: (ev: ServiceLogEvent) => void = () => {};
+		const onServiceLog = vi.fn(async (cb: (ev: ServiceLogEvent) => void) => {
+			deliver = cb;
+			return () => {};
+		});
+		const store = new LogsStore(api({ onServiceLog }));
+		await store.startRingSubscription();
+		await store.selectSource({ kind: 'serviceRing', id: 'mysql' });
+
+		deliver({ id: 'mysql', tsMs: 2, level: 'warn', line: 'port busy' });
+		expect(store.ringLogs.map((l) => l.line)).toEqual(['port busy']);
+	});
+
+	it('ignores a live service-log event for a DIFFERENT service', async () => {
+		let deliver: (ev: ServiceLogEvent) => void = () => {};
+		const onServiceLog = vi.fn(async (cb: (ev: ServiceLogEvent) => void) => {
+			deliver = cb;
+			return () => {};
+		});
+		const store = new LogsStore(api({ onServiceLog }));
+		await store.startRingSubscription();
+		await store.selectSource({ kind: 'serviceRing', id: 'mysql' });
+
+		deliver({ id: 'nginx', tsMs: 2, level: 'info', line: 'not mysql' });
+		expect(store.ringLogs).toEqual([]);
+	});
+
+	it('switching from a ring source back to a file source resumes reading via readLogWindow', async () => {
+		const readLogWindow = vi
+			.fn<() => Promise<LogWindowDto>>()
+			.mockResolvedValueOnce(windowOf({ rows: [row('file-line')], cursor: 'c1' }));
+		const store = new LogsStore(api({ readLogWindow }));
+
+		await store.selectSource({ kind: 'serviceRing', id: 'mysql' });
+		await store.selectSource({ kind: 'nginxError' });
+
+		expect(readLogWindow).toHaveBeenCalledTimes(1);
+		expect(store.rows.map((r) => r.text)).toEqual(['file-line']);
+		expect(store.ringLogs).toEqual([]); // stale ring content does not leak into the file view
 	});
 });
 

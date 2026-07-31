@@ -21,15 +21,34 @@
 // route change/blur is a tested requirement, not an assumption" — is
 // rigorously implemented and tested here via `start()`/`stop()`; see
 // task-6-report.md for this call flagged explicitly for the owner.
+//
+// Spec D7's two-mechanism seam, deliberately NOT unified (whole-branch
+// review CRITICAL finding): a `"file"` source (nginx/php-fpm/site rows) is
+// read through `readLogWindow` + this store's own poll. A `"ring"` source
+// (`{kind:'serviceRing', id}`) is read through the EXISTING
+// `service_log_tail` (one-shot tail) + `service-log` push event — `derive_path`
+// in `commands.rs` REJECTS a ring source with a validation error, by design,
+// so it must never reach `readLogWindow` at all. `selectSource` branches on
+// `source.kind` right at the top for exactly this reason; `refresh()` (the
+// poll's own entry point) carries a second, independent guard against the
+// same mistake, so a caller cannot reach `readLogWindow` for a ring source
+// through EITHER path. `ringLogs`/`startRingSubscription`/
+// `stopRingSubscription` are the ring-only counterparts to `rows`/`start`/
+// `stop` — kept as separate, clearly-named members rather than folded into
+// the file-source ones, so the two mechanisms stay visibly distinct at the
+// call site, matching spec D7's "two mechanisms, deliberately, documented
+// at the seam."
 import type {
 	IpcError,
 	LogLevel,
+	LogLine,
 	LogResetDto,
 	LogRowDto,
 	LogSourceDto,
 	LogSourceRowDto,
 	LogWindowDto,
-	LogWindowQuery
+	LogWindowQuery,
+	ServiceLogEvent
 } from './ipc';
 import { isSourceListed, truncateToUtf8Bytes, LOG_NEEDLE_MAX_BYTES } from './logs.derive';
 
@@ -37,6 +56,10 @@ export interface LogsApi {
 	listLogSources(): Promise<LogSourceRowDto[]>;
 	readLogWindow(query: LogWindowQuery): Promise<LogWindowDto>;
 	revealLogFolder(source: LogSourceDto): Promise<void>;
+	/** Ring sources only (spec D7) — the one-shot tail half of the seam. */
+	serviceLogTail(id: string, n: number): Promise<LogLine[]>;
+	/** Ring sources only (spec D7) — the live push half of the seam. */
+	onServiceLog(cb: (ev: ServiceLogEvent) => void): Promise<() => void>;
 }
 
 /** Spec D3's poll cadence. */
@@ -48,6 +71,10 @@ export const POLL_INTERVAL_MS = 500;
  *  cursor keeps advancing across many polls. Oldest rows are evicted first,
  *  the same discipline `ServicesStore.applyLog`'s `LOG_CAP` already uses. */
 export const MAX_RENDERED_ROWS = 500;
+/** Ring-log accumulation cap — reuses `ServicesStore.LOG_CAP`'s own value
+ *  (50) rather than a new, untested figure: the same cap already proven
+ *  against the real supervisor ring buffer via `serviceLogTail`. */
+export const RING_LOG_CAP = 50;
 
 export class LogsStore {
 	sources = $state<LogSourceRowDto[]>([]);
@@ -60,6 +87,11 @@ export class LogsStore {
 	requestedUnavailable = $state<LogSourceDto | null>(null);
 
 	rows = $state<LogRowDto[]>([]);
+	/** The ring-source counterpart to `rows` — populated only when `selected`
+	 *  is a `serviceRing` source. Structurally identical to
+	 *  `services.svelte.ts`'s `UiLog` (`ServiceLogEvent` already carries
+	 *  `id`), so it feeds `LogPane.svelte`'s `logs` prop directly. */
+	ringLogs = $state<ServiceLogEvent[]>([]);
 	exists = $state(true);
 	reset = $state<LogResetDto | null>(null);
 	hasMore = $state(false);
@@ -130,6 +162,29 @@ export class LogsStore {
 	 */
 	private inFlightGeneration: number | null = null;
 
+	/** The live `service-log` subscription's unlisten function, or `null`
+	 *  when not subscribed. Distinct from `ringSubscriptionActive` below —
+	 *  the registration itself is async (`onServiceLog` returns a
+	 *  `Promise<() => void>`), so there is a window where a subscription is
+	 *  INTENDED but not yet actually registered. */
+	private ringUnlisten: (() => void) | null = null;
+	/** Whether the ring subscription should be active right now — set
+	 *  synchronously by `startRingSubscription()`/`stopRingSubscription()`,
+	 *  independent of whether the `await this.api.onServiceLog(...)` call
+	 *  inside `startRingSubscription()` has actually resolved yet. Serves
+	 *  two purposes: (1) idempotency — a second `startRingSubscription()`
+	 *  call while one is already active/activating is a no-op, mirroring
+	 *  `start()`'s own `if (this.timer !== null) return;` guard; (2) the
+	 *  "stop raced an in-flight start" case — if `stopRingSubscription()`
+	 *  runs while the registration promise is still pending, this flips to
+	 *  `false` immediately, and `startRingSubscription()`'s own `await`
+	 *  continuation checks it before committing `ringUnlisten` — unregistering
+	 *  immediately instead of leaving a zombie listener alive past teardown
+	 *  (the same "orphaned interval is a permanent battery wakeup" class of
+	 *  bug `start()`/`stop()`'s own teardown discipline exists to prevent,
+	 *  applied here to a Tauri event subscription instead of a timer). */
+	private ringSubscriptionActive = false;
+
 	constructor(private api: LogsApi) {}
 
 	async loadSources(): Promise<void> {
@@ -171,13 +226,25 @@ export class LogsStore {
 	}
 
 	/** Select a source and load its first window. Resets every piece of
-	 *  per-source state (rows, cursor, filter-independent facts, follow) so
-	 *  nothing from the previous source can leak into the new one. */
+	 *  per-source state (rows, ring logs, cursor, filter-independent facts,
+	 *  follow) so nothing from the previous source can leak into the new
+	 *  one — including across a FILE↔RING switch, which is why `ringLogs`
+	 *  is cleared here unconditionally rather than only on the ring branch
+	 *  below.
+	 *
+	 *  Branches on `source.kind` here, at the single entry point every
+	 *  selection goes through, rather than only inside `refresh()`: spec
+	 *  D7's two mechanisms are chosen ONCE, at selection time, not
+	 *  re-decided on every read. A `serviceRing` source never calls
+	 *  `refresh()`/`readLogWindow` at all (see `selectRingSource`); the
+	 *  guard inside `refresh()` itself is a second, independent line of
+	 *  defence, not the only one. */
 	async selectSource(source: LogSourceDto): Promise<void> {
 		this.generation += 1;
 		this.selected = source;
 		this.requestedUnavailable = null;
 		this.rows = [];
+		this.ringLogs = [];
 		this.cursor = null;
 		this.exists = true;
 		this.reset = null;
@@ -186,7 +253,51 @@ export class LogsStore {
 		this.loaded = false;
 		this.follow = true;
 		this.newRowsWhilePaused = false;
+
+		if (source.kind === 'serviceRing') {
+			await this.selectRingSource(source.id);
+			return;
+		}
 		await this.refresh();
+	}
+
+	/** The ring-source half of `selectSource` (spec D7): a one-shot
+	 *  `service_log_tail` call, NEVER `readLogWindow` — `resolve_log_path`
+	 *  rejects a ring source with a validation error by design, so this
+	 *  must be the only read this store ever issues for one. Live updates
+	 *  arrive separately, through `applyRingLog` via the subscription
+	 *  `startRingSubscription()` owns. Guarded by `generation` exactly like
+	 *  `refresh()` is, so a slow tail response for a source the user has
+	 *  since switched away from cannot land on top of the new one. */
+	private async selectRingSource(id: string): Promise<void> {
+		const generation = this.generation;
+		try {
+			const tail = await this.api.serviceLogTail(id, RING_LOG_CAP);
+			if (generation !== this.generation) return; // superseded
+			this.ringLogs = tail.map((l) => ({ ...l, id }));
+			this.readError = null;
+		} catch (e) {
+			if (generation !== this.generation) return;
+			this.readError = e as IpcError;
+		} finally {
+			if (generation === this.generation) this.loaded = true;
+		}
+	}
+
+	/** The live half of the ring seam: applies one `service-log` push event,
+	 *  but ONLY when it belongs to the currently-selected ring source —
+	 *  everything else (a different service, or no ring source selected at
+	 *  all right now) is silently ignored. This check is by `id`, not
+	 *  `generation`: the subscription is registered once for the whole
+	 *  store lifetime (`startRingSubscription`), independent of whichever
+	 *  source happens to be selected at any given moment, so there is no
+	 *  single "current generation" this callback could compare itself
+	 *  against the way `refresh()`'s response handler does. */
+	private applyRingLog(ev: ServiceLogEvent): void {
+		if (this.selected === null || this.selected.kind !== 'serviceRing') return;
+		if (this.selected.id !== ev.id) return;
+		const next = [...this.ringLogs, ev];
+		this.ringLogs = next.length > RING_LOG_CAP ? next.slice(next.length - RING_LOG_CAP) : next;
 	}
 
 	/** A filter field changed: re-run from a fresh tail (spec D4 — an active
@@ -242,9 +353,18 @@ export class LogsStore {
 	 *  costs nothing. Also a no-op (silently, resolving immediately) when a
 	 *  call already in flight shares its generation — see
 	 *  `inFlightGeneration`'s doc comment for why a DIFFERENT generation
-	 *  (a genuinely new selection) is never held back by this. */
+	 *  (a genuinely new selection) is never held back by this.
+	 *
+	 *  A SECOND, independent no-op guard: a `serviceRing` source must NEVER
+	 *  reach `readLogWindow` (spec D7 — `resolve_log_path` rejects one by
+	 *  design). `selectSource` already never calls this method for a ring
+	 *  selection, but the poll's own timer calls `refresh()` directly on
+	 *  every tick without knowing what is currently selected — this is what
+	 *  makes "the poll must not run for [ring sources]" true even if a
+	 *  selection changes kind WHILE the poll is armed, rather than relying
+	 *  on `selectSource`'s branch alone. */
 	async refresh(): Promise<void> {
-		if (this.selected === null) return;
+		if (this.selected === null || this.selected.kind === 'serviceRing') return;
 		if (this.inFlightGeneration === this.generation) return;
 		const generation = this.generation;
 		this.inFlightGeneration = generation;
@@ -316,12 +436,53 @@ export class LogsStore {
 		this.timer = null;
 	}
 
+	/** Begin the ring seam's live half (spec D7): subscribes to `service-log`
+	 *  ONCE for the whole store lifetime, independent of which source
+	 *  happens to be selected at any moment — `applyRingLog` filters
+	 *  incoming events against the CURRENT selection itself, so there is no
+	 *  need to re-subscribe on every ring-to-ring switch. Owned by the
+	 *  page's `onMount`, called alongside `start()` (same mount +
+	 *  visibility gate) — kept as a SEPARATE method rather than folded into
+	 *  `start()` itself so the two mechanisms stay visibly distinct at
+	 *  their one call site too, not only inside this class (spec D7: "two
+	 *  mechanisms, deliberately, documented at the seam"). See
+	 *  `ringSubscriptionActive`'s doc comment for the idempotency and
+	 *  stop-raced-a-pending-start guarantees. */
+	async startRingSubscription(): Promise<void> {
+		if (this.ringSubscriptionActive) return;
+		this.ringSubscriptionActive = true;
+		const unlisten = await this.api.onServiceLog((ev) => this.applyRingLog(ev));
+		if (!this.ringSubscriptionActive) {
+			// `stopRingSubscription()` ran while the registration above was
+			// still in flight — unregister immediately rather than leaving a
+			// zombie listener alive past teardown.
+			unlisten();
+			return;
+		}
+		this.ringUnlisten = unlisten;
+	}
+
+	/** Stop the ring seam's live half. Safe to call when not started, and
+	 *  safe to call while `startRingSubscription()` is still awaiting its
+	 *  own registration — see that method's handling of
+	 *  `ringSubscriptionActive` turning `false` mid-flight. */
+	stopRingSubscription(): void {
+		this.ringSubscriptionActive = false;
+		this.ringUnlisten?.();
+		this.ringUnlisten = null;
+	}
+
 	/** Open the folder for the selected source in the OS file manager (spec
 	 *  D8's recourse against unbounded on-disk growth). A no-op when
-	 *  nothing is selected; a failure lands on `readError` like any other
-	 *  action here, never thrown at the caller. */
+	 *  nothing is selected, or when the selection is a `serviceRing` source
+	 *  (`reveal_log_folder_target` rejects one the same way `resolve_log_path`
+	 *  does — a ring source has no on-disk log file for this app to derive
+	 *  a folder from; unreachable from the UI today since `LogStatusLine`
+	 *  is not rendered for a ring selection, but guarded here too rather
+	 *  than relying on that alone). A failure lands on `readError` like any
+	 *  other action here, never thrown at the caller. */
 	async revealFolder(): Promise<void> {
-		if (this.selected === null) return;
+		if (this.selected === null || this.selected.kind === 'serviceRing') return;
 		try {
 			await this.api.revealLogFolder(this.selected);
 		} catch (e) {
