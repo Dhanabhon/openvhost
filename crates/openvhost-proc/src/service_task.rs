@@ -24,13 +24,72 @@ use crate::supervisor::{Inner, ReadinessProbe};
 /// whole wait regardless of how many attempts fit inside it.
 const PROBE_RETRY_INTERVAL: Duration = Duration::from_millis(200);
 
-fn spawn_reader(inner: Arc<Inner>, id: String, source: StreamSource, stream: OutputStream) {
+/// How long a terminal transition waits for this child's output readers to
+/// finish before snapshotting the stderr tail (see [`drain_readers`]).
+///
+/// Short on purpose: it is paid on EVERY terminal transition, and it delays
+/// the `Stopped`/`Failed` event reaching the UI and any waiting
+/// `openvhost stop`. In the normal case it costs ~nothing — the child is
+/// already gone, so both pipes are at EOF and the readers finish as fast as
+/// they can be scheduled. The budget only bites when a descendant that
+/// inherited the fd is still alive (nginx workers outliving a killed master),
+/// which is exactly the case where waiting longer would not help either.
+const READER_DRAIN_BUDGET: Duration = Duration::from_millis(500);
+
+/// Spawn a reader for one of the child's pipes, returning its handle so
+/// [`drain_readers`] can wait for it before the tail is classified.
+fn spawn_reader(
+    inner: Arc<Inner>,
+    id: String,
+    source: StreamSource,
+    stream: OutputStream,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut lines = BufReader::new(stream).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             Inner::push_log(&inner, &id, source, line);
         }
-    });
+    })
+}
+
+/// Wait (bounded) for this child's output readers to finish, so a tail
+/// snapshot taken immediately afterwards contains everything the child
+/// actually wrote.
+///
+/// Without this, `child.wait()` resolving is the ONLY thing gating
+/// classification, and the reader task is a separate task with its own
+/// wakeups: whatever is still sitting in the pipe when the child exits — up
+/// to a full pipe buffer — never reaches `stderr_tail`. Nothing between
+/// `child.wait()` and the snapshot yields, so the reader gets no scheduling
+/// opportunity at all. A service that writes the reason it is dying and then
+/// dies (`nginx: [emerg] bind() ... failed`) is precisely the case that loses
+/// the race, which is precisely the case a human needs the tail for.
+///
+/// Handles are TAKEN, so a timeout leaves the vector empty and a second call
+/// is a no-op. Dropping a `JoinHandle` detaches rather than aborts: a reader
+/// that outlives the budget keeps streaming into the log ring exactly as it
+/// does today, it just stops holding up the terminal state. Aborting would
+/// throw away output from a still-live descendant for no gain.
+async fn drain_readers(readers: &mut Vec<tokio::task::JoinHandle<()>>, id: &str) {
+    if readers.is_empty() {
+        return;
+    }
+    let handles = std::mem::take(readers);
+    let joined = async {
+        for h in handles {
+            let _ = h.await;
+        }
+    };
+    if tokio::time::timeout(READER_DRAIN_BUDGET, joined)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            service_id = id,
+            budget = ?READER_DRAIN_BUDGET,
+            "output readers did not finish before classification (a descendant still holds the pipe); the stderr tail may be incomplete"
+        );
+    }
 }
 
 /// Shared terminal-state bookkeeping: compute the broadcast `detail`, log the
@@ -74,13 +133,19 @@ async fn finish_with_state(
 /// readiness — see [`finish_never_ready`] for that one. `extra_tail` is
 /// appended to the child's own captured stderr tail before classification
 /// (empty for every pre-existing call site; today's behavior, unchanged).
+///
+/// `readers` is drained (bounded) before the snapshot: the tail must describe
+/// the run that just ended, not the part of it that happened to have been
+/// consumed already. See [`drain_readers`].
 async fn finish(
     inner: &Arc<Inner>,
     id: &str,
     stop_flag: &AtomicBool,
     status: Option<std::process::ExitStatus>,
     extra_tail: Vec<String>,
+    readers: &mut Vec<tokio::task::JoinHandle<()>>,
 ) {
+    drain_readers(readers, id).await;
     let mut tail = Inner::stderr_tail_snapshot(inner, id);
     tail.extend(extra_tail);
     let state = classify_exit(stop_flag.load(Ordering::SeqCst), status.as_ref(), tail);
@@ -97,7 +162,9 @@ async fn finish_never_ready(
     stop_flag: &AtomicBool,
     status: Option<std::process::ExitStatus>,
     extra_tail: Vec<String>,
+    readers: &mut Vec<tokio::task::JoinHandle<()>>,
 ) {
+    drain_readers(readers, id).await;
     let mut tail = Inner::stderr_tail_snapshot(inner, id);
     tail.extend(extra_tail);
     let state = classify_exit_during_probe(stop_flag.load(Ordering::SeqCst), status.as_ref(), tail);
@@ -380,6 +447,11 @@ pub(crate) async fn run(
     stop_flag: Arc<AtomicBool>,
     mut control_rx: mpsc::Receiver<()>,
 ) {
+    // Every terminal path below drains these before classifying, so the
+    // stderr tail describes THIS run in full. Declared before the spawn
+    // attempt so the spawn-failure path shares one exit shape (it drains an
+    // empty vec, which is a no-op).
+    let mut readers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut child: SpawnedChild = match inner.driver.spawn(&spec) {
         Ok(c) => c,
         Err(e) => {
@@ -389,7 +461,7 @@ pub(crate) async fn run(
                 StreamSource::Stderr,
                 format!("ERROR spawn failed: {e} — {}", spec.program.display()),
             );
-            finish(&inner, &id, &stop_flag, None, Vec::new()).await;
+            finish(&inner, &id, &stop_flag, None, Vec::new(), &mut readers).await;
             return;
         }
     };
@@ -399,10 +471,20 @@ pub(crate) async fn run(
     }
     Inner::push_supervisor_log(&inner, &id, format!("spawned pid {:?}", child.id()));
     if let Some(out) = child.take_stdout() {
-        spawn_reader(Arc::clone(&inner), id.clone(), StreamSource::Stdout, out);
+        readers.push(spawn_reader(
+            Arc::clone(&inner),
+            id.clone(),
+            StreamSource::Stdout,
+            out,
+        ));
     }
     if let Some(err) = child.take_stderr() {
-        spawn_reader(Arc::clone(&inner), id.clone(), StreamSource::Stderr, err);
+        readers.push(spawn_reader(
+            Arc::clone(&inner),
+            id.clone(),
+            StreamSource::Stderr,
+            err,
+        ));
     }
 
     match await_readiness(&inner, &id, &mut child, &readiness).await {
@@ -411,12 +493,12 @@ pub(crate) async fn run(
             Inner::set_state(&inner, &id, ServiceState::Running, None);
         }
         ReadyOutcome::ChildExitedBeforeAlive(status) => {
-            finish(&inner, &id, &stop_flag, status, Vec::new()).await;
+            finish(&inner, &id, &stop_flag, status, Vec::new(), &mut readers).await;
             return;
         }
         ReadyOutcome::ChildExitedDuringProbe(status) => {
             // The child already exited on its own — nothing left to kill.
-            finish_never_ready(&inner, &id, &stop_flag, status, Vec::new()).await;
+            finish_never_ready(&inner, &id, &stop_flag, status, Vec::new(), &mut readers).await;
             return;
         }
         ReadyOutcome::ProbeDeadlineElapsed { diagnostics } => {
@@ -425,7 +507,7 @@ pub(crate) async fn run(
             // same SIGTERM → grace → SIGKILL way a user stop would, using
             // this spec's own grace.
             let status = terminate_child(&inner, &id, &mut child, grace).await;
-            finish_never_ready(&inner, &id, &stop_flag, status, diagnostics).await;
+            finish_never_ready(&inner, &id, &stop_flag, status, diagnostics, &mut readers).await;
             return;
         }
     }
@@ -433,7 +515,7 @@ pub(crate) async fn run(
     loop {
         tokio::select! {
             status = child.wait() => {
-                finish(&inner, &id, &stop_flag, status.ok(), Vec::new()).await;
+                finish(&inner, &id, &stop_flag, status.ok(), Vec::new(), &mut readers).await;
                 return;
             }
             ctl = control_rx.recv() => {
@@ -441,9 +523,134 @@ pub(crate) async fn run(
                     continue; // sender dropped without a stop request
                 }
                 let status = terminate_child(&inner, &id, &mut child, grace).await;
-                finish(&inner, &id, &stop_flag, status, Vec::new()).await;
+                finish(&inner, &id, &stop_flag, status, Vec::new(), &mut readers).await;
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::platform::default_driver;
+    use crate::supervisor::{DEFAULT_GRACE, ReadinessProbe, ServiceSpec, Supervisor};
+
+    /// A registered-but-never-started service: these tests drive [`finish`]
+    /// directly, so nothing is ever spawned.
+    fn supervisor_with(id: &str) -> Supervisor {
+        let sup = Supervisor::new(default_driver());
+        sup.register(ServiceSpec {
+            id: id.to_string(),
+            display_name: id.to_string(),
+            endpoint: None,
+            spawn: SpawnSpec {
+                program: PathBuf::from("/does/not/exist"),
+                args: vec![],
+                cwd: None,
+                env: vec![],
+            },
+            readiness: ReadinessProbe::default(),
+            grace: DEFAULT_GRACE,
+        });
+        sup
+    }
+
+    fn tail_of(sup: &Supervisor, id: &str) -> Vec<String> {
+        match sup
+            .snapshot()
+            .into_iter()
+            .find(|s| s.id == id)
+            .expect("registered")
+            .state
+        {
+            ServiceState::Failed { stderr_tail, .. } => stderr_tail,
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// THE DRAIN HALF (spec: the A4 fix wave).
+    ///
+    /// The reader is a task of its own; `child.wait()` resolving says nothing
+    /// about whether it has consumed what the child wrote on its way out. This
+    /// pins the missing happens-before edge exactly, with no pipe and no
+    /// scheduling luck involved: the reader here has provably NOT pushed when
+    /// `finish` is entered (its first act is to yield), and every step of
+    /// `finish` after the drain is synchronous. So the line can only appear in
+    /// the tail if `finish` waited for the reader.
+    ///
+    /// VACUITY: delete the `drain_readers` call from `finish` and this fails
+    /// with an empty tail — deterministically, every run, because without it
+    /// `finish` completes without a single yield point and the spawned reader
+    /// is never polled at all.
+    #[tokio::test]
+    async fn finish_waits_for_a_reader_that_has_not_pushed_yet() {
+        let sup = supervisor_with("svc");
+        let inner = Arc::clone(&sup.inner);
+        let stop = AtomicBool::new(false);
+
+        let reader = {
+            let inner = Arc::clone(&inner);
+            tokio::spawn(async move {
+                // The state a real reader is in when a service writes the
+                // reason it is dying and dies: woken, but not yet polled to
+                // the point of delivering.
+                tokio::task::yield_now().await;
+                Inner::push_log(
+                    &inner,
+                    "svc",
+                    StreamSource::Stderr,
+                    "ERROR the reason it died".to_string(),
+                );
+            })
+        };
+        let mut readers = vec![reader];
+
+        finish(&inner, "svc", &stop, None, Vec::new(), &mut readers).await;
+
+        assert_eq!(
+            tail_of(&sup, "svc"),
+            vec!["ERROR the reason it died".to_string()],
+            "the failure was classified before its own stderr had been read"
+        );
+        assert!(readers.is_empty(), "drained handles must be taken");
+    }
+
+    /// …but the wait is a budget, not a promise. A descendant that inherited
+    /// the pipe (nginx workers outliving a killed master) keeps the reader
+    /// alive indefinitely, and a terminal state that never arrives is far
+    /// worse than an incomplete tail.
+    ///
+    /// Time is paused, so the 500 ms budget costs nothing here and the
+    /// assertion is on virtual elapsed time — a real 500 ms sleep in a unit
+    /// test would be the wrong trade and would also not prove the bound is
+    /// [`READER_DRAIN_BUDGET`] rather than an accident.
+    ///
+    /// VACUITY: replace the `timeout` in `drain_readers` with a bare join and
+    /// this test hangs instead of passing.
+    #[tokio::test(start_paused = true)]
+    async fn finish_is_not_hostage_to_a_reader_that_never_finishes() {
+        let sup = supervisor_with("svc");
+        let inner = Arc::clone(&sup.inner);
+        let stop = AtomicBool::new(false);
+
+        let never = tokio::spawn(std::future::pending::<()>());
+        let mut readers = vec![never];
+
+        let t0 = tokio::time::Instant::now();
+        finish(&inner, "svc", &stop, None, Vec::new(), &mut readers).await;
+        let waited = t0.elapsed();
+
+        assert!(
+            waited >= READER_DRAIN_BUDGET,
+            "the drain must actually wait its budget out, waited {waited:?}"
+        );
+        assert!(
+            waited < READER_DRAIN_BUDGET * 2,
+            "the drain must not wait longer than its budget, waited {waited:?}"
+        );
+        // Still classified, with whatever the tail held.
+        assert!(tail_of(&sup, "svc").is_empty());
     }
 }

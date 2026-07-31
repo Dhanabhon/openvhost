@@ -33,7 +33,13 @@ use super::model::bulk_start_ids;
 /// racing an in-flight Apply is exactly the interleaving this guards
 /// against — not merely two bulk actions racing each other, which `bulk`
 /// alone already prevents.
-pub(super) fn try_acquire_bulk<'a>(
+/// `pub(crate)`, widened from `pub(super)` by the P1 CLI slice: the control
+/// channel's `stop-all` (`control.rs`) is the third caller of this admission
+/// check, alongside [`super::dispatch_start_all`] and
+/// [`super::dispatch_stop_all`]. It calls THIS function rather than repeating
+/// the two `try_lock`s, for the same reason `dispatch_stop_all` calls
+/// `quit::stop_all` rather than reimplementing it.
+pub(crate) fn try_acquire_bulk<'a>(
     bulk: &'a tokio::sync::Mutex<()>,
     apply: &'a tokio::sync::Mutex<()>,
 ) -> Option<(

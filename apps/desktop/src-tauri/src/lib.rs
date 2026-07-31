@@ -4,6 +4,12 @@
 //! stays tauri-free and this crate owns the bridge.
 
 mod commands;
+// Desktop-side policy for the local control socket the `openvhost` CLI talks
+// to (P1 CLI design). Transport/authorization live in
+// `openvhost_proc::control`; this module is only the `ControlHandler` impl
+// over the supervisor and the two bulk locks. Ungated: the handler is
+// portable, and `openvhost_proc::control::bind` is what refuses off-unix.
+mod control;
 // The MySQL admin-CLI spawns (`mysqladmin`/`mysql` — ping, ALTER USER,
 // shutdown): orchestration-layer child processes, not config generation —
 // see this module's own doc comment for why they live here rather than in
@@ -286,6 +292,15 @@ pub fn run() {
             app.manage(tray::BulkLock::default());
             app.manage(tray::TrayInitiated::default());
 
+            // Set by `perform_quit` before it removes the control socket, and
+            // read by `control::DesktopHandler` to refuse mutating verbs from
+            // an `openvhost` invocation that raced the quit (P1 CLI design,
+            // A3 audit fix). Managed unconditionally and up front for the same
+            // reason as everything above: every `try_state` read in this app
+            // fails closed the same way, and a test's own `mock_builder` setup
+            // can reach it.
+            app.manage(quit::Quitting::default());
+
             // Single-instance lock (design spec §7): reap MUST run only
             // while this is held, otherwise a second live instance would
             // reap the first's HEALTHY services (identity matches — it
@@ -427,6 +442,70 @@ pub fn run() {
                                 eprintln!(
                                     "openvhost: failed to build the tray icon ({e}); continuing without it"
                                 );
+                            }
+
+                            // The local control socket the `openvhost` CLI
+                            // connects to (P1 CLI design, spec D1). Bound
+                            // INSIDE this arm on purpose: the socket must
+                            // exist if and only if a supervisor does, so the
+                            // degraded-boot arms below — instance lock held
+                            // elsewhere, or no resolvable home — deliberately
+                            // do NOT bind, and a CLI meeting no socket
+                            // correctly reports "the app is not running"
+                            // rather than reaching a second, supervisor-less
+                            // instance.
+                            //
+                            // Best-effort, exactly like the state.db open and
+                            // the tray above: a control socket is how a
+                            // terminal drives this app, not how the app
+                            // works. A bind failure (a stale non-socket file
+                            // at the path, an over-long OPENVHOST_HOME, a
+                            // non-unix target) is logged and the GUI carries
+                            // on.
+                            //
+                            // `bind` deliberately returns a wrapper around a
+                            // STD listener: this closure is not running
+                            // inside a tokio runtime, and
+                            // `tokio::net::UnixListener::bind` panics there.
+                            // `serve` — spawned onto tauri's runtime below —
+                            // is what converts it. `std::future::pending()`
+                            // means "serve for the process lifetime": there
+                            // is no orderly-shutdown event, only a quit.
+                            //
+                            // Which is exactly why the socket's IDENTITY is
+                            // managed here, before `serve` consumes the
+                            // listener (A1 audit fix). `serve`'s own unlink
+                            // sits after a loop this future never lets break,
+                            // so it does not run in this app — and a unix
+                            // socket is not unlinked when its process exits.
+                            // Left behind, the path outlives the app and the
+                            // next `openvhost status` gets ECONNREFUSED and
+                            // reports "not accepting control connections"
+                            // (exit 69) instead of the truthful "not running"
+                            // (exit 0). `quit::perform_quit` removes it
+                            // through this managed handle, first thing.
+                            match openvhost_proc::control::bind(&home) {
+                                Ok(listener) => {
+                                    app.manage(listener.socket());
+                                    let handler: Arc<
+                                        dyn openvhost_proc::control::ControlHandler,
+                                    > = Arc::new(control::DesktopHandler::new(
+                                        app.handle().clone(),
+                                        Arc::clone(&supervisor),
+                                    ));
+                                    tauri::async_runtime::spawn(
+                                        openvhost_proc::control::serve(
+                                            listener,
+                                            handler,
+                                            std::future::pending::<()>(),
+                                        ),
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "openvhost: control socket unavailable ({e}); the openvhost CLI cannot reach this instance"
+                                    );
+                                }
                             }
                             app.manage(supervisor);
                         }

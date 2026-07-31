@@ -13,6 +13,14 @@ use std::path::PathBuf;
 /// Fixed response body the `--http` server returns and the E2E asserts on.
 pub const E2E_BODY: &str = "openvhost-e2e-ok";
 
+/// The exact line `--stderr-lines` writes for line `i` of `n`.
+///
+/// Exposed so a test asserts against the real format rather than a copy of it
+/// — a change here fails the test instead of silently making it check nothing.
+pub fn stderr_line(i: u64, n: u64) -> String {
+    format!("ERROR stderr {i}/{n}")
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct TestchildArgs {
     pub lines: u64,
@@ -40,6 +48,11 @@ pub struct TestchildArgs {
     /// attempt's own output (not a previous attempt's) reached the
     /// supervisor's diagnostics.
     pub probe_stderr_marker: Option<String>,
+    /// Write this many [`stderr_line`]s to stderr, back to back, before the
+    /// tick loop — a run whose stderr output is predictable line for line, so
+    /// a test can assert exactly which run's lines reached
+    /// `ServiceState::Failed`'s tail.
+    pub stderr_lines: u64,
 }
 
 impl Default for TestchildArgs {
@@ -56,6 +69,7 @@ impl Default for TestchildArgs {
             probe_succeed_after: None,
             probe_delay_ms: 0,
             probe_stderr_marker: None,
+            stderr_lines: 0,
         }
     }
 }
@@ -100,6 +114,7 @@ pub fn parse(args: &[String]) -> Result<TestchildArgs, String> {
                 out.probe_succeed_after = Some(next_u64("--probe-succeed-after")?)
             }
             "--probe-delay-ms" => out.probe_delay_ms = next_u64("--probe-delay-ms")?,
+            "--stderr-lines" => out.stderr_lines = next_u64("--stderr-lines")?,
             "--probe-stderr-marker" => {
                 out.probe_stderr_marker = Some(
                     it.next()
@@ -142,6 +157,13 @@ pub fn run(args: TestchildArgs) -> i32 {
                 return 1;
             }
         }
+    }
+    // Before the tick loop, and before any exit path: a test that wants this
+    // output to be the diagnosis of a failure needs it written while the
+    // process is still healthy, so nothing about the failure itself can be
+    // credited with having flushed it.
+    for i in 1..=args.stderr_lines {
+        eprintln!("{}", stderr_line(i, args.stderr_lines));
     }
     let stdout = std::io::stdout();
     for i in 1..=args.lines {
@@ -324,8 +346,24 @@ mod tests {
                 probe_succeed_after: None,
                 probe_delay_ms: 0,
                 probe_stderr_marker: None,
+                stderr_lines: 0,
             }
         );
+    }
+
+    #[test]
+    fn parse_stderr_lines_flag() {
+        assert_eq!(parse(&s(&["--stderr-lines", "3"])).unwrap().stderr_lines, 3);
+        assert!(parse(&s(&["--stderr-lines", "lots"])).is_err());
+    }
+
+    /// The line format is a test contract — `stderr_line` is what assertions
+    /// elsewhere are written against, and every line must be distinguishable
+    /// from its neighbours.
+    #[test]
+    fn stderr_line_is_numbered() {
+        assert_eq!(stderr_line(7, 9), "ERROR stderr 7/9");
+        assert_ne!(stderr_line(7, 9), stderr_line(8, 9));
     }
 
     #[test]

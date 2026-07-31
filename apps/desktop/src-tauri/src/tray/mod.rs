@@ -39,10 +39,15 @@
 pub mod apply;
 pub mod model;
 // Bulk start/stop primitives and the failure-dialog's pure decision logic
-// (Task 5 of this slice, spec D4/D6/D7) — private: only `handle_tray_menu_id`
-// and the event-subscriber loop below ever call into it, so nothing outside
-// this module needs the path.
-mod service_control;
+// (Task 5 of the tray slice, spec D4/D6/D7).
+//
+// `pub(crate)`, widened from private by the P1 CLI slice: the control
+// channel's `stop-all` must take the SAME two locks this module's Stop-all
+// takes, through the SAME `try_acquire_bulk` — a second copy of that
+// admission check is exactly how the tray and the CLI would drift into
+// disagreeing about what "busy" means. Only that one function is reachable
+// from outside; everything else here stays `pub(super)`.
+pub(crate) mod service_control;
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -89,8 +94,15 @@ const ROWS_START_INDEX: usize = 5;
 /// dispatched from [`handle_tray_menu_id`]) has to be reachable under
 /// `tauri::test::mock_builder` WITHOUT one — see this module's own test
 /// module for exactly that.
+///
+/// The inner mutex is `pub(crate)` (widened by the P1 CLI slice, mirroring
+/// `commands::ApplyLock`'s own shape): `control.rs`'s `stop-all` needs to
+/// hand it to the same [`service_control::try_acquire_bulk`] this module
+/// does, and there is no meaningful invariant to protect by keeping the field
+/// private — `try_lock` is the only operation anything in this app ever
+/// performs on it.
 #[derive(Default)]
-pub(crate) struct BulkLock(tokio::sync::Mutex<()>);
+pub(crate) struct BulkLock(pub(crate) tokio::sync::Mutex<()>);
 
 /// The ids currently in a start attempt DISPATCHED FROM THE TRAY (spec D4):
 /// a single row's `Start`/`Retry` click, or a [`dispatch_start_all`] sweep.

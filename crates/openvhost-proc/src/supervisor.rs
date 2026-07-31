@@ -234,6 +234,25 @@ impl Supervisor {
                 _ => "?",
             };
             e.stop_requested.store(false, Ordering::SeqCst);
+            // A run's diagnostics must be ITS OWN. `stderr_tail` is the input
+            // `classify_exit` puts inside `Failed { stderr_tail }` — the one
+            // thing the GUI's Failed chip and `openvhost start` show a human
+            // as the REASON a service failed. It was created once in
+            // `register` and only ever appended to, so without this a failure
+            // reports the previous run's lines: measured over five identical
+            // nginx start-fail cycles, three reported nothing from the failing
+            // run at all — only the prior run's clean-shutdown `[notice]`
+            // lines, presented as the cause of a different process failing to
+            // start.
+            //
+            // Cleared HERE, inside the same locked guard-and-transition block
+            // as the `Starting` write below, so a run's tail cannot be cleared
+            // by a `start` that then returns early at the no-op guard.
+            //
+            // The log RING is deliberately NOT cleared: that is history, and
+            // the log viewer wants it across runs. Only the classification
+            // input is per-run.
+            e.stderr_tail.clear();
             let (ctl_tx, ctl_rx) = mpsc::channel(1);
             e.control = Some(ctl_tx);
             // The Starting write MUST happen inside this same locked block,

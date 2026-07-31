@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+async-trait = "0.1"
 serde.workspace = true
 serde_json = "1"
 thiserror.workspace = true
@@ -25,6 +26,12 @@ specta = ["dep:specta"]
 [dev-dependencies]
 libc = "0.2"
 tempfile = "3"
+# `test-util` only: lets `finish_is_not_hostage_to_a_reader_that_never_finishes`
+# advance tokio's clock virtually instead of burning READER_DRAIN_BUDGET (500ms)
+# of real time, and lets it assert on the elapsed budget rather than merely that
+# the call returned. Same dev-only posture as `openvhost-conf`'s: never compiled
+# into the library or any binary, adds no new crate to Cargo.lock.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
