@@ -212,6 +212,7 @@
 					{#each store.env.runtimes as runtime (runtime.major)}
 						<LanguageRow
 							row={runtime}
+							cataloged={runtime.cataloged}
 							serviceState={runtime.serviceId === null
 								? null
 								: (servicesStore.services.find((s) => s.id === runtime.serviceId)?.state ?? null)}

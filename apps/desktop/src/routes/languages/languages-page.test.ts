@@ -24,6 +24,10 @@ function row(
 	return {
 		major,
 		installed,
+		// Catalogue rows by default — the ordinary case. The out-of-catalogue
+		// test below overrides it, which is the only way the page can know: the
+		// flag comes off the DTO, and the row has no way to infer it.
+		cataloged: true,
 		recommended: false,
 		fullVersion: null,
 		path: installed ? `/opt/homebrew/opt/php@${major}/sbin/php-fpm` : null,
@@ -245,6 +249,25 @@ describe('the /languages route — uninstall', () => {
 		expect(body).not.toContain('data-testid="uninstall-8.4"');
 	});
 
+	// The branch review's MEDIUM, at the route layer — where the bug actually
+	// lived: `LanguageRow` had no way to know, because the page never told it.
+	// A row test alone cannot catch that, which is the "gate the assembled
+	// product" lesson this file exists for.
+	it('threads the catalogue flag through, so an unmanaged major gets no Uninstall', () => {
+		languagesStore.env = env(true, [row('7.4', true, { cataloged: false })]);
+		const { body } = render(LanguagesPage);
+		expect(body).not.toContain('data-testid="uninstall-7.4"');
+		expect(body).toContain('data-testid="php-out-of-catalogue-7.4"');
+		expect(body).toContain('brew uninstall php@7.4');
+	});
+
+	it('still offers Uninstall for the managed majors alongside it', () => {
+		languagesStore.env = env(true, [row('7.4', true, { cataloged: false }), row('8.3', true)]);
+		const { body } = render(LanguagesPage);
+		expect(body).not.toContain('data-testid="uninstall-7.4"');
+		expect(body).toContain('data-testid="uninstall-8.3"');
+	});
+
 	// The page feeds `languagesStore.installing` into the row; without that
 	// wiring the button would stay live during a build and queue on the
 	// install lock with no feedback.
@@ -284,7 +307,7 @@ describe('the /languages route — uninstall', () => {
 			kind: 'php',
 			major: '8.3',
 			removes: ['the Homebrew formula php@8.3'],
-			keeps: [{ what: 'Logs', path: '/Users/x/.openvhost/logs/php-fpm-8.3' }],
+			keeps: [{ what: 'Logs', path: '/Users/x/.openvhost/logs/php-fpm-8.3', headline: true }],
 			blockers: []
 		};
 		const { body } = render(LanguagesPage);

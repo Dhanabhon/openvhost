@@ -264,8 +264,8 @@ describe('the /databases route — uninstall', () => {
 			major: '8.4',
 			removes: ['the Homebrew formula mysql@8.4', 'the supervisor entry mysql-8.4'],
 			keeps: [
-				{ what: 'Your databases', path: '/Users/x/.openvhost/data/mysql/8.4' },
-				{ what: 'The stored root password', path: null }
+				{ what: 'Your databases', path: '/Users/x/.openvhost/data/mysql/8.4', headline: true },
+				{ what: 'The stored root password', path: null, headline: false }
 			],
 			blockers: []
 		};

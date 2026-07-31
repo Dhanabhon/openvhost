@@ -29,20 +29,40 @@ export type PackageKind = 'php' | 'mysql';
 
 /** One thing an uninstall leaves alone, with its on-disk location when it has
  *  one. `path: null` is a kept thing that is not a file — the stored root
- *  credential, a site's recorded PHP version. */
+ *  credential, a site's recorded PHP version.
+ *
+ *  `headline` marks the ONE item {@link keptSentence} may name in prose. It is
+ *  carried on the wire rather than inferred here because both gates flagged the
+ *  same thing: selecting "the first kept item with a path" coupled a
+ *  destructive dialog's central promise to the order of a Rust `Vec`, so
+ *  re-ordering the inventory for an unrelated reason would silently move the
+ *  sentence onto a different directory. Rust asserts exactly one per plan; this
+ *  file still refuses to guess if that is ever violated (see
+ *  {@link keptPathsClause}). */
 export interface KeptItem {
 	what: string;
 	path: string | null;
+	headline: boolean;
 }
 
 /**
- * Why an uninstall is refused (design D3). Both variants are REFUSALS, not
- * warnings: there is no force path, so the UI must never offer to proceed past
+ * Why an uninstall is refused (design D3). Every variant is a REFUSAL, not a
+ * warning: there is no force path, so the UI must never offer to proceed past
  * one.
  */
 export type Blocker =
 	| { kind: 'serviceNotTerminal'; id: string; state: string }
-	| { kind: 'sitesPinned'; domains: string[] };
+	| { kind: 'sitesPinned'; domains: string[] }
+	/** The keg `brew uninstall <formula>` would remove belongs to a DIFFERENT
+	 *  formula — Homebrew has aliased this version's name onto another one. On
+	 *  the owner's machine `php@8.5` is an alias of the unversioned `php`, whose
+	 *  keg is `Cellar/php/8.5.9`, so the removal this app would ask for and the
+	 *  removal brew would perform are not the same removal. */
+	| { kind: 'foreignKeg'; formula: string; owner: string; keg: string }
+	/** Nothing under any known Homebrew prefix resolved to a keg for this
+	 *  formula, so what `brew uninstall <formula>` would remove is unknown —
+	 *  which is not the same as safe. */
+	| { kind: 'unknownKeg'; formula: string; searched: string[] };
 
 /**
  * What an uninstall would do, computed by Rust before anything is spawned.
@@ -118,24 +138,38 @@ export function keptSentence(kind: PackageKind, major: string, keeps: readonly K
 }
 
 /**
- * ` — they stay in <path>`, or `''` when nothing kept has a path.
+ * ` — they stay in <path>`, or `''` when no kept item is marked as the headline.
  *
- * Names the HEADLINE kept path — the first item carrying one — rather than
- * joining all of them, and that is a correctness choice, not brevity. A MySQL
- * plan keeps four things (the datadir, the root password, `my.cnf` and the
- * user's own overrides), so joining every path turns "your databases … stay in
- * X, Y and Z" into a claim that the databases live in a config file. The Rust
- * inventory orders each kind's keeps headline-first for exactly this reason,
- * and the dialog renders the complete list, paths and all, directly below this
- * sentence — nothing is hidden by naming one here.
+ * Names ONE kept path rather than joining all of them, and that is a
+ * correctness choice, not brevity. A MySQL plan keeps four things (the datadir,
+ * the root password, `my.cnf` and the user's own overrides), so joining every
+ * path turns "your databases … stay in X, Y and Z" into a claim that the
+ * databases live in a config file. The dialog renders the complete list, paths
+ * and all, directly below this sentence — nothing is hidden by naming one here.
+ *
+ * WHICH one is `KeptItem.headline`, not `keeps[0]`. This used to take the first
+ * item carrying a path, which made the sentence a function of Rust's vector
+ * ORDER: an inventory re-ordered for any unrelated reason would move the
+ * app's central "your data is safe" promise onto a different directory, and
+ * nothing about that change would look like it touched this dialog. Both gates
+ * flagged it; the flag is now on the wire.
+ *
+ * FAIL SAFE, not fail loud: Rust asserts exactly one headline per plan, and if
+ * that is ever violated — none, or two — this drops the clause entirely rather
+ * than picking one. A confirmation that says "your databases are not touched"
+ * is still true and still safe to act on; a confirmation that names the WRONG
+ * directory is worse than one that names none, because the user reads it as a
+ * promise about that path.
  *
  * Split out so both branches of {@link keptSentence} read the same data the
  * same way and neither can quietly stop consulting it.
  */
 function keptPathsClause(keeps: readonly KeptItem[]): string {
-	const headline = keeps.find((item) => item.path !== null && item.path !== '');
-	if (headline === undefined || headline.path === null) return '';
-	return ` — they stay in ${headline.path}`;
+	const headlines = keeps.filter((item) => item.headline && item.path !== null && item.path !== '');
+	if (headlines.length !== 1) return '';
+	const path = headlines[0].path;
+	if (path === null) return '';
+	return ` — they stay in ${path}`;
 }
 
 /** `a`, `a and b`, `a, b and c` — Oxford-comma-free, matching
@@ -194,8 +228,110 @@ export function blockerMessage(blocker: Blocker): BlockerMessage {
 				action: `Point ${them} at another PHP version (or delete ${sites}) first. OpenVHost never repoints a site for you: the next version may not run its code.`
 			};
 		}
+		case 'foreignKeg':
+			// The refusal that protects something OUTSIDE OpenVHost. On the
+			// owner's machine `php@8.5` is an alias of the unversioned `php`
+			// formula, so `brew uninstall php@8.5` removes the linked `php` —
+			// the interpreter every `php` command on the machine resolves to,
+			// most of which have nothing to do with this app. Naming the OWNER
+			// and the KEG is the whole message: "this is not the removal you
+			// think you are asking for" is unarguable once the user can see
+			// which directory would go.
+			return {
+				kind: 'foreignKeg',
+				obstacle: `Homebrew treats ${blocker.formula} as an alias for its unversioned ${blocker.owner} formula — it resolves to ${blocker.keg}. Removing it would take your linked ${blocker.owner} with it, not just this version.`,
+				action: `OpenVHost won't take your ${blocker.owner} down as a side effect of removing a version here. If that is what you mean, run \`brew uninstall ${blocker.owner}\` yourself — same command, consequence in front of you.`
+			};
+		case 'unknownKeg': {
+			// Unknown is NOT safe. An absent or unreadable `opt` link is no
+			// evidence that the name is harmless to hand to brew: brew resolves
+			// its own aliases from its taps whether or not a link exists here,
+			// so the `foreignKeg` danger is fully present in this case too —
+			// just unprovable. Refusing fails visibly and leaves a manual path;
+			// proceeding would fail quietly and take the user's `php` with it.
+			const looked =
+				blocker.searched.length === 0
+					? 'no Homebrew prefix to look in'
+					: `nothing under ${joinList(blocker.searched)}`;
+			return {
+				kind: 'unknownKeg',
+				obstacle: `OpenVHost can't tell which Homebrew keg ${blocker.formula} refers to — there is ${looked}.`,
+				action: `It won't hand a name it can't resolve to \`brew uninstall\`, because an alias can point at a formula you use elsewhere. Check with \`brew info ${blocker.formula}\` first; if the answer is what you expect, run the uninstall yourself.`
+			};
+		}
 		default: {
 			const unreachable: never = blocker;
+			return unreachable;
+		}
+	}
+}
+
+/** The two facts a row needs before it may offer Uninstall at all. Structural,
+ *  so a `PhpRuntimeDto` or a `MysqlInstanceDto` can be handed straight in. */
+export interface UninstallOffer {
+	installed: boolean;
+	/** Whether THIS BUILD manages the version — `MysqlInstanceDto.cataloged`'s
+	 *  meaning exactly. */
+	cataloged: boolean;
+}
+
+/**
+ * Whether a row may offer an Uninstall action.
+ *
+ * `installed` alone is not enough, and that gap shipped: `php_rows` lists an
+ * installed-but-not-catalogued major (a hand-installed `php@7.4`, or one a
+ * later catalogue drops) so it does not vanish from the page while it is still
+ * serving sites — with `installed: true`. The row then offered Uninstall,
+ * `Target::parse` refused the major it was never going to accept, and the user
+ * read "This could not be checked, so nothing has been changed."
+ *
+ * The refusal is correct and stays: it is the catalogue gate that keeps
+ * anything but a version this build offers out of `brew`'s argv. What was wrong
+ * was offering the button. `MysqlRow.svelte` has had this guard since its own
+ * slice; this is the same rule, in one place both rows can read.
+ */
+export function offersUninstall(row: UninstallOffer): boolean {
+	return row.installed && row.cataloged;
+}
+
+/**
+ * Why the action is absent, and what to do instead — because an affordance
+ * that silently is not there teaches nothing (this page's own C2/C3 lesson).
+ *
+ * Names the formula rather than saying "use Homebrew": the version was
+ * discovered under a Homebrew prefix, so `brew uninstall <formula>` is the
+ * command that removes it, and a next action the user cannot type is not a next
+ * action. Ends on "Check again" because design D5 makes that the convergence
+ * point — a major removed behind the app's back is unregistered by the rescan,
+ * leaving exactly the state an in-app uninstall would have.
+ */
+export function outOfCatalogueNote(kind: PackageKind, major: string): string {
+	return (
+		`${packageLabel(kind)} ${major} was installed outside the versions this build manages, so ` +
+		`OpenVHost won't uninstall it. Remove it with Homebrew yourself — ` +
+		`\`brew uninstall ${brewFormula(kind, major)}\` — then press Check again.`
+	);
+}
+
+/**
+ * The Homebrew formula for a version, for COPY ONLY.
+ *
+ * Mirrors `openvhost_core::brew_formula` / `mysql_brew_formula` (`php@8.3`,
+ * `mysql@8.4`) so the command in {@link outOfCatalogueNote} is the one that
+ * actually works. Nothing composed here ever reaches a child process's argv:
+ * every real `brew` invocation is composed in `openvhost-core` from a
+ * catalogue-gated major, which is exactly why the out-of-catalogue case has no
+ * in-app path in the first place. Exhaustive over `PackageKind` with the
+ * never-typed arm, so a third kind cannot inherit PHP's naming by accident.
+ */
+function brewFormula(kind: PackageKind, major: string): string {
+	switch (kind) {
+		case 'php':
+			return `php@${major}`;
+		case 'mysql':
+			return `mysql@${major}`;
+		default: {
+			const unreachable: never = kind;
 			return unreachable;
 		}
 	}

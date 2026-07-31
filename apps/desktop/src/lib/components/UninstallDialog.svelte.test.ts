@@ -21,8 +21,8 @@ function plan(overrides: Partial<UninstallPlan> = {}): UninstallPlan {
 		major: '8.4',
 		removes: ['the Homebrew formula mysql@8.4', 'the supervisor entry mysql-8.4'],
 		keeps: [
-			{ what: 'Your databases', path: '/Users/x/.openvhost/data/mysql/8.4' },
-			{ what: 'The stored root password', path: null }
+			{ what: 'Your databases', path: '/Users/x/.openvhost/data/mysql/8.4', headline: true },
+			{ what: 'The stored root password', path: null, headline: false }
 		],
 		blockers: [],
 		...overrides
@@ -42,6 +42,17 @@ function html(props: Partial<Parameters<typeof UninstallDialog>[1]> = {}): strin
 			...props
 		}
 	}).body;
+}
+
+/** The Removed list's items, in DOM order, with Svelte's SSR block markers
+ *  stripped. Compared as an ARRAY rather than with `toContain`, so an entry
+ *  dropped, re-ordered or truncated fails: `toContain` sees a list that ends
+ *  early, or one whose longest entry lost its second sentence, as a pass. */
+function removedItems(body: string): string[] {
+	const list = body.match(/data-testid="uninstall-removes"[^>]*>([\s\S]*?)<\/ul>/)?.[1] ?? '';
+	return [...list.matchAll(/<li[^>]*>([\s\S]*?)<\/li>/g)].map((m) =>
+		m[1].replace(/<!--[\s\S]*?-->/g, '').trim()
+	);
 }
 
 describe('the uninstall confirmation, unblocked', () => {
@@ -64,7 +75,9 @@ describe('the uninstall confirmation, unblocked', () => {
 	// screen has to change with it.
 	it('follows the plan when the plan names a different path', () => {
 		const body = html({
-			plan: plan({ keeps: [{ what: 'Your databases', path: '/elsewhere/mysql/8.4' }] })
+			plan: plan({
+				keeps: [{ what: 'Your databases', path: '/elsewhere/mysql/8.4', headline: true }]
+			})
 		});
 		expect(body).toContain('/elsewhere/mysql/8.4');
 		expect(body).not.toContain('/Users/x/.openvhost/data/mysql/8.4');
@@ -74,6 +87,48 @@ describe('the uninstall confirmation, unblocked', () => {
 		const body = html();
 		expect(body).toContain('the Homebrew formula mysql@8.4');
 		expect(body).toContain('the supervisor entry mysql-8.4');
+	});
+
+	// Homebrew removes more than the formula it was asked about: the live proof
+	// watched `brew uninstall php@8.3` also take `aspell` (768 files, 338 MB),
+	// and `mysql@8.4` take abseil, protobuf and zlib-ng-compat. The plan now
+	// says so, in a second sentence on the brew step — two clauses, no path,
+	// while its neighbours are short phrases ending in one. It has to render as
+	// the prose it is: whole, in place, in order.
+	//
+	// The fixture is the shape `Removal::describe` really produces, so a change
+	// in either half shows up as a diff here rather than passing against a
+	// convenient invention.
+	it('renders every removal in the plan, including the two-sentence brew caveat', () => {
+		const removes = [
+			"PHP 8.3's program files (the php@8.3 formula). Homebrew may also remove dependencies it " +
+				'believes nothing else needs; its output names any it takes.',
+			'The php-fpm pool config at /Users/x/.openvhost/conf/php-fpm-8.3.conf',
+			'The php-fpm-8.3 entry in Services'
+		];
+		const rendered = removedItems(html({ plan: plan({ removes }) }));
+		expect(rendered).toEqual(removes);
+		// Named separately because "renders in full" is the claim: a truncation
+		// at the first sentence would still satisfy a `toContain` on the start.
+		expect(rendered[0]).toContain('its output names any it takes.');
+	});
+
+	// That caveat makes a spatial promise: brew's output NAMES the extra
+	// packages, and "below" is this dialog's log pane. Pinned as DOM order, so
+	// a refactor that moved the pane above the inventory would turn the
+	// sentence into a lie without touching a single word of it.
+	it("keeps brew's output below the inventory the caveat points at", () => {
+		const body = html({
+			uninstalling: true,
+			log: [{ id: '8.4', tsMs: 0, level: 'info' as const, line: 'Uninstalling aspell…' }]
+		});
+		const list = body.indexOf('data-testid="uninstall-removes"');
+		// `LogPane`'s own testid — its class attributes carry a Svelte scope
+		// hash, so matching on `class="log"` would break on any restyle.
+		const log = body.indexOf('data-testid="log"');
+		expect(list).toBeGreaterThan(-1);
+		expect(log).toBeGreaterThan(-1);
+		expect(list).toBeLessThan(log);
 	});
 
 	it('lists every kept item, including the ones with no path', () => {
@@ -90,10 +145,14 @@ describe('the uninstall confirmation, unblocked', () => {
 		const body = html({
 			plan: plan({
 				keeps: [
-					{ what: 'Your databases', path: '/home/data/mysql/8.4' },
-					{ what: 'The stored root password', path: null },
-					{ what: "This instance's my.cnf", path: '/home/data/mysql/8.4/my.cnf' },
-					{ what: 'Your own MySQL overrides', path: '/home/config/custom/mysql/8.4' }
+					{ what: 'Your databases', path: '/home/data/mysql/8.4', headline: true },
+					{ what: 'The stored root password', path: null, headline: false },
+					{ what: "This instance's my.cnf", path: '/home/data/mysql/8.4/my.cnf', headline: false },
+					{
+						what: 'Your own MySQL overrides',
+						path: '/home/config/custom/mysql/8.4',
+						headline: false
+					}
 				]
 			})
 		});
@@ -116,7 +175,7 @@ describe('the uninstall confirmation, unblocked', () => {
 			plan: plan({
 				kind: 'php',
 				major: '8.3',
-				keeps: [{ what: 'Logs', path: '/Users/x/.openvhost/logs/php-fpm-8.3' }]
+				keeps: [{ what: 'Logs', path: '/Users/x/.openvhost/logs/php-fpm-8.3', headline: true }]
 			})
 		});
 		expect(body).toContain('Uninstall PHP 8.3?');
@@ -128,7 +187,14 @@ describe('the uninstall confirmation, unblocked', () => {
 describe('the uninstall confirmation, blocked (design D3: a refusal, not a warning)', () => {
 	const blockers: Blocker[] = [
 		{ kind: 'serviceNotTerminal', id: 'mysql-8.4', state: 'running' },
-		{ kind: 'sitesPinned', domains: ['shop.test', 'blog.test'] }
+		{ kind: 'sitesPinned', domains: ['shop.test', 'blog.test'] },
+		{
+			kind: 'foreignKeg',
+			formula: 'php@8.5',
+			owner: 'php',
+			keg: '/opt/homebrew/Cellar/php/8.5.9'
+		},
+		{ kind: 'unknownKeg', formula: 'php@8.3', searched: ['/opt/homebrew/opt/php@8.3'] }
 	];
 
 	it('offers NO way to proceed', () => {
@@ -161,15 +227,39 @@ describe('the uninstall confirmation, blocked (design D3: a refusal, not a warni
 		expect(body).toContain('2 sites still use');
 	});
 
-	// The collapse check at the render layer: both blockers on screen at once
-	// must produce two different paragraphs, not the same sentence twice.
-	it('renders two different blockers as two different messages', () => {
+	// The refusal that protects something outside OpenVHost: `php@8.5` is an
+	// alias of the unversioned `php` formula on this machine, so removing it
+	// would take the user's linked `php` with it.
+	it('names the aliased formula, the keg it resolves to, and the command', () => {
+		const body = html({ plan: plan({ blockers: [blockers[2]] }) });
+		expect(body).toContain('unversioned php formula');
+		expect(body).toContain('/opt/homebrew/Cellar/php/8.5.9');
+		expect(body).toContain('brew uninstall php');
+		expect(body).not.toContain('data-testid="uninstall-confirm"');
+	});
+
+	it('says where it looked when the keg could not be resolved at all', () => {
+		const body = html({ plan: plan({ blockers: [blockers[3]] }) });
+		expect(body).toContain('/opt/homebrew/opt/php@8.3');
+		expect(body).toContain('brew info php@8.3');
+		expect(body).not.toContain('data-testid="uninstall-confirm"');
+	});
+
+	// The collapse check at the render layer: every blocker on screen at once
+	// must produce a different paragraph, not the same sentence repeated. Keyed
+	// on `data-blocker`, so a variant rendered as a blank row fails here too.
+	it('renders every blocker as its own distinctly-keyed message', () => {
 		const body = html({ plan: plan({ blockers }) });
-		const service = body.indexOf('mysql-8.4 is running');
-		const sites = body.indexOf('2 sites still use');
-		expect(service).toBeGreaterThan(-1);
-		expect(sites).toBeGreaterThan(-1);
-		expect(service).not.toBe(sites);
+		const keys = [...body.matchAll(/data-blocker="([^"]+)"/g)].map((m) => m[1]);
+		expect(keys).toEqual(['serviceNotTerminal', 'sitesPinned', 'foreignKeg', 'unknownKeg']);
+		const found = [
+			body.indexOf('mysql-8.4 is running'),
+			body.indexOf('2 sites still use'),
+			body.indexOf('unversioned php formula'),
+			body.indexOf("can't tell which Homebrew keg")
+		];
+		for (const at of found) expect(at).toBeGreaterThan(-1);
+		expect(new Set(found).size).toBe(found.length);
 	});
 
 	// A blocked plan is about the obstacle, not about the inventory — showing

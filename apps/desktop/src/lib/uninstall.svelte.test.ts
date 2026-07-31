@@ -18,7 +18,7 @@ function plan(overrides: Partial<UninstallPlan> = {}): UninstallPlan {
 		kind: 'php',
 		major: '8.3',
 		removes: ['the Homebrew formula php@8.3'],
-		keeps: [{ what: 'Logs', path: '/home/logs/php-fpm-8.3' }],
+		keeps: [{ what: 'Logs', path: '/home/logs/php-fpm-8.3', headline: true }],
 		blockers: [],
 		...overrides
 	};

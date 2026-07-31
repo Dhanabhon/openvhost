@@ -136,7 +136,22 @@
 		<div class="inventory">
 			<section aria-labelledby="uninstall-removes">
 				<h3 id="uninstall-removes">Removed</h3>
-				<ul class="removes">
+				<!-- Every line the executor will perform, verbatim and in its order.
+				     Entries are NOT uniform any more: the brew step now carries a
+				     second sentence saying Homebrew may also remove dependencies it
+				     believes nothing else needs — the live proof watched `brew
+				     uninstall php@8.3` take `aspell` (768 files, 338 MB) and
+				     `mysql@8.4` take abseil, protobuf and zlib-ng-compat with it.
+				     So one item is two clauses of prose ending in no path while its
+				     neighbours are short phrases ending in one. Nothing here assumes
+				     an entry has a shape: it is rendered whole, and `.removes li`
+				     below wraps it with a hanging indent rather than clipping it.
+				     That sentence also makes a spatial promise — brew's output NAMES
+				     whatever it takes, and that output is the `LogPane` at the bottom
+				     of this dialog. The test file pins the DOM order so a refactor
+				     cannot quietly move the pane above and turn the promise into a
+				     lie. -->
+				<ul class="removes" data-testid="uninstall-removes">
 					{#each plan.removes as item, i (i)}
 						<li>{item}</li>
 					{/each}
@@ -306,6 +321,13 @@
 		padding-left: var(--vh-space-4);
 		position: relative;
 		color: var(--vh-text);
+		/* Entries are not uniform: most are a short noun phrase ending in a
+		   path, one is a full sentence about what Homebrew may also take. Both
+		   have to survive a 380px panel, so long tokens break instead of
+		   overflowing the card, and `padding-left` + the absolutely positioned
+		   glyph give every wrapped line a hanging indent rather than letting it
+		   run back under the marker. */
+		overflow-wrap: anywhere;
 	}
 	/* A leading glyph per row rather than a bullet, so "removed" and "kept" are
 	   distinguishable without relying on colour (brand guidelines §4.3). */

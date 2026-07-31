@@ -527,7 +527,7 @@ describe('uninstallPlan', () => {
 		kind: 'mysql' as const,
 		major: '8.4',
 		removes: ['the Homebrew formula mysql@8.4'],
-		keeps: [{ what: 'Your databases', path: '/Users/x/.openvhost/data/mysql/8.4' }],
+		keeps: [{ what: 'Your databases', path: '/Users/x/.openvhost/data/mysql/8.4', headline: true }],
 		blockers: []
 	};
 

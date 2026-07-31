@@ -13,10 +13,15 @@
 import { describe, expect, it } from 'vitest';
 import { render } from 'svelte/server';
 import QuitDialog from './QuitDialog.svelte';
+import type { PendingOperation } from '$lib/quit.derive';
 
 function html(props: {
 	pending?: string[];
-	pendingInstall?: { kind: 'php' | 'mysql'; label: string } | null;
+	// The full `PendingOperation`, `operation` included. Typing this as
+	// `{ kind, label }` was exactly how the shipped bug hid: the prop did not
+	// require the field, so neither did the fixture, so no test could see that
+	// an uninstall was being narrated as an install.
+	pendingInstall?: PendingOperation | null;
 	quitting?: boolean;
 	error?: string;
 }): string {
@@ -120,20 +125,30 @@ describe('QuitDialog', () => {
 	// "nothing will be interrupted" while a twenty-minute build was about to be
 	// silently discarded.
 	it('names an in-flight PHP install and warns it will be discarded', () => {
-		const t = text(html({ pending: [], pendingInstall: { kind: 'php', label: '8.4' } }));
+		const t = text(
+			html({ pending: [], pendingInstall: { kind: 'php', operation: 'install', label: '8.4' } })
+		);
 		expect(t).toContain('PHP 8.4');
 		expect(t).toContain('is still installing');
 		expect(t).not.toContain('No services are running');
 	});
 
 	it('offers Stop and quit when only an install is in flight, no services', () => {
-		const m = html({ pending: [], pendingInstall: { kind: 'php', label: '8.4' } });
+		const m = html({
+			pending: [],
+			pendingInstall: { kind: 'php', operation: 'install', label: '8.4' }
+		});
 		expect(m).toContain('Stop and quit');
 		expect(m).not.toContain('>Quit<');
 	});
 
 	it('combines a running service and an in-flight install in one sentence', () => {
-		const t = text(html({ pending: ['nginx'], pendingInstall: { kind: 'php', label: '8.4' } }));
+		const t = text(
+			html({
+				pending: ['nginx'],
+				pendingInstall: { kind: 'php', operation: 'install', label: '8.4' }
+			})
+		);
 		expect(t).toContain('nginx is running');
 		expect(t).toContain('PHP 8.4');
 		expect(t).toContain('is still installing');
@@ -150,7 +165,12 @@ describe('QuitDialog', () => {
 	// The label already reads as a complete phrase ("MySQL 8.4"), so the
 	// rendered sentence must not double the word "MySQL".
 	it('names an in-flight MySQL install and warns it will be discarded, without doubling the word MySQL', () => {
-		const t = text(html({ pending: [], pendingInstall: { kind: 'mysql', label: 'MySQL 8.4' } }));
+		const t = text(
+			html({
+				pending: [],
+				pendingInstall: { kind: 'mysql', operation: 'install', label: 'MySQL 8.4' }
+			})
+		);
 		expect(t).toContain('MySQL 8.4 is still installing');
 		expect(t).not.toContain('MySQL MySQL');
 		expect(t).not.toContain('No services are running');
@@ -160,18 +180,83 @@ describe('QuitDialog', () => {
 		const t = text(
 			html({
 				pending: [],
-				pendingInstall: { kind: 'mysql', label: 'MySQL 8.4 initialization' }
+				pendingInstall: { kind: 'mysql', operation: 'install', label: 'MySQL 8.4 initialization' }
 			})
 		);
 		expect(t).toContain('MySQL 8.4 initialization is still installing');
 	});
 
 	it('offers Stop and quit when only a MySQL install is in flight, no services', () => {
-		const m = html({ pending: [], pendingInstall: { kind: 'mysql', label: 'MySQL 8.4' } });
+		const m = html({
+			pending: [],
+			pendingInstall: { kind: 'mysql', operation: 'install', label: 'MySQL 8.4' }
+		});
+		expect(m).toContain('Stop and quit');
+		expect(m).not.toContain('>Quit<');
+	});
+});
+
+// The branch review's HIGH. Rust sends `operation` end to end; this component
+// never read it, so a user quitting during `brew uninstall` was told a download
+// was about to be discarded. The wording itself is `quit.derive.test.ts`'s
+// subject — what these pin is that the DIALOG asks for the right one.
+describe('an uninstall in flight is not narrated as an install', () => {
+	const removal: PendingOperation = { kind: 'php', operation: 'uninstall', label: '8.3' };
+
+	it('says the version is being removed, naming it', () => {
+		const t = text(html({ pending: [], pendingInstall: removal }));
+		expect(t).toContain('PHP 8.3 is still being removed');
+		expect(t).not.toContain('No services are running');
+	});
+
+	it('makes none of the install sentence claims', () => {
+		const t = text(html({ pending: [], pendingInstall: removal }));
+		expect(t).not.toContain('is still installing');
+		expect(t).not.toContain('download/build');
+		expect(t).not.toContain('only starting over');
+	});
+
+	it('names the partial-removal risk and where to settle it', () => {
+		const t = text(html({ pending: [], pendingInstall: removal }));
+		expect(t).toContain('half-removed');
+		expect(t).toContain('after reopening OpenVHost');
+	});
+
+	// The rendered proof that the component branches at all: same kind, same
+	// label, different operation — two different paragraphs on screen.
+	it('renders a different body for the two operations', () => {
+		const installing = text(
+			html({ pending: [], pendingInstall: { ...removal, operation: 'install' } })
+		);
+		const removing = text(html({ pending: [], pendingInstall: removal }));
+		expect(removing).not.toBe(installing);
+	});
+
+	it('still offers Stop and quit, because there is still something to stop', () => {
+		const m = html({ pending: [], pendingInstall: removal });
 		expect(m).toContain('Stop and quit');
 		expect(m).not.toContain('>Quit<');
 	});
 
+	it('keeps a MySQL removal from doubling its own name', () => {
+		const t = text(
+			html({
+				pending: [],
+				pendingInstall: { kind: 'mysql', operation: 'uninstall', label: 'MySQL 8.4' }
+			})
+		);
+		expect(t).toContain('MySQL 8.4 is still being removed');
+		expect(t).not.toContain('MySQL MySQL');
+	});
+
+	it('combines a running service and an in-flight removal in one paragraph', () => {
+		const t = text(html({ pending: ['nginx'], pendingInstall: removal }));
+		expect(t).toContain('nginx is running');
+		expect(t).toContain('PHP 8.3 is still being removed');
+	});
+});
+
+describe('QuitDialog — the buttons and the failure path', () => {
 	// Both buttons disabled: the confirm because stopping is already underway, and
 	// Cancel because the services are already going down — offering to cancel
 	// something that cannot be undone is the worse lie.

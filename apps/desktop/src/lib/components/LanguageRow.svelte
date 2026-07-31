@@ -2,13 +2,19 @@
 <script lang="ts">
 	import type { InstallOutcomeDto, PhpRuntimeDto, ServiceStatus } from '../ipc';
 	import type { UiLog } from '../languages.svelte';
-	import { uninstallActionDisabled, uninstallConfirmLabel } from '../uninstall.derive';
+	import {
+		offersUninstall,
+		outOfCatalogueNote,
+		uninstallActionDisabled,
+		uninstallConfirmLabel
+	} from '../uninstall.derive';
 	import Button from './Button.svelte';
 	import LogPane from './LogPane.svelte';
 	import StatusPill from './StatusPill.svelte';
 
 	let {
 		row,
+		cataloged,
 		serviceState,
 		installing = '',
 		uninstalling = '',
@@ -21,6 +27,22 @@
 		onStop
 	}: {
 		row: PhpRuntimeDto;
+		/** Whether THIS BUILD manages the version — the same fact
+		 *  `MysqlInstanceDto.cataloged` carries for a MySQL row.
+		 *
+		 *  A separate prop rather than a field read off `row` inside the markup,
+		 *  for one reason: it is the input to a DECISION (`offersUninstall`), and
+		 *  keeping it explicit means a row rendered without it fails to compile
+		 *  rather than defaulting to "managed" — which is how the dead Uninstall
+		 *  button reached a user in the first place.
+		 *
+		 *  `false` happens for an installed major outside the catalogue: a
+		 *  hand-installed `php@7.4`, or one a later catalogue drops. Such a row
+		 *  is deliberately still LISTED (spec §6.1: it may still be serving
+		 *  sites) and still gets its Start/Stop control, because the pool is real
+		 *  — it just gets no Uninstall, because `Target::parse` would refuse the
+		 *  major and the dialog would open only to say so. */
+		cataloged: boolean;
 		/** The whole supervised state, not just whether it is running: `failed`
 		 *  carries the `stderrTail` this row renders, and a boolean cannot express
 		 *  it. Read from the shared services store by the caller, never tracked a
@@ -55,6 +77,10 @@
 	} = $props();
 
 	const isInstalling = $derived(installing === row.major);
+	/** Installed AND managed by this build. The second half is the fix for a
+	 *  button that opened a dialog only to report a refusal — see
+	 *  `offersUninstall`'s own doc comment. */
+	const canUninstall = $derived(offersUninstall({ installed: row.installed, cataloged }));
 	/** Page-wide, not per-row: one `InstallLock` serializes brew installs and
 	 *  brew uninstalls alike, so a second action would only queue on a mutex.
 	 *  Includes this row's own uninstall, so a double-click cannot fire twice. */
@@ -154,24 +180,40 @@
 					>
 				{/if}
 			{/if}
-			<!-- Last in the row, after the daily Start/Stop control: this is the
-			     rare, destructive one, and it opens a confirmation rather than
-			     doing anything (design D6). Offered for every installed major,
-			     including one whose pool has no supervisor row yet — that state
-			     is exactly when a user is most likely to want it gone. -->
-			<Button
-				variant="quiet"
-				size="sm"
-				testId="uninstall-{row.major}"
-				ariaLabel="Uninstall PHP {row.major}"
-				disabled={uninstallDisabled}
-				onclick={() => onUninstall(row.major)}
-			>
-				{uninstallConfirmLabel(uninstalling === row.major)}
-			</Button>
+			{#if canUninstall}
+				<!-- Last in the row, after the daily Start/Stop control: this is the
+				     rare, destructive one, and it opens a confirmation rather than
+				     doing anything (design D6). Offered for every installed major
+				     THIS BUILD MANAGES, including one whose pool has no supervisor
+				     row yet — that state is exactly when a user is most likely to
+				     want it gone. An out-of-catalogue major gets the note below
+				     instead of a button that could only report a refusal. -->
+				<Button
+					variant="quiet"
+					size="sm"
+					testId="uninstall-{row.major}"
+					ariaLabel="Uninstall PHP {row.major}"
+					disabled={uninstallDisabled}
+					onclick={() => onUninstall(row.major)}
+				>
+					{uninstallConfirmLabel(uninstalling === row.major)}
+				</Button>
+			{/if}
 		{/if}
 	</div>
 </div>
+
+{#if row.installed && !cataloged}
+	<!-- Why the Uninstall button is not there. An absent affordance with no
+	     explanation is this page's own recurring failure (C2/C3): the user is
+	     left pressing nothing and learning nothing. `MysqlRow.svelte` says the
+	     equivalent for an unmanaged MySQL instance; unlike that row, this one
+	     keeps its Start/Stop control, because the pool IS real and supervised —
+	     only the removal has no in-app path. -->
+	<p class="note" data-testid="php-out-of-catalogue-{row.major}">
+		{outOfCatalogueNote('php', row.major)}
+	</p>
+{/if}
 
 {#if log.length > 0}
 	<!-- C1 fix: no longer gated on `isInstalling`. `install()`'s `finally` resets
@@ -309,6 +351,16 @@
 		border-radius: var(--vh-radius-control);
 		padding: var(--vh-space-3);
 		margin: 0 var(--vh-space-4) var(--vh-space-3);
+		font-size: var(--vh-text-table);
+	}
+	/* Same secondary-text note `MysqlRow.svelte` uses for its own unmanaged-row
+	   explanation, so the two pages explain the same situation the same way.
+	   Deliberately NOT the amber `.note.warn` treatment: nothing is wrong here
+	   — an out-of-catalogue version keeps serving perfectly well; it just has
+	   no in-app removal. */
+	.note {
+		margin: 0 var(--vh-space-4) var(--vh-space-3);
+		color: var(--vh-text-2);
 		font-size: var(--vh-text-table);
 	}
 	.pool-stderr {
