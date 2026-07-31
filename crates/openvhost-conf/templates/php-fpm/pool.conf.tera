@@ -20,4 +20,19 @@ clear_env = yes
 ; try_files $uri =404 at the nginx layer, this is what stops php-fpm from
 ; executing a request for a file that isn't actually a .php script.
 security.limit_extensions = .php
+; P1 live-log-viewer design, Task 7 live-proof finding: php-fpm is launched
+; with `-n` (no php.ini — stack.rs::php_fpm_spec's real invocation), which
+; leaves PHP's COMPILED-IN default for log_errors in effect (Off). Without
+; this, an uncaught PHP fatal was captured in NO log at all — not this
+; pool's own error_log above, and no FastCGI stderr record for nginx to log
+; either — proven live at the raw FastCGI-protocol level, bypassing nginx
+; entirely (crates/openvhost-core/tests/site_logs_e2e.rs is the full-stack
+; version of the same proof). display_errors = Off closes the other half of
+; the same gap: without it, every uncaught error is dumped straight into the
+; HTTP response body — full file-system paths and a stack trace — visible to
+; any client that can reach 127.0.0.1:8080, the same disclosure class this
+; project already treats as a security concern for the phpinfo() catch-all
+; (security audit A1).
+php_admin_value[log_errors] = On
+php_admin_value[display_errors] = Off
 include={{ custom_pool_glob }}

@@ -235,6 +235,39 @@ mod tests {
         assert!(line_b.contains("php-fpm-8.4"), "got {line_b:?}");
     }
 
+    /// P1 live-log-viewer design (Task 7 live-proof finding, 2026-07-31): a
+    /// real php-fpm launched exactly as `stack.rs::php_fpm_spec` launches it
+    /// (`-n`, no php.ini) leaves PHP's COMPILED-IN default for `log_errors`
+    /// in effect, which is `Off` — so without these two admin values, an
+    /// uncaught PHP fatal was captured NOWHERE: not this pool's own
+    /// `error_log`, and no FastCGI STDERR record for nginx to log either
+    /// (verified live at the raw FastCGI-protocol level, bypassing nginx
+    /// entirely — `crates/openvhost-core/tests/site_logs_e2e.rs` is the
+    /// slow, full-stack version of this same proof). `display_errors = Off`
+    /// is the other half: without it, every uncaught error is dumped
+    /// straight into the HTTP response body — full file-system paths and a
+    /// stack trace — visible to any client that can reach 127.0.0.1:8080,
+    /// the same disclosure class already treated as a security concern for
+    /// the phpinfo() catch-all (security audit A1).
+    #[test]
+    fn pool_config_captures_fatals_instead_of_only_disclosing_them_in_the_response_body() {
+        let ctx = unix_ctx();
+        let c = PhpFpmRuntime
+            .generate_pool_config(&ctx.home, &ctx.php_major, &ctx.php_upstream)
+            .unwrap()
+            .unwrap()
+            .contents;
+        assert!(
+            c.contains("php_admin_value[log_errors] = On"),
+            "without this, a PHP fatal is captured in NO log — got:\n{c}"
+        );
+        assert!(
+            c.contains("php_admin_value[display_errors] = Off"),
+            "without this, every uncaught error discloses full file-system paths and a stack \
+             trace to any client on 127.0.0.1:8080 — got:\n{c}"
+        );
+    }
+
     /// P1 live-log-viewer bug fix: `validate()` used to only ensure the FLAT
     /// `logs/` directory existed, which sufficed while `error_log` lived
     /// directly under it. Now that it is per-major, a real `php-fpm -t`
