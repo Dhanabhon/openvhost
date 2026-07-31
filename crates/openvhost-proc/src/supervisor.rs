@@ -147,28 +147,46 @@ impl Supervisor {
 
     /// Register a service under `spec.id`.
     ///
-    /// Re-registering a live service is a no-op; stop it first.
+    /// Re-registering a live service is a no-op; stop it first. Otherwise
+    /// broadcasts [`SupervisorEvent::Registered`] with the freshly stored
+    /// [`ServiceStatus`] — the observer-visibility fix for a service
+    /// registered after launch (spec `2026-07-31-p1-tray-design.md` D2). A
+    /// receiver that subscribed before this call sees it; one that
+    /// subscribes later does not (ordinary broadcast-channel semantics), so
+    /// the boot sequence — which registers every initial service BEFORE
+    /// `subscribe` is ever called — observes no change in behavior.
     pub fn register(&self, spec: ServiceSpec) {
         let id = spec.id.clone();
-        let mut entries = self.inner.entries.lock().unwrap_or_else(|e| e.into_inner());
-        let is_live = entries
-            .get(&id)
-            .is_some_and(|e| matches!(e.state, ServiceState::Starting | ServiceState::Running));
-        if is_live {
-            return;
-        }
-        entries.insert(
-            id,
-            Entry {
-                spec,
-                state: ServiceState::Stopped,
+        let status = {
+            let mut entries = self.inner.entries.lock().unwrap_or_else(|e| e.into_inner());
+            let is_live = entries
+                .get(&id)
+                .is_some_and(|e| matches!(e.state, ServiceState::Starting | ServiceState::Running));
+            if is_live {
+                return;
+            }
+            let status = ServiceStatus {
+                id: id.clone(),
+                display_name: spec.display_name.clone(),
+                endpoint: spec.endpoint.clone(),
                 pid: None,
-                logs: RingBuffer::new(RING_CAPACITY),
-                stderr_tail: VecDeque::new(),
-                stop_requested: Arc::new(AtomicBool::new(false)),
-                control: None,
-            },
-        );
+                state: ServiceState::Stopped,
+            };
+            entries.insert(
+                id,
+                Entry {
+                    spec,
+                    state: ServiceState::Stopped,
+                    pid: None,
+                    logs: RingBuffer::new(RING_CAPACITY),
+                    stderr_tail: VecDeque::new(),
+                    stop_requested: Arc::new(AtomicBool::new(false)),
+                    control: None,
+                },
+            );
+            status
+        };
+        let _ = self.inner.tx.send(SupervisorEvent::Registered { status });
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<SupervisorEvent> {
@@ -393,5 +411,118 @@ impl Inner {
             StreamSource::Stdout,
             format!("supervisor: {line}"),
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::platform::{SpawnSpec, default_driver};
+
+    /// A [`ServiceSpec`] that is never actually spawned in these tests —
+    /// `register()` only touches the entry map, so `spawn` just needs to be
+    /// well-formed, not runnable.
+    fn spec(id: &str) -> ServiceSpec {
+        ServiceSpec {
+            id: id.to_string(),
+            display_name: format!("{id} display"),
+            endpoint: Some("127.0.0.1:0".to_string()),
+            spawn: SpawnSpec {
+                program: std::path::PathBuf::from("/does/not/exist"),
+                args: vec![],
+                cwd: None,
+                env: vec![],
+            },
+            readiness: ReadinessProbe::default(),
+            grace: DEFAULT_GRACE,
+        }
+    }
+
+    /// Task 1 (spec D2): the observer-visibility gap this variant closes —
+    /// registering after a subscriber already exists (the shape a
+    /// post-launch PHP/MySQL install takes) must reach it with the full,
+    /// freshly stored status, exactly once.
+    #[tokio::test]
+    async fn register_after_subscribe_emits_registered_with_full_status() {
+        let sup = Supervisor::new(default_driver());
+        let mut rx = sup.subscribe();
+
+        sup.register(spec("svc-a"));
+
+        match rx.try_recv().expect("expected a queued Registered event") {
+            SupervisorEvent::Registered { status } => {
+                assert_eq!(status.id, "svc-a");
+                assert_eq!(status.display_name, "svc-a display");
+                assert_eq!(status.endpoint.as_deref(), Some("127.0.0.1:0"));
+                assert_eq!(status.pid, None);
+                assert_eq!(status.state, ServiceState::Stopped);
+            }
+            other => panic!("expected Registered, got {other:?}"),
+        }
+        // Exactly once — not a double-emit.
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    /// Startup-safety regression net: `lib.rs`'s real boot sequence calls
+    /// `register()` for every initial service BEFORE `Supervisor::subscribe`
+    /// is ever called. A `Registered` emitted with zero receivers must not
+    /// somehow surface to whoever subscribes afterward, and the first event
+    /// such a subscriber later sees (e.g. from a state probe) must be
+    /// unchanged in shape and order — exactly what it would have been before
+    /// this variant existed.
+    #[tokio::test]
+    async fn boot_time_registrations_leave_no_trace_for_a_later_subscriber() {
+        let sup = Supervisor::new(default_driver());
+        sup.register(spec("boot-svc"));
+        sup.register(spec("boot-svc-2"));
+
+        let mut rx = sup.subscribe();
+        assert!(
+            matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "a late subscriber must not see registrations that predate it"
+        );
+
+        // The next thing that happens to either service (a probe result, not
+        // a fresh registration) must still be the ONLY thing this subscriber
+        // observes — no ordering change, no phantom Registered.
+        Inner::set_state(
+            &sup.inner,
+            "boot-svc",
+            ServiceState::Running,
+            Some("probe".into()),
+        );
+        match rx
+            .try_recv()
+            .expect("expected the StateChanged from set_state")
+        {
+            SupervisorEvent::StateChanged { id, .. } => assert_eq!(id, "boot-svc"),
+            other => panic!("expected StateChanged, got {other:?}"),
+        }
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    /// Pre-existing no-op guard, unaffected: re-registering a `Starting`/
+    /// `Running` id must still emit nothing at all — a live service is never
+    /// mistaken for a newly registered one.
+    #[tokio::test]
+    async fn registering_a_live_service_stays_a_no_op_and_emits_nothing() {
+        let sup = Supervisor::new(default_driver());
+        sup.register(spec("svc-b"));
+        Inner::set_state(&sup.inner, "svc-b", ServiceState::Running, None);
+
+        let mut rx = sup.subscribe();
+        sup.register(spec("svc-b"));
+
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
     }
 }

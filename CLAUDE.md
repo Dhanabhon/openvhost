@@ -64,10 +64,41 @@ work yourself.
   with `deep-reasoner` but reasoning from a different perspective. Treat it as a
   peer, not a reviewer — hand it the problem, not your answer to check.
 
+### Delivery pipeline (owner decision 2026-07-31 — speed over ceremony)
+
+Design: `docs/superpowers/specs/2026-07-31-lean-pipeline-design.md`. The owner
+measured the old pipeline at ~28 serial subagent round trips per slice, 43% of
+them rework, and chose speed while accepting more risk. Per slice:
+
+1. **Design once** — write the spec yourself. Spec stays; it is cheap and
+   everything downstream reads from it.
+2. **Build in ≤3 tasks**, sized to a coherent chunk. **No review between tasks.**
+3. **Gate once at the end** — whole-branch review + live proof + security audit
+   (audit whenever the slice touches the command surface, credentials, file
+   paths, or child processes).
+4. **One fix wave**, then merge.
+
+Never traded away, because they are cheap and caught this project's worst bugs:
+the **live proof against real binaries** and the **security audit**. Per-task
+review was 60–70% of the cost and produced the least severe findings — that is
+what got cut.
+
+Since per-task review is gone, every implementer brief must carry these as
+binding requirements, and the implementer must report against them: vacuity
+proof per test group; filesystem/locale semantics (case-insensitive volumes,
+separators, symlinks); reentrancy and lifecycle (overlapping polls, listeners
+outliving teardown); exhaustiveness (no wildcard arms; prove a new variant fails
+to compile); and the seams between tasks.
+
+Record **dispatch count and wall clock** per slice in the ledger. Target: ~8
+dispatches, 3–4 h. If three slices do not move, the diagnosis was wrong —
+revisit the design rather than defend it.
+
 ### High-stakes decisions
 
-For decisions that are expensive to reverse — schema and API design, concurrency
-model, framework or dependency choices, anything touching auth or data integrity:
+**Reserved** for decisions both expensive to reverse *and* without precedent in
+this codebase — schema, credentials, app lifecycle. (The MySQL slice qualified;
+the docroot warning did not.) Not the default.
 
 1. Task `deep-reasoner` and Codex on the same problem in parallel.
 2. Show neither one the other's answer, or your own leaning. Independent takes

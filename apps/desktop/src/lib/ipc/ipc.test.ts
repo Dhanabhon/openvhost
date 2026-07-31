@@ -19,6 +19,7 @@ import {
 	installPhp,
 	listServices,
 	onPhpInstallLog,
+	onServiceRegistered,
 	onServiceState,
 	pendingInstall,
 	phpEnvironment,
@@ -419,6 +420,53 @@ describe('onServiceState', () => {
 	it('passes an IpcError-shaped rejection through unchanged', async () => {
 		listenMock.mockRejectedValueOnce({ kind: 'proc', message: 'supervisor gone' });
 		await expect(onServiceState(() => {})).rejects.toEqual({
+			kind: 'proc',
+			message: 'supervisor gone'
+		});
+	});
+});
+
+// Task 1 of the tray slice (`SupervisorEvent::Registered`): the IPC half of
+// the fix — proves the wrapper subscribes to the right channel and forwards
+// the full `ServiceStatus` payload, not just a delta like `onServiceState`.
+describe('onServiceRegistered', () => {
+	beforeEach(() => listenMock.mockReset());
+
+	it('resolves to the unlisten function the transport returns', async () => {
+		const unlisten = vi.fn();
+		listenMock.mockResolvedValueOnce(unlisten);
+		await expect(onServiceRegistered(() => {})).resolves.toBe(unlisten);
+		expect(listenMock).toHaveBeenCalledWith('service-registered-event', expect.any(Function));
+	});
+
+	it('delivers the full ServiceStatus payload to the callback', async () => {
+		const seen: unknown[] = [];
+		const status = {
+			id: 'php-fpm-8.4',
+			displayName: 'php-fpm 8.4',
+			endpoint: 'run/php-fpm-8.4.sock',
+			pid: null,
+			state: { kind: 'stopped' }
+		};
+		listenMock.mockImplementationOnce(async (_name: string, cb: (e: unknown) => void) => {
+			cb({ event: 'service-registered-event', id: 1, payload: { status } });
+			return vi.fn();
+		});
+		await onServiceRegistered((ev) => seen.push(ev));
+		expect(seen).toEqual([{ status }]);
+	});
+
+	it('normalizes a raw transport failure into a core-variant IpcError', async () => {
+		listenMock.mockRejectedValueOnce(new Error('event transport down'));
+		await expect(onServiceRegistered(() => {})).rejects.toEqual({
+			kind: 'core',
+			message: 'Error: event transport down'
+		});
+	});
+
+	it('passes an IpcError-shaped rejection through unchanged', async () => {
+		listenMock.mockRejectedValueOnce({ kind: 'proc', message: 'supervisor gone' });
+		await expect(onServiceRegistered(() => {})).rejects.toEqual({
 			kind: 'proc',
 			message: 'supervisor gone'
 		});

@@ -126,6 +126,20 @@ pub struct ServiceLogEvent {
     pub line: String,
 }
 
+/// Emitted when [`openvhost_proc::SupervisorEvent::Registered`] fires — a
+/// service row was added, including after startup (tray/menu-bar design
+/// `2026-07-31-p1-tray-design.md` D2: a PHP major installed at runtime, or a
+/// freshly initialized MySQL major, used to reach no observer at all until
+/// the next full [`list_services`] round trip). Carries the full
+/// [`ServiceStatus`] rather than a delta, unlike [`ServiceStateEvent`]: the
+/// receiving side may be seeing this id for the first time, so there is no
+/// existing row to patch.
+#[derive(Debug, Clone, serde::Serialize, specta::Type, tauri_specta::Event)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceRegisteredEvent {
+    pub status: ServiceStatus,
+}
+
 // These four commands must stay `async fn`: Tauri dispatches async commands
 // onto its own tokio runtime, which is what gives `Supervisor::start`'s
 // internal `tokio::spawn` a valid reactor to spawn onto. A sync `#[tauri::

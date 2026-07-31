@@ -78,7 +78,7 @@ The mark must always remain an *opening* bracket. Rendering it mirrored, closed,
 | Reversed | Evergreen 400 `#33B79E` | Signal Green `#3FB950` | Dark backgrounds |
 | Monochrome ink | Terminal Ink | Terminal Ink | Print, engraving, favicons ≤16px (drop the dot below 16px) |
 | Monochrome paper | Plaintext | Plaintext | On photos/brand-color fills |
-| Template (macOS menu bar) | System-tinted monochrome | Dot rendered as state color overlay | Tray icon only — see §7.3 |
+| Template (macOS menu bar) | System-tinted monochrome | Dot **shape** carries state; no color | Tray icon only — see §7.3 |
 
 ### 3.4 Clear space & minimum sizes
 
@@ -196,9 +196,9 @@ Frontend implements §4 as CSS custom properties (`--vh-brand-600`, `--vh-state-
 
 ### 7.3 Tray / menu-bar icon
 
-- macOS: monochrome **template image** of the bracket (system tints it); aggregate service state shown as a small dot at the bracket's dot position — green (all running), amber (starting), red (any failed), none (all stopped).
-- Windows: same geometry in Plaintext on transparent, with the colored state dot.
-- This is the only context where the mark's dot changes color, because there it *is* the state indicator.
+- macOS: monochrome **template image** of the bracket (the system tints it); aggregate service state is carried by the **shape** of the dot at the bracket's dot position — filled with a mark (any failed), half-filled (any starting), filled (all running), absent (all stopped). Four glyphs, matching the aggregate precedence `failed > starting > running > stopped` defined in `docs/design/README.md`.
+- Windows: same geometry in Plaintext on transparent. State may use the colored dot there — Windows tray icons are not template images.
+- **Amended 2026-07-31 (owner decision).** This section previously specified a *color-coded* dot on macOS and called it the one place the mark's dot changes color. That is not achievable: `setTemplate(true)` draws the image as a mask, so every color is discarded and only the alpha shape survives. The options were to encode state as shape, or to fund native AppKit compositing (or ship non-template light/dark asset pairs) and lose the menu bar's automatic tinting. Shape-coding was chosen: it ships now and adapts correctly to light, dark and tinted menu bars. Color-only state communication is also the weaker accessibility choice, so this is not purely a concession.
 
 ### 7.4 GitHub & community surfaces
 

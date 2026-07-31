@@ -50,21 +50,25 @@ export class ServicesStore {
 	 * services changed underneath this store.
 	 *
 	 * I1 audit finding (branch-review-fix-report.md): `Supervisor::register`
-	 * emits no event, and `applyState` below only maps over the services
-	 * ALREADY in `this.services` — a `StateChanged` for an id it does not
-	 * recognize is silently dropped (see that method's own doc comment). So
-	 * installing a PHP version after launch registers a real supervisor row
-	 * that this store never learns about: the Languages page would offer
-	 * Start, the click would genuinely start the pool, and the row would keep
-	 * saying Start forever. `languages/+page.svelte` calls this after a
-	 * successful `install()`/`rescan()` — the two moments it KNOWS the
-	 * registered set may have grown.
+	 * used to emit no event, and `applyState` below only maps over the
+	 * services ALREADY in `this.services` — a `StateChanged` for an id it
+	 * does not recognize is silently dropped (see that method's own doc
+	 * comment). So installing a PHP version after launch registered a real
+	 * supervisor row this store never learned about: the Languages page would
+	 * offer Start, the click would genuinely start the pool, and the row
+	 * would keep saying Start forever. `languages/+page.svelte` calls this
+	 * after a successful `install()`/`rescan()` — the two moments it KNOWS
+	 * the registered set may have grown.
 	 *
-	 * This is the cheap, contained fix. The more durable one — `register`
-	 * itself emitting an event, and `applyState` appending an unknown id
-	 * instead of dropping it — is a larger cross-crate change (Rust event +
-	 * IPC + this store) and is recorded as a follow-up rather than folded into
-	 * this fix.
+	 * The durable fix has since shipped (tray slice, Task 1): `register` now
+	 * emits `SupervisorEvent::Registered`, forwarded over IPC and applied by
+	 * {@link applyRegistered}, which the layout subscribes to on every route —
+	 * so a newly registered service now arrives here without either caller
+	 * needing to ask. This method stays anyway: it is a synchronous
+	 * request/response the instant an install settles, independent of
+	 * however long the event takes to round-trip the broadcast channel and
+	 * IPC — cheap insurance against a caller observing a stale list in the
+	 * gap, not a sign the event-based fix is incomplete.
 	 */
 	reload(): Promise<void> {
 		this.snapshot = null;
@@ -131,16 +135,40 @@ export class ServicesStore {
 
 	/** `.map` over the EXISTING list — a `StateChanged` for an id not already in
 	 *  `this.services` (a supervisor row registered after this store's one
-	 *  `loadServices()` snapshot) matches nothing and is silently dropped. See
-	 *  `reload()`'s doc comment (I1 audit finding) for why that made an
-	 *  installed-after-launch PHP version's row never reach this store at all
-	 *  until relaunch, and for the cheap fix vs. the more durable one. */
+	 *  `loadServices()` snapshot) matches nothing and is silently dropped, by
+	 *  design: this method never grows the list. See `reload()`'s doc comment
+	 *  (I1 audit finding) for the history, and {@link applyRegistered} — the
+	 *  durable fix that DOES grow the list, for the one event
+	 *  (`SupervisorEvent::Registered`) that actually means a new row exists. */
 	applyState(ev: ServiceStateEvent): void {
 		this.services = this.services.map((s) =>
 			s.id === ev.id
 				? { ...s, state: ev.state, pid: ev.state.kind === 'running' ? s.pid : null }
 				: s
 		);
+	}
+
+	/**
+	 * React to a `Registered` event: unlike {@link applyState}, this is
+	 * allowed to GROW the list — it is the durable fix for the exact gap
+	 * `applyState`'s own drop test documents (see that method), landing
+	 * instead of the `reload()` workaround. `register()`'s no-op guard for an
+	 * already `starting`/`running` id (Rust side) means this never clobbers a
+	 * live row: an id it already knows is simply refreshed with the freshly
+	 * stored status (idempotent for a repeat registration of an
+	 * already-stopped id), and an id it has never seen is appended.
+	 *
+	 * Kept sorted by id, matching `Supervisor::snapshot()` — the same order
+	 * `listServices()` already returns — so a service arriving through this
+	 * event renders in the same position a full reload would have put it.
+	 */
+	applyRegistered(status: ServiceStatus): void {
+		const known = this.services.some((s) => s.id === status.id);
+		const next = known
+			? this.services.map((s) => (s.id === status.id ? status : s))
+			: [...this.services, status];
+		next.sort((a, b) => a.id.localeCompare(b.id));
+		this.services = next;
 	}
 
 	applyLog(ev: ServiceLogEvent): void {

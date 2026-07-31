@@ -938,8 +938,7 @@
 	/* The mock uses a `<span role="button" tabindex="0">` for Browse; this component renders
 	   a real `<button>` instead (same classes, so it looks identical) — free native keyboard
 	   activation (Enter/Space) instead of hand-rolled keydown handling for a non-native
-	   button, the same "prefer a real control" convention Rail.svelte's `.stop-all` already
-	   follows. `appearance: none` plus the explicit border/background/padding above strip the
+	   button. `appearance: none` plus the explicit border/background/padding above strip the
 	   browser's default button chrome so it matches the mock's span-based look exactly. */
 	.input-suffix--btn {
 		appearance: none;

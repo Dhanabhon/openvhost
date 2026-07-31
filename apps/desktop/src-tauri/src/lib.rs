@@ -15,12 +15,24 @@ mod quit;
 // every target. Only the macOS stack BUILDER inside is `#[cfg]`-gated.
 mod stack;
 
+// The tray/menu-bar quick-controls slice (P1 tray design): the pure menu
+// model, the diff/apply logic, the real tray construction, and the shared
+// menu-event router — see its own module docs for the breakdown.
+mod tray;
+
+// Demo-ticker only (spec D8) — see `demo_ticker_spec`'s own `#[cfg(debug_assertions)]`
+// gate for why this whole import is gated identically: a release build never
+// constructs a `ServiceSpec` for it at all, so these would otherwise be
+// unused-import errors under `-D warnings` in exactly the profile this gate
+// targets.
+#[cfg(debug_assertions)]
 use std::ffi::OsString;
 use std::sync::Arc;
 
+#[cfg(debug_assertions)]
+use openvhost_proc::{DEFAULT_GRACE, ReadinessProbe, ServiceSpec, SpawnSpec};
 use openvhost_proc::{
-    DEFAULT_GRACE, FileRegistry, InstanceLock, ReadinessProbe, ServiceSpec, SpawnSpec, Supervisor,
-    SupervisorEvent, default_driver, default_reaper,
+    FileRegistry, InstanceLock, Supervisor, SupervisorEvent, default_driver, default_reaper,
 };
 use tauri::Manager;
 use tauri_specta::{Builder, Event, collect_commands, collect_events};
@@ -71,6 +83,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
         .events(collect_events![
             commands::ServiceStateEvent,
             commands::ServiceLogEvent,
+            commands::ServiceRegisteredEvent,
             commands::PhpInstallLogEvent,
             commands::MysqlInstallLogEvent,
             commands::MysqlInitLogEvent,
@@ -94,6 +107,18 @@ fn specta_builder() -> Builder<tauri::Wry> {
 /// Dev convenience: the demo ticker runs the openvhost CLI sitting next to
 /// this executable in target/. A missing binary is an HONEST Failed state
 /// in the UI (the spawn-failure log names the path), not a crash.
+///
+/// `#[cfg(debug_assertions)]` (P1 tray design, spec D8): this service
+/// deliberately fails after 45 ticks to exercise the `Failed` UI path in
+/// development. Registering it unconditionally — as this crate did before
+/// this gate — meant a RELEASE build shipped it too, so every real user's
+/// tray (and Services page) would show "demo-ticker — Failed" once the
+/// counter ran out. `debug_assertions`, not `cfg(test)`: `cargo test`
+/// itself compiles with `debug_assertions` on (dev/test profiles share it),
+/// so this stays registered for tests and ordinary `cargo run`/`tauri dev`
+/// and disappears ONLY from a `--release` build — exactly the one profile
+/// real users run.
+#[cfg(debug_assertions)]
 fn demo_ticker_spec() -> ServiceSpec {
     let cli = std::env::current_exe()
         .ok()
@@ -160,28 +185,61 @@ pub fn run() {
         builder = builder.menu(quit::app_menu);
     }
 
-    let result = builder
-        .on_menu_event(|app, event| {
-            if event.id() == quit::QUIT_MENU_ITEM_ID {
-                // Ask, don't quit — unless the UI has never acked (see
-                // `quit::UiReady`), in which case no dialog can appear and
-                // asking would make the app unquittable from its own menu.
-                if !quit::request_quit(app) {
-                    let handle = app.clone();
-                    tauri::async_runtime::spawn(async move {
-                        if let Err(e) = quit::perform_quit(&handle).await {
-                            eprintln!("openvhost: quit failed: {e}");
-                        }
-                    });
-                }
-            }
-        })
+    let app = builder
+        // `tray::handle_tray_menu_id` is the ONE router for every menu
+        // event this app receives (see its own doc comment for why a
+        // function named for the tray also handles the app-menu Quit
+        // click): it still special-cases `quit::QUIT_MENU_ITEM_ID` with
+        // exactly the ask-unless-never-acked logic this closure used to
+        // inline directly, and P1 tray design's real tray menu (built in
+        // `setup()` below) shares that same id for its own Quit row.
+        .on_menu_event(|app, event| tray::handle_tray_menu_id(app, event.id().as_ref()))
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                // Prevent only if the UI has acked that it is listening (see
-                // `quit::UiReady`). Before that, closing behaves exactly as it
-                // did before this feature rather than wedging on a dialog that
-                // will never render.
+                // Hide rather than quit (P1 tray design, spec D1): the app and
+                // its services keep running; a Dock click or the tray's "Open
+                // OpenVHost" bring the window back via `RunEvent::Reopen`
+                // below. This never touches the webview — see
+                // `quit::hide_instead_of_close`'s docs for why that is the
+                // point. Only prevent the close if the hide actually
+                // succeeded: a failed hide must not trap the user in an app
+                // whose close button no longer works.
+                //
+                // macOS-ONLY (security audit finding H1, 2026-07-31). Every
+                // way back from a hidden window is itself macOS-only this
+                // slice: `builder.menu(quit::app_menu)` above, the real tray
+                // built in `setup()` below, and `RunEvent::Reopen` further
+                // down (spec D10 — Windows tray icons are a later slice; see
+                // `tray`'s own module docs). Tauri also installs its default
+                // menu only on macOS. Hiding the ONLY window on a platform
+                // with none of those would make the app simultaneously
+                // unreachable (no Dock/tray/Reopen to bring it back, and a
+                // hidden window has no taskbar entry either) and unquittable
+                // (the webview `confirm_quit` needs is itself hidden) — worse,
+                // the zombie process keeps holding the single-instance run
+                // lock forever, so every later launch attempt boots
+                // permanently degraded instead of replacing it.
+                #[cfg(target_os = "macos")]
+                if let Err(e) =
+                    quit::hide_instead_of_close(|| window.hide(), || api.prevent_close())
+                {
+                    eprintln!(
+                        "openvhost: failed to hide the window ({e}); letting the close proceed"
+                    );
+                }
+                // Everywhere else: the pre-tray behaviour, unchanged since it
+                // shipped in PR #19 — this is a straight re-scoping, not new
+                // logic. Ask exactly like the app-menu Quit does (`request_quit`
+                // shows and focuses the window, then emits `QuitRequestedEvent`
+                // for the webview to answer via `confirm_quit`); prevent the
+                // close only if the UI actually acked and can answer. If the UI
+                // never came up, let the close proceed exactly as it did before
+                // the confirm-quit feature existed, rather than wedging on a
+                // dialog that can never render — this deliberately does NOT
+                // fall through to `perform_quit` the way the menu handler does,
+                // matching this path's own historical behaviour on every
+                // platform before the tray slice introduced hiding.
+                #[cfg(not(target_os = "macos"))]
                 if quit::request_quit(window.app_handle()) {
                     api.prevent_close();
                 }
@@ -213,6 +271,20 @@ pub fn run() {
             // is never observed absent by a caller that could actually
             // invoke the command.
             app.manage(commands::InstallLock::default());
+
+            // Bulk Start-all/Stop-all admission guard (P1 tray design, spec
+            // D7) and the tray-initiated-failure tracking set (spec D4).
+            // Managed unconditionally and up front, same reasoning as
+            // `UiReady`/`ApplyLock`/`InstallLock` above: both are only ever
+            // READ by `tray::handle_tray_menu_id`'s Start-all/Stop-all/
+            // per-service branches, which in practice are only ever reached
+            // via a real tray click (macOS-only, built further down) — but
+            // managing them here rather than inside that `#[cfg(target_os =
+            // "macos")]` block keeps every `try_state` read in this app
+            // failing closed the same way, and keeps them reachable from a
+            // test's own `mock_builder` setup without needing a real tray.
+            app.manage(tray::BulkLock::default());
+            app.manage(tray::TrayInitiated::default());
 
             // Single-instance lock (design spec §7): reap MUST run only
             // while this is held, otherwise a second live instance would
@@ -248,6 +320,7 @@ pub fn run() {
                                 registry,
                                 default_reaper(),
                             ));
+                            #[cfg(debug_assertions)]
                             supervisor.register(demo_ticker_spec());
                             #[cfg(target_os = "macos")]
                             let (stack_paths, stack_runtimes, mysql_runtimes) = {
@@ -326,6 +399,10 @@ pub fn run() {
                                             }
                                             .emit(&handle);
                                         }
+                                        Ok(SupervisorEvent::Registered { status }) => {
+                                            let _ = commands::ServiceRegisteredEvent { status }
+                                                .emit(&handle);
+                                        }
                                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                                             continue;
                                         }
@@ -333,6 +410,24 @@ pub fn run() {
                                     }
                                 }
                             });
+                            // Best-effort, like the state.db open above: a
+                            // menu-bar tray is a quality-of-life feature, not
+                            // a boot-blocking one, so a failure here is
+                            // logged and the app continues without it rather
+                            // than aborting the whole bootstrap. Gated to
+                            // macOS only (P1 tray design, spec D10 — Windows
+                            // is out for this slice; see `tray`'s own module
+                            // docs for what a Windows-enablement slice still
+                            // needs to do). `Arc::clone`, not a move: `Db`
+                            // was NOT similarly needed again, but `supervisor`
+                            // itself is moved into `app.manage` on the very
+                            // next line.
+                            #[cfg(target_os = "macos")]
+                            if let Err(e) = tray::build(app.handle(), Arc::clone(&supervisor)) {
+                                eprintln!(
+                                    "openvhost: failed to build the tray icon ({e}); continuing without it"
+                                );
+                            }
                             app.manage(supervisor);
                         }
                         Ok(None) => {
@@ -361,17 +456,103 @@ pub fn run() {
             }
             Ok(())
         })
-        .run(tauri::generate_context!());
-    if let Err(e) = result {
-        eprintln!("fatal: tauri failed to run: {e}");
-        std::process::exit(1);
-    }
+        .build(tauri::generate_context!())
+        .unwrap_or_else(|e| {
+            // Same fatal-error text and exit code the old `.run(ctx)` call
+            // used for its `Result` — `Builder::run` is documented as
+            // exactly `self.build(context)?.run(|_, _| {})`, so splitting it
+            // into `.build(ctx)?.run(closure)` moves this failure from
+            // `.run`'s Result to `.build`'s without changing what it means
+            // or how it is reported.
+            eprintln!("fatal: tauri failed to run: {e}");
+            std::process::exit(1);
+        });
+
+    // `.build(ctx)?.run(closure)` rather than `.run(ctx)`: this is what
+    // exposes `RunEvent`, needed for `Reopen` below (P1 tray design, spec
+    // D1) — `Builder::run` only ever calls `App::run(|_, _| {})`, a closure
+    // this crate cannot reach into.
+    // `_handle`/`_event`, not `handle`/`event`: the whole body below is
+    // `#[cfg(target_os = "macos")]`, so on every other target this closure
+    // has an empty body and both parameters go unused — the underscore
+    // prefix is what keeps that warning-free (it only suppresses the
+    // unused-variable lint; both names remain fully usable, and ARE used,
+    // in the macOS-only block).
+    app.run(|_handle, _event| {
+        // `RunEvent` is `#[non_exhaustive]` (verified in the resolved tauri
+        // 2.11.5, `app.rs:219`) and this app reacts to `Reopen` only — every
+        // other variant, present or future, is intentionally left alone,
+        // exactly the posture tauri's own `App::run` doc example takes.
+        //
+        // `#[cfg]` on this whole `if let` rather than on a `match` arm is
+        // deliberate, not cosmetic: `Reopen` itself only exists on macOS
+        // (gated the same way upstream), so a `match` with a
+        // `#[cfg(target_os = "macos")]` arm plus a wildcard would compile,
+        // on every OTHER target, down to a match with a single `_ => {}`
+        // arm — exactly the shape clippy's `match_single_binding` flags.
+        // This crate cannot verify a non-macOS clippy run from a macOS
+        // sandbox, so the body is structured to make that failure mode
+        // impossible rather than to hope the lint does not fire.
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen { .. } = _event
+            && let Some(window) = _handle.get_webview_window("main")
+        {
+            reopen_window(
+                || {
+                    let _ = window.show();
+                },
+                || {
+                    let _ = window.unminimize();
+                },
+                || {
+                    let _ = window.set_focus();
+                },
+            );
+        }
+    });
+}
+
+/// The window actions a Dock click or the tray's "Open OpenVHost" perform on
+/// [`tauri::RunEvent::Reopen`] (P1 tray design, spec D1): show, un-minimize,
+/// then focus, in that order, so a window that is merely hidden (the common
+/// case now that closing hides rather than quits) or one that was minimized
+/// before being hidden both end up visible, restored, and frontmost.
+///
+/// Takes closures rather than a real `WebviewWindow`, mirroring every other
+/// lifecycle decision in this app (see `quit::stop_all_with`'s doc comment):
+/// `tauri::test`'s mock window dispatcher stubs `is_visible`/`is_focused` to
+/// fixed values regardless of what is actually called on it (verified against
+/// the resolved tauri 2.11.5), so asserting window STATE after calling the
+/// real methods would pass or fail independent of this function. The ORDER —
+/// the part a future edit could accidentally shuffle or drop a call from — is
+/// what this split makes testable.
+///
+/// Each call is independent and best-effort: there is no confirmation to
+/// answer and nothing to abort if revealing the window does not fully
+/// succeed, so (mirroring `perform_quit`'s own straggler handling) a failure
+/// in one must not skip the other two.
+///
+/// `#[cfg(target_os = "macos")]`, matching its only call site above and
+/// `quit::app_menu`'s own precedent: `RunEvent::Reopen` exists only on macOS
+/// (upstream gates it the same way), so on every other target this function
+/// would otherwise be unused — dead code, an error under this workspace's
+/// `-D warnings` — outside of a test build's own separately-gated caller.
+#[cfg(target_os = "macos")]
+fn reopen_window(show: impl FnOnce(), unminimize: impl FnOnce(), focus: impl FnOnce()) {
+    show();
+    unminimize();
+    focus();
 }
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    // Only `reopen_window_shows_then_unminimizes_then_focuses` below needs
+    // this, and that test is itself `#[cfg(target_os = "macos")]` — gated
+    // identically here so the import is not flagged as unused elsewhere.
+    #[cfg(target_os = "macos")]
+    use std::sync::Mutex;
 
     /// Regenerate the committed TS bindings headlessly (no GUI needed):
     /// `cargo test -p openvhost-desktop export_bindings`.
@@ -383,5 +564,25 @@ mod tests {
                 "../src/lib/ipc/bindings.ts",
             )
             .expect("failed to export TS bindings");
+    }
+
+    /// VACUITY (neuter-and-watch-it-fail): temporarily reordered
+    /// `reopen_window`'s body to `focus(); show(); unminimize();` — this
+    /// test failed, recording `["focus", "show", "unminimize"]` against the
+    /// asserted `["show", "unminimize", "focus"]`. Restoring the original
+    /// order made it pass again.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reopen_window_shows_then_unminimizes_then_focuses() {
+        let order: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+        reopen_window(
+            || order.lock().expect("mutex poisoned").push("show"),
+            || order.lock().expect("mutex poisoned").push("unminimize"),
+            || order.lock().expect("mutex poisoned").push("focus"),
+        );
+        assert_eq!(
+            order.lock().expect("mutex poisoned").as_slice(),
+            ["show", "unminimize", "focus"]
+        );
     }
 }

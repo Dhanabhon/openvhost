@@ -11,13 +11,19 @@
 //! ## Two entry points, only one of which is interceptable by default
 //!
 //! - The window's close button raises [`tauri::WindowEvent::CloseRequested`],
-//!   which carries an `api.prevent_close()`. That is the interceptable one.
-//! - macOS `Cmd+Q` / the app menu's Quit is NOT. Tauri builds a default macOS
-//!   menu whose Quit is `muda::PredefinedMenuItem::quit`, wired to the native
-//!   `sel!(terminate:)`, and `tao` implements no `applicationShouldTerminate:` —
-//!   so the process dies before any Rust or JS handler runs. Verified by reading
-//!   tauri 2.11.3, muda 0.19.3 (`PredefinedMenuItemType::Quit => sel!(terminate:)`)
-//!   and tao 0.35.3 (no such selector anywhere in the tree).
+//!   which carries an `api.prevent_close()`. That is the interceptable one —
+//!   `lib.rs`'s handler now feeds it through [`hide_instead_of_close`], which
+//!   hides the window instead of asking anything (P1 tray design, spec D1):
+//!   the app and its services keep running, and a Dock click or the tray's
+//!   "Open OpenVHost" bring the window back via `RunEvent::Reopen`. This path
+//!   no longer touches the webview at all — see that function's docs.
+//! - macOS `Cmd+Q` / the app menu's Quit is NOT interceptable by the OS. Tauri
+//!   builds a default macOS menu whose Quit is `muda::PredefinedMenuItem::quit`,
+//!   wired to the native `sel!(terminate:)`, and `tao` implements no
+//!   `applicationShouldTerminate:` — so the process dies before any Rust or JS
+//!   handler runs. Verified by reading tauri 2.11.3, muda 0.19.3
+//!   (`PredefinedMenuItemType::Quit => sel!(terminate:)`) and tao 0.35.3 (no such
+//!   selector anywhere in the tree).
 //!
 //! [`app_menu`] therefore replaces the default menu with the same structure minus
 //! the predefined Quit, substituting a plain [`MenuItem`] that carries the
@@ -26,13 +32,35 @@
 //! locating the predefined Quit there means indexing "last child of the first
 //! submenu", which no API guarantees and a Tauri upgrade could silently move.
 //!
-//! ## Known exposure: `prevent_close` makes the UI load-bearing
+//! ## Known exposure: `prevent_close` makes the UI load-bearing — for Quit only
 //!
-//! Both paths end in "prevent, then ask the webview". If the webview is dead the
-//! dialog never renders and the app can only be Force Quit. That is the standard
-//! exposure of any unsaved-changes prompt, and the alternative — a Rust-side
-//! timeout that quits on its own — would quit WITHOUT the confirmation the user
-//! asked for, which is worse. Left as-is, deliberately.
+//! Before the P1 tray design's hide-on-close change, BOTH entry points ended in
+//! "prevent, then ask the webview", so a dead frontend meant an app quittable
+//! only by Force Quit on either path. That is no longer true for the close
+//! button: [`hide_instead_of_close`] hides in pure Rust and never consults the
+//! webview, so the app's most-used exit no longer depends on the frontend being
+//! alive at all. `Cmd+Q` / the app menu's Quit ([`request_quit`]) is unchanged —
+//! it still ends in "prevent, then ask the webview", and its exposure is exactly
+//! what it always was: if the webview never came up, [`UiReady`] is never
+//! marked, `request_quit` reports "cannot ask", and `lib.rs`'s `on_menu_event`
+//! falls through to [`perform_quit`] directly instead of waiting on a dialog
+//! that would never render. That fallback predates this module's D1 changes;
+//! hiding just no longer needs it.
+//!
+//! ## `request_quit` must reveal the window before it asks
+//!
+//! Hiding-on-close creates a state that could not exist before it: the app can
+//! be frontmost (own the OS's notion of "active application") while its ONLY
+//! window is hidden — right after a Dock click re-activates the app but before
+//! `RunEvent::Reopen` has run, or simply because the user hid the window and
+//! then triggered `Cmd+Q` without ever clicking anything else. Emitting
+//! [`QuitRequestedEvent`] in that state, into a webview nobody can see, would
+//! silently refuse to quit: the dialog never renders, but [`UiReady`] IS marked
+//! (this webview is alive), so the `perform_quit` fallback above does not fire
+//! either — the app just does nothing, the single sharpest bug this design
+//! flagged. [`request_quit`] therefore shows and focuses the main window BEFORE
+//! emitting, not after, via [`request_quit_with`]: the closures-based split
+//! exists so a test pins the ORDER, not merely that both calls happened.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -118,15 +146,99 @@ impl UiReady {
     }
 }
 
-/// Ask the UI to confirm a quit. Returns whether the ask can be answered: false
-/// means the caller must let the close proceed rather than prevent it.
+/// Ask the UI to confirm a quit, after making sure the window it will ask in
+/// is actually visible and focused (see [`request_quit_with`] and the module
+/// docs' "`request_quit` must reveal the window before it asks"). Returns
+/// whether the ask can be answered: false means the caller must quit directly
+/// ([`perform_quit`]) rather than wait for a dialog that cannot appear.
 pub fn request_quit<R: Runtime>(app: &AppHandle<R>) -> bool {
     match app.try_state::<UiReady>() {
-        Some(ready) if ready.is_ready() => QuitRequestedEvent {}.emit(app).is_ok(),
+        Some(ready) if ready.is_ready() => {
+            // One lookup, shared by both closures below, rather than two: the
+            // window cannot have changed identity between "show" and "focus"
+            // a few instructions later, so a second `get_webview_window` call
+            // would only be able to observe the exact same value (or a
+            // spurious `None` if the window vanished mid-call, which would
+            // then inconsistently skip focus after having shown it).
+            let window = app.get_webview_window("main");
+            request_quit_with(
+                || {
+                    if let Some(w) = &window {
+                        let _ = w.show();
+                    }
+                },
+                || {
+                    if let Some(w) = &window {
+                        let _ = w.set_focus();
+                    }
+                },
+                || QuitRequestedEvent {}.emit(app).is_ok(),
+            )
+        }
         // Not acked (or the state was never managed): no dialog can appear, so
-        // report "cannot ask" and let the window close.
+        // report "cannot ask" and let the caller quit directly.
         _ => false,
     }
+}
+
+/// [`request_quit`]'s decision, parameterized over the window-reveal and emit
+/// actions so the ORDER — show and focus attempted before the confirmation is
+/// even asked — is what a test pins, not merely that all three ran. Same
+/// reasoning as [`stop_all_with`]/[`abort_and_wait_with`]: the part of this
+/// that can actually regress is a sequence of calls, and that has nothing to
+/// do with a real `Window` or webview.
+///
+/// `show`/`focus` are best-effort BY DESIGN, not merely tolerated: a `Window`
+/// method failing here has nothing to abort into (there is no window to fall
+/// back to), and the ask is still worth making even if revealing the window
+/// did not fully succeed — Force Quit remains the documented fallback either
+/// way (see the module docs). What matters is that both are attempted, and
+/// have RUN TO COMPLETION, strictly before `emit` is even called.
+///
+/// NOTE for anyone tempted to test this by building a real window under
+/// `tauri::test::mock_builder` and asserting its state afterwards instead:
+/// `tauri::test`'s `MockWindowDispatcher::is_visible`/`is_focused` are
+/// hardcoded stubs (`Ok(true)`/`Ok(false)` unconditionally, verified against
+/// tauri 2.11.5) that do not reflect calls to `show`/`set_focus` at all — such
+/// a test would pass or fail independent of whether this function, or even
+/// `request_quit`, was ever called. Closures make the ORDER the thing under
+/// test instead, which is both real and actually verifiable.
+pub fn request_quit_with(
+    show: impl FnOnce(),
+    focus: impl FnOnce(),
+    emit: impl FnOnce() -> bool,
+) -> bool {
+    show();
+    focus();
+    emit()
+}
+
+/// The `CloseRequested` decision (P1 tray design, spec D1): hide the window,
+/// and prevent the close only if the hide actually SUCCEEDED. A window that
+/// failed to hide must not be trapped open either — the alternative,
+/// preventing unconditionally, would leave a user stuck in an app whose
+/// ordinary close button no longer works, which is worse than losing the
+/// hide-instead-of-quit behaviour for that one attempt.
+///
+/// Takes closures rather than a real `Window`/`CloseRequestApi`, the same
+/// reasoning as [`stop_all_with`] and [`abort_and_wait_with`]: the decision —
+/// hide, then prevent only on success — has nothing to do with a live window.
+/// It is also the ONLY way to unit test this at all:
+/// `tauri::WindowEvent::CloseRequested`'s `api` (`CloseRequestApi`) wraps a
+/// private `Sender<bool>` with no public constructor, so a test cannot build
+/// one to drive a closure written in terms of the real types.
+///
+/// Returns the `hide` call's own result so the caller can log a failure
+/// without this function needing to know how to log.
+pub fn hide_instead_of_close<E>(
+    hide: impl FnOnce() -> Result<(), E>,
+    prevent_close: impl FnOnce(),
+) -> Result<(), E> {
+    let hidden = hide();
+    if hidden.is_ok() {
+        prevent_close();
+    }
+    hidden
 }
 
 /// The ids of services that are not in a terminal state, i.e. the ones a quit
@@ -161,6 +273,26 @@ fn is_pending(state: &ServiceState) -> bool {
 /// without spawning real processes: the timeout and give-up behaviour are the
 /// parts most likely to be wrong, and they have nothing to do with the
 /// supervisor. [`stop_all`] is the real-supervisor binding.
+///
+/// **Re-sends `stop` on every poll, not just an initial sweep before the loop**
+/// (security audit finding M2, 2026-07-31 — this used to send `stop` once, to
+/// whatever [`pending`] returned before the loop started, then only ever
+/// poll). `perform_quit` takes neither the tray's `BulkLock` nor the existing
+/// `ApplyLock`, so a bulk "Start all" dispatched moments before quit can still
+/// be mid-sweep when this function takes its very first [`pending`] read: a
+/// service `dispatch_start_all` has not yet reached is `Stopped` (not
+/// pending) at that instant and only transitions to `Starting` on a LATER
+/// poll — after a single up-front sweep would have already stopped asking
+/// anything to stop at all. Re-sending on every iteration catches such a
+/// service the next time it is observed pending, instead of abandoning it as
+/// a straggler for the full `timeout` with a live child behind it.
+///
+/// Safe to re-send unconditionally: the real binding's `Supervisor::stop`
+/// returns early for a service already `Stopped`/`Failed` (see [`stop_all`]),
+/// so re-flagging an id that has already stopped is a documented no-op, not a
+/// duplicate action — and D7's own admission-check reasoning already covers a
+/// service mid-grace receiving more than one stop signal ("the full control
+/// channel discards the duplicate").
 pub async fn stop_all_with<P, S>(
     pending: P,
     stop: S,
@@ -171,13 +303,6 @@ where
     P: Fn() -> Vec<String>,
     S: Fn(&str),
 {
-    // No early return for "nothing pending": the loop below already returns
-    // immediately in that case, without sleeping, so a guard here would only
-    // duplicate it.
-    for id in &pending() {
-        stop(id);
-    }
-
     // `Instant` rather than a deadline computed from wall-clock time: a clock
     // adjustment mid-shutdown must not turn an 8s wait into an instant give-up
     // (or a hang).
@@ -189,6 +314,14 @@ where
         }
         if started.elapsed() >= timeout {
             return still;
+        }
+        // Idempotent re-flag (see the doc comment above): everything still
+        // pending is asked again on EVERY iteration, not only once up front,
+        // so a service that becomes pending strictly after an earlier read —
+        // e.g. a bulk start that reaches it moments later — is never left
+        // with nothing telling it to stop.
+        for id in &still {
+            stop(id);
         }
         tokio::time::sleep(poll).await;
     }
@@ -366,9 +499,12 @@ pub fn app_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
 /// Tear the app down: stop every pending service, then destroy the window.
 ///
 /// `destroy` and not `close`: `close` re-emits `CloseRequested`, which this
-/// app's handler prevents — the confirmation would loop forever. `destroy`
-/// "does not emit any events and force close the window instead"
-/// (tauri 2.11.3, `Window::destroy`), so it is the only exit that terminates.
+/// app's handler feeds to [`hide_instead_of_close`] — a `close()` here would
+/// therefore hide the window instead of tearing it down, forever (the window
+/// keeps successfully hiding, so the "close" this function needs never
+/// actually happens). `destroy` "does not emit any events and force close the
+/// window instead" (tauri 2.11.3, `Window::destroy`), so it is the only exit
+/// that terminates.
 pub async fn perform_quit<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     // FIRST, before touching services or the window at all — this is the C1
     // audit fix. `install_php`'s `run_task` is only contained by
@@ -490,6 +626,77 @@ mod tests {
         assert_eq!(straggling, ["nginx"]);
     }
 
+    /// THE M2 REGRESSION TEST (security audit finding M2, 2026-07-31): a bulk
+    /// "Start all" racing quit can reach a service AFTER `stop_all_with`'s
+    /// first read of what is pending — "early" stands in for a service
+    /// already pending when the read happens (keeping the loop alive across
+    /// several polls, the way a real service takes a moment to actually
+    /// stop), "late-riser" stands in for one `dispatch_start_all` had not yet
+    /// reached: `Stopped` (not pending) on the very first read, only
+    /// transitioning to `Starting` (pending) from the second read onward,
+    /// and staying pending until it has actually been asked to stop.
+    ///
+    /// VACUITY (neuter-and-watch-it-fail): reverting `stop_all_with` to a
+    /// single up-front sweep (send `stop` once, to whatever `pending()`
+    /// returns at that instant, before the loop, then only ever poll
+    /// afterwards) makes this test fail exactly as the audit described:
+    /// "late-riser" is never in the ids handed to `stop` at all (the
+    /// up-front sweep only ever saw "early"), so it stays pending forever in
+    /// this fake model and `straggling` comes back `["late-riser"]` instead
+    /// of empty. The test's own timeout is far shorter than
+    /// [`STOP_ALL_TIMEOUT`] so that failure is fast rather than merely
+    /// "eventually true after 18s". Restoring the per-iteration re-send
+    /// fixes it.
+    #[tokio::test]
+    async fn a_service_that_becomes_pending_after_the_first_read_is_still_stopped() {
+        const EARLY_GONE_AFTER: usize = 3;
+        let reads = AtomicUsize::new(0);
+        let late_riser_stopped = std::sync::atomic::AtomicBool::new(false);
+        let asked: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+        let straggling = stop_all_with(
+            || {
+                let n = reads.fetch_add(1, Ordering::SeqCst);
+                let mut still = Vec::new();
+                // "early": pending for the first few reads, then finishes on
+                // its own — an ordinary service completing its own stop —
+                // which is what keeps the loop alive long enough for
+                // "late-riser" to ever be observed at all.
+                if n < EARLY_GONE_AFTER {
+                    still.push("early".to_string());
+                }
+                // "late-riser": NOT pending on the very first read (n == 0,
+                // still `Stopped` at that instant), but pending from the
+                // SECOND read onward — the concurrent bulk-start reached it
+                // moments later — until it has actually been asked to stop.
+                if n > 0 && !late_riser_stopped.load(Ordering::SeqCst) {
+                    still.push("late-riser".to_string());
+                }
+                still
+            },
+            |id| {
+                asked.lock().unwrap().push(id.to_string());
+                if id == "late-riser" {
+                    late_riser_stopped.store(true, Ordering::SeqCst);
+                }
+            },
+            STOP_ALL_TIMEOUT,
+            FAST_POLL,
+        )
+        .await;
+
+        assert!(
+            straggling.is_empty(),
+            "late-riser became pending only after the first read and must still be \
+             stopped, not abandoned as a straggler: {straggling:?}"
+        );
+        assert!(
+            asked.lock().unwrap().contains(&"late-riser".to_string()),
+            "a service that only became pending on a LATER poll never received a stop \
+             under the single-sweep implementation this test guards against"
+        );
+    }
+
     #[test]
     fn only_stopped_and_failed_count_as_finished() {
         // `Starting` is the one that matters: a service coming up has a live child,
@@ -507,11 +714,125 @@ mod tests {
     #[test]
     fn ui_ready_starts_false_and_latches() {
         let ready = UiReady::default();
-        // False by default is the load-bearing half: it is what makes a close
-        // proceed normally before the UI has ever mounted.
+        // False by default is the load-bearing half: it is what makes
+        // `request_quit` report "cannot ask" — so `Cmd+Q` falls through to
+        // `perform_quit` directly instead of waiting on a dialog that cannot
+        // appear — before the UI has ever mounted. (Hiding on the close
+        // button no longer consults this flag at all; see `quit.rs`'s module
+        // docs.)
         assert!(!ready.is_ready());
         ready.mark();
         assert!(ready.is_ready());
+    }
+
+    // -----------------------------------------------------------------------
+    // P1 tray design, spec D1: hide-on-close, and the `request_quit`
+    // show-first fix.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn hide_instead_of_close_prevents_the_close_when_hiding_succeeds() {
+        let prevented = AtomicUsize::new(0);
+        let result: Result<(), &'static str> = hide_instead_of_close(
+            || Ok(()),
+            || {
+                prevented.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(prevented.load(Ordering::SeqCst), 1);
+    }
+
+    /// VACUITY (neuter-and-watch-it-fail): temporarily made `prevent_close`
+    /// unconditional in `hide_instead_of_close` (dropped the `if
+    /// hidden.is_ok()` guard) — this test failed, `prevented` was 1 instead
+    /// of the asserted 0, because an unconditional implementation cannot
+    /// distinguish "hide succeeded" from "hide failed". Restoring the guard
+    /// made it pass again. The PRECEDING test alone could not have caught
+    /// this: an unconditionally-preventing implementation still passes it.
+    #[test]
+    fn a_failed_hide_does_not_prevent_the_close() {
+        let prevented = AtomicUsize::new(0);
+        let result = hide_instead_of_close(
+            || Err("window is gone"),
+            || {
+                prevented.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        assert_eq!(result, Err("window is gone"));
+        // The close must proceed — trapping the user in an app whose close
+        // button no longer works is worse than losing the hide this once.
+        assert_eq!(prevented.load(Ordering::SeqCst), 0);
+    }
+
+    /// VACUITY (neuter-and-watch-it-fail): temporarily reordered
+    /// `request_quit_with`'s body to `emit(); show(); focus();` (emit
+    /// first, the exact bug this function exists to prevent) — this test
+    /// failed, recording `["emit", "show", "focus"]` against the asserted
+    /// `["show", "focus", "emit"]`. A test that only checked "all three were
+    /// called" (e.g. three separate booleans) would have kept passing;
+    /// asserting the single ordered `Vec` is what makes order the thing
+    /// under test. Restoring the original order made it pass again.
+    #[test]
+    fn request_quit_with_shows_and_focuses_before_emitting() {
+        let order: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+        let emitted = request_quit_with(
+            || order.lock().unwrap().push("show"),
+            || order.lock().unwrap().push("focus"),
+            || {
+                order.lock().unwrap().push("emit");
+                true
+            },
+        );
+        assert!(emitted);
+        assert_eq!(order.lock().unwrap().as_slice(), ["show", "focus", "emit"]);
+    }
+
+    #[test]
+    fn request_quit_with_reports_the_emit_outcome() {
+        assert!(request_quit_with(|| {}, || {}, || true));
+        assert!(!request_quit_with(|| {}, || {}, || false));
+    }
+
+    #[test]
+    fn request_quit_reports_false_when_the_ui_never_acked() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        // No `UiReady` managed at all — the "never got that far" case
+        // `abort_pending_install_reports_finished_when_nothing_is_running`
+        // exercises for install state, applied to this module's own gate.
+        assert!(!request_quit(app.handle()));
+
+        // Managed, but not yet marked: the UI exists in principle but has
+        // not acked its listener.
+        app.manage(UiReady::default());
+        assert!(!request_quit(app.handle()));
+    }
+
+    #[test]
+    fn request_quit_asks_once_the_ui_has_acked_even_with_no_window() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        // `QuitRequestedEvent::emit` goes through `tauri_specta`, which
+        // requires an `EventRegistry` to be managed — normally done once,
+        // for every event, by `lib.rs`'s real `specta_builder().mount_events`
+        // call inside `setup()`. `mock_builder()` never runs that, and
+        // skipping this does not fail the assertion below — it PANICS deep
+        // inside `tauri_specta::Event::emit` ("EventRegistry not found in
+        // Tauri state") before this test gets anywhere near `request_quit`.
+        // Mounting just this one event is enough to exercise the real path.
+        tauri_specta::Builder::<tauri::test::MockRuntime>::new()
+            .events(tauri_specta::collect_events![QuitRequestedEvent])
+            .mount_events(&app);
+        let ready = UiReady::default();
+        ready.mark();
+        app.manage(ready);
+        // No "main" window exists in this mock context. `request_quit` must
+        // not panic, and must not let a missing window suppress the ask —
+        // the window is a best-effort reveal, not a precondition for asking.
+        assert!(request_quit(app.handle()));
     }
 
     /// The timeout must be longer than the grace period the service task waits
