@@ -273,6 +273,26 @@ fn is_pending(state: &ServiceState) -> bool {
 /// without spawning real processes: the timeout and give-up behaviour are the
 /// parts most likely to be wrong, and they have nothing to do with the
 /// supervisor. [`stop_all`] is the real-supervisor binding.
+///
+/// **Re-sends `stop` on every poll, not just an initial sweep before the loop**
+/// (security audit finding M3, 2026-07-31 — this used to send `stop` once, to
+/// whatever [`pending`] returned before the loop started, then only ever
+/// poll). `perform_quit` takes neither the tray's `BulkLock` nor the existing
+/// `ApplyLock`, so a bulk "Start all" dispatched moments before quit can still
+/// be mid-sweep when this function takes its very first [`pending`] read: a
+/// service `dispatch_start_all` has not yet reached is `Stopped` (not
+/// pending) at that instant and only transitions to `Starting` on a LATER
+/// poll — after a single up-front sweep would have already stopped asking
+/// anything to stop at all. Re-sending on every iteration catches such a
+/// service the next time it is observed pending, instead of abandoning it as
+/// a straggler for the full `timeout` with a live child behind it.
+///
+/// Safe to re-send unconditionally: the real binding's `Supervisor::stop`
+/// returns early for a service already `Stopped`/`Failed` (see [`stop_all`]),
+/// so re-flagging an id that has already stopped is a documented no-op, not a
+/// duplicate action — and D7's own admission-check reasoning already covers a
+/// service mid-grace receiving more than one stop signal ("the full control
+/// channel discards the duplicate").
 pub async fn stop_all_with<P, S>(
     pending: P,
     stop: S,
@@ -283,13 +303,6 @@ where
     P: Fn() -> Vec<String>,
     S: Fn(&str),
 {
-    // No early return for "nothing pending": the loop below already returns
-    // immediately in that case, without sleeping, so a guard here would only
-    // duplicate it.
-    for id in &pending() {
-        stop(id);
-    }
-
     // `Instant` rather than a deadline computed from wall-clock time: a clock
     // adjustment mid-shutdown must not turn an 8s wait into an instant give-up
     // (or a hang).
@@ -301,6 +314,14 @@ where
         }
         if started.elapsed() >= timeout {
             return still;
+        }
+        // Idempotent re-flag (see the doc comment above): everything still
+        // pending is asked again on EVERY iteration, not only once up front,
+        // so a service that becomes pending strictly after an earlier read —
+        // e.g. a bulk start that reaches it moments later — is never left
+        // with nothing telling it to stop.
+        for id in &still {
+            stop(id);
         }
         tokio::time::sleep(poll).await;
     }
@@ -603,6 +624,77 @@ mod tests {
         )
         .await;
         assert_eq!(straggling, ["nginx"]);
+    }
+
+    /// THE M3 REGRESSION TEST (security audit finding M3, 2026-07-31): a bulk
+    /// "Start all" racing quit can reach a service AFTER `stop_all_with`'s
+    /// first read of what is pending — "early" stands in for a service
+    /// already pending when the read happens (keeping the loop alive across
+    /// several polls, the way a real service takes a moment to actually
+    /// stop), "late-riser" stands in for one `dispatch_start_all` had not yet
+    /// reached: `Stopped` (not pending) on the very first read, only
+    /// transitioning to `Starting` (pending) from the second read onward,
+    /// and staying pending until it has actually been asked to stop.
+    ///
+    /// VACUITY (neuter-and-watch-it-fail): reverting `stop_all_with` to a
+    /// single up-front sweep (send `stop` once, to whatever `pending()`
+    /// returns at that instant, before the loop, then only ever poll
+    /// afterwards) makes this test fail exactly as the audit described:
+    /// "late-riser" is never in the ids handed to `stop` at all (the
+    /// up-front sweep only ever saw "early"), so it stays pending forever in
+    /// this fake model and `straggling` comes back `["late-riser"]` instead
+    /// of empty. The test's own timeout is far shorter than
+    /// [`STOP_ALL_TIMEOUT`] so that failure is fast rather than merely
+    /// "eventually true after 18s". Restoring the per-iteration re-send
+    /// fixes it.
+    #[tokio::test]
+    async fn a_service_that_becomes_pending_after_the_first_read_is_still_stopped() {
+        const EARLY_GONE_AFTER: usize = 3;
+        let reads = AtomicUsize::new(0);
+        let late_riser_stopped = std::sync::atomic::AtomicBool::new(false);
+        let asked: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+        let straggling = stop_all_with(
+            || {
+                let n = reads.fetch_add(1, Ordering::SeqCst);
+                let mut still = Vec::new();
+                // "early": pending for the first few reads, then finishes on
+                // its own — an ordinary service completing its own stop —
+                // which is what keeps the loop alive long enough for
+                // "late-riser" to ever be observed at all.
+                if n < EARLY_GONE_AFTER {
+                    still.push("early".to_string());
+                }
+                // "late-riser": NOT pending on the very first read (n == 0,
+                // still `Stopped` at that instant), but pending from the
+                // SECOND read onward — the concurrent bulk-start reached it
+                // moments later — until it has actually been asked to stop.
+                if n > 0 && !late_riser_stopped.load(Ordering::SeqCst) {
+                    still.push("late-riser".to_string());
+                }
+                still
+            },
+            |id| {
+                asked.lock().unwrap().push(id.to_string());
+                if id == "late-riser" {
+                    late_riser_stopped.store(true, Ordering::SeqCst);
+                }
+            },
+            STOP_ALL_TIMEOUT,
+            FAST_POLL,
+        )
+        .await;
+
+        assert!(
+            straggling.is_empty(),
+            "late-riser became pending only after the first read and must still be \
+             stopped, not abandoned as a straggler: {straggling:?}"
+        );
+        assert!(
+            asked.lock().unwrap().contains(&"late-riser".to_string()),
+            "a service that only became pending on a LATER poll never received a stop \
+             under the single-sweep implementation this test guards against"
+        );
     }
 
     #[test]

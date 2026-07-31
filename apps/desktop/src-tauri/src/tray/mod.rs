@@ -23,6 +23,18 @@
 //! Windows's own (coloured, non-template) icon set to a later slice. A
 //! Windows-enablement slice needs to add Windows icons and un-gate that one
 //! call site; it does not need to touch this module's logic.
+//!
+//! **Addendum (security audit finding H1, 2026-07-31): that checklist is
+//! incomplete on its own.** `lib.rs`'s `on_window_event` hide-on-close branch
+//! is ALSO `#[cfg(target_os = "macos")]`-gated now, precisely because hiding
+//! the only window is only safe once something in this module (or the app
+//! menu, or `RunEvent::Reopen`) can bring it back — and today none of those
+//! exist off macOS. A Windows-enablement slice must un-gate that `lib.rs`
+//! branch in the SAME change that adds Windows icons and un-gates this
+//! module's `build` call, or Windows would grow a tray with no window to
+//! show for it while the close button still just closes. Un-gating the two
+//! independently would each look complete on its own and still leave the
+//! app unreachable in between.
 
 pub mod apply;
 pub mod model;

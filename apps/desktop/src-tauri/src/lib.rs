@@ -204,12 +204,44 @@ pub fn run() {
                 // point. Only prevent the close if the hide actually
                 // succeeded: a failed hide must not trap the user in an app
                 // whose close button no longer works.
+                //
+                // macOS-ONLY (security audit finding H1, 2026-07-31). Every
+                // way back from a hidden window is itself macOS-only this
+                // slice: `builder.menu(quit::app_menu)` above, the real tray
+                // built in `setup()` below, and `RunEvent::Reopen` further
+                // down (spec D10 — Windows tray icons are a later slice; see
+                // `tray`'s own module docs). Tauri also installs its default
+                // menu only on macOS. Hiding the ONLY window on a platform
+                // with none of those would make the app simultaneously
+                // unreachable (no Dock/tray/Reopen to bring it back, and a
+                // hidden window has no taskbar entry either) and unquittable
+                // (the webview `confirm_quit` needs is itself hidden) — worse,
+                // the zombie process keeps holding the single-instance run
+                // lock forever, so every later launch attempt boots
+                // permanently degraded instead of replacing it.
+                #[cfg(target_os = "macos")]
                 if let Err(e) =
                     quit::hide_instead_of_close(|| window.hide(), || api.prevent_close())
                 {
                     eprintln!(
                         "openvhost: failed to hide the window ({e}); letting the close proceed"
                     );
+                }
+                // Everywhere else: the pre-tray behaviour, unchanged since it
+                // shipped in PR #19 — this is a straight re-scoping, not new
+                // logic. Ask exactly like the app-menu Quit does (`request_quit`
+                // shows and focuses the window, then emits `QuitRequestedEvent`
+                // for the webview to answer via `confirm_quit`); prevent the
+                // close only if the UI actually acked and can answer. If the UI
+                // never came up, let the close proceed exactly as it did before
+                // the confirm-quit feature existed, rather than wedging on a
+                // dialog that can never render — this deliberately does NOT
+                // fall through to `perform_quit` the way the menu handler does,
+                // matching this path's own historical behaviour on every
+                // platform before the tray slice introduced hiding.
+                #[cfg(not(target_os = "macos"))]
+                if quit::request_quit(window.app_handle()) {
+                    api.prevent_close();
                 }
             }
         })

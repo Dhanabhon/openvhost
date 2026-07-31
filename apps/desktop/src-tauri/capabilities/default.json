@@ -1,12 +1,18 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default permissions, plus two deliberately narrow grants. DO NOT PRUNE EITHER: core:window:allow-start-dragging is load-bearing — titleBarStyle Overlay + hiddenTitle means macOS draws no native draggable strip, so the custom titlebar's data-tauri-drag-region is the only way to move the window, and core:window:default carries only read-only getters (no allow-start-dragging), so without this grant the ACL silently rejects the drag and the window is immovable. dialog:allow-open is the folder picker for a site's project directory, deliberately chosen over dialog:default, which would also grant native save and native message dialogs (a UI-spoofing primitive) for no benefit.",
+  "description": "core:default's expansion MINUS core:menu:default/core:tray:default (security audit finding M1, 2026-07-31 — narrowed from the blanket core:default), plus two deliberately narrow grants. The menu/tray grants are withheld because the frontend has no legitimate use for them and this app's tray click-router treats a menu id as authoritative: gen/schemas/acl-manifests.json's core module lists core:default's full expansion as core:path:default, core:event:default, core:window:default, core:webview:default, core:app:default, core:image:default, core:resources:default, core:menu:default, core:tray:default — the first seven are kept below verbatim, only the last two are dropped. core:menu:default grants (among others) allow-set-as-app-menu/allow-set-accelerator, and core:tray:default grants allow-new/allow-set-menu: together they would let a COMPROMISED webview mint its own native menu item (e.g. Menu.setAsAppMenu() with an id this app's own tray::handle_tray_menu_id treats as authoritative, such as openvhost:tray:stop-all or a live service id) and fire it via setAccelerator with no user click at all — bypassing the click-driven model the whole tray design assumes. Verified safe to drop: this app's only @tauri-apps imports are api/core (invoke) and api/event (listen/emit) in src/lib/ipc/bindings.ts, type-only references to api/webview and api/window (erased at compile time, never a runtime import), and plugin-dialog's `open` in SiteDrawer.svelte — nothing here ever calls a menu or tray JS API, so nothing breaks. Every menu/tray construction in this app (quit::app_menu, tray::build) is Rust calling tauri::menu/tauri::tray directly and never touches the ACL layer at all, which is why removing these two grants changes nothing about how the app itself builds its menu or tray. If a future frontend feature genuinely needs the menu/tray JS API, add back only the specific permissions it needs and re-justify here — do not restore the blanket core:default bundle. DO NOT PRUNE THE REMAINING GRANTS EITHER: core:window:allow-start-dragging is load-bearing — titleBarStyle Overlay + hiddenTitle means macOS draws no native draggable strip, so the custom titlebar's data-tauri-drag-region is the only way to move the window, and core:window:default carries only read-only getters (no allow-start-dragging), so without this grant the ACL silently rejects the drag and the window is immovable. dialog:allow-open is the folder picker for a site's project directory, deliberately chosen over dialog:default, which would also grant native save and native message dialogs (a UI-spoofing primitive) for no benefit.",
   "windows": [
     "main"
   ],
   "permissions": [
-    "core:default",
+    "core:path:default",
+    "core:event:default",
+    "core:window:default",
+    "core:webview:default",
+    "core:app:default",
+    "core:image:default",
+    "core:resources:default",
     "core:window:allow-start-dragging",
     "dialog:allow-open"
   ]
