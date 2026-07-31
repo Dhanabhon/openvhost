@@ -275,7 +275,7 @@ fn is_pending(state: &ServiceState) -> bool {
 /// supervisor. [`stop_all`] is the real-supervisor binding.
 ///
 /// **Re-sends `stop` on every poll, not just an initial sweep before the loop**
-/// (security audit finding M3, 2026-07-31 — this used to send `stop` once, to
+/// (security audit finding M2, 2026-07-31 — this used to send `stop` once, to
 /// whatever [`pending`] returned before the loop started, then only ever
 /// poll). `perform_quit` takes neither the tray's `BulkLock` nor the existing
 /// `ApplyLock`, so a bulk "Start all" dispatched moments before quit can still
@@ -626,7 +626,7 @@ mod tests {
         assert_eq!(straggling, ["nginx"]);
     }
 
-    /// THE M3 REGRESSION TEST (security audit finding M3, 2026-07-31): a bulk
+    /// THE M2 REGRESSION TEST (security audit finding M2, 2026-07-31): a bulk
     /// "Start all" racing quit can reach a service AFTER `stop_all_with`'s
     /// first read of what is pending — "early" stands in for a service
     /// already pending when the read happens (keeping the loop alive across
