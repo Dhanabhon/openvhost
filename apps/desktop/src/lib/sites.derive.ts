@@ -193,6 +193,199 @@ export function scaffoldPreview(parent: string, name: string): string | null {
 export type ScaffoldNoticeCopy = { tone: 'ok' | 'warn'; role: 'status' | 'alert'; text: string };
 
 /**
+ * A folder whose ENTIRE contents would become the site's web root — the
+ * container-folder mistake this classifies for (see the design note in
+ * `docs/superpowers/specs/2026-07-31-p1-docroot-warning-design.md`). `null` =
+ * no known risk pattern matched; not a claim that the path is safe or exists.
+ *
+ * Three tiers, all path-shape only (spec D2 — no filesystem inspection, no IPC):
+ * `homeItself` (the user's whole home directory), `personalFolder` (a
+ * well-known folder directly under home — `Downloads`, `Desktop`, etc.), and
+ * `systemRoot` (an OS/shared root such as `/`, `/etc`, `/Applications`).
+ * `folder`/`root` carry the matched name so the warning copy can name the
+ * actual folder rather than saying "this looks risky".
+ */
+export type DocrootRisk =
+	| { kind: 'homeItself' }
+	| { kind: 'personalFolder'; folder: string }
+	| { kind: 'systemRoot'; root: string };
+
+/** Well-known personal folders macOS creates directly under every user's home.
+ *  Lowercase: membership is checked against a lowercased path segment (see
+ *  `docrootRisk`), never against these literals directly. */
+const PERSONAL_FOLDERS = new Set([
+	'downloads',
+	'desktop',
+	'documents',
+	'movies',
+	'music',
+	'pictures',
+	'public',
+	'library'
+]);
+
+/** Shared/system roots no site should ever be rooted at. Exact matches only —
+ *  spec D1 lists these as specific paths, not prefixes, so `/etc/nginx` is not
+ *  flagged by this tier (nor need it be: it is not a folder a user would pick
+ *  as a project folder in the first place). Lowercase for the same reason as
+ *  `PERSONAL_FOLDERS` above. */
+const SYSTEM_ROOTS = new Set([
+	'/',
+	'/users',
+	'/applications',
+	'/system',
+	'/library',
+	'/volumes',
+	'/tmp',
+	'/private',
+	'/etc',
+	'/usr',
+	'/var'
+]);
+
+/** Strip trailing slashes the same way `scaffoldPreview` does (restoring a
+ *  bare `/` if that strips everything — the root path itself), and collapse
+ *  any run of internal separators (`/Users//tom` → `/Users/tom`) so a
+ *  double-typed or pasted slash cannot slip a container folder past the
+ *  checks below. Case is deliberately left untouched here — `docrootRisk`
+ *  keeps this original-case string for DISPLAY and only lowercases a
+ *  separate copy for matching.
+ *
+ *  The collapse is REDUNDANT (but harmless — defense in depth) for the
+ *  `homeItself`/`personalFolder` checks, which split on `/` and drop empty
+ *  segments regardless, so a doubled separator BETWEEN two named segments
+ *  (`/Users//tom/Downloads`) is already absorbed there either way. It is the
+ *  only thing that catches a doubled separator immediately before a
+ *  single-segment `systemRoot` (`//etc`), since that check compares the
+ *  whole normalized string as one unit rather than matching segment by
+ *  segment. */
+function normalizeDocrootPath(path: string): string {
+	const collapsed = path.replace(/\/+/g, '/');
+	const trimmed = collapsed.replace(/\/+$/, '');
+	return trimmed === '' ? '/' : trimmed;
+}
+
+/**
+ * Classify a candidate docroot path into a container-folder risk tier, or
+ * `null` when it matches none.
+ *
+ * **Home detection has no IPC to lean on.** This frontend never learns the
+ * logged-in user's name or `$HOME` — spec D2 forbids adding a command for it,
+ * and stat-ing a caller-supplied path is exactly the kind of primitive that
+ * would need one. So "home itself" and "personal folder" are matched by SHAPE
+ * only: any `/Users/<single segment>` is treated as somebody's home, and any
+ * `/Users/<single segment>/<well-known name>` as a personal folder under it —
+ * on the macOS assumption that home directories live at `/Users/<name>`
+ * (true for every real account; `/Users/Shared` and `/Users/Guest` also match
+ * this shape and are accepted as false positives, since telling them apart
+ * from a real home would need the same IPC this slice deliberately omits, and
+ * warning on a folder called "Shared" is a defensible outcome anyway, not a
+ * harmful one). This also means the check does not require the path to be
+ * *this machine's own* home — a docroot under `/Users/anyone` is flagged the
+ * same way, which is intentional: the risk (an entire personal-style folder
+ * becoming a web root) does not depend on whose account it is.
+ *
+ * **Every shape check below is case-INSENSITIVE**, matched against a
+ * lowercased copy of the normalized path (`Users`/`users`/`USERS`,
+ * `Downloads`/`downloads`/`DOWNLOADS`, `/etc`/`/ETC` all match identically).
+ * macOS's default volume format (APFS, case-insensitive but case-preserving)
+ * treats those as the SAME real folder, so a case-sensitive comparison would
+ * silently let `/Users/tom/DOWNLOADS` — the exact incident's folder, just
+ * typed in caps — through with no warning. The tradeoff runs the other way on
+ * a case-SENSITIVE volume (rare; an opt-in APFS format), where `downloads`
+ * really could be a distinct, unrelated folder from `Downloads`: this
+ * over-warns there. That is the right side to err on — a spurious warning
+ * costs a glance, a missed one served 1,071 files. The MATCHED segment is
+ * still reported (`folder`/`root`) using the ORIGINAL casing from `path`, not
+ * a canonicalized one: this function has no way to know the true on-disk
+ * casing without stat-ing the filesystem (disallowed, see above), so the copy
+ * names exactly what is in the field rather than inventing a canonical form.
+ *
+ * **A leading `~` is deliberately left unexpanded, not a case this classifies
+ * at all.** `Docroot::parse` (crates/openvhost-core/src/site/model.rs)
+ * requires an absolute path, so any `~`-prefixed docroot already fails
+ * validation at Save regardless of what this function returns — the
+ * incident this exists to prevent (a container folder silently reaching a
+ * live nginx config) cannot happen through an unresolved `~`, only through
+ * the absolute form it would have to be retyped as to save at all, which
+ * this function already classifies correctly. Expanding `~` here would only
+ * change how early the warning appears for a path that cannot be saved yet,
+ * not whether the incident can occur — not worth resolving a path the user
+ * did not literally type (the same "no canonicalization" stance the sibling
+ * scaffold slice takes, spec D5 in the 2026-07-29 design note).
+ *
+ * Blank/whitespace-only input returns `null` (matches `scaffoldPreview`'s own
+ * blank guard) rather than normalizing to `/` and flagging the filesystem root.
+ */
+export function docrootRisk(path: string): DocrootRisk | null {
+	if (path.trim() === '') return null;
+	const normalized = normalizeDocrootPath(path);
+	const lower = normalized.toLowerCase();
+
+	if (SYSTEM_ROOTS.has(lower)) return { kind: 'systemRoot', root: normalized };
+
+	// Split (rather than regex) so the ORIGINAL-case segments are available for
+	// display (`segments[2]` below) alongside the lowercased ones used to match.
+	const lowerSegments = lower.split('/').filter((s) => s !== '');
+	if (lowerSegments.length === 2 && lowerSegments[0] === 'users') {
+		return { kind: 'homeItself' };
+	}
+
+	if (
+		lowerSegments.length === 3 &&
+		lowerSegments[0] === 'users' &&
+		PERSONAL_FOLDERS.has(lowerSegments[2])
+	) {
+		const segments = normalized.split('/').filter((s) => s !== '');
+		return { kind: 'personalFolder', folder: segments[2] };
+	}
+
+	return null;
+}
+
+/** The two places the docroot-risk warning renders — see `SiteDrawer.svelte`.
+ *  Not a bool (this codebase has been bitten by boolean-collapse before):
+ *  the fix each mode offers is genuinely different text, not just a different
+ *  label for the same thing. */
+export type DocrootWarningMode = 'create' | 'edit';
+
+/**
+ * Warning copy for a classified docroot risk (spec D1): states the
+ * CONSEQUENCE in the user's terms — every file becomes reachable at the
+ * site's domain, any `.php` file there runs as code — never the mechanism,
+ * and always names the actual folder. Points at whichever fix is one click
+ * away for `mode`: the create-folder checkbox only exists in create mode
+ * (`SiteDrawer.svelte`'s `{#if site === null}`), so an edit-mode reader is
+ * pointed at a subfolder instead.
+ *
+ * Exhaustive over `DocrootRisk` — same never-typed default arm as
+ * `scaffoldNotice` below, so a fourth tier fails typecheck here instead of
+ * silently rendering nothing.
+ */
+export function docrootWarningText(risk: DocrootRisk, mode: DocrootWarningMode): string {
+	const consequence =
+		"every file in it becomes reachable at this site's domain, and any .php file there will be executed.";
+	const fix =
+		mode === 'create'
+			? 'Tick "Create a site folder inside this folder" below to keep this site in its own folder instead.'
+			: 'Point this at a subfolder instead to keep this site in its own folder.';
+	switch (risk.kind) {
+		case 'homeItself':
+			return `This is your entire home folder — ${consequence} ${fix}`;
+		case 'personalFolder':
+			return `This is your ${risk.folder} folder — ${consequence} ${fix}`;
+		case 'systemRoot':
+			return `This is ${risk.root}, a system folder — ${consequence} ${fix}`;
+		default: {
+			// Standard exhaustiveness idiom (same as `scaffoldNotice` below): `risk`
+			// only narrows to `never` here if every `kind` above has been handled.
+			const unreachable: never = risk;
+			return unreachable;
+		}
+	}
+}
+
+/**
  * Copy + tone for the scaffold-outcome notice banner. Exhaustive over
  * `ScaffoldOutcomeDto` — deliberately NO `default:` case, so a fourth variant
  * fails typecheck instead of silently rendering nothing (spec D7).

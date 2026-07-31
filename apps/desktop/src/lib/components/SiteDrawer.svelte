@@ -84,12 +84,15 @@
 		composeDomain,
 		splitDomain,
 		defaultPhpVersion,
+		docrootRisk,
 		phpVersionOptions,
 		scaffoldPreview,
 		WEB_SERVERS,
+		type DocrootWarningMode,
 		type WebServerKind
 	} from '$lib/sites.derive';
 	import Button from './Button.svelte';
+	import DocrootRiskWarning from './DocrootRiskWarning.svelte';
 	import Select from './Select.svelte';
 	import WebServerIcon from './WebServerIcon.svelte';
 
@@ -355,10 +358,22 @@
 			.join(' ')
 	);
 
+	// Container-folder warning (docs/superpowers/specs/2026-07-31-p1-docroot-warning-design.md):
+	// classified LIVE off the current `docroot` state, unconditional on `site` — unlike the
+	// create-folder checkbox above, this must render in BOTH modes (spec D1). `docrootMode`
+	// only picks which one-click fix the copy offers (the checkbox only exists in create
+	// mode); `site === null` is otherwise stable for this component's whole lifetime, same
+	// read-once rationale as `heading` above.
+	const docrootMode: DocrootWarningMode = $derived(site === null ? 'create' : 'edit');
+	const docrootRiskValue = $derived(docrootRisk(docroot));
+
 	const rootDescribedBy = $derived(
 		[
 			fieldErrors.docroot ? 'f-root-error' : null,
 			pickerError ? 'f-root-picker-error' : null,
+			// Between the hard errors and the routine preview hint below: more urgent than
+			// "here is what Save will do", less urgent than "Save just failed".
+			docrootRiskValue ? 'f-root-risk' : null,
 			// Mirrors the create-folder preview's own render gate below EXACTLY
 			// (`{#if site === null}` wrapping `{#if createFolder}`) — 'f-root-preview' must
 			// join this list only in the one case that paragraph is actually on the page.
@@ -525,6 +540,15 @@
 					Browse
 				</button>
 			</div>
+			{#if docrootRiskValue}
+				<!-- Deliberately a SIBLING of the `{#if site === null}` block below, not nested
+				     inside it: an edit that re-points an existing site at a container folder is
+				     exactly as dangerous as picking one on create, and the owner's own
+				     mis-pointed site can only be fixed through Edit (design note D1). Warns,
+				     never blocks (D3) — Save stays enabled; see the drawer-foot below, which
+				     this value does not touch. -->
+				<DocrootRiskWarning risk={docrootRiskValue} mode={docrootMode} />
+			{/if}
 			{#if site === null}
 				<!-- Create mode only — an existing site's folder already exists (that is what
 				     "edit" means), so there is nothing to scaffold and this control would be a
