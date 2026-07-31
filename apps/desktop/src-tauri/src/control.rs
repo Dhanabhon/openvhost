@@ -25,12 +25,27 @@
 //!    helper, and answers [`ErrorCode::Busy`] the moment either is held.
 //!    On admission it calls [`crate::quit::stop_all`] — the literal function
 //!    Quit and the tray's Stop-all use, not a copy.
+//!
+//!    That admission is a **consistency guard, not an authorization
+//!    boundary**: N × `openvhost stop <id>` reaches the same end state
+//!    unchecked, deliberately, matching what the tray's per-row Stop already
+//!    allows. Flagged so a later reader does not mistake the `Busy` rejection
+//!    for a security control — the authorization decision on this channel is
+//!    the peer-uid check in `openvhost-proc`, and nothing else.
 //! 3. **Per-service verbs take no lock at all** (D7). `Supervisor::start` and
 //!    `stop` are already idempotent inside the entries mutex: a duplicate
 //!    start for a `Starting`/`Running` id returns early, a duplicate stop for
 //!    a `Stopped`/`Failed` one likewise. Serializing them behind the bulk
 //!    lock would make `openvhost start nginx` fail while an unrelated
 //!    Start-all was in flight, for no safety gained.
+//! 4. **Nothing mutating is admitted once a quit has begun** (A3 audit fix).
+//!    The socket keeps accepting until the process dies, and a connection
+//!    accepted just before the teardown is still served — so an
+//!    `openvhost start nginx` landing after [`crate::quit::stop_all`] returned
+//!    would spawn nginx and then lose its supervisor, leaving something
+//!    listening after the user believes the stack is down. [`mutates`] decides
+//!    which verbs that covers; reads stay open, because answering "what is
+//!    running?" during a quit is harmless and honest.
 //!
 //! # Containment
 //!
@@ -545,8 +560,20 @@ impl<R: Runtime> DesktopHandler<R> {
         }
     }
 
-    /// `restart`, sequenced server-side (D4) so a tray click or an Apply
-    /// cannot interleave between the two halves.
+    /// `restart`, sequenced server-side (D4): the start half is not
+    /// dispatched until the stop half is **observed** complete, so a client
+    /// can never ask a service to start while it is still inside its stop
+    /// grace.
+    ///
+    /// **Sequencing is all it is.** This takes no lock — rule 3 above, and
+    /// deliberately — so a tray click, an Apply, or another caller can act
+    /// between the two halves. What that costs is bounded and reported: a
+    /// concurrent start is why the second half's disposition is forced to
+    /// `Changed` below, and a concurrent stop or an Apply's own restart
+    /// surfaces as this call's own `OperationFailed`/`Timeout` rather than as
+    /// a false success. Making it exclusive would mean taking the bulk lock
+    /// on a per-service verb, which is what rule 3 explains this codebase
+    /// will not do.
     ///
     /// **The stop half is always waited on, even under `--no-wait`.**
     /// `Supervisor::stop` only requests a stop; the service stays `Running`
@@ -613,6 +640,21 @@ impl<R: Runtime> DesktopHandler<R> {
     }
 }
 
+/// Whether a request changes what is running, as opposed to reporting it.
+///
+/// Exhaustive over [`Request`] with no wildcard arm, on purpose: a verb added
+/// to the protocol must fail to compile here and be classified deliberately,
+/// rather than defaulting to "harmless" and slipping past the quit gate.
+fn mutates(req: &Request) -> bool {
+    match req {
+        Request::List | Request::Status { .. } => false,
+        Request::Start { .. }
+        | Request::Stop { .. }
+        | Request::Restart { .. }
+        | Request::StopAll => true,
+    }
+}
+
 /// The wire-ish name of a state, for human messages only.
 ///
 /// Exhaustive over [`ServiceState`], like every other match in this module.
@@ -631,6 +673,22 @@ impl<R: Runtime> ControlHandler for DesktopHandler<R> {
     /// protocol must fail to compile here rather than silently become a
     /// no-op.
     async fn execute(&self, req: Request) -> Response {
+        // Rule 4: a quit in flight refuses everything that would change what
+        // is running. Fails OPEN when `Quitting` was never managed — an app
+        // that never finished its bootstrap has no quit in flight either, and
+        // the same `try_state` posture as every other read in this module.
+        if mutates(&req)
+            && self
+                .app
+                .try_state::<crate::quit::Quitting>()
+                .is_some_and(|q| q.has_begun())
+        {
+            return Response::error(
+                ErrorCode::Busy,
+                "OpenVHost is quitting; it is stopping its services and will not start anything \
+                 new — relaunch the app and try again",
+            );
+        }
         match req {
             Request::List => self.services(None),
             Request::Status { id } => self.services(id.as_ref()),
@@ -780,14 +838,15 @@ mod tests {
     const FAILING_STDERR: &str =
         "nginx: [emerg] bind() to 0.0.0.0:80 failed (48: Address already in use)";
 
-    /// A child that writes one stderr line, waits long enough for the
-    /// supervisor's stderr reader task to have drained it, then exits 3.
+    /// A child that writes one stderr line, pauses, then exits 3.
     ///
-    /// The pause is load-bearing: `service_task::finish` snapshots the tail
-    /// concurrently with the reader task, so a child that writes and exits in
-    /// the same instant can legitimately be classified with an empty tail.
-    /// 300ms is far more than a pipe read needs and still well inside the 2s
-    /// readiness window below, so the classification path stays deterministic.
+    /// The pause used to be load-bearing: `service_task::finish` snapshotted
+    /// the tail concurrently with the reader task, so a child that wrote and
+    /// exited in the same instant could legitimately be classified with an
+    /// empty tail. The A4 fix wave closed that — `finish` now drains its
+    /// readers before it classifies — so the pause is kept only because it
+    /// makes this child's ordering obvious to a reader, not because the
+    /// assertion depends on it.
     #[cfg(unix)]
     fn failing_spec(name: &str) -> ServiceSpec {
         ServiceSpec {
@@ -995,6 +1054,163 @@ mod tests {
         assert_eq!(code, ErrorCode::UnknownService);
         assert!(message.contains("nope"), "{message}");
         assert!(message.contains("nginx"), "{message}");
+    }
+
+    // ------------------------------------------------------------------
+    // A3: a verb that raced the quit must not start anything.
+    // ------------------------------------------------------------------
+
+    /// THE A3 REGRESSION TEST. `perform_quit` marks [`crate::quit::Quitting`]
+    /// before it unlinks the socket, and a connection accepted a moment
+    /// earlier is still served — so this is what stands between
+    /// `openvhost start nginx` and a service spawned seconds before its
+    /// supervisor disappears, left listening after the user believes the stack
+    /// is down.
+    ///
+    /// The strong assertion is the driver's, not the response code's: a
+    /// refusal that still spawned would be worse than no refusal at all.
+    ///
+    /// VACUITY: the positive control below is in the same test and shares the
+    /// same driver, so "nothing spawned" cannot pass by the recorder never
+    /// working. Delete the quit gate from `execute` and this fails twice over
+    /// — `Busy` becomes `OperationFailed`, and the spawn log is no longer
+    /// empty.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_mutating_verb_is_refused_once_a_quit_has_begun() {
+        let driver = RecordingDriver::new();
+        let (app, sup, handler) = handler_with(Arc::clone(&driver) as Arc<dyn ProcessDriver>);
+        app.manage(crate::quit::Quitting::default());
+        sup.register(registered_only_spec("nginx"));
+
+        // POSITIVE CONTROL FIRST, while the app is NOT quitting: the same
+        // verb, the same handler, the same driver — admitted, and it really
+        // does reach a spawn. Without this the refusal below could be a gate
+        // that is simply always closed.
+        let admitted = handler
+            .execute(Request::Start {
+                id: id("nginx"),
+                wait: true,
+            })
+            .await;
+        assert_ne!(
+            error_of(&admitted).0,
+            ErrorCode::Busy,
+            "nothing is quitting yet; the verb must be admitted"
+        );
+        assert_eq!(
+            driver.spawned().len(),
+            1,
+            "the positive control must actually have reached the driver"
+        );
+
+        app.state::<crate::quit::Quitting>().mark();
+
+        for req in [
+            Request::Start {
+                id: id("nginx"),
+                wait: true,
+            },
+            Request::Start {
+                id: id("nginx"),
+                wait: false,
+            },
+            Request::Stop {
+                id: id("nginx"),
+                wait: true,
+            },
+            Request::Restart {
+                id: id("nginx"),
+                wait: true,
+            },
+            Request::StopAll,
+        ] {
+            let label = format!("{req:?}");
+            let response = handler.execute(req).await;
+            let (code, message) = error_of(&response);
+            assert_eq!(code, ErrorCode::Busy, "{label}");
+            assert!(message.contains("quitting"), "{label}: {message}");
+        }
+
+        assert_eq!(
+            driver.spawned().len(),
+            1,
+            "a verb arriving during a quit must not reach the process driver, got {:?}",
+            driver.spawned()
+        );
+    }
+
+    /// Reads stay open during a quit. Refusing them would make `openvhost
+    /// status` lie about a stack that is genuinely still winding down, and
+    /// nothing about answering the question can leave a process behind.
+    #[tokio::test]
+    async fn reads_still_answer_during_a_quit() {
+        let (app, sup, handler) = handler();
+        app.manage(crate::quit::Quitting::default());
+        sup.register(registered_only_spec("nginx"));
+        app.state::<crate::quit::Quitting>().mark();
+
+        assert_eq!(
+            services_of(&handler.execute(Request::List).await),
+            ["nginx"]
+        );
+        assert_eq!(
+            services_of(
+                &handler
+                    .execute(Request::Status {
+                        id: Some(id("nginx"))
+                    })
+                    .await
+            ),
+            ["nginx"]
+        );
+    }
+
+    /// The gate fails OPEN when `Quitting` was never managed — an app that
+    /// never finished its bootstrap has no quit in flight either, and this is
+    /// the same `try_state` posture as every other read in this module. Pinned
+    /// so a future "fail closed here too" change is a deliberate one: it would
+    /// make every CLI verb answer `Busy` under `mock_builder`, which is a
+    /// silent and very confusing failure mode.
+    #[tokio::test]
+    async fn an_unmanaged_quit_flag_does_not_refuse_anything() {
+        let (_app, sup, handler) = handler();
+        sup.register(registered_only_spec("nginx"));
+        assert_ne!(
+            error_of(
+                &handler
+                    .execute(Request::Start {
+                        id: id("nginx"),
+                        wait: true,
+                    })
+                    .await
+            )
+            .0,
+            ErrorCode::Busy
+        );
+    }
+
+    /// `mutates` decides what the quit gate covers, and it is the kind of
+    /// classification that goes wrong silently. Pinned per variant.
+    #[test]
+    fn mutates_classifies_every_verb() {
+        assert!(!mutates(&Request::List));
+        assert!(!mutates(&Request::Status { id: None }));
+        assert!(!mutates(&Request::Status {
+            id: Some(id("nginx"))
+        }));
+        assert!(mutates(&Request::Start {
+            id: id("nginx"),
+            wait: true
+        }));
+        assert!(mutates(&Request::Stop {
+            id: id("nginx"),
+            wait: false
+        }));
+        assert!(mutates(&Request::Restart {
+            id: id("nginx"),
+            wait: true
+        }));
+        assert!(mutates(&Request::StopAll));
     }
 
     // ------------------------------------------------------------------
@@ -1470,6 +1686,59 @@ mod tests {
         sup.stop("nginx").expect("cleanup stop");
     }
 
+    /// A2: `restart` claimed — in the wire type's own docs and in spec D4 —
+    /// that "a tray click or an Apply cannot interleave between the two
+    /// halves". Nothing implemented that, and it contradicted rule 3 two
+    /// paragraphs above it. This pins what is actually true, from the side
+    /// that would have to change first: `restart` takes no lock, so an Apply
+    /// holding both mutexes does not even delay it, let alone exclude it.
+    ///
+    /// The real guarantee — the start half is not dispatched until the stop
+    /// half is *observed* complete — is pinned separately by
+    /// `restart_recycles_a_running_service_and_leaves_it_running`: a restart
+    /// that dispatched the start early would hit `Supervisor::start`'s
+    /// already-live early return and leave the service `Stopped`.
+    ///
+    /// VACUITY: make `restart` (or the `transition` under it) acquire the
+    /// bulk lock — the exclusion the deleted sentence described — and this
+    /// test blocks or fails.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_is_sequenced_but_not_exclusive_with_an_apply() {
+        let (app, sup, handler) = handler();
+        sup.register(sleepy_spec("nginx", Duration::from_millis(100)));
+        sup.start("nginx").expect("setup start");
+        wait_until(
+            || {
+                sup.snapshot()
+                    .iter()
+                    .any(|s| s.id == "nginx" && s.state == ServiceState::Running)
+            },
+            Duration::from_secs(5),
+            "setup: nginx never reached Running",
+        )
+        .await;
+
+        // Exactly what an Apply in flight holds.
+        let bulk = app.state::<crate::tray::BulkLock>();
+        let apply = app.state::<crate::commands::ApplyLock>();
+        let _held =
+            crate::tray::service_control::try_acquire_bulk(&bulk.inner().0, &apply.inner().0)
+                .expect("setup: both locks must be free");
+
+        let response = handler
+            .execute(Request::Restart {
+                id: id("nginx"),
+                wait: true,
+            })
+            .await;
+        let (service, disposition) = transition_of(&response);
+        assert_eq!(service.state, ServiceState::Running);
+        assert_eq!(disposition, Disposition::Changed);
+
+        sup.stop("nginx").expect("cleanup stop");
+    }
+
     // ------------------------------------------------------------------
     // stop-all (D7): reject, never queue.
     // ------------------------------------------------------------------
@@ -1622,6 +1891,13 @@ mod tests {
     /// It also carries D7's stderr claim end to end: the failing service's
     /// output must survive classification, the envelope and the client's own
     /// decode to arrive at the caller unescaped.
+    ///
+    /// The socket assertion at the bottom proves the MECHANISM only — this
+    /// hands `serve` a real shutdown future, which the app never does (it
+    /// passes `std::future::pending()`). That gap is what let a socket
+    /// surviving every quit reach a live proof; `quit.rs`'s
+    /// `quitting_removes_the_control_socket_although_serve_never_stops` is
+    /// what pins the production shape.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_real_client_drives_a_real_supervisor_over_a_real_socket() {

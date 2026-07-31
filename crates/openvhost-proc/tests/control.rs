@@ -448,6 +448,13 @@ async fn a_future_schema_version_over_the_wire_gets_a_typed_error() {
     h.shutdown().await;
 }
 
+/// **Proves the mechanism, NOT the app's wiring.** This harness passes `serve`
+/// a real shutdown future; the app passes `std::future::pending()`, so the
+/// unlink below is unreachable in production. This test passing was one of
+/// three that let a socket surviving every quit reach a live proof (A1 fix
+/// wave). The app's own guarantee is pinned in `apps/desktop/src-tauri`'s
+/// `quitting_removes_the_control_socket_although_serve_never_stops`, which
+/// drives the shape production actually uses.
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_returns_and_removes_the_socket() {
     let mut h = Harness::start(&["nginx"]);

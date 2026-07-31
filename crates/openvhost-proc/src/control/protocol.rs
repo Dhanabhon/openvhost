@@ -166,8 +166,15 @@ pub enum Request {
         #[serde(default = "wait_default")]
         wait: bool,
     },
-    /// Stop then start one service, sequenced server-side so a tray click or
-    /// an Apply cannot interleave between the two halves.
+    /// Stop then start one service, sequenced server-side: the start half is
+    /// not dispatched until the stop half is **observed** complete, so a
+    /// client can never ask a service to start while it is still inside its
+    /// stop grace.
+    ///
+    /// That is a sequencing guarantee, **not an exclusion one**. Per-service
+    /// verbs deliberately take no lock (see `DesktopHandler`'s rule 3), so a
+    /// tray click, an Apply, or another caller absolutely can act between the
+    /// two halves; the second half then reports what it actually observed.
     Restart {
         /// The service to restart.
         id: ServiceId,

@@ -10,6 +10,14 @@
 //! one JSON response line out, connection closed. No session state, no
 //! multiplexing.
 //!
+//! **Removing it is the quit path's job, not [`serve`]'s.** A unix socket is
+//! not unlinked when its process exits, and the app serves for its whole
+//! process lifetime ([`std::future::pending`]), so `serve`'s own unlink is
+//! unreachable in production. Whoever quits must unlink
+//! [`ControlListener::socket`] — otherwise every quit leaves a path that
+//! `connect(2)` refuses, and the CLI reports "not accepting control
+//! connections" (exit 69) where the truth is "not running" (exit 0).
+//!
 //! # Layering
 //!
 //! Transport, parsing and authorization live here. *Policy* lives in the
@@ -60,7 +68,7 @@ pub use protocol::{
     Disposition, ErrorCode, MAX_SERVICE_ID_BYTES, Request, Response, SCHEMA_VERSION, ServiceId,
     envelope_json,
 };
-pub use server::{ControlHandler, ControlListener, bind, serve};
+pub use server::{ControlHandler, ControlListener, ControlSocket, bind, serve};
 
 pub use client::{CLIENT_RESPONSE_TIMEOUT, MAX_RESPONSE_BYTES, request};
 

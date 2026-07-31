@@ -119,6 +119,38 @@ pub const STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 #[derive(Debug, Clone, serde::Serialize, specta::Type, tauri_specta::Event)]
 pub struct QuitRequestedEvent {}
 
+/// Whether [`perform_quit`] has begun tearing this instance down.
+///
+/// Exists for the local control channel (P1 CLI design). The control socket
+/// keeps accepting for as long as the process lives, and a connection already
+/// accepted when the quit starts is still served — so an `openvhost start
+/// nginx` landing after [`stop_all`] has returned but before the process exits
+/// would spawn nginx, register it, and then lose its supervisor, leaving
+/// something listening after the user believes the stack is down.
+///
+/// Set once, never cleared: a quit does not get called off. The gate it feeds
+/// is in `control::DesktopHandler` — mutating verbs answer `Busy`, reads keep
+/// working, since answering "what is running?" while quitting is both harmless
+/// and the honest thing to do.
+///
+/// This is the second half of the fix; the first is that `perform_quit`
+/// unlinks the control socket before anything else, which is what stops NEW
+/// connections from arriving at all. The flag only closes the in-flight
+/// window that unlink cannot.
+#[derive(Debug, Default)]
+pub struct Quitting(AtomicBool);
+
+impl Quitting {
+    /// Record that a quit has started. Idempotent.
+    pub fn mark(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+    /// Whether a quit has started.
+    pub fn has_begun(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
 /// Whether the UI has told us it is listening for [`QuitRequestedEvent`].
 ///
 /// This flag is the whole reason `confirm_quit` is not the only new command.
@@ -506,7 +538,36 @@ pub fn app_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
 /// window instead" (tauri 2.11.3, `Window::destroy`), so it is the only exit
 /// that terminates.
 pub async fn perform_quit<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
-    // FIRST, before touching services or the window at all — this is the C1
+    // FIRST — before the socket is even unlinked, so there is no instant in
+    // which the control channel is still reachable AND still admits work
+    // (A3 audit fix). Cheap, infallible, and it only refuses mutating verbs.
+    if let Some(quitting) = app.try_state::<Quitting>() {
+        quitting.mark();
+    }
+
+    // SECOND, and still before a single service is touched — this is the A1
+    // audit fix, and the ordering IS the fix.
+    //
+    // The socket is unlinked here rather than by `control::serve`, whose own
+    // unlink sits after a loop the app never lets break: it is handed
+    // `std::future::pending()`, because there is no orderly-shutdown event in
+    // this app, only a quit. A unix socket is not removed when its process
+    // exits, so without this the path outlives every quit and the next
+    // `openvhost status` connects to a socket nobody is listening on —
+    // ECONNREFUSED, reported as "the app appears to be running but is not
+    // accepting control connections" with exit 69, when the truthful answer
+    // is "not running" with exit 0.
+    //
+    // Doing it BEFORE `stop_all` is what makes a control verb racing this
+    // quit get "not running" instead of starting a service moments before its
+    // supervisor disappears. Identity-checked (`ControlSocket::remove` only
+    // unlinks the inode it bound), so this cannot unlink a newer instance's
+    // socket, and is safe to run even if `serve` somehow got there first.
+    if let Some(socket) = app.try_state::<openvhost_proc::control::ControlSocket>() {
+        socket.remove();
+    }
+
+    // THEN, before touching services or the window at all — this is the C1
     // audit fix. `install_php`'s `run_task` is only contained by
     // `KillOnDrop`, which fires when its future is dropped; nothing else in
     // this app's shutdown path ever drops it. Aborting-and-waiting HERE makes
@@ -1037,5 +1098,215 @@ mod tests {
         );
 
         let _ = install_task.await;
+    }
+
+    // -----------------------------------------------------------------------
+    // A1/A3: the control socket must not outlive the quit.
+    // -----------------------------------------------------------------------
+
+    /// A handler that must never be reached: these tests drive the QUIT path,
+    /// and the only control request they make happens after the socket is
+    /// gone, so it never gets as far as a handler.
+    #[cfg(unix)]
+    struct UnreachableHandler;
+
+    #[cfg(unix)]
+    #[openvhost_proc::control::async_trait]
+    impl openvhost_proc::control::ControlHandler for UnreachableHandler {
+        async fn execute(
+            &self,
+            req: openvhost_proc::control::Request,
+        ) -> openvhost_proc::control::Response {
+            panic!("no request should have reached the handler, got {req:?}")
+        }
+    }
+
+    /// THE A1 REGRESSION TEST — driven through the PRODUCTION WIRING SHAPE.
+    ///
+    /// `serve` is handed `std::future::pending::<()>()`, exactly what `lib.rs`
+    /// passes, so its loop never breaks and its own `socket.remove()` is
+    /// unreachable — which is the whole defect. Three existing tests missed
+    /// this by passing a real shutdown future the app never passes
+    /// (`openvhost-proc/tests/control.rs`, `control.rs`'s live-supervisor
+    /// test, and `apps/cli/tests/two_process.rs`'s `Drop`): the mechanism was
+    /// tested, the wiring was not.
+    ///
+    /// The assertion is deliberately not "the file is gone" alone but what
+    /// that costs a user: `control::request` against this home must answer
+    /// `NotRunning` (which the CLI reports as "not running", exit 0) and not
+    /// `Unreachable` (exit 69, the thing spec D3 rejects and click-list item 6
+    /// checks).
+    ///
+    /// VACUITY: remove the `ControlSocket` block from `perform_quit` and this
+    /// fails on the `NotRunning` assertion with `Unreachable` — the socket is
+    /// still there, and nothing is listening.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quitting_removes_the_control_socket_although_serve_never_stops() {
+        use openvhost_proc::control::{ControlError, ControlHandler, Request};
+
+        let home = tempfile::tempdir().unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(Quitting::default());
+
+        let listener = openvhost_proc::control::bind(home.path()).unwrap();
+        let socket_path = listener.path().to_path_buf();
+        // The one line `lib.rs` also runs, before `serve` consumes the
+        // listener.
+        app.manage(listener.socket());
+        let handler: Arc<dyn ControlHandler> = Arc::new(UnreachableHandler);
+        let server = tokio::spawn(openvhost_proc::control::serve(
+            listener,
+            handler,
+            std::future::pending::<()>(),
+        ));
+        assert!(socket_path.exists(), "the socket must exist to begin with");
+
+        // `perform_quit` cannot reach `window.destroy()` under `mock_builder`
+        // (there is no "main" window), and that is fine: everything under
+        // test happens strictly before it.
+        let outcome = perform_quit(app.handle()).await;
+        assert_eq!(outcome, Err("the main window is gone".to_string()));
+
+        assert!(
+            !socket_path.exists(),
+            "the socket outlived the quit: {}",
+            socket_path.display()
+        );
+        match openvhost_proc::control::request(home.path(), &Request::List) {
+            Err(ControlError::NotRunning { .. }) => {}
+            other => panic!(
+                "a CLI meeting this home must be told the app is not running (exit 0), got {other:?}"
+            ),
+        }
+        // The proof that this did NOT come from `serve` shutting down: it is
+        // still sitting in its accept loop, exactly as in production.
+        assert!(
+            !server.is_finished(),
+            "serve returned — then this test proved the wrong mechanism"
+        );
+        server.abort();
+    }
+
+    /// A quit marks [`Quitting`] before it does anything else, which is what
+    /// lets `control::DesktopHandler` refuse a verb that raced the teardown.
+    ///
+    /// VACUITY: delete the `quitting.mark()` block from `perform_quit` and
+    /// this fails.
+    #[tokio::test]
+    async fn quitting_is_marked_before_the_teardown_runs() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(Quitting::default());
+        assert!(!app.state::<Quitting>().has_begun());
+
+        let _ = perform_quit(app.handle()).await;
+
+        assert!(
+            app.state::<Quitting>().has_begun(),
+            "a quit in flight must be observable to the control channel"
+        );
+    }
+
+    /// ORDERING, which is the half of the A1 fix that also closes A3's common
+    /// case: the socket is gone BEFORE services start being stopped, so a
+    /// control verb racing the quit meets "not running" rather than starting
+    /// something whose supervisor is about to disappear.
+    ///
+    /// The service ignores SIGTERM, so `stop_all` is stuck for the whole
+    /// grace period — a window this test observes from the outside while
+    /// `perform_quit` is still inside it. A short per-spec grace keeps it to
+    /// about a second.
+    ///
+    /// VACUITY: move the `ControlSocket` block below the `stop_all` block in
+    /// `perform_quit` and this fails — the socket is still present throughout
+    /// the stop window.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_control_socket_is_gone_before_services_are_stopped() {
+        use std::ffi::OsString;
+        use std::path::PathBuf;
+
+        use openvhost_proc::control::ControlHandler;
+        use openvhost_proc::{ReadinessProbe, ServiceSpec, SpawnSpec, Supervisor, default_driver};
+
+        const GRACE: Duration = Duration::from_millis(800);
+
+        let home = tempfile::tempdir().unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(Quitting::default());
+
+        let sup = Arc::new(Supervisor::new(default_driver()));
+        sup.register(ServiceSpec {
+            id: "stubborn".to_string(),
+            display_name: "stubborn".to_string(),
+            endpoint: None,
+            spawn: SpawnSpec {
+                // Ignores the polite stop, so the supervisor has to wait out
+                // `GRACE` and then kill it — a stop that provably takes time.
+                program: PathBuf::from("/bin/sh"),
+                args: vec![
+                    OsString::from("-c"),
+                    OsString::from("trap '' TERM; while true; do sleep 0.1; done"),
+                ],
+                cwd: None,
+                env: vec![],
+            },
+            readiness: ReadinessProbe::default(),
+            grace: GRACE,
+        });
+        sup.start("stubborn").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !matches!(
+            sup.snapshot().first().map(|s| s.state.clone()),
+            Some(ServiceState::Running)
+        ) {
+            assert!(std::time::Instant::now() < deadline, "service never ran");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        app.manage(Arc::clone(&sup));
+
+        let listener = openvhost_proc::control::bind(home.path()).unwrap();
+        let socket_path = listener.path().to_path_buf();
+        app.manage(listener.socket());
+        let handler: Arc<dyn ControlHandler> = Arc::new(UnreachableHandler);
+        let server = tokio::spawn(openvhost_proc::control::serve(
+            listener,
+            handler,
+            std::future::pending::<()>(),
+        ));
+
+        let handle = app.handle().clone();
+        let quit = tokio::spawn(async move { perform_quit(&handle).await });
+
+        // Observe from OUTSIDE, while the quit is still inside `stop_all`:
+        // the socket must already be gone, and the service must still be
+        // pending. Both halves matter — "gone" after everything has stopped
+        // would prove nothing about the order.
+        let mut observed_gone_while_stopping = false;
+        let deadline = std::time::Instant::now() + GRACE;
+        while std::time::Instant::now() < deadline {
+            let still_pending = !pending_service_ids(&sup).is_empty();
+            if still_pending && !socket_path.exists() {
+                observed_gone_while_stopping = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let _ = quit.await;
+        server.abort();
+
+        assert!(
+            observed_gone_while_stopping,
+            "the socket was still present for the whole stop window — it is being removed after \
+             services are stopped, not before"
+        );
+        assert!(!socket_path.exists());
     }
 }

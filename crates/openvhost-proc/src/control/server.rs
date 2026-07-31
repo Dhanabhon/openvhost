@@ -44,6 +44,27 @@ mod imp {
     /// rather than an `unreachable!`.
     pub enum ControlListener {}
 
+    /// Unconstructible off unix, for the same reason as [`ControlListener`].
+    pub enum ControlSocket {}
+
+    impl ControlListener {
+        /// Unreachable off unix: there is no value to call this on.
+        pub fn socket(&self) -> ControlSocket {
+            match *self {}
+        }
+    }
+
+    impl ControlSocket {
+        /// Unreachable off unix: there is no value to call this on.
+        pub fn path(&self) -> &std::path::Path {
+            match *self {}
+        }
+        /// Unreachable off unix: there is no value to call this on.
+        pub fn remove(&self) {
+            match *self {}
+        }
+    }
+
     /// Always [`ControlError::UnsupportedPlatform`] off unix (v1 is
     /// macOS-first), mirroring
     /// [`InstanceLock::acquire`](crate::InstanceLock::acquire)'s explicit
@@ -106,16 +127,84 @@ mod imp {
     #[derive(Debug)]
     pub struct ControlListener {
         listener: std::os::unix::net::UnixListener,
-        path: PathBuf,
+        socket: ControlSocket,
         owner_uid: u32,
+    }
+
+    /// What it takes to unlink a bound control socket safely, and nothing
+    /// else: the path, plus the inode that path named at bind time.
+    ///
+    /// Separate from [`ControlListener`] because the socket's lifetime is
+    /// **not** the listener's. [`serve`] takes the listener by value and, in
+    /// the app, never returns — it is handed [`std::future::pending`], because
+    /// there is no "stop serving" event, only a quit. So whoever performs the
+    /// quit needs to be able to unlink the socket without reaching into the
+    /// task that owns the listener. Cheap to clone and to hold in app state.
+    ///
+    /// A unix socket is NOT unlinked when its process exits. Without this the
+    /// path survives every quit, and the next `openvhost status` connects to
+    /// a socket nobody is listening on: `ECONNREFUSED`, reported as "the app
+    /// appears to be running but is not accepting control connections" and
+    /// exit 69, when the truthful answer is "not running" and exit 0.
+    #[derive(Debug, Clone)]
+    pub struct ControlSocket {
+        path: PathBuf,
         dev: u64,
         ino: u64,
+    }
+
+    impl ControlSocket {
+        /// Where the socket is bound.
+        pub fn path(&self) -> &Path {
+            &self.path
+        }
+
+        /// Unlink the socket, but only if the path still holds the very inode
+        /// that was bound.
+        ///
+        /// Same posture as the stale-socket rule in [`bind`]: never unlink
+        /// something that is not ours. The identity check is what makes this
+        /// safe to call from more than one place and more than once — a second
+        /// call, or a call after a newer instance has rebound the path, is a
+        /// no-op rather than a hijack.
+        ///
+        /// Best-effort and infallible by design: it is called on the quit
+        /// path, where there is nothing useful to do with an error and no
+        /// caller left to report it to. A leftover socket degrades the next
+        /// `openvhost status`'s wording; failing the quit over it would be
+        /// worse.
+        pub fn remove(&self) {
+            match std::fs::symlink_metadata(&self.path) {
+                Ok(md)
+                    if md.file_type().is_socket()
+                        && md.dev() == self.dev
+                        && md.ino() == self.ino =>
+                {
+                    if let Err(e) = std::fs::remove_file(&self.path) {
+                        tracing::warn!(error = %e, path = %self.path.display(), "control: could not remove the socket");
+                    }
+                }
+                Ok(_) => tracing::warn!(
+                    path = %self.path.display(),
+                    "control: leaving the socket path alone — it is no longer the inode we bound"
+                ),
+                Err(_) => {}
+            }
+        }
     }
 
     impl ControlListener {
         /// Where the socket is bound.
         pub fn path(&self) -> &Path {
-            &self.path
+            self.socket.path()
+        }
+
+        /// The socket's identity, for whoever removes it on shutdown.
+        ///
+        /// Cloned out rather than borrowed: the listener is consumed by
+        /// [`serve`], and the whole point is to outlive it.
+        pub fn socket(&self) -> ControlSocket {
+            self.socket.clone()
         }
 
         /// The uid every peer is checked against.
@@ -176,10 +265,12 @@ mod imp {
         let md = std::fs::symlink_metadata(&path)?;
         Ok(ControlListener {
             listener,
-            path,
+            socket: ControlSocket {
+                path,
+                dev: md.dev(),
+                ino: md.ino(),
+            },
             owner_uid: md.uid(),
-            dev: md.dev(),
-            ino: md.ino(),
         })
     }
 
@@ -191,8 +282,15 @@ mod imp {
     /// shutdown. Each connection is handled in its own task, so a `start`
     /// that waits 15 s for readiness does not stall the next caller.
     ///
+    /// **The unlink here is a convenience, never the guarantee.** The app
+    /// passes [`std::future::pending`], so this loop does not break on a quit
+    /// and the code below it does not run in production — a fact three tests
+    /// hid by passing a real shutdown future the app never passes. Whatever
+    /// tears the process down must remove [`ControlListener::socket`] itself.
+    ///
     /// ```ignore
     /// let listener = control::bind(&home)?;                 // outside the runtime is fine
+    /// app.manage(listener.socket());                        // ← quit unlinks through this
     /// let handler: Arc<dyn ControlHandler> = Arc::new(DesktopHandler::new(sup));
     /// tauri::async_runtime::spawn(control::serve(listener, handler, std::future::pending()));
     /// ```
@@ -202,16 +300,15 @@ mod imp {
     {
         let ControlListener {
             listener: std_listener,
-            path,
+            socket,
             owner_uid,
-            dev,
-            ino,
         } = listener;
+        let path = socket.path().to_path_buf();
         let tokio_listener = match tokio::net::UnixListener::from_std(std_listener) {
             Ok(l) => l,
             Err(e) => {
                 tracing::error!(error = %e, path = %path.display(), "control: could not register the socket with the runtime");
-                remove_socket_if_ours(&path, dev, ino);
+                socket.remove();
                 return;
             }
         };
@@ -249,25 +346,47 @@ mod imp {
                 }
             }
         }
-        remove_socket_if_ours(&path, dev, ino);
+        socket.remove();
     }
 
-    /// Unlink the socket on shutdown, but only if the path still holds the
-    /// very inode we bound. Same posture as the stale-socket rule in
-    /// [`bind`]: never unlink something that is not ours.
-    fn remove_socket_if_ours(path: &Path, dev: u64, ino: u64) {
-        match std::fs::symlink_metadata(path) {
-            Ok(md) if md.file_type().is_socket() && md.dev() == dev && md.ino() == ino => {
-                if let Err(e) = std::fs::remove_file(path) {
-                    tracing::warn!(error = %e, path = %path.display(), "control: could not remove the socket");
-                }
-            }
-            Ok(_) => tracing::warn!(
-                path = %path.display(),
-                "control: leaving the socket path alone — it is no longer the inode we bound"
-            ),
-            Err(_) => {}
-        }
+    /// Prefix on the two security-relevant lines below, matching how the
+    /// desktop app already reports (`lib.rs`, `quit.rs`).
+    const SECURITY_PREFIX: &str = "openvhost: control socket:";
+
+    /// Report a peer whose credentials could not be read.
+    ///
+    /// Written to a sink rather than logged, and the sink at the call site is
+    /// `stderr` — **deliberately not `tracing`**. No `tracing` subscriber is
+    /// installed anywhere in this workspace (`tracing-subscriber` is not even
+    /// in `Cargo.lock`, and nothing calls `set_global_default`), so every
+    /// `tracing::warn!` in this crate is discarded at runtime. That is
+    /// acceptable for the accept-loop chatter around it; it is not acceptable
+    /// for the only two lines that record an authorization decision. D2 keeps
+    /// peer credentials specifically as defence in depth against a future
+    /// permission regression, and a defence nobody can observe firing is not
+    /// one. Move these back to `tracing` in the same change that installs a
+    /// subscriber, not before.
+    ///
+    /// Generic over the sink so the message is testable: a test cannot
+    /// capture its own process's stderr without `unsafe`, which is exactly
+    /// what a security-sensitive path must not introduce.
+    pub(crate) fn write_peer_cred_failure<W: io::Write>(out: &mut W, error: &io::Error) {
+        // Best-effort: a failed write to stderr has nowhere left to go.
+        let _ = writeln!(
+            out,
+            "{SECURITY_PREFIX} could not read a peer's credentials ({error}); connection dropped \
+             without reading anything from it"
+        );
+    }
+
+    /// Report a peer refused for belonging to another uid. See
+    /// [`write_peer_cred_failure`] for why this is a write and not a log.
+    pub(crate) fn write_uid_refusal<W: io::Write>(out: &mut W, peer_uid: u32, our_uid: u32) {
+        let _ = writeln!(
+            out,
+            "{SECURITY_PREFIX} refused a connection from uid {peer_uid}; this instance only \
+             accepts uid {our_uid}"
+        );
     }
 
     /// One request/response exchange. Authorization happens **before** a
@@ -282,16 +401,12 @@ mod imp {
             Err(e) => {
                 // Without credentials there is no authorization decision to
                 // make, so fail closed and say nothing to the peer.
-                tracing::warn!(error = %e, "control: could not read peer credentials; dropping");
+                write_peer_cred_failure(&mut io::stderr(), &e);
                 return;
             }
         };
         if !peer_is_authorized(peer_uid, our_uid) {
-            tracing::warn!(
-                peer_uid,
-                our_uid,
-                "control: refused a peer owned by another uid"
-            );
+            write_uid_refusal(&mut io::stderr(), peer_uid, our_uid);
             respond(
                 &mut stream,
                 UNKNOWN_COMMAND,
@@ -426,7 +541,7 @@ mod imp {
     }
 }
 
-pub use imp::{ControlListener, bind, serve};
+pub use imp::{ControlListener, ControlSocket, bind, serve};
 
 #[cfg(all(test, unix))]
 #[allow(clippy::unwrap_used)]
@@ -435,9 +550,55 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
-    use super::imp::{ReadOutcome, read_line_capped};
+    use super::imp::{ReadOutcome, read_line_capped, write_peer_cred_failure, write_uid_refusal};
     use super::*;
     use crate::control::{MAX_REQUEST_BYTES, socket_path};
+
+    // ------------------------------------------------------------------
+    // A5: the authorization decision must leave a record.
+    // ------------------------------------------------------------------
+
+    /// This channel's only authorization decision must be observable when it
+    /// refuses, and must name both sides — "refused a peer" with no uids is
+    /// not enough to tell a misconfiguration from an intrusion.
+    ///
+    /// VACUITY: drop the `writeln!` from `write_uid_refusal` (its previous
+    /// shape was `tracing::warn!`, which goes nowhere: no subscriber is
+    /// installed in this workspace) and the buffer stays empty, failing every
+    /// assertion here.
+    ///
+    /// LIMIT, stated rather than papered over: this proves the message and
+    /// that it is written to the sink it is given. The one thing it cannot
+    /// prove is the call site's `&mut io::stderr()` — capturing a test
+    /// process's own stderr needs `dup2`, and `unsafe` on a security-
+    /// sensitive path is precisely what D2 forbids.
+    #[test]
+    fn a_refused_uid_is_reported_with_both_uids() {
+        let mut out: Vec<u8> = Vec::new();
+        write_uid_refusal(&mut out, 502, 501);
+        let line = String::from_utf8(out).unwrap();
+        assert!(line.contains("502"), "{line}");
+        assert!(line.contains("501"), "{line}");
+        assert!(line.contains("refused"), "{line}");
+        assert!(line.starts_with("openvhost: "), "{line}");
+        assert!(line.ends_with('\n'), "{line:?}");
+    }
+
+    /// The fail-closed path: a peer whose credentials cannot be read is
+    /// dropped without a byte being read from it, and that silence towards the
+    /// peer must not also be silence towards the operator.
+    ///
+    /// VACUITY: as above — remove the `writeln!` and this fails.
+    #[test]
+    fn an_unreadable_peer_credential_is_reported_with_its_cause() {
+        let mut out: Vec<u8> = Vec::new();
+        let cause = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        write_peer_cred_failure(&mut out, &cause);
+        let line = String::from_utf8(out).unwrap();
+        assert!(line.contains(&cause.to_string()), "{line}");
+        assert!(line.contains("dropped"), "{line}");
+        assert!(line.starts_with("openvhost: "), "{line}");
+    }
 
     #[tokio::test]
     async fn read_line_capped_returns_the_line_without_its_newline() {
@@ -621,6 +782,46 @@ mod tests {
             !Path::new(&deep).exists(),
             "a refused bind must not have created anything"
         );
+    }
+
+    /// The quit path's primitive: unlink what we bound, without needing the
+    /// listener (which `serve` owns and never gives back).
+    #[test]
+    fn socket_remove_unlinks_the_socket_that_was_bound() {
+        let home = tempdir();
+        let listener = bind(home.path()).unwrap();
+        let socket = listener.socket();
+        assert!(socket.path().exists());
+        socket.remove();
+        assert!(
+            !socket.path().exists(),
+            "remove() must unlink the socket it bound"
+        );
+        // Idempotent: the quit path may race `serve`'s own unlink, and a
+        // second call must not become an unlink of whatever is there next.
+        socket.remove();
+    }
+
+    /// The identity check, which is what makes [`ControlSocket::remove`] safe
+    /// to hold across a quit: if a NEWER instance has already rebound the
+    /// path, an older handle must not unlink the new instance's socket.
+    #[test]
+    fn socket_remove_leaves_a_rebound_socket_alone() {
+        let home = tempdir();
+        let first = bind(home.path()).unwrap();
+        let stale = first.socket();
+        drop(first); // dropping a listener does NOT unlink — force-quit shape
+        let second = bind(home.path()).unwrap(); // unlinks the stale one, binds anew
+        assert_eq!(stale.path(), second.path());
+
+        stale.remove();
+
+        assert!(
+            second.path().exists(),
+            "an older handle must not unlink a newer instance's socket"
+        );
+        let md = std::fs::symlink_metadata(second.path()).unwrap();
+        assert!(std::os::unix::fs::FileTypeExt::is_socket(&md.file_type()));
     }
 
     #[test]
