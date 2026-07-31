@@ -199,6 +199,7 @@ export const commands = {
 	 */
 	pendingInstall: () => typedError<{
 	kind: InstallKindDto,
+	operation: PackageOperationDto,
 	label: string,
 } | null, IpcError>(__TAURI_INVOKE("pending_install")),
 	/**
@@ -297,6 +298,25 @@ export const commands = {
 	 *  `open_site`/`open_homebrew_site` above.
 	 */
 	revealLogFolder: (source: LogSourceDto) => typedError<null, IpcError>(__TAURI_INVOKE("reveal_log_folder", { source })),
+	/**
+	 *  What an uninstall of `major` would remove, keep, and refuse to do.
+	 * 
+	 *  A PURE QUERY: it spawns nothing and changes nothing. It reads the
+	 *  supervisor's snapshot and the site list and derives paths — that is all —
+	 *  so the Languages/Databases pages can call it on mount to decide a disabled
+	 *  state as cheaply as they call it to fill a confirmation dialog.
+	 */
+	uninstallPlan: (kind: PackageKind, major: string) => typedError<UninstallPlan, IpcError>(__TAURI_INVOKE("uninstall_plan", { kind, major })),
+	/**
+	 *  Remove `major`: refuse if anything depends on it, otherwise
+	 *  `brew uninstall`, then drop the config this app generated and the service
+	 *  row.
+	 * 
+	 *  Re-checks the blockers itself — the plan the dialog was built from may be
+	 *  stale — and streams brew's output through the same events `install_php`
+	 *  uses, so the Languages/Databases pages need no second log channel.
+	 */
+	uninstallPackage: (kind: PackageKind, major: string) => typedError<null, IpcError>(__TAURI_INVOKE("uninstall_package", { kind, major })),
 };
 
 /** Events */
@@ -333,6 +353,26 @@ export type ApplyOutcomeDto = {
 export type ApplyPlanDto = {
 	changes: FileChangeDto[],
 };
+
+/**
+ *  Why an uninstall is refused (design D3). Both are refusals, not warnings,
+ *  and there is deliberately no `--force`: a user who wants the version gone
+ *  can stop the service or change the sites first, which is the same work with
+ *  the consequences visible.
+ */
+export type Blocker = 
+/**
+ *  The version's service is not in a terminal state. Never auto-stopped:
+ *  stopping a database mid-write as a side effect of a menu click is
+ *  exactly the surprise this app should not spring.
+ */
+{ kind: "serviceNotTerminal"; id: string; state: string } | 
+/**
+ *  Sites are still set to this PHP major. Never silently repointed: that
+ *  would edit the user's configuration without asking AND could move a
+ *  site onto a PHP version its code does not run on.
+ */
+{ kind: "sitesPinned"; domains: string[] };
 
 /**
  *  Basic environment facts, assembled by core (not by the Tauri command —
@@ -413,6 +453,21 @@ export type IpcError =
  *  the UI can mark it instead of showing a generic banner.
  */
 { kind: "validation"; field: string; message: string };
+
+/**
+ *  One thing that SURVIVES the uninstall, in the user's words.
+ * 
+ *  `path` is `Some` for anything that lives on disk (so design D6's dialog can
+ *  say "they stay in `<home>/data/mysql/8.4`" rather than a vague
+ *  reassurance), and `None` for things that have no path — a row in state.db,
+ *  a setting on every site. It is NOT an existence check: naming where a
+ *  directory would be is true whether or not it has been created yet, and
+ *  stat-ing here would make a pure query depend on the moment it ran.
+ */
+export type KeptItem = {
+	what: string,
+	path: string | null,
+};
 
 export type LogLevel = "info" | "warn" | "error";
 
@@ -639,14 +694,38 @@ export type MysqlInstanceDto = {
 export type MysqlResetOutcomeDto = { kind: "reset" } | { kind: "authFailed"; detail: string };
 
 /**
- *  What [`pending_install`] reports: which kind of install/init occupies
- *  `InstallLock`'s shared slot, and its label — e.g. `"8.4"` for a PHP
- *  install, `"MySQL 8.4"` for a MySQL install, `"MySQL 8.4 initialization"`
- *  for an init run (see `install_php`/`install_mysql`/`initialize_mysql`'s
- *  own `set_running` calls for the exact shapes).
+ *  Which family of package an uninstall targets.
+ * 
+ *  Exhaustively matched everywhere with **no wildcard arm** — adding a variant
+ *  must break the build in [`Target::parse`] and [`inventory`], because the
+ *  alternative (a `_` arm) is an uninstall that reports success having removed
+ *  nothing.
+ */
+export type PackageKind = "php" | "mysql";
+
+/**
+ *  Wire-safe copy of [`PackageOperation`] — same relationship
+ *  [`InstallKindDto`] has to [`InstallKind`].
+ */
+export type PackageOperationDto = "install" | "uninstall";
+
+/**
+ *  What [`pending_install`] reports: which kind of run occupies
+ *  `InstallLock`'s shared slot, which direction it is going, and its label —
+ *  e.g. `"8.4"` for a PHP install or uninstall, `"MySQL 8.4"` for a MySQL one,
+ *  `"MySQL 8.4 initialization"` for an init run (see the `set_running` calls in
+ *  `install_php`/`install_mysql`/`initialize_mysql`/`uninstall_package` for the
+ *  exact shapes).
+ * 
+ *  `operation` exists because the quit dialog's copy — "… is still installing.
+ *  Quitting stops it immediately and discards the download/build in progress"
+ *  — is simply false for a removal, where what is at risk is a
+ *  half-uninstalled formula rather than a discarded download. The Rust side
+ *  reports the distinction; rendering it is the dialog's own (owed) change.
  */
 export type PendingInstallDto = {
 	kind: InstallKindDto,
+	operation: PackageOperationDto,
 	label: string,
 };
 
@@ -831,6 +910,24 @@ export type SiteInput = {
 	webServer: string,
 	phpVersion: string,
 	enabled: boolean,
+};
+
+/**
+ *  What an uninstall would do, for the confirmation dialog and for the
+ *  disabled state. Produced by the pure-query command `uninstall_plan`.
+ */
+export type UninstallPlan = {
+	kind: PackageKind,
+	major: string,
+	/**  Human-readable, in the order the executor performs them. */
+	removes: string[],
+	/**  What survives, with paths where they exist. */
+	keeps: KeptItem[],
+	/**
+	 *  Empty => may proceed. Non-empty => the action is refused, and these say
+	 *  why and what to do about it.
+	 */
+	blockers: Blocker[],
 };
 
 export type ValidationReportDto = {

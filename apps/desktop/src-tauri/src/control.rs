@@ -694,7 +694,17 @@ fn mutates(req: &Request) -> bool {
 /// The wire-ish name of a state, for human messages only.
 ///
 /// Exhaustive over [`ServiceState`], like every other match in this module.
-fn state_label(state: &ServiceState) -> &'static str {
+/// The app's ONE vocabulary for a service state, shared by `openvhost status`
+/// and by the uninstall refusal that names a service which is not stopped
+/// (package-uninstall design D3).
+///
+/// `pub(crate)` rather than duplicated: `openvhost_proc`'s own
+/// `check_terminal` deliberately kept its naming table private (it produces
+/// `ProcError::NotTerminal`'s `&'static str`), so widening this one is what
+/// stops the desktop crate from growing a third, drifting table. Exhaustive
+/// with no wildcard arm — a new [`ServiceState`] must be given a name here on
+/// purpose, not inherit some other state's.
+pub(crate) fn state_label(state: &ServiceState) -> &'static str {
     match state {
         ServiceState::Stopped => "stopped",
         ServiceState::Starting => "starting",

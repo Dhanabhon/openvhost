@@ -2,23 +2,20 @@
 //! Homebrew as a PHP source: which versions we offer, where brew lives, and
 //! the exact command that installs one.
 //!
-//! SECURITY: this module composes the argv. A caller supplies a version, never
-//! a formula and never a flag. Arguments are passed as a vector rather than
-//! through a shell, which stops command injection — but not flag injection, so
-//! `PhpMajor::parse` enforces the shape AND membership of [`CATALOGUE`].
-//!
-//! SECURITY: [`brew_install_spec`] also requires `brew` to be an absolute
-//! path. An empty or relative leading component in `PATH` is resolved by
-//! `exec` as the current working directory, and brew shells out to `git` and
-//! `curl` — so a relative `brew` path would turn the composed `PATH` into a
-//! PATH-hijack primitive for anyone who controls a file in the CWD.
+//! SECURITY: a caller supplies a version, never a formula and never a flag —
+//! `PhpMajor::parse` enforces the shape AND membership of [`CATALOGUE`], which
+//! is what defeats flag injection (argv alone stops command injection but not
+//! `--build-from-source`). The argv/env itself is composed by
+//! [`crate::brew_cmd::brew_spec`], the one chokepoint for every `brew`
+//! invocation in this crate — see that module for the absolute-`brew`-path and
+//! composed-`PATH` rationale that used to be duplicated here.
 
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use openvhost_proc::SpawnSpec;
 
 use super::BREW_PREFIXES;
+use crate::brew_cmd::{BrewVerb, brew_spec};
 use crate::error::CoreError;
 
 /// The versions this build offers. Hand-maintained: asking `brew` would mean
@@ -78,65 +75,33 @@ pub fn find_brew() -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// The command that installs `major`. Composed here — the formula name is
-/// never accepted from a caller.
-///
-/// INVARIANT: `brew` must be an absolute path with a real parent directory.
-/// `Path::new("brew").parent()` is `Some("")`, not `None`, so a naive
-/// `unwrap_or_default()` fallback never fires for a relative or bare-filename
-/// path — the composed `PATH` would then start with an empty (or `.`)
-/// leading component. `exec` resolves an empty/`.` leading `PATH` component
-/// as the current working directory, and brew shells out to `git` and
-/// `curl`, so that would hand execution of `git`/`curl` to whoever controls
-/// a file in the process's CWD. Rejecting non-absolute input here — rather
-/// than trusting callers — is what keeps that primitive from ever reaching
-/// argv.
+/// The Homebrew formula that provides `major` — THE definition. A formula name
+/// is never accepted from a caller, only derived from a catalogue-gated
+/// [`PhpMajor`], and the install spec, the uninstall spec and any UI that
+/// names the formula to a user all read it from here, so the string shown and
+/// the string executed are one expression rather than two that can drift.
+pub fn brew_formula(major: &PhpMajor) -> String {
+    format!("php@{}", major.as_str())
+}
+
+/// The command that installs `major`. Composed via
+/// [`crate::brew_cmd::brew_spec`] — see that module for the absolute-`brew`
+/// invariant and the composed `PATH` this used to spell out inline.
 pub fn brew_install_spec(brew: &Path, major: &PhpMajor) -> Result<SpawnSpec, CoreError> {
-    if !brew.is_absolute() {
-        return Err(CoreError::Validation {
-            field: "brew_path",
-            reason: format!("{} is not an absolute path", brew.display()),
-        });
-    }
-    let brew_bin = match brew.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => {
-            return Err(CoreError::Validation {
-                field: "brew_path",
-                reason: format!("{} has no parent directory", brew.display()),
-            });
-        }
-    };
+    brew_spec(brew, BrewVerb::Install, &brew_formula(major))
+}
 
-    // brew shells out to git, curl and friends, resolved through THIS PATH —
-    // so it inherits the same rule `discover.rs` documents for php-fpm and
-    // nginx: never resolve anything through the process's ambient PATH,
-    // because a ServBay install shadows binaries there. Composed from a
-    // fixed baseline (brew's own bin, then the standard system dirs) rather
-    // than appending the parent's inherited PATH: that inherited value is
-    // attacker-influenced environment the app does not control, and brew's
-    // own prefix does not ship git/curl/tar — prepending it would not have
-    // closed the gap, only hidden it behind "PATH looks populated".
-    let mut path = OsString::from(brew_bin);
-    path.push(":/usr/bin:/bin:/usr/sbin:/sbin");
-
-    Ok(SpawnSpec {
-        program: brew.to_path_buf(),
-        args: vec![
-            OsString::from("install"),
-            OsString::from(format!("php@{}", major.as_str())),
-        ],
-        cwd: None,
-        env: vec![
-            // Without this, pressing Install can spend five minutes updating
-            // Homebrew itself before starting the work the user asked for.
-            (
-                OsString::from("HOMEBREW_NO_AUTO_UPDATE"),
-                OsString::from("1"),
-            ),
-            (OsString::from("PATH"), path),
-        ],
-    })
+/// The command that REMOVES `major` (package-uninstall design D1: uninstall is
+/// `brew uninstall`, mirroring install through the same composer, so the two
+/// cannot drift in how they reach `brew`).
+///
+/// No `--ignore-dependencies` and no `--force`: if brew refuses because another
+/// formula depends on this one, that refusal is the caller's to surface
+/// verbatim. Nothing here checks that the formula is currently installed —
+/// `brew uninstall` on a keg that is already gone fails loudly by itself, which
+/// is more honest than this crate second-guessing brew's own state.
+pub fn brew_uninstall_spec(brew: &Path, major: &PhpMajor) -> Result<SpawnSpec, CoreError> {
+    brew_spec(brew, BrewVerb::Uninstall, &brew_formula(major))
 }
 
 #[cfg(test)]
@@ -210,6 +175,53 @@ mod tests {
         // Pinned exactly. This test fails the moment anyone adds a flag —
         // which is both a security property and a no-surprises property.
         assert_eq!(args, vec!["install".to_string(), "php@8.3".to_string()]);
+    }
+
+    #[test]
+    fn the_uninstall_command_is_exactly_uninstall_and_the_formula() {
+        let spec = brew_uninstall_spec(
+            std::path::Path::new("/opt/homebrew/bin/brew"),
+            &PhpMajor::parse("8.3").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            spec.program,
+            std::path::PathBuf::from("/opt/homebrew/bin/brew")
+        );
+        let args: Vec<String> = spec
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        // Pinned exactly, like the install spec above. Design D1: NO
+        // `--ignore-dependencies`, NO `--force` — brew's refusal is surfaced
+        // verbatim, never overridden. This test fails the moment anyone adds
+        // one.
+        assert_eq!(args, vec!["uninstall".to_string(), "php@8.3".to_string()]);
+    }
+
+    #[test]
+    fn install_and_uninstall_name_the_same_formula() {
+        // The two specs must agree on the target: an uninstall that removed a
+        // different formula than the install created would be catastrophic and
+        // silent. Both derive it from `formula`, and this pins that they do.
+        let major = PhpMajor::parse("8.4").unwrap();
+        let brew = std::path::Path::new("/opt/homebrew/bin/brew");
+        let installed = brew_install_spec(brew, &major).unwrap();
+        let removed = brew_uninstall_spec(brew, &major).unwrap();
+        assert_eq!(installed.args[1], removed.args[1]);
+        assert_eq!(installed.args[1].to_string_lossy(), "php@8.4");
+    }
+
+    #[test]
+    fn a_relative_brew_path_is_refused_for_an_uninstall_too() {
+        for bad in ["brew", "./brew", "bin/brew", ""] {
+            assert!(
+                brew_uninstall_spec(std::path::Path::new(bad), &PhpMajor::parse("8.3").unwrap())
+                    .is_err(),
+                "accepted {bad:?}"
+            );
+        }
     }
 
     #[test]

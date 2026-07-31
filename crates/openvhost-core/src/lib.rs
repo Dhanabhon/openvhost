@@ -6,6 +6,10 @@
 //! openvhost CLI. Current slice: home-directory resolution + CoreInfo.
 
 mod atomicfile;
+// The single chokepoint every `brew` argv/env in this crate is composed
+// through (`php::brew` and `mysql::brew` are thin formula-naming wrappers over
+// it). Private: nothing outside this crate may name a verb or a formula.
+mod brew_cmd;
 pub mod db;
 mod error;
 mod home;
@@ -27,11 +31,14 @@ pub use logs::{
 pub use mysql::{
     DatadirState, MYSQL_CATALOGUE, MysqlInitOutcome, MysqlInitStep, MysqlInstance,
     MysqlInstanceRepo, MysqlMajor, MysqlPaths, MysqlRuntime, RootPassword, alter_user_sql,
-    classify_datadir, discover_mysql, finalize_staging, generate_root_password,
-    mysql_brew_install_spec, mysql_paths, remove_staging_dir, staging_dir_path,
-    sweep_stale_staging,
+    classify_datadir, discover_mysql, finalize_staging, generate_root_password, mysql_brew_formula,
+    mysql_brew_install_spec, mysql_brew_uninstall_spec, mysql_paths, remove_staging_dir,
+    staging_dir_path, sweep_stale_staging,
 };
-pub use php::{BREW_PREFIXES, CATALOGUE, PhpMajor, brew_install_spec, discover_php_in, find_brew};
+pub use php::{
+    BREW_PREFIXES, CATALOGUE, PhpMajor, brew_formula, brew_install_spec, brew_uninstall_spec,
+    discover_php_in, find_brew,
+};
 pub use settings_repo::{SqliteWebServerSettings, WebServerSettingsRepository};
 pub use site::apply::{
     ApplyError, ApplyInput, ApplyOutcome, ApplyPlan, ChangeKind, ConfigValidator, FileChange,

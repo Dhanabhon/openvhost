@@ -13,7 +13,10 @@ mod discover;
 mod init;
 mod repo;
 
-pub use brew::{MYSQL_CATALOGUE, MysqlMajor, mysql_brew_install_spec};
+pub use brew::{
+    MYSQL_CATALOGUE, MysqlMajor, mysql_brew_formula, mysql_brew_install_spec,
+    mysql_brew_uninstall_spec,
+};
 pub use datadir::{
     DatadirState, MysqlPaths, classify_datadir, mysql_data_root, mysql_paths, sweep_stale_staging,
 };

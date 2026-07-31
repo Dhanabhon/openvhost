@@ -1436,6 +1436,7 @@ mod tests {
         let lock = app.state::<crate::commands::InstallLock>();
         lock.inner().set_running(
             crate::commands::InstallKind::Php,
+            crate::commands::PackageOperation::Install,
             "8.4".to_string(),
             install_task.abort_handle(),
         );
