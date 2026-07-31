@@ -158,8 +158,27 @@ fn render_services(r: &mut Rendered, ex: &Exchange, services: &[ServiceStatus]) 
 /// One `start` / `stop` / `restart` answer.
 fn render_transition(r: &mut Rendered, service: &ServiceStatus, disposition: Disposition) {
     if let ServiceState::Failed { exit, stderr_tail } = &service.state {
-        // The run failed, so this is stderr's business (exit 70).
-        write_failure(&mut r.err, &service.id, *exit, stderr_tail);
+        match disposition {
+            // The run happened and it failed, so this is stderr's business
+            // (exit 70).
+            Disposition::Changed => {
+                write_failure(&mut r.err, &service.id, *exit, stderr_tail);
+            }
+            // Nothing ran: the verb found the service already where it was
+            // asked to put it. In practice this is `stop` on a service that
+            // had already crashed — it is not running, which is what was
+            // asked, so this is a success on **stdout** (exit 0, see
+            // `exit::exit_for`). Routing it to stderr under a `failed (exit
+            // 1)` heading read as though the stop itself had failed.
+            //
+            // The stale failure is still shown, because a service parked in
+            // `Failed` is worth knowing about — just not phrased as this
+            // command's failure.
+            Disposition::Unchanged => {
+                let _ = writeln!(r.out, "{} is not running; nothing to do", service.id);
+                write_stale_failure(&mut r.out, &service.id, *exit, stderr_tail);
+            }
+        }
         return;
     }
     let state = state_label(&service.state);
@@ -182,12 +201,32 @@ fn render_transition(r: &mut Rendered, service: &ServiceStatus, disposition: Dis
 
 /// The failure detail block: what exited, and the real stderr it left behind.
 fn write_failure(into: &mut String, id: &str, exit: Option<i32>, stderr_tail: &[String]) {
+    write_failure_detail(into, &format!("{id} failed"), exit, stderr_tail);
+}
+
+/// The same detail block for a failure that is **not** this command's — a
+/// service found already parked in `Failed`.
+///
+/// A separate lead-in rather than a separate block: the wording must not read
+/// as "the verb you just ran failed" (that is what `write_failure` is for),
+/// but the exit status and stderr tail are exactly as worth showing.
+fn write_stale_failure(into: &mut String, id: &str, exit: Option<i32>, stderr_tail: &[String]) {
+    write_failure_detail(
+        into,
+        &format!("{id} is in a failed state from an earlier run"),
+        exit,
+        stderr_tail,
+    );
+}
+
+/// Shared body of the two detail blocks: `<lead> (exit N):` and the tail.
+fn write_failure_detail(into: &mut String, lead: &str, exit: Option<i32>, stderr_tail: &[String]) {
     let code = exit.map_or_else(|| "no exit status".to_owned(), |c| format!("exit {c}"));
     if stderr_tail.is_empty() {
-        let _ = writeln!(into, "{id} failed ({code}) with no captured output");
+        let _ = writeln!(into, "{lead} ({code}) with no captured output");
         return;
     }
-    let _ = writeln!(into, "{id} failed ({code}):");
+    let _ = writeln!(into, "{lead} ({code}):");
     for line in stderr_tail {
         let _ = writeln!(into, "    {line}");
     }
@@ -321,6 +360,19 @@ mod tests {
                 Exchange::answered(Response::Transition {
                     service: svc("nginx", failed()),
                     disposition: Disposition::Changed,
+                }),
+            ),
+            // `stop` on an already-crashed service: a `Failed` row on a
+            // SUCCESSFUL verb. Its absence from this fixture is why
+            // `stderr_is_used_exactly_when_the_exit_code_is_non_zero` passed
+            // over a case it exists to catch — the renderer sent this to
+            // stderr while the exit code said 0.
+            (
+                "stop",
+                Header::Bare,
+                Exchange::answered(Response::Transition {
+                    service: svc("nginx", failed()),
+                    disposition: Disposition::Unchanged,
                 }),
             ),
             (
@@ -610,6 +662,40 @@ mod tests {
 
         let list = human(Header::Supervisor, home(), &ex).out;
         assert!(!list.contains("/Users/x/.openvhost"), "{list}");
+    }
+
+    /// `openvhost stop nginx` on an nginx that had already crashed. The user
+    /// asked for it to be down and it is down, so this has to *read* as the
+    /// success its exit code claims — while still saying that the service is
+    /// parked in a failed state.
+    ///
+    /// Before the fix this printed `nginx failed (exit 1):` and a wall of
+    /// stderr, which reads as though the stop had failed.
+    #[test]
+    fn stopping_an_already_crashed_service_reads_as_success_on_stdout() {
+        let ex = Exchange::answered(Response::Transition {
+            service: svc("nginx", failed()),
+            disposition: Disposition::Unchanged,
+        });
+        assert_eq!(exit_for(&ex.response), Exit::Ok, "spec D3: unchanged is 0");
+        let r = human(Header::Bare, home(), &ex);
+        assert!(
+            r.err.is_empty(),
+            "a success writes nothing to stderr: {r:?}"
+        );
+        assert!(r.out.contains("nothing to do"), "{:?}", r.out);
+        assert!(
+            !r.out.contains("nginx failed"),
+            "must not read as though the stop failed: {:?}",
+            r.out
+        );
+        // The stale failure is still surfaced, tail and all.
+        assert!(
+            r.out.contains("failed state from an earlier run (exit 1)"),
+            "{:?}",
+            r.out
+        );
+        assert!(r.out.contains("Address already in use"), "{:?}", r.out);
     }
 
     /// `unchanged` is a success and has to read like one.

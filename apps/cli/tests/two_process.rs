@@ -22,10 +22,23 @@ use openvhost_proc::control::{
 use openvhost_proc::events::{ServiceState, ServiceStatus};
 use serde_json::{Value, json};
 
-/// The one registered service the fake knows about. Anything else is an
-/// unknown id, which is what proves the CLI reports 66 rather than inventing
-/// a service.
+/// The registered service the fake reports in its table. Anything unregistered
+/// is an unknown id, which is what proves the CLI reports 66 rather than
+/// inventing a service.
 const KNOWN: &str = "nginx";
+
+/// A second registered service, parked in `Failed`: it crashed earlier and
+/// nothing brought it back.
+///
+/// `stop` on this one is the only shape that pairs a `failed` row with a
+/// **successful** verb — the desktop handler's
+/// `settled(Target::Stopped, Failed) => true` shortcut — and spec D3 says that
+/// is exit 0, because being down is exactly what was asked for.
+///
+/// Deliberately absent from `list`/`status`: the fake answers per request
+/// rather than modelling a registry, and keeping the table at one row keeps
+/// the byte-exact envelope assertions small.
+const CRASHED: &str = "php-fpm-8.4";
 
 fn nginx(state: ServiceState) -> ServiceStatus {
     ServiceStatus {
@@ -34,6 +47,24 @@ fn nginx(state: ServiceState) -> ServiceStatus {
         endpoint: Some("http://127.0.0.1:80".into()),
         pid: Some(4242),
         state,
+    }
+}
+
+/// The [`CRASHED`] row, carrying the real stderr its child died with.
+fn crashed() -> ServiceStatus {
+    ServiceStatus {
+        id: CRASHED.into(),
+        display_name: "PHP 8.4".into(),
+        endpoint: Some("unix:/run/php-fpm-8.4.sock".into()),
+        // Nothing is alive, so there is no pid to report.
+        pid: None,
+        state: ServiceState::Failed {
+            exit: Some(78),
+            stderr_tail: vec![
+                "ERROR: failed to open configuration file '/x/php-fpm.conf'".into(),
+                "ERROR: FPM initialization failed".into(),
+            ],
+        },
     }
 }
 
@@ -79,19 +110,23 @@ impl ControlHandler for Fake {
                     )
                 }
             }
-            Request::Stop { id, .. } => {
-                if known(&id) {
-                    Response::Transition {
-                        service: nginx(ServiceState::Stopped),
-                        disposition: Disposition::Unchanged,
-                    }
-                } else {
-                    Response::error(
-                        ErrorCode::UnknownService,
-                        format!("no service is registered as {id}"),
-                    )
-                }
-            }
+            Request::Stop { id, .. } => match id.as_str() {
+                KNOWN => Response::Transition {
+                    service: nginx(ServiceState::Stopped),
+                    disposition: Disposition::Unchanged,
+                },
+                // Already down because it crashed. The handler answers
+                // `Unchanged` and hands back the failed row exactly as it
+                // stands, stderr tail and all.
+                CRASHED => Response::Transition {
+                    service: crashed(),
+                    disposition: Disposition::Unchanged,
+                },
+                other => Response::error(
+                    ErrorCode::UnknownService,
+                    format!("no service is registered as {other}"),
+                ),
+            },
             Request::StopAll => Response::StopAll {
                 stragglers: vec!["mysql-8.4".into()],
             },
@@ -273,6 +308,117 @@ fn an_unchanged_stop_is_a_success() {
     assert_eq!(value["result"]["disposition"], "unchanged");
 }
 
+/// `openvhost stop` on a service that had already crashed. The user asked for
+/// it to be down and it is down, so this is spec D3's "0 = success, including
+/// an explicit unchanged result" — in both modes.
+///
+/// It used to answer `ok:true` and exit **70**, printing `php-fpm-8.4 failed
+/// (exit 78):` and a wall of stderr, which reads as though the stop had
+/// failed. `stop-all` over the same failed service already said `All services
+/// stopped.` and exited 0.
+#[test]
+fn stopping_an_already_crashed_service_exits_0_in_both_modes() {
+    let server = Server::start();
+
+    let (code, value, stderr) = json_run(server.home.path(), &["stop", CRASHED, "--json"]);
+    assert_eq!(code, 0, "being down is what was asked for");
+    assert_eq!(stderr, "", "--json keeps stderr empty");
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["result"]["disposition"], "unchanged");
+    // The stale failure still travels: `ServiceStatus` is reused verbatim, so
+    // exiting 0 hides nothing (spec D5).
+    assert_eq!(
+        value["result"]["service"]["state"],
+        json!({
+            "kind": "failed",
+            "exit": 78,
+            "stderrTail": [
+                "ERROR: failed to open configuration file '/x/php-fpm.conf'",
+                "ERROR: FPM initialization failed",
+            ],
+        })
+    );
+
+    let out = openvhost(server.home.path(), &["stop", CRASHED]);
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(out.stderr).unwrap(),
+        "",
+        "a success is quiet on stderr, whatever the row says"
+    );
+    assert!(stdout.contains("nothing to do"), "{stdout}");
+    assert!(
+        !stdout.contains("php-fpm-8.4 failed"),
+        "must not read as though the stop failed: {stdout}"
+    );
+    // …while still saying the service is parked in a failed state.
+    assert!(
+        stdout.contains("failed state from an earlier run (exit 78)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("FPM initialization failed"), "{stdout}");
+}
+
+/// `restart`'s happy path over a real socket, which nothing covered.
+#[test]
+fn restart_reaches_the_server_and_reports_a_changed_transition() {
+    let server = Server::start();
+    let (code, value, stderr) = json_run(server.home.path(), &["restart", "nginx", "--json"]);
+    assert_eq!(code, 0);
+    assert_eq!(stderr, "");
+    assert_eq!(
+        value,
+        json!({
+            "schemaVersion": 1,
+            "ok": true,
+            "command": "restart",
+            "result": {
+                "kind": "transition",
+                "service": running_nginx_row(),
+                "disposition": "changed",
+            },
+        })
+    );
+    assert_eq!(
+        server.requests(),
+        vec![Request::Restart {
+            id: control::ServiceId::parse("nginx").unwrap(),
+            wait: true,
+        }],
+        "the default is to wait"
+    );
+}
+
+/// `restart --no-wait` — the combination D4 gives an asymmetric rule to (the
+/// stop half is waited on regardless; the flag skips only the readiness wait
+/// on the way back up) and which had no coverage at all.
+///
+/// The asymmetry itself is the handler's, so what the CLI owes is putting
+/// `wait:false` on the wire under the verb that has two halves. A `restart`
+/// that silently sent `wait:true` would make `--help` a lie and would block a
+/// CI script for a full readiness deadline.
+#[test]
+fn restart_no_wait_puts_wait_false_on_the_wire() {
+    let server = Server::start();
+    let (code, value, stderr) = json_run(
+        server.home.path(),
+        &["restart", "nginx", "--no-wait", "--json"],
+    );
+    assert_eq!(code, 0);
+    assert_eq!(stderr, "");
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["command"], "restart");
+    assert_eq!(value["result"]["disposition"], "changed");
+    assert_eq!(
+        server.requests(),
+        vec![Request::Restart {
+            id: control::ServiceId::parse("nginx").unwrap(),
+            wait: false,
+        }],
+    );
+}
+
 #[test]
 fn stop_all_reporting_stragglers_exits_70() {
     let server = Server::start();
@@ -388,6 +534,103 @@ fn with_no_server_human_mode_says_so_loudly_on_stdout() {
         stderr.contains("Start it"),
         "the message must name the fix: {stderr}"
     );
+}
+
+/// Leave behind exactly what a force quit leaves: the socket **file**, with
+/// nothing listening on it and nothing holding the run lock.
+///
+/// Bound with `std`'s listener and dropped, deliberately **not** through
+/// [`control::bind`] — dropping a `std` `UnixListener` does not unlink, and
+/// going through the app's own binder would let an unlink-on-drop added there
+/// later silently turn this into a "there is no socket at all" test, which
+/// takes a different path and would pass for the wrong reason.
+fn leave_a_stale_socket(home: &std::path::Path) {
+    use std::os::unix::fs::FileTypeExt as _;
+
+    let path = control::socket_path(home).expect("a home short enough for sun_path");
+    std::fs::create_dir_all(path.parent().expect("the socket has a parent"))
+        .expect("create <home>/run");
+    drop(std::os::unix::net::UnixListener::bind(&path).expect("bind a socket to leave behind"));
+    assert!(
+        std::fs::symlink_metadata(&path)
+            .expect("the leftover socket")
+            .file_type()
+            .is_socket(),
+        "the leftover has to still be a socket, or this tests the wrong path"
+    );
+}
+
+/// After a force quit (or a crash, or `pkill`) the socket file outlives the
+/// app. `connect` then fails with ECONNREFUSED — but the lock probe says
+/// nothing is alive, so the app is definitively down and that is an *answer*.
+///
+/// This exited **69** with `supervisor:"unknown"` for as long as the leftover
+/// file survived, which is until the next launch: the CLI had the probe result
+/// in hand, said "No app is running" in its own message, and then reported
+/// that it could not answer. Spec D3 scopes 69 to "lock held but socket
+/// unreachable" — the genuinely ambiguous case — and click-list item 7
+/// anticipates this one.
+#[test]
+fn a_force_quit_leftover_socket_still_lets_status_and_list_answer() {
+    let home = new_home();
+    leave_a_stale_socket(home.path());
+
+    for verb in ["status", "list"] {
+        let (code, value, stderr) = json_run(home.path(), &[verb, "--json"]);
+        assert_eq!(code, 0, "{verb} must still answer");
+        assert_eq!(stderr, "");
+        assert_eq!(value["ok"], true, "{verb}");
+        assert_eq!(value["supervisor"], "notRunning", "{verb}");
+        assert_eq!(value["result"]["services"], json!([]), "{verb}");
+    }
+
+    // Human mode says what happened and how to clear it, on stdout.
+    let out = openvhost(home.path(), &["status"]);
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8(out.stderr).unwrap(), "");
+    assert!(stdout.contains("not running"), "{stdout}");
+    assert!(stdout.contains("force quit"), "{stdout}");
+
+    // Control verbs are unmoved: there is still nothing to control.
+    for verb in [
+        vec!["start", "nginx"],
+        vec!["stop", "nginx"],
+        vec!["restart", "nginx"],
+        vec!["stop-all"],
+    ] {
+        let mut args = verb.clone();
+        args.push("--json");
+        let (code, value, stderr) = json_run(home.path(), &args);
+        assert_eq!(code, 69, "{verb:?} over a stale socket must still exit 69");
+        assert_eq!(stderr, "");
+        assert_eq!(value["ok"], false, "{verb:?}");
+    }
+}
+
+/// The other half of the same story, and the reason the probe is consulted
+/// rather than assumed: a socket that refuses connections **while an app holds
+/// the run lock** is genuinely "I could not answer" — an app still starting up
+/// — and stays a failure even for `status`.
+#[test]
+fn an_unreachable_socket_with_a_live_app_is_still_a_failure_for_status() {
+    let home = new_home();
+    leave_a_stale_socket(home.path());
+    // Hold the run lock the way a live app does, in a process that is not the
+    // CLI, so the CLI's own probe contends with it exactly as it would in
+    // production.
+    let held = openvhost_proc::InstanceLock::acquire(&home.path().join("run"))
+        .expect("acquire the run lock")
+        .expect("nothing else holds it");
+
+    let (code, value, stderr) = json_run(home.path(), &["status", "--json"]);
+    assert_eq!(code, 69, "an app IS alive, so this is not an answer");
+    assert_eq!(stderr, "");
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["supervisor"], "unknown");
+    assert_eq!(value["error"]["code"], "controlChannelUnavailable");
+
+    drop(held);
 }
 
 /// Never, under any verb: an absent app is reported, not fixed.

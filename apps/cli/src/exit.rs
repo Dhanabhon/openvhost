@@ -50,15 +50,32 @@ impl Exit {
 pub fn exit_for(response: &Response) -> Exit {
     match response {
         Response::Services { .. } => Exit::Ok,
-        // A transition is judged by where the service *landed*, not by whether
-        // it moved: `Unchanged` is an explicit success (spec D3), but a run
-        // that ends on `Failed` is a failure even if the handler chose to
-        // report it as a transition rather than an error.
         Response::Transition {
             service,
             disposition,
         } => match disposition {
-            Disposition::Changed | Disposition::Unchanged => match &service.state {
+            // Spec D3, literally: "0 = success, including an explicit
+            // unchanged result". `Unchanged` means the verb found the service
+            // already where it was asked to put it and touched nothing, so
+            // there is no run that could have failed.
+            //
+            // The row can still be `Failed`, and exactly one producer does
+            // that: `settled(Target::Stopped, ServiceState::Failed) => true`
+            // in the desktop handler — `openvhost stop nginx` on an nginx
+            // that had already crashed. That is the user's request already
+            // satisfied, so it is exit 0, and `render::render_transition`
+            // says so on stdout while still showing the stale failure.
+            //
+            // No other verb can reach here with a `Failed` row:
+            // `(Target::Running, Failed) => false` always, so a `start` never
+            // takes the shortcut, and `restart` overwrites its answer with
+            // `Disposition::Changed` unconditionally.
+            Disposition::Unchanged => Exit::Ok,
+            // A run that actually happened is judged by where the service
+            // *landed*, so a transition that ends on `Failed` is a failure
+            // even though the handler chose to report it as a transition
+            // rather than an error.
+            Disposition::Changed => match &service.state {
                 ServiceState::Stopped | ServiceState::Starting | ServiceState::Running => Exit::Ok,
                 ServiceState::Failed { .. } => Exit::Failure,
             },
@@ -148,6 +165,18 @@ mod tests {
                 },
                 Exit::Failure,
             ),
+            // `stop` on a service that had already crashed — the one shape
+            // that pairs a `Failed` row with a successful verb.
+            (
+                Response::Transition {
+                    service: status(ServiceState::Failed {
+                        exit: Some(1),
+                        stderr_tail: vec!["boom".into()],
+                    }),
+                    disposition: Disposition::Unchanged,
+                },
+                Exit::Ok,
+            ),
             (Response::StopAll { stragglers: vec![] }, Exit::Ok),
             (
                 Response::StopAll {
@@ -208,19 +237,39 @@ mod tests {
         assert_eq!(Exit::Unauthorized.code(), 77);
     }
 
-    /// A transition that lands on `Failed` is not a success, whatever the
-    /// disposition says. Without this a handler that reported a failed start
-    /// as a `Transition` rather than an `Error` would exit 0.
+    /// `Unchanged` is an explicit success (spec D3) **even when the row is
+    /// `Failed`**, because nothing ran that could have failed.
+    ///
+    /// The producer is `stop` on a service that had already crashed: the
+    /// desktop handler's `settled(Target::Stopped, Failed)` is `true`, and it
+    /// answers with the crashed row. Judging that by the row rather than by
+    /// the disposition made `openvhost stop nginx` exit 70 for doing exactly
+    /// what it was asked. A `start` cannot reach here — `settled` is `false`
+    /// for every `(Target::Running, _)` but `Running` — and `restart` always
+    /// overwrites its disposition with `Changed`.
+    ///
+    /// The `Changed` half is asserted alongside so the fix cannot be
+    /// over-applied into "any transition is a success".
     #[test]
-    fn a_transition_onto_failed_is_a_failure_even_when_unchanged() {
-        let r = Response::Transition {
-            service: status(ServiceState::Failed {
-                exit: Some(78),
-                stderr_tail: vec![],
-            }),
-            disposition: Disposition::Unchanged,
+    fn an_unchanged_transition_is_a_success_even_when_the_row_is_failed() {
+        let failed = || ServiceState::Failed {
+            exit: Some(78),
+            stderr_tail: vec![],
         };
-        assert_eq!(exit_for(&r), Exit::Failure);
+        assert_eq!(
+            exit_for(&Response::Transition {
+                service: status(failed()),
+                disposition: Disposition::Unchanged,
+            }),
+            Exit::Ok
+        );
+        assert_eq!(
+            exit_for(&Response::Transition {
+                service: status(failed()),
+                disposition: Disposition::Changed,
+            }),
+            Exit::Failure
+        );
     }
 
     /// `stop-all` that leaves something running has not done its job — the

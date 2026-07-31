@@ -93,10 +93,26 @@ impl Exchange {
     /// code.
     ///
     /// `presence` is [`InstanceLock::probe`](openvhost_proc::InstanceLock::probe)'s
-    /// advisory, mildly racy answer, and it may influence **the wording and
-    /// nothing else** (spec D3). The connect result is authoritative: neither
-    /// the [`ErrorCode`] nor the [`SupervisorReport`] is derived from it, so a
-    /// script can never end up branching on a race.
+    /// advisory, mildly racy answer. The connect result stays authoritative
+    /// about *whether contact was made*; the probe only ever answers the
+    /// separate question "is an app alive at all", and it is consulted for
+    /// exactly two variants:
+    ///
+    /// - [`ControlError::NotRunning`] — wording only. There is no socket, so
+    ///   there is no supervisor whatever the lock says.
+    /// - [`ControlError::Unreachable`] — wording **and** the answer. A socket
+    ///   that refuses connections while nothing holds the run lock is a force
+    ///   quit's leftover, not an ambiguity: the app is definitively down, and
+    ///   saying "I could not answer" there is the state-as-error collapse
+    ///   spec D3 exists to prevent (it made `status` exit 69 for an indefinite
+    ///   window after any force quit). `Present` and `Indeterminate` stay
+    ///   [`ErrorCode::ControlChannelUnavailable`], because those genuinely are
+    ///   "I could not answer".
+    ///
+    /// A script still never branches on a race: both probe answers for
+    /// `Unreachable` map onto exit 69 for control verbs, and the only verbs
+    /// whose exit code moves are `status`/`list`, whose entire job is to
+    /// report whether the app is up.
     ///
     /// Taken as a closure so it is only evaluated by the two variants that
     /// use it: probing takes the run lock and may create `<home>/run/lock`, and
@@ -143,23 +159,52 @@ impl Exchange {
                     path.display()
                 ),
             ),
-            ControlError::Unreachable { path, source } => (
-                SupervisorReport::Unknown,
-                ErrorCode::ControlChannelUnavailable,
-                format!(
-                    "the control socket at {} is not accepting connections ({source}). {}",
-                    path.display(),
-                    match presence() {
-                        SupervisorPresence::Present =>
-                            "The OpenVHost app appears to be running; it may still be starting.",
-                        SupervisorPresence::Absent =>
-                            "No app is running, so this looks like a leftover from a force quit; \
-                             relaunching the OpenVHost app clears it.",
-                        SupervisorPresence::Indeterminate { .. } =>
-                            "Whether an app is live could not be checked.",
-                    }
+            // A socket file that refuses connections. Whether that is an
+            // answer or a failure depends entirely on the probe, which is the
+            // one place it is allowed to decide more than the wording — see
+            // this function's own doc comment.
+            ControlError::Unreachable { path, source } => match presence() {
+                // Force quit, crash, `pkill`: the socket file outlived the
+                // app that bound it. Nothing holds the run lock, so there is
+                // definitively no supervisor — which is not "I could not
+                // answer", it is the answer. Reported exactly as a missing
+                // socket is, so `status`/`list` relax it into an empty list
+                // and exit 0 (spec D3) while control verbs still exit 69.
+                SupervisorPresence::Absent => (
+                    SupervisorReport::NotRunning,
+                    ErrorCode::SupervisorUnavailable,
+                    format!(
+                        "the OpenVHost app is not running, so the control socket at {} is a \
+                         leftover from a force quit ({source}). Start the app, then run this \
+                         again; relaunching clears the stale socket.",
+                        path.display()
+                    ),
                 ),
-            ),
+                // Something holds the lock but will not talk: genuinely
+                // ambiguous, most likely an app still starting up. This is
+                // D3's `controlChannelUnavailable`, and it stays a failure
+                // for every verb including `status`.
+                SupervisorPresence::Present => (
+                    SupervisorReport::Unknown,
+                    ErrorCode::ControlChannelUnavailable,
+                    format!(
+                        "the control socket at {} is not accepting connections ({source}). The \
+                         OpenVHost app appears to be running; it may still be starting.",
+                        path.display()
+                    ),
+                ),
+                // "I could not find out" is not "no" — the reason travels so
+                // the third state is worth having.
+                SupervisorPresence::Indeterminate { reason } => (
+                    SupervisorReport::Unknown,
+                    ErrorCode::ControlChannelUnavailable,
+                    format!(
+                        "the control socket at {} is not accepting connections ({source}), and \
+                         whether an app is live could not be checked ({reason}).",
+                        path.display()
+                    ),
+                ),
+            },
             ControlError::Io(e) => (
                 SupervisorReport::Unknown,
                 ErrorCode::OperationFailed,
@@ -196,10 +241,15 @@ impl Exchange {
     /// For `status` and `list` only: a definitively absent supervisor is *the
     /// answer* — an empty service list and exit 0 — not a failure (spec D3).
     ///
-    /// Deliberately narrow. Only [`SupervisorReport::NotRunning`], which only
-    /// [`ControlError::NotRunning`] produces, is relaxed. A socket that exists
-    /// but will not answer is "I could not answer", not "the answer is no",
-    /// and stays a failure even for `status`.
+    /// Deliberately narrow: only [`SupervisorReport::NotRunning`] is relaxed,
+    /// and only [`from_client_error`](Self::from_client_error) decides who
+    /// gets it — a missing socket, or a socket that refuses connections while
+    /// the lock probe says nothing is alive (a force quit's leftover). Both
+    /// mean "there is no supervisor", which is an answer.
+    ///
+    /// Everything else stays a failure, including for `status`: a socket that
+    /// will not answer while an app *is* alive, or while the probe could not
+    /// tell, is "I could not answer", not "the answer is no".
     pub fn absent_supervisor_is_an_answer(self) -> Self {
         match self.supervisor {
             SupervisorReport::NotRunning => Exchange {
@@ -246,10 +296,13 @@ mod tests {
         PathBuf::from("/home/run/control.sock")
     }
 
-    /// EVERY `ControlError` variant. `ControlError` is deliberately not
-    /// `#[non_exhaustive]`, so `from_client_error`'s match is a compile error
-    /// when a variant is added; this table is the behavioural half of that
-    /// guarantee.
+    /// EVERY `ControlError` variant, as answered under an **absent** probe.
+    /// `ControlError` is deliberately not `#[non_exhaustive]`, so
+    /// `from_client_error`'s match is a compile error when a variant is added;
+    /// this table is the behavioural half of that guarantee.
+    ///
+    /// `Unreachable` is the one entry that depends on the probe — see
+    /// `an_unreachable_socket_is_a_failure_unless_the_probe_says_nothing_is_alive`.
     fn every_client_error() -> Vec<(ControlError, SupervisorReport, ErrorCode)> {
         vec![
             (
@@ -271,13 +324,15 @@ mod tests {
                 SupervisorReport::Unknown,
                 ErrorCode::ControlChannelUnavailable,
             ),
+            // Under an absent probe this is a force quit's leftover socket:
+            // no supervisor, reported exactly as a missing socket is.
             (
                 ControlError::Unreachable {
                     path: sock(),
                     source: std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
                 },
-                SupervisorReport::Unknown,
-                ErrorCode::ControlChannelUnavailable,
+                SupervisorReport::NotRunning,
+                ErrorCode::SupervisorUnavailable,
             ),
             (
                 ControlError::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
@@ -397,23 +452,98 @@ mod tests {
         assert_eq!(ex.response, Response::Services { services: vec![] });
     }
 
-    /// "I could not answer" must NOT be relaxed into "the answer is no" — a
-    /// stale socket after a force quit is a failure, including for `status`.
+    /// "I could not answer" must NOT be relaxed into "the answer is no".
+    ///
+    /// The probe says `Absent` throughout, so these are refused on the shape
+    /// of the failure alone: something that is not a socket sitting at the
+    /// path is a broken home directory, not an absent app, and a peer talking
+    /// gibberish answered — badly.
     #[test]
     fn a_channel_that_will_not_answer_is_not_relaxed_into_an_answer() {
         for err in [
             ControlError::NotASocket { path: sock() },
-            ControlError::Unreachable {
-                path: sock(),
-                source: std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
-            },
             ControlError::Protocol("garbage".into()),
+            ControlError::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
         ] {
             let ex = Exchange::from_client_error(&err, absent).absent_supervisor_is_an_answer();
             match ex.response {
                 Response::Error { .. } => {}
                 other => panic!("{err:?} was relaxed into {other:?}"),
             }
+        }
+    }
+
+    /// A stale socket left by a force quit is **not** an ambiguity: nothing
+    /// holds the run lock, so the app is definitively down and `status` must
+    /// say so and exit 0 like any other "no app" answer.
+    ///
+    /// The alternative — 69, `ok:false`, `supervisor:"unknown"` — persisted
+    /// for as long as the leftover file did (indefinitely, until the next
+    /// launch), which is D3's state-as-error collapse in the exact scenario
+    /// the spec's click-list item 7 anticipates.
+    ///
+    /// It stays a failure when the probe says an app IS alive, or could not
+    /// tell: those are genuinely "I could not answer".
+    #[test]
+    fn an_unreachable_socket_is_a_failure_unless_the_probe_says_nothing_is_alive() {
+        let refused = || ControlError::Unreachable {
+            path: sock(),
+            source: std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+        };
+
+        let ex = Exchange::from_client_error(&refused(), absent);
+        assert_eq!(ex.supervisor, SupervisorReport::NotRunning);
+        let relaxed = ex.absent_supervisor_is_an_answer();
+        assert_eq!(relaxed.response, Response::Services { services: vec![] });
+        let note = relaxed.note.expect("the force-quit wording must survive");
+        assert!(note.contains("not running"), "{note}");
+        assert!(note.contains("force quit"), "{note}");
+
+        for presence in [
+            SupervisorPresence::Present,
+            SupervisorPresence::Indeterminate {
+                reason: "cannot stat /home/run: permission denied".into(),
+            },
+        ] {
+            let ex = Exchange::from_client_error(&refused(), || clone_presence(&presence))
+                .absent_supervisor_is_an_answer();
+            assert_eq!(ex.supervisor, SupervisorReport::Unknown, "{presence:?}");
+            match ex.response {
+                Response::Error { code, .. } => {
+                    assert_eq!(code, ErrorCode::ControlChannelUnavailable, "{presence:?}");
+                }
+                other => panic!("{presence:?} was relaxed into {other:?}"),
+            }
+        }
+    }
+
+    /// Whatever the probe says, an unreachable socket is exit 69 for a
+    /// control verb — there is nothing to start or stop through. Only the
+    /// two reporting verbs' exit code moves, and only because reporting
+    /// whether the app is up is their entire job.
+    #[test]
+    fn an_unreachable_socket_never_becomes_an_answer_for_a_control_verb() {
+        for presence in [
+            SupervisorPresence::Absent,
+            SupervisorPresence::Present,
+            SupervisorPresence::Indeterminate {
+                reason: "unreadable".into(),
+            },
+        ] {
+            // No `absent_supervisor_is_an_answer`: that is exactly what
+            // `main::run` withholds from a control verb.
+            let ex = Exchange::from_client_error(
+                &ControlError::Unreachable {
+                    path: sock(),
+                    source: std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+                },
+                || clone_presence(&presence),
+            );
+            assert_eq!(
+                crate::exit::exit_for(&ex.response).code(),
+                69,
+                "{presence:?}"
+            );
         }
     }
 
