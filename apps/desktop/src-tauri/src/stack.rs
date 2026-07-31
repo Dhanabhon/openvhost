@@ -163,7 +163,14 @@ pub(crate) const MYSQL_GRACE: Duration = Duration::from_secs(15);
 
 /// How long [`mysql_spec`]'s readiness probe (`mysqladmin ping`) may keep
 /// retrying before the service is declared `Failed` (spec D4).
-const MYSQL_READY_DEADLINE: Duration = Duration::from_secs(15);
+///
+/// `pub(crate)`, not private (widened by the P1 CLI slice, same reasoning as
+/// [`MYSQL_GRACE`] above): the control channel's per-service transition
+/// deadline (`control::TRANSITION_TIMEOUT`) must outlive this probe PLUS the
+/// grace that tears down a child which never became ready, and its test pins
+/// against these constants rather than bare literals so the two cannot
+/// silently drift apart.
+pub(crate) const MYSQL_READY_DEADLINE: Duration = Duration::from_secs(15);
 
 /// The `mysql-<major>` service row for one runtime: id, display name, TCP
 /// endpoint, and the exact spawn + readiness spec (spec D4).

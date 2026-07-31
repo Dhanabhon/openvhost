@@ -4,6 +4,12 @@
 //! stays tauri-free and this crate owns the bridge.
 
 mod commands;
+// Desktop-side policy for the local control socket the `openvhost` CLI talks
+// to (P1 CLI design). Transport/authorization live in
+// `openvhost_proc::control`; this module is only the `ControlHandler` impl
+// over the supervisor and the two bulk locks. Ungated: the handler is
+// portable, and `openvhost_proc::control::bind` is what refuses off-unix.
+mod control;
 // The MySQL admin-CLI spawns (`mysqladmin`/`mysql` — ping, ALTER USER,
 // shutdown): orchestration-layer child processes, not config generation —
 // see this module's own doc comment for why they live here rather than in
@@ -427,6 +433,60 @@ pub fn run() {
                                 eprintln!(
                                     "openvhost: failed to build the tray icon ({e}); continuing without it"
                                 );
+                            }
+
+                            // The local control socket the `openvhost` CLI
+                            // connects to (P1 CLI design, spec D1). Bound
+                            // INSIDE this arm on purpose: the socket must
+                            // exist if and only if a supervisor does, so the
+                            // degraded-boot arms below — instance lock held
+                            // elsewhere, or no resolvable home — deliberately
+                            // do NOT bind, and a CLI meeting no socket
+                            // correctly reports "the app is not running"
+                            // rather than reaching a second, supervisor-less
+                            // instance.
+                            //
+                            // Best-effort, exactly like the state.db open and
+                            // the tray above: a control socket is how a
+                            // terminal drives this app, not how the app
+                            // works. A bind failure (a stale non-socket file
+                            // at the path, an over-long OPENVHOST_HOME, a
+                            // non-unix target) is logged and the GUI carries
+                            // on.
+                            //
+                            // `bind` deliberately returns a wrapper around a
+                            // STD listener: this closure is not running
+                            // inside a tokio runtime, and
+                            // `tokio::net::UnixListener::bind` panics there.
+                            // `serve` — spawned onto tauri's runtime below —
+                            // is what converts it. `std::future::pending()`
+                            // means "serve for the process lifetime": there
+                            // is no orderly-shutdown future to pass, because
+                            // `perform_quit` ends in `window.destroy()` and
+                            // the process exits; the next launch's `bind`
+                            // clears the stale socket (only after
+                            // `symlink_metadata` proves it IS one).
+                            match openvhost_proc::control::bind(&home) {
+                                Ok(listener) => {
+                                    let handler: Arc<
+                                        dyn openvhost_proc::control::ControlHandler,
+                                    > = Arc::new(control::DesktopHandler::new(
+                                        app.handle().clone(),
+                                        Arc::clone(&supervisor),
+                                    ));
+                                    tauri::async_runtime::spawn(
+                                        openvhost_proc::control::serve(
+                                            listener,
+                                            handler,
+                                            std::future::pending::<()>(),
+                                        ),
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "openvhost: control socket unavailable ({e}); the openvhost CLI cannot reach this instance"
+                                    );
+                                }
                             }
                             app.manage(supervisor);
                         }
