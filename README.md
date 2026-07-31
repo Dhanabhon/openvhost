@@ -52,7 +52,21 @@ cargo build --workspace && pnpm -C apps/desktop build   # build everything
 cargo test --workspace && pnpm -C apps/desktop test     # run tests
 cargo fmt --check && cargo clippy --workspace -- -D warnings   # lint gate
 ./scripts/dev.sh                                        # run the app (one command; installs deps on first run)
+pnpm -C apps/desktop tauri:bundle                       # build OpenVHost.app with the `openvhost` CLI inside it
 ```
+
+`tauri:bundle` is the only command that produces a distributable bundle. It
+passes `src-tauri/tauri.bundle.conf.json`, which adds `bundle.externalBin` and
+stages the CLI (`scripts/stage-cli-sidecar.sh`) so the bundler drops it at
+`OpenVHost.app/Contents/MacOS/openvhost`, beside the app binary — where the
+**Install Command Line Tool…** menu action looks for it.
+
+That `externalBin` entry deliberately lives in a **separate** config rather than
+in `tauri.conf.json`, because `tauri-build` acts on it from `build.rs` on *every*
+compile: in the base config a missing staged file fails `cargo build --workspace`
+outright, and a present one is copied over `target/debug/openvhost`, replacing the
+debug CLI that `apps/cli`'s tests run. Keeping it out of the base config keeps
+`cargo build`/`cargo test` untouched.
 
 ## Contributing
 

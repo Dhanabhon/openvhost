@@ -1,0 +1,9 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "build": {
+    "beforeBuildCommand": "pnpm build && pnpm stage:cli"
+  },
+  "bundle": {
+    "externalBin": ["../../../target/sidecar/openvhost"]
+  }
+}

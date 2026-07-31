@@ -34,12 +34,13 @@ mod exit;
 mod render;
 
 /// Internal fixture subcommand, intercepted before `clap` ever sees the
-/// arguments.
+/// arguments — **in debug builds only** (install design D7).
 ///
 /// The raw intercept is what guarantees its flags reach
 /// [`openvhost_proc::testchild::parse`] exactly as written rather than being
 /// reinterpreted by this binary's own global options. It is not declared to
 /// `clap` at all, which is also why it cannot appear in `--help`.
+#[cfg(debug_assertions)]
 const TESTCHILD: &str = "__testchild";
 
 fn main() -> ExitCode {
@@ -49,9 +50,7 @@ fn main() -> ExitCode {
         .skip(1)
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
-    if argv.first().map(String::as_str) == Some(TESTCHILD) {
-        run_testchild(&argv[1..]);
-    }
+    intercept_testchild(&argv);
     // Read off raw argv, because a usage error has to be reported before
     // parsing has succeeded and still has to be JSON when JSON was asked for.
     let wants_json = cli::json_requested(&argv);
@@ -62,7 +61,35 @@ fn main() -> ExitCode {
     ExitCode::from(run(&parsed).code())
 }
 
+/// Divert to the hidden fixture, if that is what was asked — debug builds only.
+///
+/// [`openvhost_proc::testchild`] exists to give the supervisor a deterministic
+/// child to drive. `--probe-state P` writes `P` and `P.pid`, `--http` binds a
+/// listener and `--spawn-child` re-execs this binary detached — all at the
+/// caller's direction, none of it confined. That is unremarkable for a binary
+/// living in `target/debug/`, and quite another thing once this slice symlinks
+/// the binary into a directory on the user's PATH, where anything it can do is
+/// a capability of the shipped tool. So a release build simply does not contain
+/// the intercept, and `__testchild` reaches `clap` as the unrecognised verb it
+/// should have been all along.
+///
+/// `debug_assertions` rather than `cfg(test)`, matching `demo_ticker_spec` in
+/// the desktop crate: the dev and test profiles share the flag, so the fixture
+/// stays available to `cargo test` and `tauri dev` — including to the demo
+/// ticker, which spawns exactly this — and disappears only from `--release`.
+#[cfg(debug_assertions)]
+fn intercept_testchild(argv: &[String]) {
+    if argv.first().map(String::as_str) == Some(TESTCHILD) {
+        run_testchild(&argv[1..]);
+    }
+}
+
+/// A release build has no fixture to divert to. See the debug counterpart.
+#[cfg(not(debug_assertions))]
+fn intercept_testchild(_argv: &[String]) {}
+
 /// Run the fixture child and exit; never returns to the CLI proper.
+#[cfg(debug_assertions)]
 fn run_testchild(args: &[String]) -> ! {
     match openvhost_proc::testchild::parse(args) {
         Ok(a) => std::process::exit(openvhost_proc::testchild::run(a)),

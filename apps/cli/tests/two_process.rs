@@ -714,22 +714,38 @@ fn help_and_version_exit_0_on_stdout() {
     }
 }
 
-/// Other crates spawn this binary as a supervised child fixture; breaking the
-/// intercept breaks them, and it must stay out of `--help`.
+/// The fixture is undeclared to `clap`, so it must never surface in `--help` —
+/// in **either** profile, for different reasons: a debug build intercepts it
+/// before `clap` is reached, and a release build does not have it at all
+/// (install design D7).
+///
+/// What the fixture *does* per profile is asserted in `tests/release_gate.rs`,
+/// against the real binary. It cannot be asserted here, because this file is
+/// only ever compiled in one profile at a time and the interesting claim is
+/// about the other one.
 #[test]
-fn the_testchild_fixture_still_runs_and_stays_hidden() {
+fn testchild_never_surfaces_in_help() {
     let home = new_home();
-    let out = openvhost(home.path(), &["__testchild", "--lines", "2", "--exit", "3"]);
-    assert_eq!(out.status.code(), Some(3));
-    assert_eq!(String::from_utf8(out.stdout).unwrap().lines().count(), 2);
-
-    let bad = openvhost(home.path(), &["__testchild", "--lines", "not-a-number"]);
-    assert_eq!(bad.status.code(), Some(64));
-
     let help = openvhost(home.path(), &["--help"]);
     assert!(
         !String::from_utf8(help.stdout)
             .unwrap()
             .contains("__testchild")
+    );
+}
+
+/// A debug build still parses the fixture's own flags rather than reinterpreting
+/// them, which is what the raw pre-`clap` intercept buys.
+#[cfg(debug_assertions)]
+#[test]
+fn the_fixture_reports_its_own_usage_errors() {
+    let home = new_home();
+    let bad = openvhost(home.path(), &["__testchild", "--lines", "not-a-number"]);
+    assert_eq!(bad.status.code(), Some(64));
+    assert!(
+        String::from_utf8(bad.stderr)
+            .unwrap()
+            .contains("--lines needs a number"),
+        "the fixture's parser, not clap's, should have reported this"
     );
 }
