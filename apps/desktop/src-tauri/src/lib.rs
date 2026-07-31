@@ -15,9 +15,9 @@ mod quit;
 // every target. Only the macOS stack BUILDER inside is `#[cfg]`-gated.
 mod stack;
 
-// The tray/menu-bar quick-controls slice (P1 tray design). `tray::model` is
-// Phase A: the pure menu model, not yet wired to a real tray — see its own
-// module docs.
+// The tray/menu-bar quick-controls slice (P1 tray design): the pure menu
+// model, the diff/apply logic, the real tray construction, and the shared
+// menu-event router — see its own module docs for the breakdown.
 mod tray;
 
 use std::ffi::OsString;
@@ -167,21 +167,14 @@ pub fn run() {
     }
 
     let app = builder
-        .on_menu_event(|app, event| {
-            if event.id() == quit::QUIT_MENU_ITEM_ID {
-                // Ask, don't quit — unless the UI has never acked (see
-                // `quit::UiReady`), in which case no dialog can appear and
-                // asking would make the app unquittable from its own menu.
-                if !quit::request_quit(app) {
-                    let handle = app.clone();
-                    tauri::async_runtime::spawn(async move {
-                        if let Err(e) = quit::perform_quit(&handle).await {
-                            eprintln!("openvhost: quit failed: {e}");
-                        }
-                    });
-                }
-            }
-        })
+        // `tray::handle_tray_menu_id` is the ONE router for every menu
+        // event this app receives (see its own doc comment for why a
+        // function named for the tray also handles the app-menu Quit
+        // click): it still special-cases `quit::QUIT_MENU_ITEM_ID` with
+        // exactly the ask-unless-never-acked logic this closure used to
+        // inline directly, and P1 tray design's real tray menu (built in
+        // `setup()` below) shares that same id for its own Quit row.
+        .on_menu_event(|app, event| tray::handle_tray_menu_id(app, event.id().as_ref()))
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 // Hide rather than quit (P1 tray design, spec D1): the app and
@@ -351,6 +344,24 @@ pub fn run() {
                                     }
                                 }
                             });
+                            // Best-effort, like the state.db open above: a
+                            // menu-bar tray is a quality-of-life feature, not
+                            // a boot-blocking one, so a failure here is
+                            // logged and the app continues without it rather
+                            // than aborting the whole bootstrap. Gated to
+                            // macOS only (P1 tray design, spec D10 — Windows
+                            // is out for this slice; see `tray`'s own module
+                            // docs for what a Windows-enablement slice still
+                            // needs to do). `Arc::clone`, not a move: `Db`
+                            // was NOT similarly needed again, but `supervisor`
+                            // itself is moved into `app.manage` on the very
+                            // next line.
+                            #[cfg(target_os = "macos")]
+                            if let Err(e) = tray::build(app.handle(), Arc::clone(&supervisor)) {
+                                eprintln!(
+                                    "openvhost: failed to build the tray icon ({e}); continuing without it"
+                                );
+                            }
                             app.manage(supervisor);
                         }
                         Ok(None) => {

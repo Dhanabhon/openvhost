@@ -13,7 +13,13 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# `tray-icon`: gates `tauri::tray`/the ability to build a real menu-bar tray
+# (P1 tray design). Off by default even with no other features listed —
+# `features = []` on a dependency still pulls in tauri's OWN default set,
+# but `tray-icon` is not one of tauri's defaults (verified against the
+# resolved tauri 2.11.5: `tray-icon = ["dep:tray-icon"]` is a plain,
+# non-default feature) — it must be named explicitly here.
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 serde.workspace = true

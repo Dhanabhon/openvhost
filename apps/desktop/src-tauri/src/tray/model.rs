@@ -70,6 +70,15 @@ pub enum Action {
 pub enum BulkState {
     #[default]
     Idle,
+    // Only ever constructed by this module's own tests today: `tray::build`
+    // (Phase B) always passes `Idle` because the real `BulkLock` that would
+    // ever observe `Busy` is a later task in this slice's plan (spec D7) —
+    // until it lands, nothing in production can hold the lock, so `Idle` is
+    // the only truthful value a real caller can pass, and rustc's dead-code
+    // analysis (correctly) sees no production path constructing this
+    // variant yet. Drop this `allow` the moment `BulkLock`'s `try_lock`
+    // probe lands and maps its "held" case to `Busy`.
+    #[allow(dead_code)]
     Busy,
 }
 
