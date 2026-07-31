@@ -673,6 +673,14 @@ mod tests {
         assert_eq!(prevented.load(Ordering::SeqCst), 0);
     }
 
+    /// VACUITY (neuter-and-watch-it-fail): temporarily reordered
+    /// `request_quit_with`'s body to `emit(); show(); focus();` (emit
+    /// first, the exact bug this function exists to prevent) — this test
+    /// failed, recording `["emit", "show", "focus"]` against the asserted
+    /// `["show", "focus", "emit"]`. A test that only checked "all three were
+    /// called" (e.g. three separate booleans) would have kept passing;
+    /// asserting the single ordered `Vec` is what makes order the thing
+    /// under test. Restoring the original order made it pass again.
     #[test]
     fn request_quit_with_shows_and_focuses_before_emitting() {
         let order: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
@@ -688,14 +696,6 @@ mod tests {
         assert_eq!(order.lock().unwrap().as_slice(), ["show", "focus", "emit"]);
     }
 
-    /// VACUITY (neuter-and-watch-it-fail): temporarily reordered
-    /// `request_quit_with`'s body to `emit(); show(); focus();` (emit
-    /// first, the exact bug this function exists to prevent) — this test
-    /// failed, recording `["emit", "show", "focus"]` against the asserted
-    /// `["show", "focus", "emit"]`. A test that only checked "all three were
-    /// called" (e.g. three separate booleans) would have kept passing;
-    /// asserting the single ordered `Vec` is what makes order the thing
-    /// under test. Restoring the original order made it pass again.
     #[test]
     fn request_quit_with_reports_the_emit_outcome() {
         assert!(request_quit_with(|| {}, || {}, || true));

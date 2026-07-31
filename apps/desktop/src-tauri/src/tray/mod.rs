@@ -253,11 +253,12 @@ pub fn handle_tray_menu_id<R: Runtime>(app: &AppHandle<R>, id: &str) {
 /// it, so even a start that fails instantly is still caught by the failure
 /// dialog.
 ///
-/// Forces a menu recompute the INSTANT the locks are acquired
-/// (`BulkState::Busy`) and again the instant they are released, rather than
-/// waiting for the next unrelated `StateChanged` to happen to recompute
-/// anyway — see [`refresh_tray_if_built`]'s own doc comment for why that
-/// matters.
+/// Forces a menu recompute the INSTANT the locks are acquired (the fresh
+/// probe inside that recompute reports `Busy`, since the locks are still
+/// held at that point) and again the instant they are released (now
+/// reporting `Idle`), rather than waiting for the next unrelated
+/// `StateChanged` to happen to recompute anyway — see
+/// [`refresh_tray_if_built`]'s own doc comment for why that matters.
 ///
 /// Requires `Arc<Supervisor>`/[`BulkLock`]/`ApplyLock`/[`TrayInitiated`] all
 /// to be managed; missing ANY of them is a silent no-op (mirrors every other
@@ -286,15 +287,14 @@ fn dispatch_start_all<R: Runtime>(app: &AppHandle<R>) {
         };
 
         let snapshot = sup.snapshot();
-        refresh_tray_if_built(&app, snapshot.clone(), BulkState::Busy);
+        refresh_tray_if_built(&app, snapshot.clone());
         service_control::start_all_with(&snapshot, |id| {
             tracked.mark(id);
             let _ = sup.start(id);
         });
 
         drop(_guards);
-        let bulk = probe_bulk_state(&app);
-        refresh_tray_if_built(&app, sup.snapshot(), bulk);
+        refresh_tray_if_built(&app, sup.snapshot());
     });
 }
 
@@ -332,7 +332,7 @@ fn dispatch_stop_all<R: Runtime>(app: &AppHandle<R>) {
             return;
         };
 
-        refresh_tray_if_built(&app, sup.snapshot(), BulkState::Busy);
+        refresh_tray_if_built(&app, sup.snapshot());
         let stragglers = crate::quit::stop_all(Arc::clone(&sup)).await;
         if !stragglers.is_empty() {
             eprintln!(
@@ -343,18 +343,17 @@ fn dispatch_stop_all<R: Runtime>(app: &AppHandle<R>) {
         }
 
         drop(_guards);
-        let bulk = probe_bulk_state(&app);
-        refresh_tray_if_built(&app, sup.snapshot(), bulk);
+        refresh_tray_if_built(&app, sup.snapshot());
     });
 }
 
-/// Recompute a [`TrayModel`] from `snapshot`/`bulk`, diff it against the
-/// last-applied model, and apply the result — all inside ONE
-/// `run_on_main_thread` dispatch (see [`build`]'s own doc comment, "critical
-/// mechanic"). A no-op, not a panic, when no real tray was built (non-macOS,
-/// spec D10 — or `build` itself failed and logged; see `lib.rs`'s
-/// `#[cfg(target_os = "macos")]` call site) — mirrors every other
-/// `try_state` read in this app.
+/// Recompute a [`TrayModel`] from `snapshot`/a freshly-probed [`BulkState`],
+/// diff it against the last-applied model, and apply the result — all
+/// inside ONE `run_on_main_thread` dispatch (see [`build`]'s own doc
+/// comment, "critical mechanic"). A no-op, not a panic, when no real tray
+/// was built (non-macOS, spec D10 — or `build` itself failed and logged;
+/// see `lib.rs`'s `#[cfg(target_os = "macos")]` call site) — mirrors every
+/// other `try_state` read in this app.
 ///
 /// Shared by the live event-subscriber loop in [`build`] and the bulk-action
 /// dispatch functions above (spec D7): a bulk action must show
@@ -364,18 +363,45 @@ fn dispatch_stop_all<R: Runtime>(app: &AppHandle<R>) {
 /// its whole 15s grace, so without this a Stop-all click would leave the
 /// menu looking idle-and-clickable for up to 15s before anything visibly
 /// changed.
-fn refresh_tray_if_built<R: Runtime>(
-    app: &AppHandle<R>,
-    snapshot: Vec<ServiceStatus>,
-    bulk: BulkState,
-) {
+///
+/// **`BulkState` is probed INSIDE the `run_on_main_thread` closure — at
+/// APPLY time, not at enqueue time.** It used to be probed by the caller and
+/// passed in, which left an enqueue-order race: a bulk-dispatch function
+/// (releasing its guards, probing `Idle`, then enqueueing) and this same
+/// event-subscriber loop (reacting to the state change the release itself
+/// produced, probing — typically `Busy`, since the release may not have
+/// happened yet — then enqueueing) can each enqueue their own closure around
+/// the same instant, and `run_on_main_thread`'s delivery order is not
+/// guaranteed to match either caller's probe-then-enqueue order. Whichever
+/// closure happened to carry the STALER pre-probed value could therefore
+/// apply LAST — and because a Stop-all's own final event is often the last
+/// event there is (nothing else necessarily follows to trigger a healing
+/// recompute), a stale `Busy` applying last could wedge both bulk rows
+/// disabled with nothing actually in flight. Probing fresh from INSIDE the
+/// closure means whichever one genuinely runs last reads the CURRENT lock
+/// state at that moment, so enqueue order stops mattering.
+///
+/// The `snapshot` parameter is NOT given the same treatment, deliberately:
+/// it is still captured once at the caller's enqueue time, not re-read
+/// inside the closure. That is fine as-is — an out-of-date `snapshot` only
+/// means the applied model is briefly behind current reality, and any
+/// service state that changed in the meantime is, by definition, a state
+/// change the supervisor separately broadcasts, which drives its own later
+/// call to this same function with a fresh snapshot that heals the
+/// discrepancy. `BulkState` has no equivalent follow-up event once a bulk
+/// action's own two calls (acquire, then release) are both enqueued — which
+/// is exactly why it, unlike `snapshot`, needed the fix above. Do not
+/// "fix" this half too.
+fn refresh_tray_if_built<R: Runtime>(app: &AppHandle<R>, snapshot: Vec<ServiceStatus>) {
     let Some(tray) = app
         .try_state::<Arc<TrayHandle<R>>>()
         .map(|t| Arc::clone(&t))
     else {
         return;
     };
+    let app_for_probe = app.clone();
     let _ = app.run_on_main_thread(move || {
+        let bulk = probe_bulk_state(&app_for_probe);
         let new_model = tray_model(&snapshot, bulk);
         let mut last = tray.last_model.lock().unwrap_or_else(|e| e.into_inner());
         apply(&last, &new_model, tray.as_ref());
@@ -394,6 +420,11 @@ fn refresh_tray_if_built<R: Runtime>(
 /// `Idle` when [`BulkLock`] is not even managed — mirrors every other
 /// `try_state` absent-state fallback in this app; there is nothing that
 /// could be holding a lock that was never created.
+///
+/// Called from exactly one place: INSIDE [`refresh_tray_if_built`]'s
+/// `run_on_main_thread` closure, never by that function's own callers — see
+/// its doc comment for why probing at apply time rather than enqueue time
+/// matters.
 fn probe_bulk_state<R: Runtime>(app: &AppHandle<R>) -> BulkState {
     match app.try_state::<BulkLock>() {
         Some(lock) if lock.inner().0.try_lock().is_ok() => BulkState::Idle,
@@ -590,25 +621,33 @@ impl<R: Runtime> TraySink for TrayHandle<R> {
             }
         }
 
-        let mut new_items: Vec<MenuItem<R>> = Vec::with_capacity(model.rows.len());
+        // `(id, item)` pairs built in the SAME loop/push as each other,
+        // deliberately, rather than collecting ids and items into two
+        // parallel `Vec`s and `zip`-ing them back together afterwards: if
+        // one `MenuItem::with_id` call in the middle fails and is skipped,
+        // a separately-collected id list stays the full length of
+        // `model.rows` while the item list comes up one short, so zipping
+        // them shifts every id/item pairing AFTER the failure by one
+        // position — a later row's label/enabled updates would then
+        // silently land on an earlier row's `MenuItem`. Pushing the pair
+        // together means a skipped item skips its own id too, so nothing
+        // downstream ever shifts.
+        let mut new_items: Vec<(String, MenuItem<R>)> = Vec::with_capacity(model.rows.len());
         for row in &model.rows {
             match MenuItem::with_id(&app, row.id.clone(), &row.label, row.enabled, None::<&str>) {
-                Ok(item) => new_items.push(item),
+                Ok(item) => new_items.push((row.id.clone(), item)),
                 Err(e) => eprintln!("openvhost: failed to build tray row {}: {e}", row.id),
             }
         }
-        let refs: Vec<&dyn IsMenuItem<R>> =
-            new_items.iter().map(|i| i as &dyn IsMenuItem<R>).collect();
+        let refs: Vec<&dyn IsMenuItem<R>> = new_items
+            .iter()
+            .map(|(_, item)| item as &dyn IsMenuItem<R>)
+            .collect();
         if let Err(e) = self.menu.insert_items(&refs, ROWS_START_INDEX) {
             eprintln!("openvhost: failed to insert refreshed tray rows: {e}");
         }
 
-        *rows = model
-            .rows
-            .iter()
-            .map(|r| r.id.clone())
-            .zip(new_items)
-            .collect();
+        *rows = new_items;
         drop(rows);
 
         self.set_summary(&model.summary);
@@ -781,8 +820,7 @@ pub fn build<R: Runtime>(app: &AppHandle<R>, supervisor: Arc<Supervisor>) -> tau
                 continue;
             }
             let snapshot = supervisor.snapshot();
-            let bulk = probe_bulk_state(&app_for_task);
-            refresh_tray_if_built(&app_for_task, snapshot, bulk);
+            refresh_tray_if_built(&app_for_task, snapshot);
         }
     });
 

@@ -110,6 +110,13 @@ Rust-testable, and the seams are chosen to maximise it:
 1. **Brand guideline §7.3 vs macOS reality — RESOLVED 2026-07-31: option (a), shape-coding.** §7.3 specified a system-tinted template bracket **with a colour-coded state dot** and called it the one place the mark's dot changes colour. Not achievable: `setTemplate(true)` draws the image as a **mask**, so all colour is discarded. The owner chose (a) — amend the guideline to shape-coding — over (b) funding native AppKit compositing at the cost of losing automatic menu-bar tinting. `docs/OPENVHOST_BRAND_GUIDELINES.md` §3.3 and §7.3 are amended on this branch with a dated note recording the constraint and the decision. Windows keeps the coloured dot (its tray icons are not template images).
 2. **Hide-on-close discoverability.** No first-run hint ships; the Dock icon is the macOS-conventional "still running" signal. If you want a one-time notice, it is a clean fast-follow (a flag in state.db).
 
+## Deferred follow-ups
+
+Named here so neither is rediscovered as a bug later — both are follow-ups to a rule this slice deliberately binds (D2/D3), not defects in that rule.
+
+- **Cancel-safe `Starting` / `ServiceState::Stopping`** (D3). `Supervisor::stop` on a service still coming up is queued until its readiness probe finishes; a disabled row is the honest rendering of that limitation today. See D3 for the full reasoning and the P0-3 consumer-contract line it cites.
+- **Stop-click inversion.** A click on a row rendered `Stop nginx — Running` after `nginx` has since crashed derives `Retry` — via D2's "staleness is closed by construction" rule, which always re-reads `Supervisor::snapshot()` and derives the action from the CURRENT state rather than the rendered label — and restarts a service the user meant to stop. The window is as long as the menu is held open. This is the current, deliberate behavior D2's re-derive-from-current-state rule binds, not a bug in it, so it is a design follow-up: a future fix could have the router consult `last_model` and no-op when the derived verb class differs from what was rendered, and a `Stopping` state (the item above) would shrink the window further on its own.
+
 ## Verification owed to a human (click-list)
 
 1. Tray icon appears; its glyph matches the stack's aggregate state.
@@ -117,7 +124,8 @@ Rust-testable, and the seams are chosen to maximise it:
 3. Dock click and tray "Open OpenVHost" both restore and focus the window.
 4. Toggle one service from the tray; the Services page agrees when reopened.
 5. Start all / Stop all with the window hidden; verify with `curl` and `pgrep`.
-6. Occupy port 80 externally, then tray-start nginx → the dialog shows the real stderr; dismissing it leaves the icon in the attention state and the row on `Retry`.
-7. Install a PHP major while the app runs → its row appears in the tray without a restart (the `Registered` event).
-8. ⌘Q while the window is hidden → the window shows and the confirmation appears (the `request_quit` fix); confirm → no `nginx`/`php-fpm`/`mysqld` survives.
-9. Dark and light menu bars: the icon is legible in both; Retina shows no blur.
+6. After Stop all completes and every row shows Stopped, confirm Start all re-enables without a further click — closes a rare enqueue-order race between the bulk dispatch and the event subscriber that could otherwise leave both bulk rows disabled with nothing actually in flight.
+7. Occupy port 80 externally, then tray-start nginx → the dialog shows the real stderr; dismissing it leaves the icon in the attention state and the row on `Retry`.
+8. Install a PHP major while the app runs → its row appears in the tray without a restart (the `Registered` event).
+9. ⌘Q while the window is hidden → the window shows and the confirmation appears (the `request_quit` fix); confirm → no `nginx`/`php-fpm`/`mysqld` survives.
+10. Dark and light menu bars: the icon is legible in both; Retina shows no blur.

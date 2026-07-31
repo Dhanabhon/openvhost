@@ -195,19 +195,41 @@ fn is_pending(state: &ServiceState) -> bool {
 /// - is NOT `demo-ticker` (spec D6/D8, regardless of its current state),
 /// - is in a terminal state (`Stopped` or `Failed` — anything already
 ///   `Starting`/`Running` needs no help getting there), and
-/// - is the FIRST service seen carrying its particular `endpoint` value.
+/// - is the FIRST TERMINAL service seen carrying its particular `endpoint`
+///   value, where an endpoint already held by some OTHER, non-terminal
+///   service (already `Starting`/`Running`) is excluded before this pass
+///   even begins — see the seeding step below.
 ///
-/// The last rule exists because every `mysql-<major>` declares the literal
-/// endpoint `127.0.0.1:3306` (verified: `stack.rs:171` says so explicitly)
-/// — starting two of them at once guarantees an "Address already in use"
-/// failure for the second. `php-fpm-<major>` rows do NOT collapse: each
-/// pool's endpoint is its own per-major unix-socket path, so two majors are
-/// two distinct endpoint values and both survive the filter. A `None`
-/// endpoint never collides with another `None` — the absence of an
-/// endpoint says nothing about address contention, so every no-endpoint
+/// The endpoint rule exists because every `mysql-<major>` declares the
+/// literal endpoint `127.0.0.1:3306` (verified: `stack.rs:171` says so
+/// explicitly) — starting two of them at once guarantees an "Address
+/// already in use" failure for the second, and starting one while another
+/// is already `Running`/`Starting` guarantees the identical failure, which
+/// is exactly the case the seeding step below exists to catch (a machine
+/// with one mysql major already up is the ordinary case "Start all" gets
+/// pressed into, not the exception). `php-fpm-<major>` rows do NOT
+/// collapse: each pool's endpoint is its own per-major unix-socket path, so
+/// two majors are two distinct endpoint values and both survive the filter.
+/// A `None` endpoint never collides with another `None` — the absence of
+/// an endpoint says nothing about address contention, so every no-endpoint
 /// service is kept independently rather than only the first one seen.
 pub fn bulk_start_ids(services: &[ServiceStatus]) -> Vec<String> {
-    let mut seen_endpoints: HashSet<&str> = HashSet::new();
+    // Seed with the endpoints already held by a service that is NOT
+    // terminal right now (i.e. `Starting` or `Running`) — a pass over ALL
+    // services, done BEFORE the selection pass below filters those same
+    // rows out. Filtering first and only recording endpoints from what
+    // survives would miss precisely the case that matters in practice:
+    // "Start all" pressed while part of the stack is already up. Without
+    // this seed, a Stopped/Failed sibling sharing a Running service's
+    // endpoint (e.g. another mysql major — see the doc comment above) would
+    // be the FIRST claimant `seen_endpoints` ever sees for that endpoint,
+    // and would be wrongly selected to start.
+    let mut seen_endpoints: HashSet<&str> = services
+        .iter()
+        .filter(|s| is_pending(&s.state))
+        .filter_map(|s| s.endpoint.as_deref())
+        .collect();
+
     services
         .iter()
         .filter(|s| s.id != DEMO_TICKER_ID)
@@ -421,6 +443,28 @@ mod tests {
             status("mysql-8.1", Some("127.0.0.1:3306"), ServiceState::Stopped),
         ];
         assert_eq!(bulk_start_ids(&services), vec!["mysql-8.4".to_string()]);
+    }
+
+    /// RED-first: fails against the pre-fix `bulk_start_ids`, which only
+    /// recorded an endpoint into `seen_endpoints` from services that had
+    /// already survived the `is_pending` filter — so a Running service's
+    /// endpoint was never recorded at all (it was filtered out first), and
+    /// a Stopped sibling sharing that same endpoint was wrongly treated as
+    /// the first-and-only claimant and selected to start. Every prior test
+    /// in this group only ever has both majors `Stopped`, which is exactly
+    /// why this blind spot survived them. Fixed by seeding `seen_endpoints`
+    /// with every NON-terminal service's endpoint before the selection pass
+    /// runs at all.
+    #[test]
+    fn a_stopped_mysql_major_is_not_started_while_another_running_major_holds_its_endpoint() {
+        let services = [
+            status("mysql-8.4", Some("127.0.0.1:3306"), ServiceState::Running),
+            status("mysql-8.1", Some("127.0.0.1:3306"), ServiceState::Stopped),
+        ];
+        assert!(
+            bulk_start_ids(&services).is_empty(),
+            "mysql-8.1 must not be selected: mysql-8.4 already holds 127.0.0.1:3306"
+        );
     }
 
     #[test]
