@@ -15,6 +15,11 @@ mod quit;
 // every target. Only the macOS stack BUILDER inside is `#[cfg]`-gated.
 mod stack;
 
+// The tray/menu-bar quick-controls slice (P1 tray design). `tray::model` is
+// Phase A: the pure menu model, not yet wired to a real tray — see its own
+// module docs.
+mod tray;
+
 use std::ffi::OsString;
 use std::sync::Arc;
 
