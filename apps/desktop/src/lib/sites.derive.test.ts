@@ -3,13 +3,16 @@ import { describe, expect, it } from 'vitest';
 import {
 	composeDomain,
 	defaultPhpVersion,
+	docrootRisk,
+	docrootWarningText,
 	enabledPill,
 	findMissingRuntimeSite,
 	phpVersionMissing,
 	phpVersionOptions,
 	scaffoldNotice,
 	scaffoldPreview,
-	splitDomain
+	splitDomain,
+	type DocrootRisk
 } from './sites.derive';
 import type { ScaffoldOutcomeDto, SiteDto } from './ipc';
 
@@ -179,6 +182,136 @@ describe('scaffoldNotice', () => {
 		expect(notice.role).toBe('alert');
 		expect(notice.text).toContain('hello');
 		expect(notice.text).toContain('Permission denied (os error 13)');
+	});
+});
+
+describe('docrootRisk', () => {
+	// The exact incident: ~/Downloads picked as the Project folder, checkbox left
+	// off. Every tier from spec D1, plus the near-miss cases the task calls out by
+	// name so a shape check that is one path segment too greedy (or too strict)
+	// gets caught immediately.
+	it('flags a well-known personal folder directly under home', () => {
+		expect(docrootRisk('/Users/tom/Downloads')).toEqual({
+			kind: 'personalFolder',
+			folder: 'Downloads'
+		});
+	});
+
+	it('flags a personal folder with a trailing slash the same way', () => {
+		expect(docrootRisk('/Users/tom/Downloads/')).toEqual({
+			kind: 'personalFolder',
+			folder: 'Downloads'
+		});
+	});
+
+	it('does NOT flag a real project folder one level inside Downloads', () => {
+		// The near-miss this whole feature must not false-positive on: a site
+		// legitimately rooted at a subfolder of Downloads is not the incident.
+		expect(docrootRisk('/Users/tom/Downloads/my-site')).toBeNull();
+	});
+
+	it('flags every well-known personal folder, not only Downloads', () => {
+		const folders = [
+			'Downloads',
+			'Desktop',
+			'Documents',
+			'Movies',
+			'Music',
+			'Pictures',
+			'Public',
+			'Library'
+		];
+		for (const folder of folders) {
+			expect(docrootRisk(`/Users/tom/${folder}`)).toEqual({ kind: 'personalFolder', folder });
+		}
+	});
+
+	it('does not flag an arbitrary folder under home that merely resembles one', () => {
+		expect(docrootRisk('/Users/tom/downloads')).toBeNull(); // wrong case
+		expect(docrootRisk('/Users/tom/Downloader')).toBeNull(); // similar name
+	});
+
+	it('flags the home directory itself', () => {
+		expect(docrootRisk('/Users/tom')).toEqual({ kind: 'homeItself' });
+	});
+
+	it('does NOT flag a real project folder directly under home', () => {
+		expect(docrootRisk('/Users/tom/Projects')).toBeNull();
+	});
+
+	it('flags home with a trailing slash the same way', () => {
+		expect(docrootRisk('/Users/tom/')).toEqual({ kind: 'homeItself' });
+	});
+
+	it('flags every listed system/shared root', () => {
+		const roots = [
+			'/',
+			'/Users',
+			'/Applications',
+			'/System',
+			'/Library',
+			'/Volumes',
+			'/tmp',
+			'/private',
+			'/etc',
+			'/usr',
+			'/var'
+		];
+		for (const root of roots) {
+			expect(docrootRisk(root)).toEqual({ kind: 'systemRoot', root });
+		}
+	});
+
+	it('flags a system root with a trailing slash the same way', () => {
+		expect(docrootRisk('/etc/')).toEqual({ kind: 'systemRoot', root: '/etc' });
+	});
+
+	it('does not flag a subfolder of a system root', () => {
+		// D1 lists these as specific paths, not prefixes — /etc/nginx is not a
+		// folder a user would ever pick as a project folder.
+		expect(docrootRisk('/etc/nginx')).toBeNull();
+	});
+
+	it('does not flag an ordinary project path', () => {
+		expect(docrootRisk('/Users/tom/Sites/my-app')).toBeNull();
+		expect(docrootRisk('/srv/www/hello')).toBeNull();
+	});
+
+	it('returns null for a blank or whitespace-only path, matching scaffoldPreview', () => {
+		expect(docrootRisk('')).toBeNull();
+		expect(docrootRisk('   ')).toBeNull();
+	});
+});
+
+describe('docrootWarningText', () => {
+	// Exhaustive over DocrootRisk's three variants (compile-time enforced by the
+	// helper's own never-typed default arm) — one assertion per variant proving
+	// the consequence copy and the fix copy, crossed with both modes to prove the
+	// fix text genuinely differs (create points at the checkbox, edit does not).
+	it('names the personal folder, states the consequence, and offers the checkbox fix in create mode', () => {
+		const risk: DocrootRisk = { kind: 'personalFolder', folder: 'Downloads' };
+		const text = docrootWarningText(risk, 'create');
+		expect(text).toContain('Downloads');
+		expect(text).toContain("reachable at this site's domain");
+		expect(text).toContain('.php');
+		expect(text).toContain('Create a site folder inside this folder');
+	});
+
+	it('offers the subfolder fix in edit mode instead of the checkbox', () => {
+		const risk: DocrootRisk = { kind: 'personalFolder', folder: 'Downloads' };
+		const text = docrootWarningText(risk, 'edit');
+		expect(text).toContain('subfolder');
+		expect(text).not.toContain('Create a site folder inside this folder');
+	});
+
+	it('names "home folder" for the homeItself tier', () => {
+		const text = docrootWarningText({ kind: 'homeItself' }, 'create');
+		expect(text).toContain('home folder');
+	});
+
+	it('names the actual root path for the systemRoot tier', () => {
+		const text = docrootWarningText({ kind: 'systemRoot', root: '/etc' }, 'edit');
+		expect(text).toContain('/etc');
 	});
 });
 
