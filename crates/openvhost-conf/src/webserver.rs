@@ -844,7 +844,10 @@ mod tests {
     // -- P1 live-log-viewer: per-site logs + a private, named access format --
     //
     // Spec D1 (site.conf.tera gains access_log/error_log) + D5 (log_format
-    // built on $uri, never $request/$args — the privacy guarantee).
+    // built on $request_path — the ORIGINAL, pre-rewrite path, never
+    // $uri/$request/$args — the privacy guarantee AND the attribution
+    // guarantee; see `the_log_format_uses_the_original_pre_rewrite_path_not_the_post_rewrite_uri`
+    // for why $uri itself was wrong here).
 
     #[test]
     fn main_config_declares_an_explicit_log_format_and_uses_it_for_the_global_access_log() {
@@ -854,7 +857,7 @@ mod tests {
             .find(|l| l.trim_start().starts_with("log_format "))
             .unwrap_or_else(|| panic!("no log_format line in:\n{c}"));
         assert!(log_format_line.contains(ACCESS_LOG_FORMAT_NAME));
-        assert!(log_format_line.contains("$uri"));
+        assert!(log_format_line.contains("$request_path"));
         assert!(log_format_line.contains("$request_method"));
         assert!(log_format_line.contains("$server_protocol"));
         assert!(log_format_line.contains("$status"));
@@ -876,9 +879,22 @@ mod tests {
     }
 
     /// Spec D5's privacy guarantee, asserted as an explicit ABSENCE — not
-    /// merely that `$uri` is present. This is the CLOSED set of nginx
-    /// variables that can expose the raw request line or the query string,
-    /// each considered deliberately rather than typed from memory:
+    /// merely that `$request_path` is present. **Scoped to the `log_format`
+    /// DIRECTIVE LINE specifically, not the whole rendered file**: the
+    /// guarantee this test pins is "the log_format directive must not
+    /// reference the full request line or the raw query", and
+    /// `$request_uri` now legitimately appears ELSEWHERE in the rendered
+    /// main config (the `map` that derives `$request_path` from it,
+    /// stripping its query string BEFORE the result ever reaches this
+    /// directive — see
+    /// `the_log_format_uses_the_original_pre_rewrite_path_not_the_post_rewrite_uri`
+    /// for why `$request_path` replaced `$uri` here) —
+    /// `request_uri_is_confined_to_the_one_map_that_strips_its_query_string`
+    /// is the complementary guarantee that the map is the ONLY place
+    /// `$request_uri` may appear anywhere in the file. This is the CLOSED
+    /// set of nginx variables that can expose the raw request line or the
+    /// query string if referenced directly from `log_format`, each
+    /// considered deliberately rather than typed from memory:
     /// - `$request` — the whole request line (bare-token checked below,
     ///   see why).
     /// - `$request_uri` — path + query string as originally received.
@@ -895,12 +911,13 @@ mod tests {
     ///   as the literal prefix `$arg_`, which cannot collide with any
     ///   wanted variable here (none contain that substring).
     ///
-    /// `$uri` never leaks a query string, by construction. `$request_method`
-    /// legitimately CONTAINS the substring `$request`, so a naive
-    /// `!contains("$request")` would reject the very field this format is
-    /// required to carry — `contains_bare_variable` checks `$request` as
-    /// its own token instead, so this assertion cannot vacuously pass by
-    /// rejecting a correct implementation.
+    /// `$request_path` never leaks a query string, by construction — it is
+    /// `$request_uri` with everything from the first `?` onward stripped by
+    /// the `map`. `$request_method` legitimately CONTAINS the substring
+    /// `$request`, so a naive `!contains("$request")` would reject the very
+    /// field this format is required to carry — `contains_bare_variable`
+    /// checks `$request` as its own token instead, so this assertion cannot
+    /// vacuously pass by rejecting a correct implementation.
     ///
     /// Considered and deliberately NOT included: `$http_referer` (a
     /// PREVIOUS page's URL, arriving via a request HEADER rather than this
@@ -932,6 +949,81 @@ mod tests {
                  {log_format_line:?}"
             );
         }
+    }
+
+    /// The complementary half of the guarantee above (review finding, P1
+    /// live-log-viewer): `$request_uri` DOES carry the raw query string
+    /// (spec D5's whole concern), so it is sanctioned in exactly ONE place
+    /// — the http-level `map` that strips everything from the first `?`
+    /// onward BEFORE the result (`$request_path`) ever reaches
+    /// `log_format`. Anywhere else in the rendered main config it is
+    /// exactly as forbidden as it would be inside `log_format` itself: this
+    /// is what stops a future edit from re-introducing the leak by reaching
+    /// for `$request_uri` in some OTHER directive (or a second,
+    /// differently-named map) whose result then flows into a log — a
+    /// mistake the log_format-scoped test above cannot see by construction,
+    /// since it only ever looks at one line.
+    #[test]
+    fn request_uri_is_confined_to_the_one_map_that_strips_its_query_string() {
+        let c = main_conf();
+        // Comment lines (this template explains the map right above it, in
+        // prose that names `$request_uri`) are not nginx directives and
+        // cannot influence what gets logged, so they are excluded here —
+        // the same `#`-skipping discipline `scope_of` above already applies
+        // when walking this same rendered output for a directive's scope.
+        let request_uri_lines: Vec<&str> = c
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .filter(|l| l.contains("$request_uri"))
+            .collect();
+        assert_eq!(
+            request_uri_lines.len(),
+            1,
+            "expected exactly ONE non-comment line referencing $request_uri (the \
+             map that strips its query string): {request_uri_lines:?}\nfull config:\n{c}"
+        );
+        assert!(
+            request_uri_lines[0].trim_start().starts_with("map "),
+            "the one sanctioned $request_uri reference must be the map directive \
+             that strips its query string before anything downstream (like \
+             log_format) can see it, got: {:?}",
+            request_uri_lines[0]
+        );
+    }
+
+    /// The behavioral property this whole fix exists for (review finding):
+    /// `site.conf.tera`'s front controller (`try_files $uri $uri/
+    /// /index.php$is_args$args;`) internally rewrites the request for
+    /// nearly every routed request on a Laravel/WordPress-shaped site, and
+    /// `$uri` is evaluated POST-rewrite/post-`try_files` — so a
+    /// `log_format` built on `$uri` logged `GET /index.php` for almost
+    /// everything, defeating the per-site attribution this whole slice
+    /// exists for. (Static files happened to still log correctly, since
+    /// they need no rewrite — which is how this slipped through the first
+    /// review.) `$request_path` is derived from the ORIGINAL, untouched
+    /// `$request_uri` (via the http-level `map`, with its query string
+    /// stripped), so it survives the rewrite and reflects what was
+    /// actually requested. Do not "simplify" this back to `$uri`.
+    #[test]
+    fn the_log_format_uses_the_original_pre_rewrite_path_not_the_post_rewrite_uri() {
+        let c = main_conf();
+        let log_format_line = c
+            .lines()
+            .find(|l| l.trim_start().starts_with("log_format "))
+            .unwrap_or_else(|| panic!("no log_format line in:\n{c}"));
+        assert!(
+            log_format_line.contains("$request_path"),
+            "log_format must reference $request_path (the original, pre-rewrite \
+             path) so a front-controller site's routed requests are attributable \
+             to what was actually requested, not always /index.php: \
+             {log_format_line:?}"
+        );
+        assert!(
+            !log_format_line.contains("$uri"),
+            "log_format must NOT reference $uri: it is evaluated POST-rewrite, so \
+             a front-controller site would log /index.php for nearly every \
+             request: {log_format_line:?}"
+        );
     }
 
     /// True when `haystack` contains `var` as its OWN nginx-variable token —

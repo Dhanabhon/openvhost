@@ -114,6 +114,23 @@ async fn generated_stack_passes_native_validators() {
         dump_out.contains("server_name myapp.localhost"),
         "nginx -T did not show the expanded site include:\n{dump_out}"
     );
+    // Live proof for the `map`/named-capture regex specifically (review
+    // finding, P1 live-log-viewer): `dump.status.success()` above already
+    // proves nginx accepted `map $request_uri $request_path { ~^(?<p>[^?]*)
+    // $p; }` as valid syntax -- a bad regex or an unsupported named-capture
+    // form is exactly the kind of error nginx -t/-T refuses, not one a unit
+    // test rendering a string could ever catch. This goes further and reads
+    // nginx's OWN resolved view back, so a map that parsed but silently
+    // bound the wrong variable (or was dropped) would still be caught.
+    assert!(
+        dump_out.contains("map $request_uri $request_path"),
+        "nginx -T did not show the map that derives $request_path from \
+         $request_uri:\n{dump_out}"
+    );
+    assert!(
+        dump_out.contains("$request_path"),
+        "nginx -T did not show log_format referencing $request_path:\n{dump_out}"
+    );
 }
 
 /// REAL-NGINX proof for condition (6) of `inspect`'s golden-rule-4 reading:
