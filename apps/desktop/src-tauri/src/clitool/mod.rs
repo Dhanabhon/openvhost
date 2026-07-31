@@ -169,9 +169,22 @@ pub enum InstallOutcome {
         dir: PathBuf,
         path_status: PathStatus,
     },
-    /// Something that is not ours occupies the path. **Nothing was written,
-    /// nothing was unlinked.** `what_is_there` describes the node; the
-    /// directory is `dir` and the exact path is [`installed_path`].
+    /// Something that is not ours occupies the path. **The occupant is
+    /// untouched** — no unlink, no rename, no truncation, left byte for byte
+    /// and inode for inode as it was.
+    ///
+    /// Stated as "the occupant", not as "nothing was written", because the
+    /// stronger phrasing is not quite true and this codebase has twice been
+    /// blocked over an invariant that read stronger than the code: [`install`]
+    /// stages a symlink under a temporary name in the directory *before* it
+    /// classifies the target — that creation is how writability is tested —
+    /// and removes it again on every exit path. So a refusal does briefly
+    /// write a name of its own. What holds, and what the user is owed, is that
+    /// the thing we refused to touch was not touched. [`install`]'s module doc
+    /// carries the same wording.
+    ///
+    /// `what_is_there` describes the node; the directory is `dir` and the
+    /// exact path is [`installed_path`].
     Refused { dir: PathBuf, what_is_there: String },
 }
 
@@ -378,12 +391,40 @@ pub fn report_for_error(error: &CliToolError) -> Report {
 
 /// The one actionable sentence per failure. Exhaustive over [`CliToolError`]
 /// — a new variant fails to compile here rather than silently rendering a
-/// dead end.
+/// dead end. The guarded [`CliToolError::SourceMissing`] arm below does not
+/// weaken that: the unguarded arm after it still covers the variant, so a new
+/// variant is as uncovered as it ever was.
 fn next_step(error: &CliToolError) -> &'static str {
     match error {
         // `current_exe` is recorded at exec time; a relaunch re-establishes
         // it. See `detect::source_binary`'s "moved while running" note.
         CliToolError::CurrentExe(_) => "Relaunch OpenVHost and try again.",
+        // The likeliest way a user ever sees `SourceMissing`, and the reason
+        // this arm exists: they drag `OpenVHost.app` to `/Applications` **while
+        // it is running**. `current_exe()` on macOS reports the path recorded
+        // at `exec` and does not track a move, so the sibling binary is
+        // "missing" from a bundle that is completely intact — and the fix is a
+        // relaunch, not a redownload. Sending that user to reinstall the app
+        // sends them off to repair something that is not broken.
+        //
+        // **The path cannot tell the two causes apart**, and nothing here
+        // tries to. A moved bundle and a genuinely incomplete one produce the
+        // same `…/X.app/Contents/MacOS/openvhost`; the only signal that would
+        // separate them is whether that directory still exists, and reading
+        // the filesystem here would make a deliberately pure renderer do I/O,
+        // race the very move it is describing, and still answer wrongly for an
+        // app dragged to the Trash. So both are covered in one message, with
+        // the action that fixes the common case first and the rarer one as the
+        // fallback.
+        //
+        // No `cargo build` hint: a packaged bundle has no cargo tree to build
+        // in, and a dev build is not in a `.app` (`tauri dev` runs the raw
+        // binary out of `target/debug`), so it lands in the arm below.
+        CliToolError::SourceMissing(path) if is_inside_app_bundle(path) => {
+            "Relaunch OpenVHost and try again — if the app was moved while it was running, \
+             it is still looking for its files where it started. If a relaunch does not \
+             help, reinstall OpenVHost: this copy is missing its command line binary."
+        }
         CliToolError::SourceMissing(_) => {
             "Reinstall OpenVHost — this copy is missing its command line binary. \
              In a development build, run: cargo build -p openvhost"
@@ -398,6 +439,29 @@ fn next_step(error: &CliToolError) -> &'static str {
             "Run the openvhost binary directly from where it is installed instead."
         }
     }
+}
+
+/// Does this path live inside a macOS application bundle — i.e. is any of its
+/// ancestors a `.app`?
+///
+/// **A copy decision, and never a security one.** It picks which sentence
+/// [`next_step`] shows and nothing else; it must never be used to decide
+/// whether a file may be touched.
+///
+/// Deliberately broader than `detect`'s own `.app` predicate, which asks for
+/// the exact `…/X.app/Contents/MacOS/openvhost` shape because it guards a
+/// `rename` over a user's file and a narrow answer is the safe one there. The
+/// question *here* is "are we running out of a bundle the user can drag?", and
+/// widening it can only ever offer a relaunch to someone a stricter shape
+/// check would have sent to redownload the app. Case-insensitive on the
+/// extension, matching `detect` and the volumes this runs on.
+///
+/// Lives here rather than in `detect` because it is compiled on every
+/// platform: `detect` is `#[cfg(unix)]`, and [`next_step`] is not.
+fn is_inside_app_bundle(path: &Path) -> bool {
+    path.ancestors()
+        .filter_map(Path::extension)
+        .any(|ext| ext.eq_ignore_ascii_case("app"))
 }
 
 // ---------------------------------------------------------------------------
@@ -826,12 +890,25 @@ mod tests {
     // the five `Display` strings differ on their own. Restoring it passed.
     // -----------------------------------------------------------------------
 
+    /// The packaged shape: a sibling missing from inside an application
+    /// bundle. Reached both by a moved-while-running app and by a genuinely
+    /// incomplete bundle.
+    const BUNDLED_SOURCE: &str = "/Applications/OpenVHost.app/Contents/MacOS/openvhost";
+    /// The unbundled shape: `tauri dev` runs the raw binary out of
+    /// `target/debug`, so a dev build never appears inside a `.app`.
+    const DEV_BUILD_SOURCE: &str = "/Users/tester/openvhost/target/debug/openvhost";
+
+    /// Every error the dialog can be handed — **shapes, not variants**.
+    ///
+    /// [`CliToolError::SourceMissing`] appears twice on purpose: inside a
+    /// `.app` bundle and outside one. They are one variant that deliberately
+    /// renders different advice, so a list of variants would leave the newer
+    /// of the two arms untested by everything below.
     fn every_error() -> Vec<CliToolError> {
         vec![
             CliToolError::CurrentExe("no such process".to_string()),
-            CliToolError::SourceMissing(PathBuf::from(
-                "/Applications/OpenVHost.app/Contents/MacOS/openvhost",
-            )),
+            CliToolError::SourceMissing(PathBuf::from(BUNDLED_SOURCE)),
+            CliToolError::SourceMissing(PathBuf::from(DEV_BUILD_SOURCE)),
             CliToolError::NoWritableDir("/usr/local/bin, /Users/tester/.local/bin".to_string()),
             CliToolError::Io {
                 op: "install",
@@ -874,6 +951,126 @@ mod tests {
             for b in reports.iter().skip(i + 1) {
                 assert_ne!(a, b, "two error variants render the same dialog");
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // group: a missing sibling inside a bundle is a MOVED app, not a broken
+    // download (F1, found by the live proof).
+    //
+    // The user drags OpenVHost.app to /Applications while it is running.
+    // `current_exe()` still names the old location, so `source_binary` refuses
+    // — correctly — and the copy used to send that user off to redownload a
+    // bundle that is perfectly fine.
+    //
+    // VACUITY (neuter-and-watch-it-fail): deleted the guarded `.app` arm from
+    // `next_step`, so both shapes fell through to the reinstall/cargo copy —
+    // the state this branch was in before the fix.
+    // `a_missing_binary_inside_an_app_bundle_leads_with_relaunching` FAILED on
+    // its first assertion ("the first thing a moved-app user reads..."), and
+    // `every_error_shape_offers_a_distinct_next_step` FAILED with "two error
+    // shapes offer the same way forward". Everything else in this file kept
+    // passing — including `every_error_variant_renders_a_distinct_message`,
+    // which cannot catch it: the two shapes carry different paths, so their
+    // `Display` lines differ no matter what advice follows. That is exactly
+    // why the distinctness assertion below is made over `next_step` itself
+    // rather than over the assembled `Report`.
+    // -----------------------------------------------------------------------
+
+    /// THE ONE THE LIVE PROOF FOUND: relaunching is the action that works, so
+    /// it is the first thing the user reads. The dev-build hint is dropped —
+    /// there is no cargo tree inside `/Applications`.
+    #[test]
+    fn a_missing_binary_inside_an_app_bundle_leads_with_relaunching() {
+        let advice = next_step(&CliToolError::SourceMissing(PathBuf::from(BUNDLED_SOURCE)));
+        assert!(
+            advice.starts_with("Relaunch"),
+            "the first thing a moved-app user reads must be the action that works: {advice}"
+        );
+        assert!(
+            advice.contains("moved"),
+            "the advice must say WHY a relaunch would help: {advice}"
+        );
+        assert!(
+            !advice.contains("cargo build"),
+            "a packaged bundle has no cargo tree to build in: {advice}"
+        );
+    }
+
+    /// The two causes are indistinguishable from the path alone (see
+    /// [`next_step`]), so the rarer one is carried in the same message rather
+    /// than dropped — after the relaunch, not before it.
+    #[test]
+    fn the_bundle_advice_still_offers_reinstalling_as_the_fallback() {
+        // Lowercased so ORDER is the thing under test and not capitalisation:
+        // searching for a capital "Reinstall" would make this fail for the
+        // wrong reason against copy that merely reworded the sentence.
+        let advice =
+            next_step(&CliToolError::SourceMissing(PathBuf::from(BUNDLED_SOURCE))).to_lowercase();
+        let reinstall = advice
+            .find("reinstall")
+            .unwrap_or_else(|| panic!("an incomplete bundle is still a real cause: {advice}"));
+        let relaunch = advice
+            .find("relaunch")
+            .unwrap_or_else(|| panic!("the relaunch advice is missing entirely: {advice}"));
+        assert!(relaunch < reinstall, "relaunch must come first: {advice}");
+    }
+
+    /// A dev build is not in a `.app`, and `cargo build -p openvhost` is the
+    /// whole answer there. Relaunching would fix nothing.
+    #[test]
+    fn a_missing_binary_outside_an_app_bundle_keeps_the_dev_build_hint() {
+        let advice = next_step(&CliToolError::SourceMissing(PathBuf::from(
+            DEV_BUILD_SOURCE,
+        )));
+        assert!(
+            advice.contains("cargo build -p openvhost"),
+            "the dev-build hint is the point of this arm: {advice}"
+        );
+        assert!(
+            !advice.starts_with("Relaunch"),
+            "a binary that was never built does not come back from a relaunch: {advice}"
+        );
+    }
+
+    /// The distinctness assertion at the level that can actually catch a
+    /// collapsed arm — `next_step` sees only the SHAPE of the path, so two
+    /// shapes rendering one sentence show up here and nowhere else.
+    #[test]
+    fn every_error_shape_offers_a_distinct_next_step() {
+        let advice: Vec<&str> = every_error().iter().map(next_step).collect();
+        assert_eq!(
+            advice.len(),
+            6,
+            "5 variants, one of them in two shapes — update this if an arm lands"
+        );
+        for (i, a) in advice.iter().enumerate() {
+            for b in advice.iter().skip(i + 1) {
+                assert_ne!(a, b, "two error shapes offer the same way forward");
+            }
+        }
+    }
+
+    /// The predicate behind the arm, pinned directly. Broader than `detect`'s
+    /// `.app` check on purpose — see [`is_inside_app_bundle`] — but not so
+    /// broad that a Cargo build directory or a `Contents/MacOS` outside a
+    /// bundle reads as one.
+    #[test]
+    fn only_a_path_under_a_dot_app_counts_as_a_bundle() {
+        for inside in [
+            BUNDLED_SOURCE,
+            "/Users/tester/Desktop/OpenVHost.APP/Contents/MacOS/openvhost",
+            "/Users/tester/openvhost/target/release/bundle/macos/OpenVHost.app/Contents/MacOS/openvhost",
+        ] {
+            assert!(is_inside_app_bundle(Path::new(inside)), "{inside}");
+        }
+        for outside in [
+            DEV_BUILD_SOURCE,
+            "/Users/tester/NotABundle/Contents/MacOS/openvhost",
+            "/Users/tester/My.App.Stuff/target/debug/openvhost",
+            "/usr/local/bin/openvhost",
+        ] {
+            assert!(!is_inside_app_bundle(Path::new(outside)), "{outside}");
         }
     }
 

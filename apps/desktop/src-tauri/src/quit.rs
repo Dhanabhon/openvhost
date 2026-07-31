@@ -493,10 +493,23 @@ static INSTALL_CLI_TOOL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 /// A claim on [`INSTALL_CLI_TOOL_IN_FLIGHT`], released on drop.
 ///
 /// `Drop` and not an explicit release call, for the same reason
-/// `clitool::install`'s staging link uses one: every exit path has to release
-/// it — the task finishing, the task being ABORTED (which is what a quit
-/// mid-install does: `perform_quit` drops the runtime's tasks), or a panic.
-/// An explicit call could only claim to cover the first.
+/// `clitool::install`'s staging link uses one: every way the run can end has
+/// to release it — the task finishing, the task's future being dropped before
+/// it finishes, or a panic. An explicit call could only claim to cover the
+/// first.
+///
+/// **Nothing aborts this task, and nothing here depends on anything doing
+/// so.** An earlier draft of this comment said a quit mid-install aborts it.
+/// It does not: [`perform_quit`] aborts the PHP install and only that one, via
+/// [`abort_pending_install`] on `InstallLock`, and there is no equivalent
+/// handle for this task — no `.abort()` call reaches it and no test claims
+/// one does. Harmless either way, and worth stating why rather than leaving a
+/// mechanism asserted that is not wired: `clitool::install` has exactly one
+/// `.await`, the login-shell probe, and it sits *after* all of the filesystem
+/// work — `place` is synchronous from staging through `rename`. So the most a
+/// quit can interrupt is a probe whose only product is the wording of a
+/// dialog, on a process that is exiting anyway. The `Drop` release is what
+/// carries this guard; an abort is not part of the argument.
 struct InFlight<'a>(&'a AtomicBool);
 
 impl<'a> InFlight<'a> {
@@ -1242,6 +1255,54 @@ mod tests {
         assert!(
             InFlight::claim(&flag).is_some(),
             "a panicking run left the row permanently disabled"
+        );
+    }
+
+    /// The third exit, and the one [`InFlight`]'s doc now leans on: the task's
+    /// future is DESTROYED part-way through, suspended at an await, without
+    /// ever finishing and without anything calling `.abort()` on it. That is a
+    /// genuinely different shape from the two above — both of those unwind a
+    /// stack that owns the guard directly, while this one drops a suspended
+    /// future that owns it *across* an await point, which is where a guard
+    /// released on a success path would survive and latch the menu row.
+    ///
+    /// The `pending()` stands in for the up-to-2s login-shell probe, which is
+    /// `clitool::install`'s only await and therefore the only place a run can
+    /// be suspended at all.
+    ///
+    /// VACUITY (neuter-and-watch-it-fail): emptied `InFlight`'s `Drop` body —
+    /// this failed on the final claim ("a dropped task left the row
+    /// disabled"). The `claimed` flag is what keeps it from passing
+    /// vacuously in the other direction: without it, a future that never got
+    /// far enough to claim anything would satisfy the final assertion for the
+    /// wrong reason.
+    #[tokio::test]
+    async fn a_task_dropped_before_it_finishes_releases_the_slot() {
+        let flag = AtomicBool::new(false);
+        let claimed = AtomicBool::new(false);
+
+        let task = async {
+            let _held = InFlight::claim(&flag).expect("the slot must start free");
+            claimed.store(true, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        };
+
+        // `timeout` polls the inner future first, so the claim above happens;
+        // when the timeout elapses, `.await` returning consumes and DROPS that
+        // half-run future — no abort involved, which is the point.
+        let outcome = tokio::time::timeout(Duration::from_millis(20), task).await;
+
+        assert!(
+            outcome.is_err(),
+            "the task was supposed to still be running"
+        );
+        assert!(
+            claimed.load(Ordering::SeqCst),
+            "the task never got as far as claiming the slot — nothing was under test"
+        );
+        assert!(
+            InFlight::claim(&flag).is_some(),
+            "a dropped task left the row permanently disabled"
         );
     }
 
