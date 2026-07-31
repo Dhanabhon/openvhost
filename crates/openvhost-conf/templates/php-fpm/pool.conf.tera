@@ -27,12 +27,25 @@ security.limit_extensions = .php
 ; pool's own error_log above, and no FastCGI stderr record for nginx to log
 ; either — proven live at the raw FastCGI-protocol level, bypassing nginx
 ; entirely (crates/openvhost-core/tests/site_logs_e2e.rs is the full-stack
-; version of the same proof). display_errors = Off closes the other half of
-; the same gap: without it, every uncaught error is dumped straight into the
-; HTTP response body — full file-system paths and a stack trace — visible to
-; any client that can reach 127.0.0.1:8080, the same disclosure class this
-; project already treats as a security concern for the phpinfo() catch-all
-; (security audit A1).
+; version of the same proof). display_errors defaulting to Off closes the
+; other half of the same gap: without it, every uncaught error is dumped
+; straight into the HTTP response body — full file-system paths and a stack
+; trace — visible to any client that can reach 127.0.0.1:8080, the same
+; disclosure class this project already treats as a security concern for
+; the phpinfo() catch-all (security audit A1).
+;
+; Security audit M1: log_errors stays php_admin_value — a script must not be
+; able to call ini_set('log_errors', 0) to go dark, since the log viewer's
+; usefulness depends on it. display_errors deliberately uses the WEAKER
+; php_value form instead: php_admin_value can only be set here (or in the
+; main php-fpm config) and can never be changed at runtime, so
+; ini_set('display_errors', 1) — the single most common PHP debugging
+; incantation — would silently return false and do nothing. The security
+; value of Off comes from it being the DEFAULT a script has to deliberately
+; opt out of, not from making it unoverridable: by the time a script calls
+; ini_set() at all it has already executed arbitrary PHP as this user, so
+; locking the directive buys nothing further and only costs debuggability.
+; Do not "harmonize" this with log_errors above — they differ on purpose.
 php_admin_value[log_errors] = On
-php_admin_value[display_errors] = Off
+php_value[display_errors] = Off
 include={{ custom_pool_glob }}

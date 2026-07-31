@@ -238,17 +238,17 @@ mod tests {
     /// P1 live-log-viewer design (Task 7 live-proof finding, 2026-07-31): a
     /// real php-fpm launched exactly as `stack.rs::php_fpm_spec` launches it
     /// (`-n`, no php.ini) leaves PHP's COMPILED-IN default for `log_errors`
-    /// in effect, which is `Off` — so without these two admin values, an
-    /// uncaught PHP fatal was captured NOWHERE: not this pool's own
-    /// `error_log`, and no FastCGI STDERR record for nginx to log either
-    /// (verified live at the raw FastCGI-protocol level, bypassing nginx
-    /// entirely — `crates/openvhost-core/tests/site_logs_e2e.rs` is the
-    /// slow, full-stack version of this same proof). `display_errors = Off`
-    /// is the other half: without it, every uncaught error is dumped
-    /// straight into the HTTP response body — full file-system paths and a
-    /// stack trace — visible to any client that can reach 127.0.0.1:8080,
-    /// the same disclosure class already treated as a security concern for
-    /// the phpinfo() catch-all (security audit A1).
+    /// in effect, which is `Off` — so without this, an uncaught PHP fatal
+    /// was captured NOWHERE: not this pool's own `error_log`, and no
+    /// FastCGI STDERR record for nginx to log either (verified live at the
+    /// raw FastCGI-protocol level, bypassing nginx entirely —
+    /// `crates/openvhost-core/tests/site_logs_e2e.rs` is the slow,
+    /// full-stack version of this same proof). `display_errors` defaulting
+    /// to `Off` is the other half: without it, every uncaught error is
+    /// dumped straight into the HTTP response body — full file-system paths
+    /// and a stack trace — visible to any client that can reach
+    /// 127.0.0.1:8080, the same disclosure class already treated as a
+    /// security concern for the phpinfo() catch-all (security audit A1).
     #[test]
     fn pool_config_captures_fatals_instead_of_only_disclosing_them_in_the_response_body() {
         let ctx = unix_ctx();
@@ -262,9 +262,52 @@ mod tests {
             "without this, a PHP fatal is captured in NO log — got:\n{c}"
         );
         assert!(
-            c.contains("php_admin_value[display_errors] = Off"),
+            c.contains("php_value[display_errors] = Off"),
             "without this, every uncaught error discloses full file-system paths and a stack \
              trace to any client on 127.0.0.1:8080 — got:\n{c}"
+        );
+    }
+
+    /// Security audit M1: `log_errors` and `display_errors` deliberately use
+    /// DIFFERENT directive forms, and this pins that they stay different.
+    ///
+    /// `php_admin_value` can only be set here (or in the main php-fpm
+    /// config) and can never be changed at runtime — not even by the script
+    /// itself. `log_errors` needs exactly that: the log viewer's usefulness
+    /// depends on a script not being able to call `ini_set('log_errors', 0)`
+    /// to go dark.
+    ///
+    /// `display_errors` must NOT be locked the same way. If it were
+    /// `php_admin_value`, `ini_set('display_errors', 1)` — the single most
+    /// common PHP debugging incantation — would silently return `false` and
+    /// do nothing, with no error or indication why. The security value of
+    /// defaulting `display_errors` to `Off` comes from it being the default
+    /// a script has to deliberately opt out of, not from making it
+    /// unoverridable: by the time a script calls `ini_set()` at all it has
+    /// already executed arbitrary PHP as this user, so locking the
+    /// directive buys nothing further and only costs debuggability. Do not
+    /// "harmonize" this with `log_errors` above — they differ on purpose.
+    #[test]
+    fn log_errors_is_admin_locked_but_display_errors_stays_overridable() {
+        let ctx = unix_ctx();
+        let c = PhpFpmRuntime
+            .generate_pool_config(&ctx.home, &ctx.php_major, &ctx.php_upstream)
+            .unwrap()
+            .unwrap()
+            .contents;
+        assert!(
+            c.contains("php_admin_value[log_errors] = On"),
+            "log_errors must stay admin-locked so a script cannot disable the log viewer's \
+             source of truth — got:\n{c}"
+        );
+        assert!(
+            c.contains("php_value[display_errors] = Off"),
+            "display_errors must use the overridable form (default Off, but ini_set() must \
+             still work) — got:\n{c}"
+        );
+        assert!(
+            !c.contains("php_admin_value[display_errors]"),
+            "display_errors must not ALSO carry an admin_value line — got:\n{c}"
         );
     }
 

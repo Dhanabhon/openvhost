@@ -126,10 +126,15 @@ fn provisioning_creates_a_brand_new_home_directory_at_0700() {
     assert_eq!(mode, 0o700);
 }
 
-/// P1 live-log-viewer design (spec D2/D5): `logs/sites` and `logs/services`
-/// are the two parent directories `site::apply::commit` creates a per-site
-/// or per-major directory under during an Apply, seeded here so they exist
-/// (and are already the right mode) before the first Apply ever runs.
+/// P1 live-log-viewer design (spec D2/D5), plus security audit L2: `logs`
+/// itself — parent of the GLOBAL nginx access+error logs, the aggregate of
+/// EVERY site's requests — and `logs/sites`/`logs/services`, the two parent
+/// directories `site::apply::commit` creates a per-site or per-major
+/// directory under during an Apply, are all seeded here so they exist (and
+/// are already the right mode) before the first Apply ever runs. `logs`
+/// itself used to come from a plain `create_dir_all` (ambient umask,
+/// typically 0755) instead of [`openvhost_core`]'s shared `ensure_log_dir`
+/// like its two children — this proves it no longer does.
 #[cfg(unix)]
 #[test]
 fn provisioning_seeds_the_log_parent_directories_at_0700() {
@@ -138,7 +143,7 @@ fn provisioning_seeds_the_log_parent_directories_at_0700() {
 
     provision_home(home.path()).unwrap();
 
-    for dir in ["logs/sites", "logs/services"] {
+    for dir in ["logs", "logs/sites", "logs/services"] {
         let path = home.path().join(dir);
         assert!(path.is_dir(), "{dir} must exist");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;

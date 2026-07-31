@@ -31,18 +31,22 @@
 //! pool config sent zero STDERR bytes for an uncaught fatal, and its own
 //! `error_log` file stayed empty; only the raw HTTP response body (via
 //! `display_errors`, On by default) showed anything. `pool.conf.tera` now
-//! sets `php_admin_value[log_errors] = On` and
-//! `php_admin_value[display_errors] = Off` (see that file's own comment and
-//! `phpruntime.rs`'s
+//! sets `php_admin_value[log_errors] = On` and `php_value[display_errors] =
+//! Off` (see that file's own comment and `phpruntime.rs`'s
 //! `pool_config_captures_fatals_instead_of_only_disclosing_them_in_the_response_body`
-//! for the fast unit-level regression) — the second directive also closes an
+//! /
+//! `log_errors_is_admin_locked_but_display_errors_stays_overridable` for the
+//! fast unit-level regressions) — the second directive also closes an
 //! information-disclosure gap (full file-system paths and a stack trace,
 //! visible to any client on 127.0.0.1:8080) of the same class already
 //! treated as a security concern for the phpinfo() catch-all (security audit
-//! A1). **This template change touches PHP error-disclosure behavior and has
-//! not had a security-auditor look — flagged for that review before this
-//! branch merges to main**, per this project's established pattern for
-//! exactly this class of change.
+//! A1). `display_errors` deliberately stays `php_value`, not
+//! `php_admin_value` like `log_errors`: the security win is the *default*
+//! (Off), not making it unmodifiable, and locking it would silently break
+//! `ini_set('display_errors', 1)` — the single most common PHP debugging
+//! call — for every script that opts in (security audit M1). This template
+//! change touched PHP error-disclosure behavior and has since had a
+//! security-auditor look (APPROVE).
 //!
 //! # Sibling of `site_apply_e2e.rs`, not an extension of it
 //!

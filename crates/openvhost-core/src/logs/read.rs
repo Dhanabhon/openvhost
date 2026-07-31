@@ -142,6 +142,20 @@ impl FileIdentity {
     }
 }
 
+/// Whether the identity `symlink_metadata` observed for `path` before
+/// opening it differs from the identity of the file that was actually
+/// opened (security audit L1). See the call site in [`read_window`] for why
+/// this check exists and what a mismatch means; see this module's own tests
+/// for why the check itself, rather than the race that motivates it, is
+/// what gets exercised deterministically.
+///
+/// On the `#[cfg(not(unix))]` [`FileIdentity::of`] fallback this can never
+/// observe a mismatch (every file reports the same trivial identity there)
+/// — a stated, not hidden, extension of that fallback's own limitation.
+fn identity_mismatch(pre_open: FileIdentity, opened: FileIdentity) -> bool {
+    pre_open != opened
+}
+
 /// A resume point for [`read_window`]: which file (by identity, not path)
 /// and how far into it.
 ///
@@ -344,7 +358,10 @@ fn fresh_tail_start(len: u64, query_active: bool, limits: &LogLimits) -> (u64, b
 /// [`CoreError::NotAPlainFile`] when `path` exists but is not a regular
 /// file (refused rather than followed — a symlink's target is never read).
 /// A `path` that does not exist at all is NOT an error: see
-/// [`LogWindow::exists`].
+/// [`LogWindow::exists`]. Nor is a same-UID swap of `path` between the
+/// initial check and the open that follows it (security audit L1) — this
+/// also reports as `exists: false` for that one call; see the
+/// `identity_mismatch` check inside this function's body for why.
 pub fn read_window(
     path: &Path,
     cursor: Option<LogCursor>,
@@ -376,6 +393,10 @@ pub fn read_window(
             found,
         });
     }
+    // Captured BEFORE `File::open` below, specifically so it can be compared
+    // against what actually got opened — see the mismatch check further
+    // down for why.
+    let pre_open_identity = FileIdentity::of(&meta);
 
     let mut file = match File::open(path) {
         Ok(file) => file,
@@ -400,6 +421,26 @@ pub fn read_window(
     })?;
     let len = file_meta.len();
     let identity = FileIdentity::of(&file_meta);
+
+    // Security audit L1: `symlink_metadata` above and `File::open` /
+    // `file.metadata()` here are separate syscalls, so a same-UID process
+    // could swap the file at `path` in between (rename a different file, or
+    // a hardlink to one, into place) and have this call read and return ITS
+    // contents under the caller's belief that it is reading `path`'s log.
+    // Comparing the identity the pre-open check saw against the identity of
+    // what actually got opened closes that window: on a mismatch, this call
+    // treats the poll the same way a file REMOVED between the check and the
+    // open already is, just above — a benign, errorless "nothing new right
+    // now" rather than trusting or returning unverified content. A genuine
+    // rotation landing inside this exact TOCTOU gap (distinct from, and much
+    // narrower than, the wider between-POLLS window `LogReset::Rotated`
+    // above already handles) costs at most one such benign poll: the very
+    // next call's own pre-open stat and open observe the same, by-then-
+    // stable file and proceed normally, with `cursor: None` again since
+    // `missing_window()` cleared it.
+    if identity_mismatch(pre_open_identity, identity) {
+        return Ok(missing_window());
+    }
 
     let (start, discard_leading_partial, reset) = match cursor {
         None => {
@@ -848,6 +889,43 @@ mod tests {
             }
             other => panic!("expected NotAPlainFile, got {other:?}"),
         }
+    }
+
+    // -- TOCTOU identity re-check (security audit L1) ---------------------
+    //
+    // The actual race this closes — the file at `path` getting swapped in
+    // the exact instant between `read_window`'s `symlink_metadata` check and
+    // its `File::open` — cannot be triggered deterministically from a test
+    // without adding a seam production code does not otherwise need (there
+    // is no hook to pause `read_window` between those two syscalls, and a
+    // background thread racing against it would be inherently flaky). What
+    // IS tested here, deterministically, is the comparison `read_window`
+    // bases its decision on: given the identity observed by the pre-open
+    // check and the identity of whatever actually got opened, this proves
+    // the mismatch branch is taken exactly when those identities differ, and
+    // not when they match — using two genuinely distinct real files, not
+    // hand-built structs, so the comparison is exercised the same way
+    // `read_window` exercises it. The race window itself is NOT directly
+    // exercised by this test; see `read_window`'s own comment at the call
+    // site for the reasoning that stands in its place.
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_mismatch_is_true_for_two_distinct_files_and_false_for_the_same_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.log");
+        let b = dir.path().join("b.log");
+        std::fs::write(&a, "a").unwrap();
+        std::fs::write(&b, "b").unwrap();
+        let ident_a = FileIdentity::of(&std::fs::symlink_metadata(&a).unwrap());
+        let ident_b = FileIdentity::of(&std::fs::symlink_metadata(&b).unwrap());
+        assert_ne!(
+            ident_a, ident_b,
+            "fixture must have two distinct identities for this test to prove anything"
+        );
+
+        assert!(identity_mismatch(ident_a, ident_b));
+        assert!(!identity_mismatch(ident_a, ident_a));
     }
 
     // -- Truncation of an over-long line -----------------------------------

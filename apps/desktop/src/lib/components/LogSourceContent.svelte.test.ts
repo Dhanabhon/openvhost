@@ -75,6 +75,21 @@ describe('LogSourceContent (spec D7: two mechanisms, deliberately)', () => {
 		expect(body).not.toContain('data-testid="log-state-error"');
 	});
 
+	// Security audit L3: `privacyNoteCopy()` used to render only via
+	// `LogToolbar` on the file-source branch — a ring source rendered
+	// `LogPane` with no toolbar and therefore no note at all, even though
+	// ring output (raw child stdout/stderr — mysqld/php-fpm startup noise)
+	// is at least as likely to carry a connection string as a file log.
+	it('renders the privacy note for a ring source too (spec D5: no false redaction promise)', () => {
+		const body = renderContent({
+			selected: { kind: 'serviceRing', id: 'mysql' },
+			ringLogs: [{ id: 'mysql', tsMs: 1, level: 'info', line: 'ready for connections' }]
+		});
+		expect(body).toContain('data-testid="log-privacy-note"');
+		expect(body).toMatch(/local/i);
+		expect(body).toMatch(/sensitive/i);
+	});
+
 	it('still renders the file toolbar/body/status-line for a file source, unchanged', () => {
 		const body = renderContent({ selected: { kind: 'nginxError' } });
 		expect(body).toContain('data-testid="log-filter"');
