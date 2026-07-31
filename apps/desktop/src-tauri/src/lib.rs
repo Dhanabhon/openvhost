@@ -166,7 +166,7 @@ pub fn run() {
         builder = builder.menu(quit::app_menu);
     }
 
-    let result = builder
+    let app = builder
         .on_menu_event(|app, event| {
             if event.id() == quit::QUIT_MENU_ITEM_ID {
                 // Ask, don't quit — unless the UI has never acked (see
@@ -184,12 +184,20 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                // Prevent only if the UI has acked that it is listening (see
-                // `quit::UiReady`). Before that, closing behaves exactly as it
-                // did before this feature rather than wedging on a dialog that
-                // will never render.
-                if quit::request_quit(window.app_handle()) {
-                    api.prevent_close();
+                // Hide rather than quit (P1 tray design, spec D1): the app and
+                // its services keep running; a Dock click or the tray's "Open
+                // OpenVHost" bring the window back via `RunEvent::Reopen`
+                // below. This never touches the webview — see
+                // `quit::hide_instead_of_close`'s docs for why that is the
+                // point. Only prevent the close if the hide actually
+                // succeeded: a failed hide must not trap the user in an app
+                // whose close button no longer works.
+                if let Err(e) =
+                    quit::hide_instead_of_close(|| window.hide(), || api.prevent_close())
+                {
+                    eprintln!(
+                        "openvhost: failed to hide the window ({e}); letting the close proceed"
+                    );
                 }
             }
         })
@@ -371,17 +379,103 @@ pub fn run() {
             }
             Ok(())
         })
-        .run(tauri::generate_context!());
-    if let Err(e) = result {
-        eprintln!("fatal: tauri failed to run: {e}");
-        std::process::exit(1);
-    }
+        .build(tauri::generate_context!())
+        .unwrap_or_else(|e| {
+            // Same fatal-error text and exit code the old `.run(ctx)` call
+            // used for its `Result` — `Builder::run` is documented as
+            // exactly `self.build(context)?.run(|_, _| {})`, so splitting it
+            // into `.build(ctx)?.run(closure)` moves this failure from
+            // `.run`'s Result to `.build`'s without changing what it means
+            // or how it is reported.
+            eprintln!("fatal: tauri failed to run: {e}");
+            std::process::exit(1);
+        });
+
+    // `.build(ctx)?.run(closure)` rather than `.run(ctx)`: this is what
+    // exposes `RunEvent`, needed for `Reopen` below (P1 tray design, spec
+    // D1) — `Builder::run` only ever calls `App::run(|_, _| {})`, a closure
+    // this crate cannot reach into.
+    // `_handle`/`_event`, not `handle`/`event`: the whole body below is
+    // `#[cfg(target_os = "macos")]`, so on every other target this closure
+    // has an empty body and both parameters go unused — the underscore
+    // prefix is what keeps that warning-free (it only suppresses the
+    // unused-variable lint; both names remain fully usable, and ARE used,
+    // in the macOS-only block).
+    app.run(|_handle, _event| {
+        // `RunEvent` is `#[non_exhaustive]` (verified in the resolved tauri
+        // 2.11.5, `app.rs:219`) and this app reacts to `Reopen` only — every
+        // other variant, present or future, is intentionally left alone,
+        // exactly the posture tauri's own `App::run` doc example takes.
+        //
+        // `#[cfg]` on this whole `if let` rather than on a `match` arm is
+        // deliberate, not cosmetic: `Reopen` itself only exists on macOS
+        // (gated the same way upstream), so a `match` with a
+        // `#[cfg(target_os = "macos")]` arm plus a wildcard would compile,
+        // on every OTHER target, down to a match with a single `_ => {}`
+        // arm — exactly the shape clippy's `match_single_binding` flags.
+        // This crate cannot verify a non-macOS clippy run from a macOS
+        // sandbox, so the body is structured to make that failure mode
+        // impossible rather than to hope the lint does not fire.
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen { .. } = _event
+            && let Some(window) = _handle.get_webview_window("main")
+        {
+            reopen_window(
+                || {
+                    let _ = window.show();
+                },
+                || {
+                    let _ = window.unminimize();
+                },
+                || {
+                    let _ = window.set_focus();
+                },
+            );
+        }
+    });
+}
+
+/// The window actions a Dock click or the tray's "Open OpenVHost" perform on
+/// [`tauri::RunEvent::Reopen`] (P1 tray design, spec D1): show, un-minimize,
+/// then focus, in that order, so a window that is merely hidden (the common
+/// case now that closing hides rather than quits) or one that was minimized
+/// before being hidden both end up visible, restored, and frontmost.
+///
+/// Takes closures rather than a real `WebviewWindow`, mirroring every other
+/// lifecycle decision in this app (see `quit::stop_all_with`'s doc comment):
+/// `tauri::test`'s mock window dispatcher stubs `is_visible`/`is_focused` to
+/// fixed values regardless of what is actually called on it (verified against
+/// the resolved tauri 2.11.5), so asserting window STATE after calling the
+/// real methods would pass or fail independent of this function. The ORDER —
+/// the part a future edit could accidentally shuffle or drop a call from — is
+/// what this split makes testable.
+///
+/// Each call is independent and best-effort: there is no confirmation to
+/// answer and nothing to abort if revealing the window does not fully
+/// succeed, so (mirroring `perform_quit`'s own straggler handling) a failure
+/// in one must not skip the other two.
+///
+/// `#[cfg(target_os = "macos")]`, matching its only call site above and
+/// `quit::app_menu`'s own precedent: `RunEvent::Reopen` exists only on macOS
+/// (upstream gates it the same way), so on every other target this function
+/// would otherwise be unused — dead code, an error under this workspace's
+/// `-D warnings` — outside of a test build's own separately-gated caller.
+#[cfg(target_os = "macos")]
+fn reopen_window(show: impl FnOnce(), unminimize: impl FnOnce(), focus: impl FnOnce()) {
+    show();
+    unminimize();
+    focus();
 }
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    // Only `reopen_window_shows_then_unminimizes_then_focuses` below needs
+    // this, and that test is itself `#[cfg(target_os = "macos")]` — gated
+    // identically here so the import is not flagged as unused elsewhere.
+    #[cfg(target_os = "macos")]
+    use std::sync::Mutex;
 
     /// Regenerate the committed TS bindings headlessly (no GUI needed):
     /// `cargo test -p openvhost-desktop export_bindings`.
@@ -393,5 +487,25 @@ mod tests {
                 "../src/lib/ipc/bindings.ts",
             )
             .expect("failed to export TS bindings");
+    }
+
+    /// VACUITY (neuter-and-watch-it-fail): temporarily reordered
+    /// `reopen_window`'s body to `focus(); show(); unminimize();` — this
+    /// test failed, recording `["focus", "show", "unminimize"]` against the
+    /// asserted `["show", "unminimize", "focus"]`. Restoring the original
+    /// order made it pass again.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reopen_window_shows_then_unminimizes_then_focuses() {
+        let order: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+        reopen_window(
+            || order.lock().expect("mutex poisoned").push("show"),
+            || order.lock().expect("mutex poisoned").push("unminimize"),
+            || order.lock().expect("mutex poisoned").push("focus"),
+        );
+        assert_eq!(
+            order.lock().expect("mutex poisoned").as_slice(),
+            ["show", "unminimize", "focus"]
+        );
     }
 }
