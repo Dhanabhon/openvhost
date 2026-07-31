@@ -308,6 +308,7 @@ export const events = {
 	serviceLogEvent: makeEvent<ServiceLogEvent>("service-log-event"),
 	serviceRegisteredEvent: makeEvent<ServiceRegisteredEvent>("service-registered-event"),
 	serviceStateEvent: makeEvent<ServiceStateEvent>("service-state-event"),
+	serviceUnregisteredEvent: makeEvent<ServiceUnregisteredEvent>("service-unregistered-event"),
 };
 
 /* Types */
@@ -768,6 +769,21 @@ export type ServiceStatus = {
 	endpoint: string | null,
 	pid: number | null,
 	state: ServiceState,
+};
+
+/**
+ *  Emitted when [`openvhost_proc::SupervisorEvent::Unregistered`] fires — a
+ *  service row was REMOVED (package-uninstall design
+ *  `2026-07-31-p1-pkg-uninstall-design.md` D4: uninstalling a PHP or MySQL
+ *  major must make its row leave the Services page and the tray without a
+ *  restart, not leave it behind failing).
+ * 
+ *  Carries the id alone, the mirror of [`ServiceRegisteredEvent`]'s full
+ *  status: the row is gone, so there is no state left to describe, and every
+ *  receiver's job is the same subtraction.
+ */
+export type ServiceUnregisteredEvent = {
+	id: string,
 };
 
 /**

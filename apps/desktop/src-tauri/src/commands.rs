@@ -140,6 +140,21 @@ pub struct ServiceRegisteredEvent {
     pub status: ServiceStatus,
 }
 
+/// Emitted when [`openvhost_proc::SupervisorEvent::Unregistered`] fires — a
+/// service row was REMOVED (package-uninstall design
+/// `2026-07-31-p1-pkg-uninstall-design.md` D4: uninstalling a PHP or MySQL
+/// major must make its row leave the Services page and the tray without a
+/// restart, not leave it behind failing).
+///
+/// Carries the id alone, the mirror of [`ServiceRegisteredEvent`]'s full
+/// status: the row is gone, so there is no state left to describe, and every
+/// receiver's job is the same subtraction.
+#[derive(Debug, Clone, serde::Serialize, specta::Type, tauri_specta::Event)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceUnregisteredEvent {
+    pub id: String,
+}
+
 // These four commands must stay `async fn`: Tauri dispatches async commands
 // onto its own tokio runtime, which is what gives `Supervisor::start`'s
 // internal `tokio::spawn` a valid reactor to spawn onto. A sync `#[tauri::

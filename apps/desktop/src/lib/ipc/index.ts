@@ -41,6 +41,7 @@ import type {
 	ServicesMemoryDto,
 	ServiceStateEvent,
 	ServiceStatus,
+	ServiceUnregisteredEvent,
 	SiteDto,
 	SiteInput,
 	ValidationReportDto,
@@ -88,6 +89,7 @@ export type {
 	ServicesMemoryDto,
 	ServiceStateEvent,
 	ServiceStatus,
+	ServiceUnregisteredEvent,
 	SiteDto,
 	SiteInput,
 	ValidationReportDto,
@@ -194,6 +196,22 @@ export async function onServiceRegistered(
 ): Promise<() => void> {
 	try {
 		return await events.serviceRegisteredEvent.listen((e) => cb(e.payload));
+	} catch (e) {
+		throw normalizeError(e);
+	}
+}
+
+/**
+ * Subscribe to `service-unregistered`, emitted when the supervisor FORGETS a
+ * row — an in-app uninstall of a PHP or MySQL major (package-uninstall design
+ * D4). Carries the id alone: the row is gone, so there is no status left to
+ * describe. Same `IpcError` contract as {@link onServiceState}.
+ */
+export async function onServiceUnregistered(
+	cb: (ev: ServiceUnregisteredEvent) => void
+): Promise<() => void> {
+	try {
+		return await events.serviceUnregisteredEvent.listen((e) => cb(e.payload));
 	} catch (e) {
 		throw normalizeError(e);
 	}

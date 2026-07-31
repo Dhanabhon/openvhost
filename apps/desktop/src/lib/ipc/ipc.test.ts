@@ -20,6 +20,7 @@ import {
 	listServices,
 	onPhpInstallLog,
 	onServiceRegistered,
+	onServiceUnregistered,
 	onServiceState,
 	pendingInstall,
 	phpEnvironment,
@@ -467,6 +468,46 @@ describe('onServiceRegistered', () => {
 	it('passes an IpcError-shaped rejection through unchanged', async () => {
 		listenMock.mockRejectedValueOnce({ kind: 'proc', message: 'supervisor gone' });
 		await expect(onServiceRegistered(() => {})).rejects.toEqual({
+			kind: 'proc',
+			message: 'supervisor gone'
+		});
+	});
+});
+
+// Task 1 of the package-uninstall slice (`SupervisorEvent::Unregistered`):
+// the IPC half of a row DISAPPEARING. Same contract as `onServiceRegistered`,
+// on its own channel, carrying the id alone — there is no status left to send.
+describe('onServiceUnregistered', () => {
+	beforeEach(() => listenMock.mockReset());
+
+	it('resolves to the unlisten function the transport returns', async () => {
+		const unlisten = vi.fn();
+		listenMock.mockResolvedValueOnce(unlisten);
+		await expect(onServiceUnregistered(() => {})).resolves.toBe(unlisten);
+		expect(listenMock).toHaveBeenCalledWith('service-unregistered-event', expect.any(Function));
+	});
+
+	it('delivers the removed id to the callback', async () => {
+		const seen: unknown[] = [];
+		listenMock.mockImplementationOnce(async (_name: string, cb: (e: unknown) => void) => {
+			cb({ event: 'service-unregistered-event', id: 1, payload: { id: 'php-fpm-8.3' } });
+			return vi.fn();
+		});
+		await onServiceUnregistered((ev) => seen.push(ev));
+		expect(seen).toEqual([{ id: 'php-fpm-8.3' }]);
+	});
+
+	it('normalizes a raw transport failure into a core-variant IpcError', async () => {
+		listenMock.mockRejectedValueOnce(new Error('event transport down'));
+		await expect(onServiceUnregistered(() => {})).rejects.toEqual({
+			kind: 'core',
+			message: 'Error: event transport down'
+		});
+	});
+
+	it('passes an IpcError-shaped rejection through unchanged', async () => {
+		listenMock.mockRejectedValueOnce({ kind: 'proc', message: 'supervisor gone' });
+		await expect(onServiceUnregistered(() => {})).rejects.toEqual({
 			kind: 'proc',
 			message: 'supervisor gone'
 		});

@@ -73,6 +73,19 @@ pub enum SupervisorEvent {
     /// service that was already live — only for a genuinely fresh or
     /// currently-idle (`Stopped`) row.
     Registered { status: ServiceStatus },
+    /// A service row was REMOVED — the mirror of [`SupervisorEvent::Registered`]
+    /// (package-uninstall design `2026-07-31-p1-pkg-uninstall-design.md` D4).
+    /// Emitted by [`crate::Supervisor::unregister`], which refuses unless the
+    /// service is in a terminal state, so an observer can treat this as
+    /// "nothing of ours is running under this id, and never will be again
+    /// unless it is registered afresh".
+    ///
+    /// Carries the id alone, not a [`ServiceStatus`]: the row it described no
+    /// longer exists, and handing out a status for a service the supervisor
+    /// has just forgotten would invite an observer to keep rendering it.
+    /// Every consumer's job here is subtraction — drop the row — which needs
+    /// nothing but the key.
+    Unregistered { id: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

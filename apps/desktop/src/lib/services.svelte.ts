@@ -171,6 +171,28 @@ export class ServicesStore {
 		this.services = next;
 	}
 
+	/**
+	 * React to an `Unregistered` event: the mirror of {@link applyRegistered},
+	 * and the only thing that SHRINKS the list. Uninstalling a PHP or MySQL
+	 * major removes its supervisor row (package-uninstall design D4); without
+	 * this the row would sit on the Services page — and in the titlebar's
+	 * "N running" count — until the next relaunch, offering Start for a binary
+	 * that is no longer installed.
+	 *
+	 * Silent for an id this store does not hold: the event is broadcast to
+	 * every subscriber, and a store whose first snapshot is still in flight
+	 * (or that loaded before the id ever existed) has nothing to drop. Filter
+	 * rather than index-and-splice, so a repeat event is idempotent for free.
+	 *
+	 * The log feed is deliberately NOT pruned. Spec D2 keeps a package's logs
+	 * on disk precisely because a user often uninstalls BECAUSE something
+	 * failed; erasing the lines already on screen at that moment would be the
+	 * same mistake in miniature.
+	 */
+	applyUnregistered(id: string): void {
+		this.services = this.services.filter((s) => s.id !== id);
+	}
+
 	applyLog(ev: ServiceLogEvent): void {
 		const next = [...this.logs, { id: ev.id, tsMs: ev.tsMs, level: ev.level, line: ev.line }];
 		this.logs = next.length > LOG_CAP ? next.slice(next.length - LOG_CAP) : next;
