@@ -79,11 +79,23 @@ impl RenderCtx {
         let php_major = php_major.into();
         let upstream_name = upstream_name.into();
 
-        if server_name.is_empty() || !server_name.bytes().all(valid_hostname_char) {
+        // The empty-label check (rejects `.`, `..`, `a..b`, `.a`, `a.`) is
+        // defense-in-depth, not reachable in production (the sole caller
+        // feeds an already-`Domain::parse`d string, which already excludes
+        // it) — see `rejects_a_server_name_with_an_empty_dot_separated_label`'s
+        // doc comment for why it matters here anyway: `server_name` is
+        // spliced into a WHOLE PATH COMPONENT (`webserver.rs`'s
+        // `site_log_dir`), where `..` climbs a directory level, not merely
+        // a filename suffix as it always used to be.
+        if server_name.is_empty()
+            || !server_name.bytes().all(valid_hostname_char)
+            || server_name.split('.').any(str::is_empty)
+        {
             return Err(ConfError::InvalidField {
                 field: "server_name",
                 value: server_name,
-                reason: "must be a non-empty [a-z0-9.-] hostname",
+                reason: "must be a non-empty [a-z0-9.-] hostname with no empty dot-separated \
+                         label",
             });
         }
         if !valid_component(&php_major) {
@@ -206,6 +218,39 @@ mod tests {
                 "php_x",
             );
             assert!(r.is_err(), "should reject server_name {bad:?}");
+        }
+    }
+
+    /// Defense-in-depth (review finding, P1 live-log-viewer): before that
+    /// slice `server_name` was only ever spliced in as a FILENAME SUFFIX
+    /// (`<server_name>.conf`, `<server_name>.d`); `webserver.rs`'s
+    /// `site_log_dir` now also makes it a WHOLE PATH COMPONENT for the
+    /// first time (`<home>/logs/sites/<server_name>/`), so an empty
+    /// dot-separated label — `.` or `..` — means something it never did
+    /// before: `..` climbs one directory level. Unreachable in production
+    /// today (the sole caller feeds an already-`Domain::parse`d string,
+    /// which already rejects empty labels — see `site::model::Domain`), but
+    /// this project's standing rule is that each layer confines on its own
+    /// rather than trusting its caller (the Site-newtype-permissiveness
+    /// carry-forward): `valid_hostname_char` admits `.` and this
+    /// constructor had no empty-label check, so `.`/`..` passed straight
+    /// through the charset check.
+    #[test]
+    fn rejects_a_server_name_with_an_empty_dot_separated_label() {
+        for bad in [".", "..", "...", "a..b", ".a", "a.", "..a.."] {
+            let r = RenderCtx::new(
+                PathBuf::from("/tmp/ovh"),
+                bad,
+                PathBuf::from("/tmp/ovh/www"),
+                "127.0.0.1:8080".parse().unwrap(),
+                "8.4",
+                PhpUpstream::UnixSocket(PathBuf::from("/tmp/ovh/run/php-fpm.sock")),
+                "php_x",
+            );
+            assert!(
+                r.is_err(),
+                "should reject server_name {bad:?} (empty dot-separated label)"
+            );
         }
     }
 

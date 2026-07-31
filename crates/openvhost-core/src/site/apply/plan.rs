@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 
 use openvhost_conf::GeneratedFile;
 
-use super::{ApplyError, ApplyInput, render_set};
+use crate::{LogPaths, PhpVersion};
+
+use super::{ApplyError, ApplyInput, PhpRuntime, is_servable, render_set};
+use crate::site::model::Site;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeKind {
@@ -33,9 +36,75 @@ pub struct FileChange {
 pub struct ApplyPlan {
     pub gen_root: PathBuf,
     pub main_conf: PathBuf,
+    /// Every log directory that must exist before `commit()` installs a
+    /// generated config pointing a validator (nginx/php-fpm) at a file
+    /// inside it (P1 live-log-viewer design, spec D2): one entry per
+    /// installed PHP runtime's per-major pool directory (`render_set`
+    /// renders a pool config for every INSTALLED major regardless of
+    /// whether any site currently uses it), plus one entry per SERVABLE
+    /// site's own directory ([`is_servable`] — the SAME predicate
+    /// `render_set` filters its site-config loop on, so a disabled site or
+    /// one on Apache, which gets no `access_log`/`error_log` directive in
+    /// the first place, gets no entry here either).
+    ///
+    /// This is the ONE mechanism the design always intended — it folds
+    /// together what were two narrower, independent interim fixes
+    /// (`ApplyPlan::php_fpm_log_dirs` from the php-fpm per-major log-path
+    /// change, `ApplyPlan::site_log_dirs` from the per-site nginx log
+    /// directives), each of which existed only to stop its own template
+    /// change from breaking every install the moment it shipped. `commit()`
+    /// creates every directory named here at mode `0700` (spec D5) before
+    /// installing any generated file or running validation.
+    ///
+    /// Computed purely (no I/O) by [`log_dirs`], so `plan()` stays
+    /// read-only — populating this field must never touch disk.
+    pub log_dirs: Vec<PathBuf>,
     /// Sorted by path. EMPTY means the disk already matches the sites — that
     /// is exactly the condition the banner hides on.
     pub changes: Vec<FileChange>,
+}
+
+/// See [`ApplyPlan::log_dirs`]. Pure path arithmetic — no I/O — so `plan()`
+/// stays read-only. Sorted for a deterministic result, mirroring `plan()`'s
+/// own `changes` ordering.
+///
+/// `PhpVersion::parse` is not expected to fail for an already-probed,
+/// already-installed runtime major; if it somehow does, this fails the whole
+/// plan rather than silently dropping that major's directory (and therefore
+/// its ability to start). `Domain` is already a validated newtype by the
+/// time a `Site` reaches this pipeline, so the site half has no equivalent
+/// parse step that could fail.
+fn log_dirs(home: &Path, php: &[PhpRuntime], sites: &[Site]) -> Result<Vec<PathBuf>, ApplyError> {
+    let paths = LogPaths::new(home);
+    let mut dirs: Vec<PathBuf> = php
+        .iter()
+        .map(|rt| {
+            let major = PhpVersion::parse(&rt.major)?;
+            let error_log = paths.php_fpm_error(&major);
+            error_log.parent().map(Path::to_path_buf).ok_or_else(|| {
+                // Structurally unreachable — `php_fpm_error` always nests at
+                // least `services/php-fpm-<major>/error.log` below `root`,
+                // so it always has a parent — but an honest error beats
+                // `unwrap`/`expect` for a case the compiler cannot itself
+                // rule out.
+                ApplyError::Io {
+                    op: "parent",
+                    path: error_log.clone(),
+                    source: std::io::Error::other(
+                        "LogPaths::php_fpm_error returned a path with no parent directory",
+                    ),
+                }
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    dirs.extend(
+        sites
+            .iter()
+            .filter(|s| is_servable(s))
+            .map(|s| paths.site_dir(&s.domain)),
+    );
+    dirs.sort();
+    Ok(dirs)
 }
 
 /// Read a generated-config path if it exists, refusing anything that is not a
@@ -255,6 +324,7 @@ pub fn plan(input: &ApplyInput) -> Result<ApplyPlan, ApplyError> {
     Ok(ApplyPlan {
         main_conf: gen_root.join("nginx/nginx.conf"),
         gen_root,
+        log_dirs: log_dirs(&input.home, &input.runtimes.php, &input.sites)?,
         changes,
     })
 }
@@ -508,6 +578,57 @@ mod tests {
         }
         // The file outside the generated tree must be completely untouched.
         assert!(outside.join("victim.conf").exists());
+    }
+
+    /// P1 live-log-viewer design, Task 4 (spec D2): `ApplyPlan::log_dirs`
+    /// folds together what were two narrower interim fixes landed
+    /// independently — one covering only the php-fpm per-major directories
+    /// (from moving `error_log` off a flat shared file), one covering only
+    /// per-site directories (from the new `access_log`/`error_log`
+    /// directives) — into the ONE mechanism the design always intended.
+    /// This test exercises BOTH sources in a single plan: every installed
+    /// PHP major contributes its pool directory, every SERVABLE site
+    /// contributes its own directory, and a disabled site contributes
+    /// nothing (it never gets an `access_log`/`error_log` directive from
+    /// `render_set` in the first place). `plan()` must stay read-only, so
+    /// none of these may exist on disk merely from calling it.
+    #[test]
+    fn log_dirs_cover_every_installed_major_and_every_servable_site_and_touch_no_disk() {
+        let home = tempfile::tempdir().unwrap();
+        let i = input_with_home(
+            home.path(),
+            vec![
+                site("app", "app.localhost", "8.4", true),
+                site("off", "off.localhost", "8.4", false),
+            ],
+            &["8.3", "8.4"],
+        );
+        let p = plan(&i).unwrap();
+
+        let paths = crate::LogPaths::new(home.path());
+        let php_dir = |major: &str| {
+            paths
+                .php_fpm_error(&crate::PhpVersion::parse(major).unwrap())
+                .parent()
+                .unwrap()
+                .to_path_buf()
+        };
+        let mut want = vec![
+            php_dir("8.3"),
+            php_dir("8.4"),
+            paths.site_dir(&crate::site::model::Domain::parse("app.localhost").unwrap()),
+        ];
+        want.sort();
+        let mut got = p.log_dirs.clone();
+        got.sort();
+        assert_eq!(
+            got, want,
+            "off.localhost is disabled and must not contribute a directory"
+        );
+
+        for dir in &p.log_dirs {
+            assert!(!dir.exists(), "{dir:?} must not be created by plan() alone");
+        }
     }
 
     #[test]

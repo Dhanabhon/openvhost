@@ -173,6 +173,59 @@ describe('the /services route', () => {
 		expect(railLink(body, 'Services').current).toBe(true);
 		expect(railLink(body, 'Sites').current).toBe(false);
 	});
+
+	// LogPane's v0 feed is seeded from `services[0]` (unchanged by task 6 —
+	// see logs.svelte.ts's file header for why the deeper "scoped to the
+	// selected service" part of spec D6 is deferred), so "Open in Logs"
+	// must link to THAT service's ring source, not an arbitrary one.
+	it("gives LogPane an Open in Logs link to the first service's ring source", () => {
+		servicesStore.services = [svc('nginx', 'running'), svc('php-fpm', 'stopped')];
+		const { body } = render(ServicesPage);
+		expect(body).toContain('href="/logs?source=service-ring%3Anginx"');
+		expect(body).toContain('>Open in Logs<');
+	});
+
+	it('omits Open in Logs when there is no service to link to', () => {
+		servicesStore.services = [];
+		const { body } = render(ServicesPage);
+		expect(body).not.toContain('>Open in Logs<');
+	});
+
+	// Spec D6: a FAILED service row gains "View logs" — deep-linking to its
+	// ring source (read via the existing service_log_tail/service-log path,
+	// spec D7, never read_log_window).
+	//
+	// `nginx` is listed FIRST and `mysql` (the failed one) SECOND on purpose:
+	// LogPane's OWN "Open in Logs" link (a different feature, this same
+	// task) points at `services[0]`, which would ALSO be `mysql` if it were
+	// first — and would then produce the identical href this test asserts,
+	// passing even if ServiceRow's own link were deleted entirely. An
+	// earlier version of this test did exactly that by accident (single-
+	// service fixture) and stayed green through a neuter-proof that removed
+	// the real link; see task-6-report.md.
+	it('gives a failed service row a View logs link to its ring source', () => {
+		servicesStore.services = [
+			svc('nginx', 'running'),
+			{
+				id: 'mysql',
+				displayName: 'mysql',
+				endpoint: null,
+				pid: null,
+				state: { kind: 'failed', exit: 1, stderrTail: ['bind: address already in use'] }
+			}
+		];
+		const { body } = render(ServicesPage);
+		const failDetail = body.match(/data-testid="failed-mysql"[\s\S]*?<\/div>\s*<\/div>/)?.[0];
+		expect(failDetail).toBeDefined();
+		expect(failDetail).toContain('href="/logs?source=service-ring%3Amysql"');
+		expect(failDetail).toContain('>View logs<');
+	});
+
+	it('does not offer View logs on a healthy row (no fail-detail at all)', () => {
+		servicesStore.services = [svc('nginx', 'running')];
+		const { body } = render(ServicesPage);
+		expect(body).not.toContain('>View logs<');
+	});
 });
 
 // `onMount` does not run under SSR, so this renders the page WITHOUT its

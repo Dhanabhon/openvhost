@@ -72,6 +72,21 @@ fn remove_if_exists(path: &Path) -> Result<(), ApplyError> {
 }
 
 pub fn commit(plan: &ApplyPlan) -> Result<(), ApplyError> {
+    // Ahead of writing any generated file that could point a validator
+    // (nginx -t / php-fpm -t) at one: see `ApplyPlan::log_dirs`'s doc
+    // comment for why. Mode `0700` (spec D5), via `logs::ensure_log_dir` —
+    // the same function `provision_home` and the desktop crate's
+    // `ensure_php_fpm_log_dir` use, so every log directory this app itself
+    // creates (as opposed to `openvhost-conf`'s validate()-only scratch
+    // dirs under a throwaway home — see that crate's module docs for why it
+    // cannot share this function) gets the identical mode.
+    for dir in &plan.log_dirs {
+        crate::logs::ensure_log_dir(dir).map_err(|source| ApplyError::Io {
+            op: "create_log_dir",
+            path: dir.clone(),
+            source,
+        })?;
+    }
     for c in &plan.changes {
         match c.kind {
             ChangeKind::Added | ChangeKind::Modified => {
@@ -309,6 +324,7 @@ mod tests {
         let plan = ApplyPlan {
             gen_root: home.path().join("config/generated"),
             main_conf: home.path().join("config/generated/nginx/nginx.conf"),
+            log_dirs: vec![],
             changes: vec![FileChange {
                 path: path.clone(),
                 kind: ChangeKind::Removed,
@@ -347,6 +363,227 @@ mod tests {
             leftovers.is_empty(),
             "temp files must not survive: {leftovers:?}"
         );
+    }
+
+    /// P1 live-log-viewer design (spec D2): without this, every install
+    /// breaks the moment php-fpm's `error_log` moves to a per-major
+    /// directory — see `ApplyPlan::log_dirs`'s doc comment. No site is
+    /// needed to reproduce it: the pool config is rendered for every
+    /// INSTALLED runtime regardless of whether a site uses it yet
+    /// (`render_set`), so an empty site list still exercises this.
+    #[test]
+    fn commit_creates_the_php_fpm_log_directory_before_anything_needs_it() {
+        let home = tempfile::tempdir().unwrap();
+        let i = input_with_home(home.path(), vec![], &["8.4"]);
+        commit(&make_plan(&i).unwrap()).unwrap();
+        let dir = crate::LogPaths::new(home.path())
+            .php_fpm_error(&crate::PhpVersion::parse("8.4").unwrap())
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        assert!(dir.is_dir(), "{dir:?} must exist after commit()");
+    }
+
+    /// P1 live-log-viewer design (spec D2): without this, every install with
+    /// at least one enabled nginx site breaks the moment the site config
+    /// starts rendering its own `access_log`/`error_log` — see
+    /// `ApplyPlan::log_dirs`'s doc comment.
+    #[test]
+    fn commit_creates_the_site_log_directory_before_anything_needs_it() {
+        let home = tempfile::tempdir().unwrap();
+        let i = input_with_home(
+            home.path(),
+            vec![site("app", "app.localhost", "8.4", true)],
+            &["8.4"],
+        );
+        commit(&make_plan(&i).unwrap()).unwrap();
+        let dir = crate::LogPaths::new(home.path())
+            .site_dir(&crate::site::model::Domain::parse("app.localhost").unwrap());
+        assert!(dir.is_dir(), "{dir:?} must exist after commit()");
+    }
+
+    /// A disabled site never gets an `access_log`/`error_log` directive
+    /// (`render_set`'s own `is_servable` filter), so `commit()` must not
+    /// create a log directory for it either — the directory's mere
+    /// existence would be a "not yet created" lie to a future log-viewer
+    /// reader for a site nginx never writes to.
+    #[test]
+    fn commit_does_not_create_a_log_directory_for_a_disabled_site() {
+        let home = tempfile::tempdir().unwrap();
+        let i = input_with_home(
+            home.path(),
+            vec![site("off", "off.localhost", "8.4", false)],
+            &["8.4"],
+        );
+        commit(&make_plan(&i).unwrap()).unwrap();
+        let dir = crate::LogPaths::new(home.path())
+            .site_dir(&crate::site::model::Domain::parse("off.localhost").unwrap());
+        assert!(
+            !dir.exists(),
+            "{dir:?} must not exist — off.localhost is disabled and render_set never gives it \
+             an access_log/error_log directive"
+        );
+    }
+
+    /// Spec D5: log directories are `0700`, not whatever the ambient umask
+    /// would otherwise give `create_dir_all`.
+    #[cfg(unix)]
+    #[test]
+    fn commit_creates_log_dirs_at_mode_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let i = input_with_home(
+            home.path(),
+            vec![site("app", "app.localhost", "8.4", true)],
+            &["8.4"],
+        );
+        let p = make_plan(&i).unwrap();
+        assert!(
+            !p.log_dirs.is_empty(),
+            "the fixture must exercise at least one log dir"
+        );
+        commit(&p).unwrap();
+
+        for dir in &p.log_dirs {
+            let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{dir:?} must be 0700 (spec D5), got {mode:o}");
+        }
+    }
+
+    /// Mirrors `demo_stack::lock_down_home`'s own "even when it already
+    /// existed looser" discipline: a directory left over from before this
+    /// mechanism existed (created at the ambient umask by an older app
+    /// version) must be TIGHTENED to `0700` the next time `commit()` runs,
+    /// not left alone merely because it already existed.
+    #[cfg(unix)]
+    #[test]
+    fn commit_tightens_a_pre_existing_log_dir_to_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let i = input_with_home(
+            home.path(),
+            vec![site("app", "app.localhost", "8.4", true)],
+            &["8.4"],
+        );
+        let p = make_plan(&i).unwrap();
+        for dir in &p.log_dirs {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        commit(&p).unwrap();
+
+        for dir in &p.log_dirs {
+            let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o700,
+                "{dir:?} pre-existed at a looser mode and must be tightened, not left alone"
+            );
+        }
+    }
+
+    /// Re-applying an unchanged plan must not fail merely because its log
+    /// directories already exist from the previous apply.
+    #[test]
+    fn committing_the_same_log_dirs_twice_is_a_harmless_no_op() {
+        let home = tempfile::tempdir().unwrap();
+        let i = input_with_home(
+            home.path(),
+            vec![site("app", "app.localhost", "8.4", true)],
+            &["8.4"],
+        );
+        commit(&make_plan(&i).unwrap()).unwrap();
+        let p = make_plan(&i).unwrap();
+
+        commit(&p).unwrap();
+
+        for dir in &p.log_dirs {
+            assert!(dir.is_dir());
+        }
+    }
+
+    /// THE ORDERING PROOF (spec D2): `commit()` must create every log
+    /// directory BEFORE `apply()` ever calls the validator. This stub
+    /// asserts every directory `plan()` named already exists at the moment
+    /// `validate()` runs — an assertion that can only hold if `commit()` ran
+    /// to completion first. `ConfigValidator::validate` receives only
+    /// `main_conf`, not the plan itself, so the expected directory list is
+    /// captured in the stub at construction time (from the SAME plan the
+    /// test hands to `apply()`), not re-derived independently.
+    struct AssertsLogDirsExistWhenCalled {
+        dirs: Vec<PathBuf>,
+    }
+    #[async_trait::async_trait]
+    impl ConfigValidator for AssertsLogDirsExistWhenCalled {
+        async fn validate(
+            &self,
+            _main: &Path,
+        ) -> Result<openvhost_conf::ValidationReport, ApplyError> {
+            for d in &self.dirs {
+                assert!(
+                    d.is_dir(),
+                    "{d:?} must already exist by the time validate() runs — commit() must \
+                     create log directories BEFORE validation, not after"
+                );
+            }
+            Ok(openvhost_conf::ValidationReport {
+                ok: true,
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_creates_log_dirs_before_validation_runs() {
+        let home = tempfile::tempdir().unwrap();
+        let i = input_with_home(
+            home.path(),
+            vec![site("app", "app.localhost", "8.4", true)],
+            &["8.4"],
+        );
+        let p = make_plan(&i).unwrap();
+        assert!(
+            !p.log_dirs.is_empty(),
+            "the fixture must exercise at least one log dir"
+        );
+        let validator = AssertsLogDirsExistWhenCalled {
+            dirs: p.log_dirs.clone(),
+        };
+
+        apply(&p, &validator).await.unwrap();
+    }
+
+    /// "Rollback with dirs already created is harmless" (spec D2):
+    /// `rollback()` only ever restores or removes FILES (`plan.changes`), so
+    /// a rejected apply must leave the log directories it already created in
+    /// place — an empty, unused directory is harmless, unlike a stranded
+    /// config file.
+    #[tokio::test]
+    async fn a_rejected_apply_leaves_log_dirs_in_place_harmlessly() {
+        let home = tempfile::tempdir().unwrap();
+        let i = input_with_home(
+            home.path(),
+            vec![site("app", "app.localhost", "8.4", true)],
+            &["8.4"],
+        );
+        let p = make_plan(&i).unwrap();
+        assert!(
+            !p.log_dirs.is_empty(),
+            "the fixture must exercise at least one log dir"
+        );
+
+        let err = apply(&p, &AlwaysRejects).await.unwrap_err();
+        assert!(matches!(err, ApplyError::ValidationFailed { .. }));
+
+        for dir in &p.log_dirs {
+            assert!(
+                dir.is_dir(),
+                "{dir:?} must still exist after a rejected apply — leaving a harmless empty \
+                 directory behind is the expected outcome, not an error"
+            );
+        }
     }
 
     #[cfg(unix)]

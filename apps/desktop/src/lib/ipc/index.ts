@@ -10,7 +10,15 @@ import type {
 	HomeUsageDto,
 	InstallOutcomeDto,
 	IpcError,
+	LogLevel,
 	LogLine,
+	LogResetDto,
+	LogRowDto,
+	LogSourceDto,
+	LogSourceKindDto,
+	LogSourceRowDto,
+	LogWindowDto,
+	LogWindowQuery,
 	MysqlConnectionProofDto,
 	MysqlDatadirStateDto,
 	MysqlEnvironmentDto,
@@ -48,7 +56,15 @@ export type {
 	HomeUsageDto,
 	InstallOutcomeDto,
 	IpcError,
+	LogLevel,
 	LogLine,
+	LogResetDto,
+	LogRowDto,
+	LogSourceDto,
+	LogSourceKindDto,
+	LogSourceRowDto,
+	LogWindowDto,
+	LogWindowQuery,
 	MysqlConnectionProofDto,
 	MysqlDatadirStateDto,
 	MysqlEnvironmentDto,
@@ -438,4 +454,36 @@ export async function resetMysqlRootPassword(major: string): Promise<MysqlResetO
  */
 export async function verifyMysqlConnection(major: string): Promise<MysqlConnectionProofDto> {
 	return unwrap(commands.verifyMysqlConnection(major));
+}
+
+/**
+ * The full log-source catalogue: nginx's two globals, one row per installed
+ * PHP major, an access/error pair per site, and one `"ring"` row per
+ * supervised service. `"ring"` rows are read through {@link serviceLogTail}/
+ * {@link onServiceLog}, never through {@link readLogWindow} — two
+ * mechanisms, deliberately (spec D7).
+ */
+export async function listLogSources(): Promise<LogSourceRowDto[]> {
+	return unwrap(commands.listLogSources());
+}
+
+/**
+ * A bounded, filtered window of one `"file"` log source. `query.cursor` is
+ * opaque — pass back exactly what a previous call returned in
+ * `LogWindowDto.cursor` to resume, or `null` for a fresh tail. Never call
+ * this with a `"ring"` source (see {@link listLogSources}); it is rejected
+ * server-side.
+ */
+export async function readLogWindow(query: LogWindowQuery): Promise<LogWindowDto> {
+	return unwrap(commands.readLogWindow(query));
+}
+
+/**
+ * Open the folder containing a log source's file(s) in the OS file manager
+ * — the user's one recourse against unbounded on-disk growth this slice
+ * ships without rotation. The path is derived entirely server-side; this
+ * only ever names a source.
+ */
+export async function revealLogFolder(source: LogSourceDto): Promise<void> {
+	await unwrap(commands.revealLogFolder(source));
 }

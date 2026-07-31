@@ -14,7 +14,25 @@ events {
 }
 
 http {
-    access_log "{{ access_log }}";
+    # $request_path = $request_uri (the ORIGINAL request URI, never
+    # rewritten) with everything from the first "?" onward stripped, so it
+    # is BOTH the actually-requested path (not the internal front-controller
+    # rewrite target site.conf.tera's `try_files $uri $uri/
+    # /index.php$is_args$args;` sends nearly every routed request to — $uri
+    # itself is evaluated POST-rewrite, which is why it is not used here)
+    # AND never carries a query string. This is the ONLY place
+    # $request_uri may appear in this file — see log_format below.
+    map $request_uri $request_path {
+        ~^(?<p>[^?]*)  $p;
+    }
+    # Explicit, named, and built on $request_path (never $uri/$request/$args)
+    # so a site's access log never carries a request's raw query string —
+    # $request/$args/$query_string/$arg_* would let a
+    # `?token=…`/`?api_key=…` reach a file the UI renders and users
+    # screenshot (P1 live-log-viewer design, spec D5).
+    # Site access logs (site.conf.tera) reference this SAME named format.
+    log_format {{ access_log_format }} '$remote_addr - [$time_local] "$request_method $request_path $server_protocol" $status $body_bytes_sent';
+    access_log "{{ access_log }}" {{ access_log_format }};
     client_max_body_size {{ client_max_body_size }};
     keepalive_timeout {{ keepalive_timeout }};
     tcp_nodelay {{ tcp_nodelay }};

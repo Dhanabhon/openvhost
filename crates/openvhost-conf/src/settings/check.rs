@@ -185,6 +185,10 @@ async fn check_in(
             source: e,
         })?;
     }
+    // `dir` is a fresh scratch directory (see `scratch_dir`'s doc comment),
+    // removed right after this check returns — scratch plumbing for
+    // `nginx -t`, not the live log path `openvhost_core::logs::LogPaths`
+    // owns, so it is not routed through it.
     let err_log = dir.join("logs/nginx.error.log");
     let report = crate::inspect::validate_live(bin, &main.path, &err_log).await?;
     Ok(if report.ok {

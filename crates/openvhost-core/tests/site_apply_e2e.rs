@@ -19,8 +19,8 @@ use openvhost_conf::{WebServerSettings, probe_php_fpm_version};
 use openvhost_core::platform::macos::demo_stack::{find_brew_binaries, provision_home};
 use openvhost_core::site::apply::LISTEN_PORT;
 use openvhost_core::{
-    ApplyInput, Docroot, Domain, InstalledRuntimes, NginxValidator, PhpRuntime, PhpVersion, Site,
-    SiteId, SiteName, WebServer, apply, plan,
+    ApplyInput, Docroot, Domain, InstalledRuntimes, LogPaths, NginxValidator, PhpRuntime,
+    PhpVersion, Site, SiteId, SiteName, WebServer, apply, plan,
 };
 
 /// Both nginx (`worker_processes 1`) and php-fpm (`pm = ondemand`) fork
@@ -176,7 +176,7 @@ async fn site_apply_serves_a_real_site_end_to_end() {
 
     let site_plan = plan(&input).unwrap_or_else(|e| panic!("plan() failed: {e}"));
     let main_conf = site_plan.main_conf.clone();
-    let err_log = home.path().join("logs/nginx.error.log");
+    let err_log = LogPaths::new(home.path()).nginx_error();
     let validator = NginxValidator {
         bin: brew.nginx.clone(),
         err_log: err_log.clone(),

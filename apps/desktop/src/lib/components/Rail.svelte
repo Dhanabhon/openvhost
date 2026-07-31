@@ -2,15 +2,18 @@
 <script lang="ts">
 	import { resolve } from '$app/paths';
 
-	// 'sites', 'services', 'web-server', 'languages' and 'databases' are real destinations. The
-	// union stays narrow on purpose — Logs/Settings join it once their own slices land.
+	// 'sites', 'services', 'web-server', 'languages', 'databases' and now 'logs' are real
+	// destinations. The union stays narrow on purpose — Settings joins it once its own slice
+	// lands.
 	//
 	// Defaults to 'sites' because Sites is what `/` renders: the app's landing page needs no
 	// `active` of its own, and an unset prop can only ever highlight the destination the user
 	// is most likely on. AppShell.svelte defaults the same way — change both together.
 	let {
 		active = 'sites'
-	}: { active?: 'services' | 'sites' | 'web-server' | 'languages' | 'databases' } = $props();
+	}: {
+		active?: 'services' | 'sites' | 'web-server' | 'languages' | 'databases' | 'logs';
+	} = $props();
 </script>
 
 <nav class="rail" aria-label="Main">
@@ -156,8 +159,11 @@
 		Databases
 	</a>
 
-	<!-- Logs: inert placeholder — full log-viewer redesign is slice B. -->
-	<span class="nav-item" aria-disabled="true">
+	<!-- Logs: its own `/logs` route (P1 live-log-viewer slice), after Databases — task brief
+	     order (every "what runtimes/services are managed" destination sits ahead of it; Logs
+	     answers "why did any of that fail", which only matters once something above it exists
+	     to investigate). -->
+	<a class="nav-item" href={resolve('/logs')} aria-current={active === 'logs' ? 'page' : undefined}>
 		<svg
 			width="18"
 			height="18"
@@ -171,7 +177,7 @@
 			<path d="M3 4.5h12M3 9h12M3 13.5h7" />
 		</svg>
 		Logs
-	</span>
+	</a>
 
 	<!-- Settings: inert placeholder — no settings content yet. -->
 	<span class="nav-item" aria-disabled="true">

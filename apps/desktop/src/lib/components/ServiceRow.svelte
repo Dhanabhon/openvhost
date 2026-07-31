@@ -1,6 +1,8 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <script lang="ts">
+	import { resolve } from '$app/paths';
 	import type { ServiceStatus } from '../ipc';
+	import { logSourceQuery } from '../logs.derive';
 	import Button from './Button.svelte';
 	import StatusPill from './StatusPill.svelte';
 
@@ -56,6 +58,23 @@
 					.exit}){/if}
 		</div>
 		<pre>{service.state.stderrTail.join('\n')}</pre>
+		<!-- Spec D6: a failed service row gains "View logs" — the ring source read live via
+		     the EXISTING service_log_tail/service-log path (spec D7), never read_log_window.
+		     A real link, not a Button: NAVIGATION to /logs?source=…, not an IPC action. -->
+		<div class="fail-actions">
+			<!-- eslint-plugin-svelte's `no-navigation-without-resolve` cannot see through a
+			     template literal combining a genuine `resolve(...)` call with a second
+			     interpolated expression (see SiteListRow.svelte's identical, longer note on
+			     this false positive, checked against the rule's own source). Block
+			     disable/enable, not `-next-line` — prettier may re-wrap this line. -->
+			<!-- eslint-disable svelte/no-navigation-without-resolve -->
+			<a
+				class="link"
+				href={`${resolve('/logs')}${logSourceQuery({ kind: 'serviceRing', id: service.id })}`}
+				>View logs</a
+			>
+			<!-- eslint-enable svelte/no-navigation-without-resolve -->
+		</div>
 	</div>
 {/if}
 
@@ -180,5 +199,24 @@
 		overflow-wrap: anywhere;
 		overflow-x: auto;
 		color: var(--vh-text);
+	}
+	.fail-actions {
+		margin-top: var(--vh-space-2);
+		display: flex;
+		gap: var(--vh-space-4);
+	}
+	/* mock.css's `.link` recipe (color/weight/hover-underline only) — this app's own
+	   tokens.css does not port `.link` as a global utility, so each component that needs it
+	   defines it locally, the same convention routes/+page.svelte's `.banner-info a` already
+	   follows. No focus-visible override needed: unlike `.btn-quiet`/`.input`, this link has
+	   no border of its own to double up with the global ring in tokens.css. */
+	.link {
+		color: var(--vh-link);
+		text-decoration: none;
+		font-weight: 500;
+		font-size: var(--vh-text-table);
+	}
+	.link:hover {
+		text-decoration: underline;
 	}
 </style>

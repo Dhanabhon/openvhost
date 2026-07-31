@@ -39,6 +39,14 @@ impl RingBuffer {
 
 /// v0 heuristic (spec §3): "ERROR" anywhere → Error; else "WARN" → Warn;
 /// else Info. Same rule for both streams.
+///
+/// Deliberately NOT unified with `openvhost_core::logs::read::classify_level`
+/// (P1 live-log-viewer design, spec D4): that one classifies FILE lines
+/// (nginx/php-fpm log text with no stream dimension), this one classifies
+/// RING lines and also knows which stream (`source`) a line came from. Two
+/// different input shapes, so two functions — this is the asymmetry spec
+/// D4 asks to have documented at both sites so nobody "unifies" them by
+/// accident.
 pub(crate) fn classify_level(_source: StreamSource, line: &str) -> LogLevel {
     if line.contains("ERROR") {
         LogLevel::Error

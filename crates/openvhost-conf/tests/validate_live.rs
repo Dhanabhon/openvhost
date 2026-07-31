@@ -58,6 +58,15 @@ fn materialize_with(ctx: &RenderCtx, settings: &WebServerSettings) -> std::path:
     for d in ["run", "run/nginx", "logs"] {
         std::fs::create_dir_all(ctx.home.join(d)).unwrap();
     }
+    // P1 live-log-viewer: the site config's `access_log`/`error_log` now
+    // point under `logs/sites/<domain>/` (mirroring `webserver.rs`'s own
+    // `NginxAdapter::validate`, which this helper otherwise stands in for —
+    // see the doc comment above). Literal, not a shared helper: this whole
+    // function already hardcodes the nginx-globals formula the same way
+    // (`ctx.home.join("logs/nginx.error.log")`, repeated at every call site
+    // below) — scratch plumbing for a throwaway validation home, not the
+    // live path `openvhost_core::logs::LogPaths` owns.
+    std::fs::create_dir_all(ctx.home.join("logs/sites").join(&ctx.server_name)).unwrap();
     main.path
 }
 
@@ -104,6 +113,23 @@ async fn generated_stack_passes_native_validators() {
     assert!(
         dump_out.contains("server_name myapp.localhost"),
         "nginx -T did not show the expanded site include:\n{dump_out}"
+    );
+    // Live proof for the `map`/named-capture regex specifically (review
+    // finding, P1 live-log-viewer): `dump.status.success()` above already
+    // proves nginx accepted `map $request_uri $request_path { ~^(?<p>[^?]*)
+    // $p; }` as valid syntax -- a bad regex or an unsupported named-capture
+    // form is exactly the kind of error nginx -t/-T refuses, not one a unit
+    // test rendering a string could ever catch. This goes further and reads
+    // nginx's OWN resolved view back, so a map that parsed but silently
+    // bound the wrong variable (or was dropped) would still be caught.
+    assert!(
+        dump_out.contains("map $request_uri $request_path"),
+        "nginx -T did not show the map that derives $request_path from \
+         $request_uri:\n{dump_out}"
+    );
+    assert!(
+        dump_out.contains("$request_path"),
+        "nginx -T did not show log_format referencing $request_path:\n{dump_out}"
     );
 }
 

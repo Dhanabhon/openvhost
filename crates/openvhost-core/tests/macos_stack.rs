@@ -28,7 +28,14 @@ fn short_home() -> tempfile::TempDir {
 fn provisioning_creates_the_directories_and_seeds_the_welcome_page() {
     let home = short_home();
     provision_home(home.path()).unwrap();
-    for dir in ["www", "run", "run/nginx", "logs"] {
+    for dir in [
+        "www",
+        "run",
+        "run/nginx",
+        "logs",
+        "logs/sites",
+        "logs/services",
+    ] {
         assert!(home.path().join(dir).is_dir(), "{dir} must exist");
     }
     let index = home.path().join("www/index.php");
@@ -117,4 +124,53 @@ fn provisioning_creates_a_brand_new_home_directory_at_0700() {
 
     let mode = std::fs::metadata(&home).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o700);
+}
+
+/// P1 live-log-viewer design (spec D2/D5), plus security audit L2: `logs`
+/// itself — parent of the GLOBAL nginx access+error logs, the aggregate of
+/// EVERY site's requests — and `logs/sites`/`logs/services`, the two parent
+/// directories `site::apply::commit` creates a per-site or per-major
+/// directory under during an Apply, are all seeded here so they exist (and
+/// are already the right mode) before the first Apply ever runs. `logs`
+/// itself used to come from a plain `create_dir_all` (ambient umask,
+/// typically 0755) instead of [`openvhost_core`]'s shared `ensure_log_dir`
+/// like its two children — this proves it no longer does.
+#[cfg(unix)]
+#[test]
+fn provisioning_seeds_the_log_parent_directories_at_0700() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = short_home();
+
+    provision_home(home.path()).unwrap();
+
+    for dir in ["logs", "logs/sites", "logs/services"] {
+        let path = home.path().join(dir);
+        assert!(path.is_dir(), "{dir} must exist");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{dir} must be 0700 (spec D5), got {mode:o}");
+    }
+}
+
+/// Mirrors `provisioning_locks_the_home_directory_to_0700_even_when_it_already_existed_looser`:
+/// an install that predates this seeding (or one that ran an Apply, which
+/// creates a per-site/per-major directory but never re-visits these two
+/// PARENTS) may have left one of these at whatever the ambient umask gave
+/// it. Provisioning again must tighten it, not leave it alone merely because
+/// it already existed.
+#[cfg(unix)]
+#[test]
+fn provisioning_tightens_a_pre_existing_log_parent_directory_to_0700() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = short_home();
+    let sites_dir = home.path().join("logs/sites");
+    std::fs::create_dir_all(&sites_dir).unwrap();
+    std::fs::set_permissions(&sites_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    provision_home(home.path()).unwrap();
+
+    let mode = std::fs::metadata(&sites_dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o700,
+        "logs/sites pre-existed at a looser mode and must be tightened, not left alone"
+    );
 }

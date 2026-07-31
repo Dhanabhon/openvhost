@@ -7,6 +7,13 @@
     server_name {{ server_name }};
     root "{{ docroot }}";
     index index.php index.html;
+    # Per-site, not the global nginx.access.log/nginx.error.log (P1
+    # live-log-viewer design, spec D1): overriding these in a server block
+    # replaces, rather than adds to, the http-level ones, so this site's
+    # lines land ONLY here — attributable to this site, not mixed with
+    # every other site's. Same named format main.conf.tera declares.
+    access_log "{{ access_log }}" {{ access_log_format }};
+    error_log "{{ error_log }}" warn;
 
     location / {
         try_files $uri $uri/ /index.php$is_args$args;

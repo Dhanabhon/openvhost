@@ -154,3 +154,30 @@ describe('SiteListRow actions', () => {
 		expect(badge).toBeGreaterThan(label);
 	});
 });
+
+// Spec D6: every site row (not only a "broken" one — SiteDto carries no
+// state to be broken) gains a "View logs" deep link, defaulting to the
+// site's ERROR log (the live-proof entry point).
+describe('SiteListRow View logs deep link', () => {
+	it('links to /logs with the site error log preselected', () => {
+		const html = rowHtml(site(true));
+		expect(html).toContain('href="/logs?source=site-error%3Ashop.localhost"');
+	});
+
+	it('names the site, not just "View logs" — the icon has no other text', () => {
+		const html = rowHtml(site(true));
+		expect(html).toContain('aria-label="View logs for shop"');
+		expect(html).toContain('title="View logs for shop.localhost"');
+	});
+
+	it('stays reachable even when the site is disabled, unlike Open', () => {
+		const html = rowHtml(site(false));
+		const link = html.match(/<a[^>]*aria-label="View logs for shop"[^>]*>/)?.[0];
+		expect(link).not.toContain('disabled');
+	});
+
+	it('is a real navigation link, not a button pretending to be one', () => {
+		const html = rowHtml(site(true));
+		expect(html).toMatch(/<a[^>]*aria-label="View logs for shop"/);
+	});
+});
