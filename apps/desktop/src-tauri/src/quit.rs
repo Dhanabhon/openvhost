@@ -69,6 +69,7 @@ use std::time::Duration;
 use openvhost_proc::{ServiceState, Supervisor};
 use tauri::menu::{AboutMetadata, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::{AppHandle, Manager, Runtime};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 // `tauri_specta::Event`, not `tauri::Emitter`: the emit method on a
 // `#[derive(tauri_specta::Event)]` type comes from this trait, and it is what
 // keeps the event name in sync with the generated TS binding.
@@ -77,6 +78,17 @@ use tauri_specta::Event as _;
 /// Menu-item id for the substituted Quit. Namespaced so it cannot collide with a
 /// predefined item's generated id.
 pub const QUIT_MENU_ITEM_ID: &str = "openvhost:quit";
+
+/// Menu-item id for the app menu's **Install Command Line Tool…** row (P1
+/// CLI-install design D6).
+///
+/// Distinct from every other id in this app, and that is a correctness
+/// requirement rather than tidiness: muda's menu events are GLOBAL — there is
+/// one listener list for the whole process, which is why `tray::handle_tray_menu_id`
+/// receives this app-menu row's clicks at all — so a colliding id would run
+/// two actions from one click. Pinned by
+/// `the_install_row_id_collides_with_nothing_else_this_app_dispatches`.
+pub const INSTALL_CLI_TOOL_MENU_ITEM_ID: &str = "openvhost:install-cli-tool";
 
 /// How long [`stop_all_with`] waits for services to actually reach a stopped
 /// state before giving up on the stragglers.
@@ -448,6 +460,163 @@ pub async fn abort_pending_install<R: Runtime>(app: &AppHandle<R>) -> bool {
     .await
 }
 
+// ---------------------------------------------------------------------------
+// **Install Command Line Tool…** (P1 CLI-install design, D5/D6).
+//
+// Lives here, next to [`app_menu`] which builds the row, for the same reason
+// [`QUIT_MENU_ITEM_ID`] does: the app menu is this module's. The click reaches
+// it through `tray::handle_tray_menu_id`, the app's ONE menu-event listener —
+// see that function's doc comment for why a function named for the tray also
+// routes app-menu rows.
+//
+// **No new Tauri command and no `capabilities/*.json` change.** The handler
+// calls `crate::clitool` directly, exactly as the tray's handlers call
+// `service_control`. The webview gets no new surface.
+// ---------------------------------------------------------------------------
+
+/// Whether an install started from the menu is still running.
+///
+/// The action is not instantaneous: the D4 login-shell probe alone is bounded
+/// at 2s, so a user can comfortably click the row a second time before the
+/// first click has produced a dialog. `install()` itself is safe to run
+/// concurrently — the CLI-install slice proved eight racing placements
+/// converge on one link with no residue — so this is not about the
+/// filesystem. It is about not stacking a second modal alert, and not
+/// spawning a second login shell, for one intent.
+///
+/// **Reject, never queue**, the same posture the tray's `BulkLock` takes for
+/// Start-all/Stop-all. A process-wide `static` rather than managed state:
+/// there is one app per process and one such row, and a `static` needs no
+/// `lib.rs` registration, so it has no "not managed yet" arm to get wrong.
+static INSTALL_CLI_TOOL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// A claim on [`INSTALL_CLI_TOOL_IN_FLIGHT`], released on drop.
+///
+/// `Drop` and not an explicit release call, for the same reason
+/// `clitool::install`'s staging link uses one: every exit path has to release
+/// it — the task finishing, the task being ABORTED (which is what a quit
+/// mid-install does: `perform_quit` drops the runtime's tasks), or a panic.
+/// An explicit call could only claim to cover the first.
+struct InFlight<'a>(&'a AtomicBool);
+
+impl<'a> InFlight<'a> {
+    /// Claim the slot, or `None` if something already holds it.
+    ///
+    /// Written as an `if`, and **not** as
+    /// `….is_ok().then_some(InFlight(flag))`, which is what this was first:
+    /// `bool::then_some` evaluates its argument EAGERLY, so a REJECTED claim
+    /// still constructed an `InFlight` and immediately dropped it — and this
+    /// guard releases the flag in `Drop`. The rejected second click would
+    /// therefore have handed the slot away from the first click that
+    /// legitimately held it, so a third click would be admitted and the
+    /// rejection would work exactly once. Caught by
+    /// `a_second_click_is_rejected_while_the_first_install_is_still_running`'s
+    /// third-claim assertion. `bool::then` (lazy) would also be correct; the
+    /// `if` is spelled out because the failure it avoids is invisible in the
+    /// combinator.
+    fn claim(flag: &'a AtomicBool) -> Option<InFlight<'a>> {
+        if flag
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            Some(InFlight(flag))
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Route a menu id to the CLI-tool install action, and report whether `id`
+/// was ours.
+///
+/// Takes an **id, not a `tauri::menu::MenuEvent`**, exactly like
+/// `tray::handle_tray_menu_id`: a `MenuEvent`'s only field is a private
+/// `MenuId` with no public constructor, so a handler shaped around one would
+/// be unreachable under `tauri::test::mock_builder`.
+///
+/// Parameterized over the ACTION as well, which the tray's router does not
+/// need to be, for a reason specific to this feature: the real action writes
+/// a symlink into a directory on the PATH of whoever is running the tests. No
+/// test may do that. The closure is what lets a test observe the dispatch
+/// decision — including that an unknown id dispatches NOTHING — without the
+/// filesystem ever being touched. [`install_cli_tool`] is the production
+/// argument and is passed by name, so the seam is one function reference
+/// wide.
+pub fn handle_install_cli_tool_id<R: Runtime>(
+    app: &AppHandle<R>,
+    id: &str,
+    install: impl FnOnce(&AppHandle<R>),
+) -> bool {
+    if id != INSTALL_CLI_TOOL_MENU_ITEM_ID {
+        return false;
+    }
+    install(app);
+    true
+}
+
+/// Install the CLI and report what happened in a native dialog (D6).
+///
+/// Returns immediately. `crate::clitool::install` is `async` while
+/// `on_menu_event` fires on the native main thread — which is NOT a tokio
+/// worker — so the work goes through `tauri::async_runtime::spawn`, which
+/// `.enter()`s tauri's own runtime before spawning. That is the established
+/// crossing in this app (see `tray::handle_tray_menu_id`'s doc comment for
+/// the verified details), and it is also what keeps the window responsive
+/// across the up-to-2s login-shell probe instead of freezing the main thread
+/// on it.
+///
+/// A second click while the first is still running does nothing at all — see
+/// [`INSTALL_CLI_TOOL_IN_FLIGHT`].
+pub fn install_cli_tool<R: Runtime>(app: &AppHandle<R>) {
+    let Some(in_flight) = InFlight::claim(&INSTALL_CLI_TOOL_IN_FLIGHT) else {
+        return;
+    };
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        // Moved into the task, so the slot is held for exactly as long as the
+        // work runs and is released however the task ends.
+        let _in_flight = in_flight;
+        let report = match crate::clitool::install().await {
+            Ok(outcome) => crate::clitool::report_for_outcome(&outcome),
+            Err(e) => crate::clitool::report_for_error(&e),
+        };
+        show_report_dialog(&app, report);
+    });
+}
+
+/// The actual native dialog call — the one piece of this feature that cannot
+/// be tested (no `NSAlert` in a test process), kept as small as that fact
+/// demands. Every DECISION feeding it (the title, the body, the PATH verdict,
+/// the export line, the kind) is `crate::clitool`'s pure rendering, which is
+/// tested without this function ever running. Same split as
+/// `tray::show_failure_dialog`.
+///
+/// `.show(..)`, never `.blocking_show(..)`: the latter's own documentation
+/// says it must not run on the main thread, and this is reached from a tokio
+/// worker, which it would then block for as long as the user leaves the
+/// dialog up.
+fn show_report_dialog<R: Runtime>(app: &AppHandle<R>, report: crate::clitool::Report) {
+    // Exhaustive: `clitool` deliberately owns its own kind enum so that
+    // module stays free of Tauri, and this is the one place the two meet.
+    let kind = match report.kind {
+        crate::clitool::ReportKind::Info => MessageDialogKind::Info,
+        crate::clitool::ReportKind::Warning => MessageDialogKind::Warning,
+        crate::clitool::ReportKind::Error => MessageDialogKind::Error,
+    };
+    app.dialog()
+        .message(report.body)
+        .title(report.title)
+        .kind(kind)
+        .buttons(MessageDialogButtons::Ok)
+        .show(|_| {});
+}
+
 /// The app menu, with a Quit that this app can intercept.
 ///
 /// Mirrors `tauri::menu::Menu::default` — same submenus in the same order — with
@@ -474,6 +643,31 @@ pub fn app_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         Some("CmdOrCtrl+Q"),
     )?;
 
+    // **Install Command Line Tool…**, after About with its own separator (D6):
+    // the app menu is already ours, there is no Settings route to put a row in
+    // today, and this is the idiomatic macOS home for an "install helper /
+    // command line tool" action.
+    //
+    // The label reflects `detect()`, which is why that function is
+    // synchronous and does NOT run the D4 login-shell probe: this call
+    // happens while the menu is being built, and a 2s probe here would be a
+    // 2s stall before the app has a menu bar. The filesystem questions it
+    // does ask are a handful of `symlink_metadata` calls.
+    //
+    // Computed ONCE, at menu-build time, and never refreshed — deliberately.
+    // The one state that changes the label (`Broken`) arises from the app
+    // being moved or deleted, which `current_exe()` does not observe in a
+    // running process anyway (see `clitool::detect::source_binary`'s "moved
+    // while running" note), so a relaunch is already part of reaching it —
+    // and the click-list checks it across exactly that relaunch.
+    let install_cli_tool_item = MenuItem::with_id(
+        app,
+        INSTALL_CLI_TOOL_MENU_ITEM_ID,
+        crate::clitool::menu_label(&crate::clitool::detect()),
+        true,
+        None::<&str>,
+    )?;
+
     Menu::with_items(
         app,
         &[
@@ -483,6 +677,8 @@ pub fn app_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
                 true,
                 &[
                     &PredefinedMenuItem::about(app, None, Some(about))?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &install_cli_tool_item,
                     &PredefinedMenuItem::separator(app)?,
                     &PredefinedMenuItem::services(app, None)?,
                     &PredefinedMenuItem::separator(app)?,
@@ -894,6 +1090,159 @@ mod tests {
         // not panic, and must not let a missing window suppress the ask —
         // the window is a best-effort reveal, not a precondition for asking.
         assert!(request_quit(app.handle()));
+    }
+
+    // -----------------------------------------------------------------------
+    // P1 CLI-install design, D5/D6: the **Install Command Line Tool…** row.
+    //
+    // These drive `handle_install_cli_tool_id` under `mock_builder` with a
+    // recording closure in place of `install_cli_tool`. That substitution is
+    // not a convenience: the real action symlinks into `/usr/local/bin` or
+    // `~/.local/bin`, i.e. the PATH of whoever runs `cargo test`. A test that
+    // called it would modify the developer's machine. The rendering it feeds
+    // is proven separately and fully in `clitool`'s own test module.
+    // -----------------------------------------------------------------------
+
+    /// A recorder for "was the action dispatched, and with which app?".
+    fn dispatch_count(id: &str) -> usize {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let calls = AtomicUsize::new(0);
+        let handled = handle_install_cli_tool_id(app.handle(), id, |_app| {
+            calls.fetch_add(1, Ordering::SeqCst);
+        });
+        let calls = calls.load(Ordering::SeqCst);
+        // The return value and the side effect must agree, always: a router
+        // that claimed an id without acting on it would silently swallow the
+        // click (this `return`s in `handle_tray_menu_id`), and one that acted
+        // without claiming it would fall through to the service lookup below
+        // it and act twice.
+        assert_eq!(handled, calls == 1, "handled={handled} but calls={calls}");
+        calls
+    }
+
+    /// VACUITY (neuter-and-watch-it-fail): dropped the `if id != …` guard from
+    /// `handle_install_cli_tool_id` so it dispatched unconditionally — THIS
+    /// test kept passing, and `an_unknown_id_never_dispatches_the_install_action`
+    /// failed for every id it tries. The pair is the test; neither half alone
+    /// is.
+    #[test]
+    fn the_install_row_id_dispatches_the_install_action() {
+        assert_eq!(dispatch_count(INSTALL_CLI_TOOL_MENU_ITEM_ID), 1);
+    }
+
+    /// VACUITY (neuter-and-watch-it-fail): replaced the exact-match guard with
+    /// `id.starts_with("openvhost:install")` — a plausible "helpful" loosening
+    /// — and this failed on the `openvhost:install-cli-tool-uninstall`
+    /// near-miss below, which is exactly the shape a later id would take.
+    #[test]
+    fn an_unknown_id_never_dispatches_the_install_action() {
+        for id in [
+            "",
+            "does-not-exist",
+            QUIT_MENU_ITEM_ID,
+            crate::tray::OPEN_MENU_ITEM_ID,
+            crate::tray::START_ALL_MENU_ITEM_ID,
+            crate::tray::STOP_ALL_MENU_ITEM_ID,
+            crate::tray::SUMMARY_MENU_ITEM_ID,
+            "nginx",
+            // Near misses in both directions: a prefix, and an id this one is
+            // a prefix of.
+            "openvhost:install",
+            "openvhost:install-cli-tool-uninstall",
+            " openvhost:install-cli-tool",
+        ] {
+            assert_eq!(dispatch_count(id), 0, "{id:?} must not install anything");
+        }
+    }
+
+    /// muda's menu events are global — one listener list for the app menu and
+    /// the tray together — so two rows sharing an id would run both actions
+    /// from one click.
+    #[test]
+    fn the_install_row_id_collides_with_nothing_else_this_app_dispatches() {
+        let ids = [
+            INSTALL_CLI_TOOL_MENU_ITEM_ID,
+            QUIT_MENU_ITEM_ID,
+            crate::tray::OPEN_MENU_ITEM_ID,
+            crate::tray::SUMMARY_MENU_ITEM_ID,
+            crate::tray::START_ALL_MENU_ITEM_ID,
+            crate::tray::STOP_ALL_MENU_ITEM_ID,
+        ];
+        for (i, a) in ids.iter().enumerate() {
+            for b in ids.iter().skip(i + 1) {
+                assert_ne!(a, b, "two menu rows share an id");
+            }
+        }
+    }
+
+    /// Reentrancy (D6): a second click landing while the first install is
+    /// still probing the login shell — up to 2s — must do nothing at all
+    /// rather than stack a second dialog.
+    ///
+    /// Driven against a local `AtomicBool` rather than the real
+    /// `INSTALL_CLI_TOOL_IN_FLIGHT` static, deliberately: `cargo test` runs
+    /// this file's tests in parallel threads of ONE process, so a test that
+    /// claimed the process-wide slot would be visible to every other test
+    /// that touched it. The static is only ever claimed by
+    /// `install_cli_tool`, which no test may call.
+    ///
+    /// VACUITY: this one did not need a neuter — it went RED against the
+    /// first real implementation and found a live bug. `InFlight::claim` was
+    /// `….is_ok().then_some(InFlight(flag))`, and `bool::then_some` evaluates
+    /// its argument EAGERLY: a rejected claim still built an `InFlight` and
+    /// dropped it on the spot, and `Drop` releases the flag. So the SECOND
+    /// click, while correctly reporting itself rejected, handed the slot away
+    /// from the first click that held it, and a THIRD click was admitted. The
+    /// third-claim assertion below is the one that caught it; a test that
+    /// stopped after the second would have passed against that bug.
+    ///
+    /// Confirmed as a vacuity check afterwards too: replacing
+    /// `compare_exchange` with an unconditional `store(true)` +
+    /// `Some(InFlight(flag))` fails on the second claim.
+    #[test]
+    fn a_second_click_is_rejected_while_the_first_install_is_still_running() {
+        let flag = AtomicBool::new(false);
+        let first = InFlight::claim(&flag).expect("the slot must start free");
+        assert!(
+            InFlight::claim(&flag).is_none(),
+            "a second click must be rejected, not queued"
+        );
+        assert!(
+            InFlight::claim(&flag).is_none(),
+            "and so must a third — rejection is not a one-shot"
+        );
+        drop(first);
+    }
+
+    /// The other half: the slot must come back. A gate that latched would
+    /// disable the menu row for the rest of the session after one use — and
+    /// it must come back however the run ended, which is why `InFlight`
+    /// releases in `Drop` rather than on a success path.
+    ///
+    /// VACUITY (neuter-and-watch-it-fail): emptied `InFlight`'s `Drop` body —
+    /// this failed on the claim after the drop. It also failed after the
+    /// panic-unwind half below, which is the case an explicit release call
+    /// could not have covered.
+    #[test]
+    fn the_slot_is_released_however_the_run_ended() {
+        let flag = AtomicBool::new(false);
+        drop(InFlight::claim(&flag).expect("free"));
+        let again = InFlight::claim(&flag);
+        assert!(again.is_some(), "the slot never came back");
+        drop(again);
+
+        // An aborted or panicking run still drops the guard.
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = InFlight::claim(&flag).expect("free again");
+            panic!("the install task blew up");
+        }));
+        assert!(unwound.is_err(), "the closure was supposed to panic");
+        assert!(
+            InFlight::claim(&flag).is_some(),
+            "a panicking run left the row permanently disabled"
+        );
     }
 
     /// The timeout must be longer than the grace period the service task waits

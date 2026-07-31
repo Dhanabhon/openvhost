@@ -221,6 +221,16 @@ pub fn handle_tray_menu_id<R: Runtime>(app: &AppHandle<R>, id: &str) {
         return;
     }
 
+    // The app menu's **Install Command Line Tool…** row (P1 CLI-install
+    // design D6). Same shape as the Quit row above — the id, the action and
+    // the `app_menu` that builds the row all live together in `quit`, and
+    // this router, being the app's ONE menu-event listener, is what reaches
+    // them. Returns whether it was ours, so the dispatch decision itself is
+    // testable without performing a real install; see its doc comment.
+    if crate::quit::handle_install_cli_tool_id(app, id, crate::quit::install_cli_tool) {
+        return;
+    }
+
     if id == OPEN_MENU_ITEM_ID {
         if let Some(window) = app.get_webview_window("main") {
             let _ = window.show();

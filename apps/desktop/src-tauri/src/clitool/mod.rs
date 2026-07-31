@@ -215,6 +215,192 @@ pub enum CliToolError {
 }
 
 // ---------------------------------------------------------------------------
+// What the user is told (D5/D6). Every user-visible string this feature has
+// lives in this section — one place to extract from when the Phase 2 i18n
+// layer lands, and one place to read when reviewing the copy.
+//
+// Pure by construction: these take enum values and return text. Nothing here
+// touches Tauri, so the DECISIONS are unit-testable even though the dialog
+// that shows them (`quit::show_report_dialog`, no `NSAlert` in a test
+// process) is not — the same split `tray::service_control::failure_dialog_text`
+// already uses.
+// ---------------------------------------------------------------------------
+
+/// How a [`Report`] should be presented.
+///
+/// This module's OWN enum rather than `tauri_plugin_dialog::MessageDialogKind`
+/// because nothing here talks to Tauri (see the module docs). The caller maps
+/// it in one exhaustive match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportKind {
+    /// The tool is where it should be.
+    Info,
+    /// Nothing was damaged, but the tool is not installed and the user has to
+    /// act before it can be.
+    Warning,
+    /// We could not act at all.
+    Error,
+}
+
+/// A dialog's worth of text: what happened, and what to do next.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Report {
+    pub kind: ReportKind,
+    pub title: String,
+    pub body: String,
+}
+
+/// The app-menu row's label for the state [`detect`](detect()) found (D5/D6).
+///
+/// Exhaustive — a new [`InstallState`] variant fails to compile here rather
+/// than silently inheriting whichever label a wildcard arm happened to name.
+///
+/// **`Installed` reads "Install…", not "Installed"**: the row is an action,
+/// and running it while already installed is a legitimate, documented no-op
+/// (it reports [`InstallOutcome::AlreadyInstalled`] and changes nothing).
+/// Only `Broken` gets its own wording, because that is the one state where
+/// the user is being told something they did not know — the link is there and
+/// does not work.
+pub fn menu_label(state: &InstallState) -> &'static str {
+    match state {
+        InstallState::Broken { .. } => "Reinstall Command Line Tool…",
+        InstallState::NotInstalled
+        | InstallState::Installed { .. }
+        | InstallState::Blocked { .. } => "Install Command Line Tool…",
+    }
+}
+
+/// What to tell the user about what [`install`] just did.
+///
+/// Exhaustive over [`InstallOutcome`], and the PATH paragraph is exhaustive
+/// over [`PathStatus`] — so every one of the ten reachable combinations
+/// produces its own text. That is asserted, not merely intended: collapsing
+/// two states into one sentence is the exact failure this codebase has paid
+/// for four times.
+pub fn report_for_outcome(outcome: &InstallOutcome) -> Report {
+    match outcome {
+        InstallOutcome::Installed { dir, path_status } => Report {
+            kind: ReportKind::Info,
+            title: "Command line tool installed".to_string(),
+            body: format!(
+                "openvhost is now linked at {}.\n\n{}",
+                installed_path(dir).display(),
+                path_paragraph(dir, path_status)
+            ),
+        },
+        InstallOutcome::AlreadyInstalled { dir, path_status } => Report {
+            kind: ReportKind::Info,
+            title: "Command line tool already installed".to_string(),
+            body: format!(
+                "openvhost was already linked at {}. Nothing was changed.\n\n{}",
+                installed_path(dir).display(),
+                path_paragraph(dir, path_status)
+            ),
+        },
+        InstallOutcome::Repaired { dir, path_status } => Report {
+            kind: ReportKind::Info,
+            title: "Command line tool repaired".to_string(),
+            body: format!(
+                "The link at {} pointed somewhere else. It now points at this copy of \
+                 OpenVHost.\n\n{}",
+                installed_path(dir).display(),
+                path_paragraph(dir, path_status)
+            ),
+        },
+        // Names the exact PATH, not just the directory: the user has to be
+        // able to go and look at the thing we refused to touch. Printing it
+        // is also what makes D8's "no uninstall action" honest — `rm` on a
+        // path we printed is the whole answer.
+        InstallOutcome::Refused { dir, what_is_there } => Report {
+            kind: ReportKind::Warning,
+            title: "Command line tool not installed".to_string(),
+            body: format!(
+                "{} is {}, which OpenVHost did not create — so it was left exactly as it \
+                 was.\n\nMove or remove it yourself, then run this again.",
+                installed_path(dir).display(),
+                what_is_there
+            ),
+        },
+    }
+}
+
+/// The PATH verdict paragraph (D4), exhaustive over [`PathStatus`].
+///
+/// `NotOnPath` **and** `Unknown` both carry the `export` line, and `Unknown`
+/// says plainly that the check did not succeed. There is deliberately no
+/// wording anywhere in this function that claims the tool is reachable
+/// unless the probe actually said so.
+fn path_paragraph(dir: &Path, status: &PathStatus) -> String {
+    match status {
+        PathStatus::OnPath => format!(
+            "{} is on your PATH. Open a new terminal window and run: openvhost list",
+            dir.display()
+        ),
+        PathStatus::NotOnPath {
+            export_line,
+            profile,
+        } => format!(
+            "{} is not on your PATH, so a new terminal window will not find openvhost \
+             yet.\n\nAdd this line to {}, then open a new terminal window:\n\n{}",
+            dir.display(),
+            profile.display(),
+            export_line
+        ),
+        // The caveat comes FIRST, before any advice, so a user who reads one
+        // sentence reads the one that says we do not know.
+        PathStatus::Unknown {
+            reason,
+            export_line,
+            profile,
+        } => format!(
+            "OpenVHost could not check whether {} is on your PATH: {}\n\nIf a new terminal \
+             window cannot find openvhost, add this line to {}:\n\n{}",
+            dir.display(),
+            reason,
+            profile.display(),
+            export_line
+        ),
+    }
+}
+
+/// What to tell the user when the install could not happen at all.
+///
+/// The error's own `Display` is the evidence; [`next_step`] is the way
+/// forward. Brand guidelines §6.2: state what happened, show the evidence,
+/// offer the next action — never just "something went wrong".
+pub fn report_for_error(error: &CliToolError) -> Report {
+    Report {
+        kind: ReportKind::Error,
+        title: "Could not install the command line tool".to_string(),
+        body: format!("{error}\n\n{}", next_step(error)),
+    }
+}
+
+/// The one actionable sentence per failure. Exhaustive over [`CliToolError`]
+/// — a new variant fails to compile here rather than silently rendering a
+/// dead end.
+fn next_step(error: &CliToolError) -> &'static str {
+    match error {
+        // `current_exe` is recorded at exec time; a relaunch re-establishes
+        // it. See `detect::source_binary`'s "moved while running" note.
+        CliToolError::CurrentExe(_) => "Relaunch OpenVHost and try again.",
+        CliToolError::SourceMissing(_) => {
+            "Reinstall OpenVHost — this copy is missing its command line binary. \
+             In a development build, run: cargo build -p openvhost"
+        }
+        // D2: this cannot happen while $HOME is writable, so the home
+        // directory is the thing worth checking.
+        CliToolError::NoWritableDir(_) => {
+            "Check that your home directory is writable, then try again."
+        }
+        CliToolError::Io { .. } => "Check the permissions on that path, then try again.",
+        CliToolError::Unsupported => {
+            "Run the openvhost binary directly from where it is installed instead."
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Non-unix: report unsupported. Mirrors `openvhost_proc::orphan::lock`'s
 // `#[cfg(not(unix))]` arm — an explicit refusal, never a pretend success.
 // ---------------------------------------------------------------------------
@@ -302,5 +488,405 @@ mod tests {
             profile: PathBuf::from("/home/u/.zprofile"),
         };
         assert_ne!(unknown, PathStatus::OnPath);
+    }
+
+    // -----------------------------------------------------------------------
+    // group: the menu label follows `detect()` (D5/D6).
+    //
+    // VACUITY (neuter-and-watch-it-fail): folded `Broken` into the shared arm
+    // of `menu_label` so every state returned "Install Command Line Tool…" —
+    // `a_broken_install_offers_to_reinstall` failed on the "Reinstall"
+    // assertion while every other test in this group kept passing, which is
+    // the point: only the `Broken` case distinguishes the two labels.
+    // -----------------------------------------------------------------------
+
+    const DIR: &str = "/Users/tester/.local/bin";
+    const EXPORT_LINE: &str = "export PATH=\"/Users/tester/.local/bin:$PATH\"";
+    const PROFILE: &str = "/Users/tester/.zprofile";
+
+    #[test]
+    fn a_broken_install_offers_to_reinstall() {
+        assert_eq!(
+            menu_label(&InstallState::Broken {
+                dir: PathBuf::from(DIR),
+                reason: "it points at /Gone.app/Contents/MacOS/openvhost".to_string(),
+            }),
+            "Reinstall Command Line Tool…"
+        );
+    }
+
+    #[test]
+    fn every_other_state_offers_to_install() {
+        let states = [
+            InstallState::NotInstalled,
+            InstallState::Installed {
+                dir: PathBuf::from(DIR),
+                path_status: PathStatus::OnPath,
+            },
+            InstallState::Blocked {
+                dir: PathBuf::from(DIR),
+                what_is_there: "a regular file".to_string(),
+            },
+        ];
+        for state in &states {
+            assert_eq!(menu_label(state), "Install Command Line Tool…", "{state:?}");
+        }
+    }
+
+    /// The row is an action, and macOS convention is that a trailing ellipsis
+    /// means "this opens something". Pinned because the verification
+    /// click-list looks for this exact string (D6).
+    #[test]
+    fn both_labels_end_in_an_ellipsis() {
+        for state in [
+            InstallState::NotInstalled,
+            InstallState::Broken {
+                dir: PathBuf::from(DIR),
+                reason: "gone".to_string(),
+            },
+        ] {
+            assert!(menu_label(&state).ends_with('…'), "{state:?}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // group: every outcome x every path status renders a DISTINCT message.
+    //
+    // This is the group guarding the failure this codebase has paid for four
+    // times — a rendering that collapses two states into one text. Asserting
+    // "not empty" would not catch it; asserting pairwise inequality does.
+    //
+    // VACUITY (neuter-and-watch-it-fail), twice, once per axis:
+    //
+    // - STATUS AXIS: made `path_paragraph`'s `Unknown` arm render `NotOnPath`'s
+    //   paragraph verbatim (`reason: _`, i.e. "we could not check" silently
+    //   becomes "it is not on PATH") — the exact collapse D4 exists to
+    //   prevent. `every_outcome_and_path_status_combination_renders_a_distinct_message`
+    //   FAILED with "Installed/NotOnPath and Installed/Unknown render the same
+    //   dialog", and `an_unknown_verdict_renders_the_caveat_and_the_export_line`
+    //   failed alongside it.
+    // - OUTCOME AXIS: gave `Repaired` `Installed`'s title and first line —
+    //   only the distinctness test FAILED ("Installed/OnPath and
+    //   Repaired/OnPath render the same dialog"); every other test in this
+    //   file still passed, which is precisely why pairwise inequality is
+    //   asserted rather than a per-variant substring check.
+    //
+    // Restoring each arm made them pass again.
+    // -----------------------------------------------------------------------
+
+    /// The three PATH verdicts, with `NotOnPath` and `Unknown` deliberately
+    /// carrying the **same** `export_line` and `profile`. The only difference
+    /// between those two inputs is which variant they are — so a renderer
+    /// that printed the advice and ignored the state it came from produces
+    /// identical text and fails the distinctness assertion below.
+    fn statuses() -> Vec<(&'static str, PathStatus)> {
+        vec![
+            ("OnPath", PathStatus::OnPath),
+            (
+                "NotOnPath",
+                PathStatus::NotOnPath {
+                    export_line: EXPORT_LINE.to_string(),
+                    profile: PathBuf::from(PROFILE),
+                },
+            ),
+            (
+                "Unknown",
+                PathStatus::Unknown {
+                    reason: "/bin/zsh did not answer within 2 seconds".to_string(),
+                    export_line: EXPORT_LINE.to_string(),
+                    profile: PathBuf::from(PROFILE),
+                },
+            ),
+        ]
+    }
+
+    /// Every reachable outcome, labelled: the three that carry a
+    /// [`PathStatus`] crossed with all three verdicts, plus `Refused`, which
+    /// carries none (an install that never happened has no PATH verdict to
+    /// report, and inventing one would be the guess D4 forbids).
+    fn every_report() -> Vec<(String, Report)> {
+        let dir = PathBuf::from(DIR);
+        let mut out = Vec::new();
+        for (status_name, status) in statuses() {
+            let built: [(&str, InstallOutcome); 3] = [
+                (
+                    "Installed",
+                    InstallOutcome::Installed {
+                        dir: dir.clone(),
+                        path_status: status.clone(),
+                    },
+                ),
+                (
+                    "AlreadyInstalled",
+                    InstallOutcome::AlreadyInstalled {
+                        dir: dir.clone(),
+                        path_status: status.clone(),
+                    },
+                ),
+                (
+                    "Repaired",
+                    InstallOutcome::Repaired {
+                        dir: dir.clone(),
+                        path_status: status.clone(),
+                    },
+                ),
+            ];
+            for (outcome_name, outcome) in built {
+                out.push((
+                    format!("{outcome_name}/{status_name}"),
+                    report_for_outcome(&outcome),
+                ));
+            }
+        }
+        out.push((
+            "Refused".to_string(),
+            report_for_outcome(&InstallOutcome::Refused {
+                dir,
+                what_is_there: "a regular file".to_string(),
+            }),
+        ));
+        out
+    }
+
+    #[test]
+    fn every_outcome_and_path_status_combination_renders_a_distinct_message() {
+        let reports = every_report();
+        assert_eq!(
+            reports.len(),
+            10,
+            "3 outcomes x 3 verdicts, plus Refused — update this if a variant lands"
+        );
+        for (i, (a_name, a)) in reports.iter().enumerate() {
+            for (b_name, b) in reports.iter().skip(i + 1) {
+                assert_ne!(
+                    a, b,
+                    "{a_name} and {b_name} render the same dialog — two states collapsed into one"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_report_names_the_directory_it_acted_on() {
+        for (name, report) in every_report() {
+            assert!(!report.title.is_empty(), "{name} has no title");
+            assert!(
+                report.body.contains(DIR),
+                "{name} never names the directory: {}",
+                report.body
+            );
+        }
+    }
+
+    /// The one outcome that is not a success must not look like one.
+    #[test]
+    fn a_refusal_is_a_warning_and_every_completed_install_is_not() {
+        for (name, report) in every_report() {
+            let expected = if name == "Refused" {
+                ReportKind::Warning
+            } else {
+                ReportKind::Info
+            };
+            assert_eq!(report.kind, expected, "{name}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // group: the PATH verdict paragraph, state by state (D4).
+    // -----------------------------------------------------------------------
+
+    fn body_for(status: PathStatus) -> String {
+        report_for_outcome(&InstallOutcome::Installed {
+            dir: PathBuf::from(DIR),
+            path_status: status,
+        })
+        .body
+    }
+
+    /// THE ONE THAT MATTERS MOST: a probe that did not succeed must say so
+    /// **and** still offer the advice, and must never read as "you're all
+    /// set".
+    #[test]
+    fn an_unknown_verdict_renders_the_caveat_and_the_export_line() {
+        let body = body_for(PathStatus::Unknown {
+            reason: "/bin/zsh did not answer within 2 seconds".to_string(),
+            export_line: EXPORT_LINE.to_string(),
+            profile: PathBuf::from(PROFILE),
+        });
+        assert!(
+            body.contains("could not check"),
+            "the caveat is missing: {body}"
+        );
+        assert!(
+            body.contains("/bin/zsh did not answer within 2 seconds"),
+            "the reason is missing: {body}"
+        );
+        assert!(body.contains(EXPORT_LINE), "the export line is missing");
+        assert!(body.contains(PROFILE), "the profile file is missing");
+        assert!(
+            !body.contains("is on your PATH."),
+            "an unchecked directory must never be reported as being on PATH: {body}"
+        );
+    }
+
+    #[test]
+    fn a_not_on_path_verdict_renders_the_export_line_and_the_profile_to_add_it_to() {
+        let body = body_for(PathStatus::NotOnPath {
+            export_line: EXPORT_LINE.to_string(),
+            profile: PathBuf::from(PROFILE),
+        });
+        assert!(body.contains("not on your PATH"), "{body}");
+        assert!(body.contains(EXPORT_LINE), "the export line is missing");
+        assert!(body.contains(PROFILE), "the profile file is missing");
+    }
+
+    /// The profile file is rendered VERBATIM from the enum. `.zprofile` is
+    /// the one the shell layer computes for zsh, and it is not `.zshrc` for a
+    /// hard-won reason (a login zsh never reads `.zshrc`, and the probe is
+    /// `zsh -l -c`) — this layer must not second-guess it by naming a file of
+    /// its own.
+    #[test]
+    fn the_profile_is_whatever_the_enum_carries_and_is_never_named_here() {
+        for profile in ["/Users/tester/.bash_profile", "/Users/tester/.profile"] {
+            let body = body_for(PathStatus::NotOnPath {
+                export_line: EXPORT_LINE.to_string(),
+                profile: PathBuf::from(profile),
+            });
+            assert!(body.contains(profile), "{body}");
+            assert!(
+                !body.contains(".zprofile") && !body.contains(".zshrc"),
+                "this layer invented a profile filename: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_on_path_verdict_tells_the_user_what_to_run_and_offers_no_export_line() {
+        let body = body_for(PathStatus::OnPath);
+        assert!(body.contains("is on your PATH"), "{body}");
+        assert!(body.contains("openvhost list"), "{body}");
+        assert!(
+            !body.contains("export PATH"),
+            "no advice is owed when it already works: {body}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // group: a refusal names the exact occupied path (D3).
+    //
+    // VACUITY (neuter-and-watch-it-fail): swapped `installed_path(dir)` for
+    // `dir` in the `Refused` arm — the dialog then named the DIRECTORY, which
+    // is what the enum carries and the easy thing to reach for.
+    // `a_refusal_names_the_occupying_path_and_what_is_there` FAILED ("the
+    // refusal must name /Users/tester/.local/bin/openvhost"), while
+    // `every_report_names_the_directory_it_acted_on` kept passing — a
+    // directory-only refusal satisfies that weaker check completely.
+    // -----------------------------------------------------------------------
+
+    /// The DIRECTORY is not enough — the user has to be told which file to go
+    /// and look at. `installed_path`, not a second hardcoded join.
+    #[test]
+    fn a_refusal_names_the_occupying_path_and_what_is_there() {
+        let dir = PathBuf::from(DIR);
+        let report = report_for_outcome(&InstallOutcome::Refused {
+            dir: dir.clone(),
+            what_is_there: "a symlink to /opt/homebrew/Cellar/openvhost/1.0/bin/openvhost"
+                .to_string(),
+        });
+        let expected = installed_path(&dir).display().to_string();
+        assert!(
+            report.body.contains(&expected),
+            "the refusal must name {expected}, got {}",
+            report.body
+        );
+        assert!(
+            report
+                .body
+                .contains("/opt/homebrew/Cellar/openvhost/1.0/bin/openvhost"),
+            "the refusal must say what is there: {}",
+            report.body
+        );
+        assert!(
+            report.body.contains("did not create"),
+            "the refusal must say we left it alone: {}",
+            report.body
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // group: every error variant renders something actionable.
+    //
+    // VACUITY (neuter-and-watch-it-fail): dropped `next_step` from
+    // `report_for_error`, leaving the body as the error's own `Display` —
+    // evidence with no way forward, which reads plausible and is the whole
+    // thing brand guidelines §6.2 forbids.
+    // `every_error_variant_states_what_happened_and_what_to_do_next` FAILED
+    // ("offers no next step") for the first variant, while
+    // `every_error_variant_renders_a_distinct_message` kept passing, since
+    // the five `Display` strings differ on their own. Restoring it passed.
+    // -----------------------------------------------------------------------
+
+    fn every_error() -> Vec<CliToolError> {
+        vec![
+            CliToolError::CurrentExe("no such process".to_string()),
+            CliToolError::SourceMissing(PathBuf::from(
+                "/Applications/OpenVHost.app/Contents/MacOS/openvhost",
+            )),
+            CliToolError::NoWritableDir("/usr/local/bin, /Users/tester/.local/bin".to_string()),
+            CliToolError::Io {
+                op: "install",
+                path: PathBuf::from(DIR).join(CLI_BINARY_NAME),
+                source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            },
+            CliToolError::Unsupported,
+        ]
+    }
+
+    #[test]
+    fn every_error_variant_states_what_happened_and_what_to_do_next() {
+        for error in every_error() {
+            let report = report_for_error(&error);
+            assert_eq!(report.kind, ReportKind::Error, "{error:?}");
+            assert!(!report.title.is_empty(), "{error:?}");
+            // The evidence: the error's own message, verbatim.
+            assert!(
+                report.body.contains(&error.to_string()),
+                "{error:?} lost its own message: {}",
+                report.body
+            );
+            // The way forward: a sentence past the evidence, not a dead end.
+            let advice = report
+                .body
+                .strip_prefix(&error.to_string())
+                .unwrap_or_default();
+            assert!(
+                advice.trim().len() > 10,
+                "{error:?} offers no next step: {}",
+                report.body
+            );
+        }
+    }
+
+    #[test]
+    fn every_error_variant_renders_a_distinct_message() {
+        let reports: Vec<Report> = every_error().iter().map(report_for_error).collect();
+        for (i, a) in reports.iter().enumerate() {
+            for b in reports.iter().skip(i + 1) {
+                assert_ne!(a, b, "two error variants render the same dialog");
+            }
+        }
+    }
+
+    /// A refusal is not an error — it is a normal outcome the user has to act
+    /// on — so the two must never render alike either.
+    #[test]
+    fn a_refusal_never_renders_like_a_failure_to_act() {
+        let refused = report_for_outcome(&InstallOutcome::Refused {
+            dir: PathBuf::from(DIR),
+            what_is_there: "a regular file".to_string(),
+        });
+        for error in every_error() {
+            assert_ne!(refused, report_for_error(&error));
+        }
     }
 }

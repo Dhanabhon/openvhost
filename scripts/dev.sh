@@ -22,4 +22,13 @@ if [ ! -d "$root/apps/desktop/node_modules" ]; then
   pnpm -C "$root/apps/desktop" install --frozen-lockfile
 fi
 
+# The CLI is NOT a dependency of the desktop crate, so `tauri dev` never builds
+# it. "Install Command Line Tool…" resolves the binary as current_exe()'s
+# sibling (install design D1), which in a dev build means
+# target/debug/openvhost sitting beside target/debug/openvhost-desktop — so on
+# a fresh clone that menu item would correctly, and uselessly, report the
+# binary as missing. Cheap once built; a no-op on every later run.
+echo "building the openvhost CLI so it sits beside the app in target/debug…"
+cargo build --manifest-path "$root/Cargo.toml" -p openvhost
+
 exec pnpm -C "$root/apps/desktop" run tauri dev "$@"
