@@ -4,6 +4,7 @@
 	import { onMysqlInitLog, onMysqlInstallLog, openHomebrewSite } from '$lib/ipc';
 	import { databasesStore as store } from '$lib/databases.shared.svelte';
 	import { servicesStore } from '$lib/services.shared.svelte';
+	import { uninstallStore } from '$lib/uninstall.shared.svelte';
 	import { runningCount } from '$lib/services.derive';
 	import { catalogedMajors } from '$lib/databases.derive';
 	import { copyToClipboard } from '$lib/utils/clipboard';
@@ -11,6 +12,7 @@
 	import Button from '$lib/components/Button.svelte';
 	import DatabasesEmpty from '$lib/components/DatabasesEmpty.svelte';
 	import MysqlRow from '$lib/components/MysqlRow.svelte';
+	import UninstallDialog from '$lib/components/UninstallDialog.svelte';
 
 	const running = $derived(runningCount(servicesStore.services));
 	const catalogedMajorsList = $derived(store.env ? catalogedMajors(store.env.instances) : []);
@@ -70,6 +72,27 @@
 		if (password !== undefined) await copyToClipboard(password);
 	}
 
+	/**
+	 * Opens the uninstall confirmation (design D6). Uninstalls nothing on its
+	 * own — and for MySQL that dialog is the whole point of this slice: it is
+	 * the only place the user is told the datadir and the stored root password
+	 * survive (design D2), which is what makes the button safe to press.
+	 */
+	async function onUninstall(major: string): Promise<void> {
+		await uninstallStore.request('mysql', major);
+	}
+
+	/** The dialog's confirm. Re-reads the MySQL environment on success; the
+	 *  supervisor row disappearing is handled by the layout's
+	 *  `onServiceUnregistered` subscription, not here. */
+	async function onConfirmUninstall(): Promise<void> {
+		const uninstalled = await uninstallStore.confirm();
+		if (uninstalled) {
+			await store.refresh();
+			await servicesStore.reload();
+		}
+	}
+
 	onMount(() => {
 		let unlistenInstall: (() => void) | null = null;
 		let unlistenInit: (() => void) | null = null;
@@ -77,9 +100,16 @@
 
 		void (async () => {
 			try {
-				const stopInstall = await onMysqlInstallLog((ev) =>
-					store.appendInstallLog(ev.major, ev.line)
-				);
+				// One channel, two operations: `uninstall_package` streams a MySQL
+				// uninstall on the SAME `mysql-install-log` event `install_mysql`
+				// uses (design D1 — one lock, one output surface), so the line is
+				// routed by whichever operation currently holds that lock.
+				// `UninstallStore.appendLog` re-checks the same condition itself,
+				// so this routing is a convenience, not the guard.
+				const stopInstall = await onMysqlInstallLog((ev) => {
+					if (uninstallStore.uninstalling !== '') uninstallStore.appendLog(ev.major, ev.line);
+					else store.appendInstallLog(ev.major, ev.line);
+				});
 				const stopInit = await onMysqlInitLog((ev) => store.appendInitLog(ev.major, ev.line));
 				// Mirrors languages/+page.svelte's onMount wiring: this page can
 				// unmount while the listener registrations are still in flight.
@@ -171,6 +201,7 @@
 							initLog={store.initLogFor(instance.major)}
 							initFailure={store.initFailureFor(instance.major)}
 							initError={instance.major === lastInitAttempted ? store.error : ''}
+							uninstallingMajor={uninstallStore.uninstalling}
 							{catalogedMajorsList}
 							serviceState={instance.serviceId === null
 								? null
@@ -187,6 +218,7 @@
 							verifyError={store.verifyError[instance.major] ?? ''}
 							onInstall={(major) => void onInstall(major)}
 							onInitialize={(major) => void onInitialize(major)}
+							onUninstall={(major) => void onUninstall(major)}
 							onStart={(id) => void servicesStore.start(id)}
 							onStop={(id) => void servicesStore.stop(id)}
 							onReveal={(major) => void store.reveal(major)}
@@ -201,6 +233,20 @@
 		{/if}
 	</section>
 </AppShell>
+
+<!-- Same shared store the Languages page renders; only one of the two routes is
+     ever mounted, so the dialog can never double up. -->
+{#if uninstallStore.isOpen}
+	<UninstallDialog
+		plan={uninstallStore.plan}
+		planning={uninstallStore.planning}
+		uninstalling={uninstallStore.uninstalling !== ''}
+		error={uninstallStore.error}
+		log={uninstallStore.log}
+		onCancel={() => uninstallStore.close()}
+		onConfirm={() => void onConfirmUninstall()}
+	/>
+{/if}
 
 <style>
 	/* Same recipe as ServicesPanel.svelte's/languages/+page.svelte's own

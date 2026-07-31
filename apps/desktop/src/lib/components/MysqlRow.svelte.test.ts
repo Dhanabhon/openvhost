@@ -40,6 +40,7 @@ function renderRow(
 		initLog: UiLog[];
 		initFailure: MysqlInitFailure | null;
 		initError: string;
+		uninstallingMajor: string;
 		catalogedMajorsList: string[];
 		serviceState: ServiceStatus['state'] | null;
 		password?: string;
@@ -69,6 +70,7 @@ function renderRow(
 			initLog: props.initLog ?? [],
 			initFailure: props.initFailure ?? null,
 			initError: props.initError ?? '',
+			uninstallingMajor: props.uninstallingMajor ?? '',
 			catalogedMajorsList: props.catalogedMajorsList ?? ['8.4'],
 			serviceState: props.serviceState ?? null,
 			password: props.password,
@@ -83,6 +85,7 @@ function renderRow(
 			verifyError: props.verifyError ?? '',
 			onInstall: () => {},
 			onInitialize: () => {},
+			onUninstall: () => {},
 			onStart: () => {},
 			onStop: () => {},
 			onReveal: () => {},
@@ -327,5 +330,99 @@ describe('MysqlRow — out-of-catalogue (truly actionless)', () => {
 	it('still names the major so it is not simply invisible', () => {
 		const body = renderRow({ instance: foreign });
 		expect(body).toContain('9.7');
+	});
+});
+
+/** Just the Uninstall button's own opening tag, so a `disabled` assertion can
+ *  fail for the reason it names rather than matching another control on the
+ *  row. */
+function uninstallTag(body: string, major: string): string {
+	const match = body.match(new RegExp(`<button[^>]*data-testid="uninstall-${major}"[^>]*>`));
+	if (!match) throw new Error(`expected an Uninstall button for ${major}`);
+	return match[0];
+}
+
+// Package-uninstall design D6: an installed managed major gets an Uninstall
+// action. What the confirmation SAYS is `UninstallDialog.svelte.test.ts` and
+// `uninstall.derive.test.ts`; this file only pins when the action exists and
+// when it is live.
+describe('MysqlRow — the Uninstall action', () => {
+	const ready = instance({
+		installed: true,
+		datadirState: { kind: 'initialized' },
+		serviceId: 'mysql-8.4',
+		socketPath: '/Users/x/.openvhost/run/mysql-8.4.sock'
+	});
+
+	it('offers Uninstall for a ready major', () => {
+		const body = renderRow({ instance: ready, serviceState: { kind: 'stopped' } });
+		expect(body).toContain('data-testid="uninstall-8.4"');
+	});
+
+	// Installed but never initialized: the engine's files are on disk, so there
+	// is something to remove — and this is a likely moment to want it gone.
+	it('offers Uninstall for an installed major that was never initialized', () => {
+		const body = renderRow({ instance: instance({ installed: true }) });
+		expect(body).toContain('data-testid="uninstall-8.4"');
+		expect(body).toContain('data-testid="initialize-8.4"');
+	});
+
+	// Removing the engine never touches a datadir (design D2), so a datadir this
+	// app refuses to adopt is no reason to trap the binaries with it.
+	it('offers Uninstall for an installed major with a foreign datadir', () => {
+		const body = renderRow({
+			instance: instance({ installed: true, datadirState: { kind: 'foreign', detail: 'x' } })
+		});
+		expect(body).toContain('data-testid="uninstall-8.4"');
+	});
+
+	it('offers no Uninstall for a major that is not installed', () => {
+		const body = renderRow({ instance: instance({ installed: false }), brewFound: true });
+		expect(body).toContain('data-testid="install-8.4"');
+		expect(body).not.toContain('data-testid="uninstall-8.4"');
+	});
+
+	// The out-of-catalogue row renders NO action of any kind on purpose (spec
+	// D1) — every command rejects an unmanaged major server-side, so an
+	// Uninstall button here could only produce an error.
+	it('offers no Uninstall for an installed major this build does not manage', () => {
+		const body = renderRow({
+			instance: instance({ major: '5.7', cataloged: false, installed: true }),
+			catalogedMajorsList: ['8.4']
+		});
+		expect(body).toContain('data-testid="mysql-row-5.7"');
+		expect(body).not.toContain('data-testid="uninstall-5.7"');
+	});
+
+	it('is enabled when nothing is in flight', () => {
+		const body = renderRow({ instance: ready });
+		expect(uninstallTag(body, '8.4')).not.toContain('disabled');
+	});
+
+	it('is disabled while an install is running', () => {
+		const body = renderRow({ instance: ready, installingMajor: '8.4' });
+		expect(uninstallTag(body, '8.4')).toContain('disabled');
+	});
+
+	it('is disabled while an initialize is running', () => {
+		const body = renderRow({ instance: ready, initializingMajor: '8.4' });
+		expect(uninstallTag(body, '8.4')).toContain('disabled');
+	});
+
+	it('is disabled while ANOTHER major is being uninstalled', () => {
+		const body = renderRow({ instance: ready, uninstallingMajor: '8.0' });
+		expect(uninstallTag(body, '8.4')).toContain('disabled');
+		expect(uninstallTag(body, '8.4')).not.toContain('Uninstalling');
+	});
+
+	it('is disabled and says what it is doing while THIS major is uninstalled', () => {
+		const body = renderRow({ instance: ready, uninstallingMajor: '8.4' });
+		expect(uninstallTag(body, '8.4')).toContain('disabled');
+		expect(body).toContain('Uninstalling…');
+	});
+
+	it('names the version in its accessible label', () => {
+		const body = renderRow({ instance: ready });
+		expect(uninstallTag(body, '8.4')).toContain('aria-label="Uninstall MySQL 8.4"');
 	});
 });

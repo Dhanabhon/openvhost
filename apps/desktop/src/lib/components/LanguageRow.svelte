@@ -2,6 +2,7 @@
 <script lang="ts">
 	import type { InstallOutcomeDto, PhpRuntimeDto, ServiceStatus } from '../ipc';
 	import type { UiLog } from '../languages.svelte';
+	import { uninstallActionDisabled, uninstallConfirmLabel } from '../uninstall.derive';
 	import Button from './Button.svelte';
 	import LogPane from './LogPane.svelte';
 	import StatusPill from './StatusPill.svelte';
@@ -10,10 +11,12 @@
 		row,
 		serviceState,
 		installing = '',
+		uninstalling = '',
 		log = [],
 		error = '',
 		outcome = null,
 		onInstall,
+		onUninstall,
 		onStart,
 		onStop
 	}: {
@@ -31,17 +34,37 @@
 		 *  every install button, not just this row's — only one install can run
 		 *  at a time (`LanguagesStore.install`'s own re-entrancy guard). */
 		installing?: string;
+		/** The major being UNINSTALLED anywhere in the app, '' when idle — a
+		 *  state, not a boolean, for the same reason `installing` is one: this
+		 *  row has to tell "somebody else is busy" (disabled) from "it is me"
+		 *  (disabled AND labelled "Uninstalling…"), and a boolean can express
+		 *  only one of those. */
+		uninstalling?: string;
 		log?: UiLog[];
 		error?: string;
 		/** The last install attempt's outcome, whichever major it was for — this
 		 *  row only renders it once `outcome.major` matches its own. */
 		outcome?: InstallOutcomeDto | null;
 		onInstall: (major: string) => void;
+		/** Opens the uninstall confirmation (package-uninstall design D6). Never
+		 *  uninstalls anything on its own — nothing is spawned until the dialog's
+		 *  own confirm, and the plan it shows is a pure query. */
+		onUninstall: (major: string) => void;
 		onStart: (serviceId: string) => void;
 		onStop: (serviceId: string) => void;
 	} = $props();
 
 	const isInstalling = $derived(installing === row.major);
+	/** Page-wide, not per-row: one `InstallLock` serializes brew installs and
+	 *  brew uninstalls alike, so a second action would only queue on a mutex.
+	 *  Includes this row's own uninstall, so a double-click cannot fire twice. */
+	const uninstallDisabled = $derived(
+		uninstallActionDisabled({
+			installingMajor: installing,
+			initializingMajor: '',
+			uninstallingMajor: uninstalling
+		})
+	);
 	const rowOutcome = $derived(outcome && outcome.major === row.major ? outcome : null);
 	/** Brew exited 0 but the version was not found afterwards — `detected` exists
 	 *  precisely for this case. Silence here is the failure it prevents: without
@@ -103,32 +126,49 @@
 			>
 				{isInstalling ? 'Installing…' : 'Install'}
 			</Button>
-		{:else if row.serviceId && serviceState !== null}
-			{#if serviceState.kind === 'failed'}
-				<Button
-					variant="quiet"
-					size="sm"
-					testId="retry-{row.serviceId}"
-					ariaLabel="Retry PHP {row.major}"
-					onclick={() => onStart(row.serviceId ?? '')}>Retry</Button
-				>
-			{:else if serviceState.kind === 'stopped'}
-				<Button
-					variant="quiet"
-					size="sm"
-					testId="start-{row.serviceId}"
-					ariaLabel="Start PHP {row.major}"
-					onclick={() => onStart(row.serviceId ?? '')}>Start</Button
-				>
-			{:else}
-				<Button
-					variant="quiet"
-					size="sm"
-					testId="stop-{row.serviceId}"
-					ariaLabel="Stop PHP {row.major}"
-					onclick={() => onStop(row.serviceId ?? '')}>Stop</Button
-				>
+		{:else}
+			{#if row.serviceId && serviceState !== null}
+				{#if serviceState.kind === 'failed'}
+					<Button
+						variant="quiet"
+						size="sm"
+						testId="retry-{row.serviceId}"
+						ariaLabel="Retry PHP {row.major}"
+						onclick={() => onStart(row.serviceId ?? '')}>Retry</Button
+					>
+				{:else if serviceState.kind === 'stopped'}
+					<Button
+						variant="quiet"
+						size="sm"
+						testId="start-{row.serviceId}"
+						ariaLabel="Start PHP {row.major}"
+						onclick={() => onStart(row.serviceId ?? '')}>Start</Button
+					>
+				{:else}
+					<Button
+						variant="quiet"
+						size="sm"
+						testId="stop-{row.serviceId}"
+						ariaLabel="Stop PHP {row.major}"
+						onclick={() => onStop(row.serviceId ?? '')}>Stop</Button
+					>
+				{/if}
 			{/if}
+			<!-- Last in the row, after the daily Start/Stop control: this is the
+			     rare, destructive one, and it opens a confirmation rather than
+			     doing anything (design D6). Offered for every installed major,
+			     including one whose pool has no supervisor row yet — that state
+			     is exactly when a user is most likely to want it gone. -->
+			<Button
+				variant="quiet"
+				size="sm"
+				testId="uninstall-{row.major}"
+				ariaLabel="Uninstall PHP {row.major}"
+				disabled={uninstallDisabled}
+				onclick={() => onUninstall(row.major)}
+			>
+				{uninstallConfirmLabel(uninstalling === row.major)}
+			</Button>
 		{/if}
 	</div>
 </div>
@@ -255,9 +295,12 @@
 		text-overflow: ellipsis;
 		white-space: nowrap;
 	}
+	/* `gap` since the uninstall slice: an installed row can now hold two
+	   controls (Start/Stop and Uninstall), and without it they would touch. */
 	.row-actions {
 		display: flex;
 		justify-content: flex-end;
+		gap: var(--vh-space-2);
 	}
 	.error {
 		color: var(--vh-fail);

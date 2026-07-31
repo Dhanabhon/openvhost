@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // The ONLY module allowed to touch Tauri IPC (master plan §5).
 import { commands, events } from './bindings';
+// The one non-generated type import in this file, and it is load-bearing:
+// `uninstall_plan`'s payload is what a DESTRUCTIVE confirmation renders, so the
+// two uninstall wrappers below are typed against the shape that dialog reads
+// (`uninstall.derive.ts`) rather than a generated alias. A Rust-side drift then
+// fails to compile at the wrapper instead of silently rendering a blank where a
+// kept datadir path belongs. `uninstall.derive.ts` imports nothing from here, so
+// this introduces no cycle.
+import type { PackageKind, UninstallPlan } from '../uninstall.derive';
 import type {
 	ApplyOutcomeDto,
 	ApplyPlanDto,
@@ -376,6 +384,37 @@ export async function rescanPhpRuntimes(): Promise<PhpEnvironmentDto> {
  */
 export async function installPhp(major: string): Promise<InstallOutcomeDto> {
 	return unwrap(commands.installPhp(major));
+}
+
+/**
+ * What uninstalling `major` would remove, what it would keep, and what — if
+ * anything — refuses it (package-uninstall design D2/D3). A PURE QUERY: it
+ * spawns no process and changes nothing, which is what makes it safe to call
+ * every time the user presses Uninstall, so the confirmation shows the real
+ * inventory instead of a guess.
+ *
+ * Typed against `uninstall.derive.ts`'s own `PackageKind`/`UninstallPlan`
+ * rather than a generated alias, deliberately: that is the shape the
+ * confirmation actually renders, so a Rust-side change that stopped matching it
+ * fails to compile HERE instead of surfacing as a blank line in a destructive
+ * dialog. See `uninstall.shared.svelte.ts` for the other half of that seam.
+ */
+export async function uninstallPlan(kind: PackageKind, major: string): Promise<UninstallPlan> {
+	return unwrap(commands.uninstallPlan(kind, major));
+}
+
+/**
+ * Uninstall `major` — `brew uninstall` plus the generated-config cleanup,
+ * through the same install lock and the same live-output channel
+ * {@link installPhp} uses (design D1). The datadir, the stored credentials and
+ * the log directories are never touched on any path (design D2).
+ *
+ * Every refusal is decided server-side before anything is spawned, so calling
+ * this without checking {@link uninstallPlan} first is refused rather than
+ * forced.
+ */
+export async function uninstallPackage(kind: PackageKind, major: string): Promise<void> {
+	await unwrap(commands.uninstallPackage(kind, major));
 }
 
 /** Subscribe to `php-install-log`. Same `IpcError` contract as {@link onServiceState}. */

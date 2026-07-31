@@ -13,6 +13,7 @@ import { render } from 'svelte/server';
 import LanguagesPage from './+page.svelte';
 import { languagesStore } from '$lib/languages.shared.svelte';
 import { servicesStore } from '$lib/services.shared.svelte';
+import { uninstallStore } from '$lib/uninstall.shared.svelte';
 import type { PhpEnvironmentDto, PhpRuntimeDto, ServiceStatus } from '$lib/ipc';
 
 function row(
@@ -51,6 +52,13 @@ function checkAgainHeaderButtonTag(body: string): string {
 	return match[0];
 }
 
+/** Just the Uninstall button's own opening tag for `major`. */
+function uninstallTag(body: string, major: string): string {
+	const match = body.match(new RegExp(`<button[^>]*data-testid="uninstall-${major}"[^>]*>`));
+	if (!match) throw new Error(`expected an Uninstall button for ${major}`);
+	return match[0];
+}
+
 // `languagesStore`/`servicesStore` are module singletons — reset every field
 // this page reads so no test inherits state a previous one left behind.
 beforeEach(() => {
@@ -61,6 +69,12 @@ beforeEach(() => {
 	languagesStore.outcome = null;
 	servicesStore.services = [];
 	servicesStore.error = null;
+	uninstallStore.target = null;
+	uninstallStore.plan = null;
+	uninstallStore.planning = false;
+	uninstallStore.uninstalling = '';
+	uninstallStore.error = '';
+	uninstallStore.log = [];
 });
 
 describe('the /languages route', () => {
@@ -211,5 +225,120 @@ describe('the /languages route', () => {
 		const { body } = render(LanguagesPage);
 		expect(body).toContain('data-testid="install-8.4"');
 		expect(body).not.toContain('data-testid="lang-pill-8.4"');
+	});
+});
+
+// Package-uninstall design D6, at the route layer. Everything here is the
+// PAGE's own glue — which store field reaches which prop, and whether the
+// dialog is mounted at all — because that glue is exactly what per-component
+// tests cannot see (the "gate the assembled product" lesson).
+describe('the /languages route — uninstall', () => {
+	it('offers Uninstall on an installed row', () => {
+		languagesStore.env = env(true, [row('8.3', true)]);
+		const { body } = render(LanguagesPage);
+		expect(body).toContain('data-testid="uninstall-8.3"');
+	});
+
+	it('offers no Uninstall on a row that is not installed', () => {
+		languagesStore.env = env(true, [row('8.4', false)]);
+		const { body } = render(LanguagesPage);
+		expect(body).not.toContain('data-testid="uninstall-8.4"');
+	});
+
+	// The page feeds `languagesStore.installing` into the row; without that
+	// wiring the button would stay live during a build and queue on the
+	// install lock with no feedback.
+	it('disables Uninstall while an install is running', () => {
+		languagesStore.env = env(true, [row('8.3', true)]);
+		languagesStore.installing = '8.4';
+		const { body } = render(LanguagesPage);
+		expect(uninstallTag(body, '8.3')).toContain('disabled');
+	});
+
+	// …and the same for `uninstallStore.uninstalling`, which is the OTHER
+	// store this page now reads. A page that forgot to thread it would leave
+	// every other row's Uninstall live during an uninstall.
+	it('disables Uninstall while another uninstall is running', () => {
+		languagesStore.env = env(true, [row('8.3', true)]);
+		uninstallStore.uninstalling = '8.4';
+		const { body } = render(LanguagesPage);
+		expect(uninstallTag(body, '8.3')).toContain('disabled');
+	});
+
+	it('leaves Uninstall enabled when nothing is in flight', () => {
+		languagesStore.env = env(true, [row('8.3', true)]);
+		const { body } = render(LanguagesPage);
+		expect(uninstallTag(body, '8.3')).not.toContain('disabled');
+	});
+
+	it('renders no confirmation until one is requested', () => {
+		languagesStore.env = env(true, [row('8.3', true)]);
+		const { body } = render(LanguagesPage);
+		expect(body).not.toContain('data-testid="uninstall-dialog"');
+	});
+
+	it('renders the confirmation, with the kept paths, once a plan is open', () => {
+		languagesStore.env = env(true, [row('8.3', true)]);
+		uninstallStore.target = { kind: 'php', major: '8.3' };
+		uninstallStore.plan = {
+			kind: 'php',
+			major: '8.3',
+			removes: ['the Homebrew formula php@8.3'],
+			keeps: [{ what: 'Logs', path: '/Users/x/.openvhost/logs/php-fpm-8.3' }],
+			blockers: []
+		};
+		const { body } = render(LanguagesPage);
+		expect(body).toContain('data-testid="uninstall-dialog"');
+		expect(body).toContain('Uninstall PHP 8.3?');
+		expect(body).toContain('/Users/x/.openvhost/logs/php-fpm-8.3');
+		expect(body).toContain('data-testid="uninstall-confirm"');
+	});
+
+	// Design D3 at the route layer: a blocked plan offers no way forward
+	// anywhere on the page, not merely a disabled button.
+	it('offers no way to proceed when the plan is blocked', () => {
+		languagesStore.env = env(true, [row('8.3', true)]);
+		uninstallStore.target = { kind: 'php', major: '8.3' };
+		uninstallStore.plan = {
+			kind: 'php',
+			major: '8.3',
+			removes: ['the Homebrew formula php@8.3'],
+			keeps: [],
+			blockers: [{ kind: 'sitesPinned', domains: ['shop.test'] }]
+		};
+		const { body } = render(LanguagesPage);
+		expect(body).toContain('data-testid="uninstall-refused"');
+		expect(body).toContain('shop.test');
+		expect(body).not.toContain('data-testid="uninstall-confirm"');
+	});
+});
+
+// Task 1's wiring, observed from this page rather than re-implemented: the
+// layout's `onServiceUnregistered` subscription calls
+// `ServicesStore.applyUnregistered`, and this page reads that same shared
+// snapshot for its pill and its Start/Stop control. Asserting through the
+// store proves the page needs no reload of its own for the row to go quiet.
+describe('the /languages route — a service that disappears', () => {
+	it('drops the pool pill and its control without a page reload', () => {
+		languagesStore.env = env(true, [row('8.3', true)]);
+		servicesStore.services = [svc('php-fpm-8.3', { kind: 'running' })];
+		const before = render(LanguagesPage).body;
+		expect(before).toContain('data-testid="lang-pill-8.3"');
+		expect(before).toContain('data-testid="stop-php-fpm-8.3"');
+
+		// Exactly what the layout does on `SupervisorEvent::Unregistered`.
+		servicesStore.applyUnregistered('php-fpm-8.3');
+
+		const after = render(LanguagesPage).body;
+		expect(after).not.toContain('data-testid="lang-pill-8.3"');
+		expect(after).not.toContain('data-testid="stop-php-fpm-8.3"');
+	});
+
+	it('leaves an unrelated service alone', () => {
+		languagesStore.env = env(true, [row('8.3', true)]);
+		servicesStore.services = [svc('php-fpm-8.3', { kind: 'running' })];
+		servicesStore.applyUnregistered('mysql-8.4');
+		const body = render(LanguagesPage).body;
+		expect(body).toContain('data-testid="lang-pill-8.3"');
 	});
 });
