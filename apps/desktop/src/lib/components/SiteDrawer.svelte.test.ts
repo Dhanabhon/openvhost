@@ -433,13 +433,36 @@ describe('SiteDrawer docroot risk warning', () => {
 		return { ...site('8.3'), docroot };
 	}
 
+	/** The risk-warning paragraph's OWN inner text, so mode-specific assertions
+	 *  are precise about what the warning itself says rather than coupled to
+	 *  whatever else does or does not appear elsewhere on the page. */
+	function riskWarningText(html: string): string {
+		const match = html.match(/<p\b[^>]*data-testid="docroot-risk-warning"[^>]*>([\s\S]*?)<\/p>/);
+		if (match === null) throw new Error('the drawer rendered no docroot-risk-warning element');
+		return text(match[1]);
+	}
+
 	it('edit mode: a risky docroot renders the warning, naming the folder and consequence', () => {
 		const html = drawerHtml(siteAt('/Users/tom/Downloads'));
 		expect(html).toContain('data-testid="docroot-risk-warning"');
-		const body = text(html);
-		expect(body).toContain('Downloads');
-		expect(body).toContain("reachable at this site's domain");
-		expect(body).toContain('.php');
+		const warning = riskWarningText(html);
+		expect(warning).toContain('Downloads');
+		expect(warning).toContain("reachable at this site's domain");
+		expect(warning).toContain('.php');
+	});
+
+	// Regression: the first six tests in this block used only mode-INDEPENDENT
+	// substrings, so a `docrootMode` ternary silently wired backwards (create's
+	// fix text shown in edit mode, or vice versa) would not have failed any of
+	// them. Edit mode is the one case fully SSR-testable at all (create mode's
+	// fix text is proven in DocrootRiskWarning.svelte.test.ts, see the header
+	// above) — this is what actually pins SiteDrawer wires the CORRECT mode
+	// through, not just A mode. Vacuity-proved by temporarily inverting
+	// `docrootMode`'s ternary in SiteDrawer.svelte and confirming this goes red.
+	it('edit mode: the warning offers the subfolder fix, not the create-only checkbox wording', () => {
+		const warning = riskWarningText(drawerHtml(siteAt('/Users/tom/Downloads')));
+		expect(warning).toContain('subfolder');
+		expect(warning).not.toContain('Create a site folder inside this folder');
 	});
 
 	it('edit mode: the warning is NOT gated behind the create-only checkbox block', () => {
@@ -459,9 +482,15 @@ describe('SiteDrawer docroot risk warning', () => {
 		expect(tagWith(html, 'id="f-root"')).not.toContain('f-root-risk');
 	});
 
+	// Deliberately the ONLY assertion in this test (split out from a combined
+	// "renders AND stays enabled" test per review): the render-gate vacuity
+	// probe used elsewhere in this block makes the FIRST expect in a combined
+	// test fail before the enablement expect ever runs, so it never actually
+	// proved this claim. Vacuity-proved on its own by temporarily wiring
+	// `disabled={submitting || phpUnavailable || !!docrootRiskValue}` on the
+	// Save button in SiteDrawer.svelte and confirming ONLY this test goes red.
 	it('edit mode: Save stays enabled next to the warning — warn, never block', () => {
 		const html = drawerHtml(siteAt('/Users/tom/Downloads'));
-		expect(html).toContain('data-testid="docroot-risk-warning"');
 		expect(tagWith(html, 'data-testid="drawer-save"')).not.toContain('disabled');
 	});
 

@@ -210,29 +210,32 @@ export type DocrootRisk =
 	| { kind: 'personalFolder'; folder: string }
 	| { kind: 'systemRoot'; root: string };
 
-/** Well-known personal folders macOS creates directly under every user's home. */
+/** Well-known personal folders macOS creates directly under every user's home.
+ *  Lowercase: membership is checked against a lowercased path segment (see
+ *  `docrootRisk`), never against these literals directly. */
 const PERSONAL_FOLDERS = new Set([
-	'Downloads',
-	'Desktop',
-	'Documents',
-	'Movies',
-	'Music',
-	'Pictures',
-	'Public',
-	'Library'
+	'downloads',
+	'desktop',
+	'documents',
+	'movies',
+	'music',
+	'pictures',
+	'public',
+	'library'
 ]);
 
 /** Shared/system roots no site should ever be rooted at. Exact matches only —
  *  spec D1 lists these as specific paths, not prefixes, so `/etc/nginx` is not
  *  flagged by this tier (nor need it be: it is not a folder a user would pick
- *  as a project folder in the first place). */
+ *  as a project folder in the first place). Lowercase for the same reason as
+ *  `PERSONAL_FOLDERS` above. */
 const SYSTEM_ROOTS = new Set([
 	'/',
-	'/Users',
-	'/Applications',
-	'/System',
-	'/Library',
-	'/Volumes',
+	'/users',
+	'/applications',
+	'/system',
+	'/library',
+	'/volumes',
 	'/tmp',
 	'/private',
 	'/etc',
@@ -240,10 +243,25 @@ const SYSTEM_ROOTS = new Set([
 	'/var'
 ]);
 
-/** Strip trailing slashes the same way `scaffoldPreview` does, but restore a
- *  bare `/` if that strips everything (the root path itself). */
+/** Strip trailing slashes the same way `scaffoldPreview` does (restoring a
+ *  bare `/` if that strips everything — the root path itself), and collapse
+ *  any run of internal separators (`/Users//tom` → `/Users/tom`) so a
+ *  double-typed or pasted slash cannot slip a container folder past the
+ *  checks below. Case is deliberately left untouched here — `docrootRisk`
+ *  keeps this original-case string for DISPLAY and only lowercases a
+ *  separate copy for matching.
+ *
+ *  The collapse is REDUNDANT (but harmless — defense in depth) for the
+ *  `homeItself`/`personalFolder` checks, which split on `/` and drop empty
+ *  segments regardless, so a doubled separator BETWEEN two named segments
+ *  (`/Users//tom/Downloads`) is already absorbed there either way. It is the
+ *  only thing that catches a doubled separator immediately before a
+ *  single-segment `systemRoot` (`//etc`), since that check compares the
+ *  whole normalized string as one unit rather than matching segment by
+ *  segment. */
 function normalizeDocrootPath(path: string): string {
-	const trimmed = path.replace(/\/+$/, '');
+	const collapsed = path.replace(/\/+/g, '/');
+	const trimmed = collapsed.replace(/\/+$/, '');
 	return trimmed === '' ? '/' : trimmed;
 }
 
@@ -267,20 +285,59 @@ function normalizeDocrootPath(path: string): string {
  * same way, which is intentional: the risk (an entire personal-style folder
  * becoming a web root) does not depend on whose account it is.
  *
+ * **Every shape check below is case-INSENSITIVE**, matched against a
+ * lowercased copy of the normalized path (`Users`/`users`/`USERS`,
+ * `Downloads`/`downloads`/`DOWNLOADS`, `/etc`/`/ETC` all match identically).
+ * macOS's default volume format (APFS, case-insensitive but case-preserving)
+ * treats those as the SAME real folder, so a case-sensitive comparison would
+ * silently let `/Users/tom/DOWNLOADS` — the exact incident's folder, just
+ * typed in caps — through with no warning. The tradeoff runs the other way on
+ * a case-SENSITIVE volume (rare; an opt-in APFS format), where `downloads`
+ * really could be a distinct, unrelated folder from `Downloads`: this
+ * over-warns there. That is the right side to err on — a spurious warning
+ * costs a glance, a missed one served 1,071 files. The MATCHED segment is
+ * still reported (`folder`/`root`) using the ORIGINAL casing from `path`, not
+ * a canonicalized one: this function has no way to know the true on-disk
+ * casing without stat-ing the filesystem (disallowed, see above), so the copy
+ * names exactly what is in the field rather than inventing a canonical form.
+ *
+ * **A leading `~` is deliberately left unexpanded, not a case this classifies
+ * at all.** `Docroot::parse` (crates/openvhost-core/src/site/model.rs)
+ * requires an absolute path, so any `~`-prefixed docroot already fails
+ * validation at Save regardless of what this function returns — the
+ * incident this exists to prevent (a container folder silently reaching a
+ * live nginx config) cannot happen through an unresolved `~`, only through
+ * the absolute form it would have to be retyped as to save at all, which
+ * this function already classifies correctly. Expanding `~` here would only
+ * change how early the warning appears for a path that cannot be saved yet,
+ * not whether the incident can occur — not worth resolving a path the user
+ * did not literally type (the same "no canonicalization" stance the sibling
+ * scaffold slice takes, spec D5 in the 2026-07-29 design note).
+ *
  * Blank/whitespace-only input returns `null` (matches `scaffoldPreview`'s own
  * blank guard) rather than normalizing to `/` and flagging the filesystem root.
  */
 export function docrootRisk(path: string): DocrootRisk | null {
 	if (path.trim() === '') return null;
 	const normalized = normalizeDocrootPath(path);
+	const lower = normalized.toLowerCase();
 
-	if (SYSTEM_ROOTS.has(normalized)) return { kind: 'systemRoot', root: normalized };
+	if (SYSTEM_ROOTS.has(lower)) return { kind: 'systemRoot', root: normalized };
 
-	if (/^\/Users\/[^/]+$/.test(normalized)) return { kind: 'homeItself' };
+	// Split (rather than regex) so the ORIGINAL-case segments are available for
+	// display (`segments[2]` below) alongside the lowercased ones used to match.
+	const lowerSegments = lower.split('/').filter((s) => s !== '');
+	if (lowerSegments.length === 2 && lowerSegments[0] === 'users') {
+		return { kind: 'homeItself' };
+	}
 
-	const personalMatch = normalized.match(/^\/Users\/[^/]+\/([^/]+)$/);
-	if (personalMatch && PERSONAL_FOLDERS.has(personalMatch[1])) {
-		return { kind: 'personalFolder', folder: personalMatch[1] };
+	if (
+		lowerSegments.length === 3 &&
+		lowerSegments[0] === 'users' &&
+		PERSONAL_FOLDERS.has(lowerSegments[2])
+	) {
+		const segments = normalized.split('/').filter((s) => s !== '');
+		return { kind: 'personalFolder', folder: segments[2] };
 	}
 
 	return null;

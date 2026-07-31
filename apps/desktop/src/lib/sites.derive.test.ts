@@ -226,9 +226,11 @@ describe('docrootRisk', () => {
 		}
 	});
 
-	it('does not flag an arbitrary folder under home that merely resembles one', () => {
-		expect(docrootRisk('/Users/tom/downloads')).toBeNull(); // wrong case
-		expect(docrootRisk('/Users/tom/Downloader')).toBeNull(); // similar name
+	it('does not flag a folder whose name merely resembles a well-known one', () => {
+		// Genuine near-misses — different real folders, not the same one under a
+		// different case (see the case-insensitivity block below for that).
+		expect(docrootRisk('/Users/tom/Downloader')).toBeNull();
+		expect(docrootRisk('/Users/tom/Downloads2')).toBeNull();
 	});
 
 	it('flags the home directory itself', () => {
@@ -280,6 +282,99 @@ describe('docrootRisk', () => {
 	it('returns null for a blank or whitespace-only path, matching scaffoldPreview', () => {
 		expect(docrootRisk('')).toBeNull();
 		expect(docrootRisk('   ')).toBeNull();
+	});
+
+	describe('case-insensitivity (default APFS is case-insensitive but case-preserving)', () => {
+		// A reviewer reconstructed and RAN the pre-fix classifier: on the default
+		// macOS volume format, `/Users/tom/downloads` and `/Users/tom/DOWNLOADS`
+		// are not lookalikes, they are the exact same real folder as
+		// `/Users/tom/Downloads` — the exact incident's folder, just retyped in a
+		// different case. A case-sensitive comparison silently missed both.
+		it('flags a personal folder regardless of case, preserving the AS-TYPED case for display', () => {
+			expect(docrootRisk('/Users/tom/downloads')).toEqual({
+				kind: 'personalFolder',
+				folder: 'downloads'
+			});
+			expect(docrootRisk('/Users/tom/DOWNLOADS')).toEqual({
+				kind: 'personalFolder',
+				folder: 'DOWNLOADS'
+			});
+			expect(docrootRisk('/Users/tom/DoWnLoAdS')).toEqual({
+				kind: 'personalFolder',
+				folder: 'DoWnLoAdS'
+			});
+		});
+
+		it('flags a system root regardless of case, preserving the AS-TYPED case for display', () => {
+			expect(docrootRisk('/ETC')).toEqual({ kind: 'systemRoot', root: '/ETC' });
+			expect(docrootRisk('/Etc')).toEqual({ kind: 'systemRoot', root: '/Etc' });
+		});
+
+		it('flags home itself and a personal folder even when "Users" is typed lowercase', () => {
+			// Same case-insensitive-volume argument, one segment earlier in the path.
+			expect(docrootRisk('/users/tom')).toEqual({ kind: 'homeItself' });
+			expect(docrootRisk('/USERS/tom/Downloads')).toEqual({
+				kind: 'personalFolder',
+				folder: 'Downloads'
+			});
+		});
+
+		it('still does not flag a genuine near-miss once case is folded', () => {
+			// Folding case must not make the match GREEDIER than the real folder
+			// set — only members of PERSONAL_FOLDERS/SYSTEM_ROOTS, case aside.
+			expect(docrootRisk('/Users/tom/DOWNLOADER')).toBeNull();
+			expect(docrootRisk('/ETCETERA')).toBeNull();
+		});
+	});
+
+	describe('separator collapsing', () => {
+		// Only reachable by hand-typing/pasting into the freely-editable field
+		// (Browse always returns a clean OS path) — lower stakes than the
+		// case-insensitivity gap above, but the field IS freely editable.
+		it('collapses a doubled internal separator before matching', () => {
+			expect(docrootRisk('/Users/tom//Downloads')).toEqual({
+				kind: 'personalFolder',
+				folder: 'Downloads'
+			});
+			expect(docrootRisk('/Users//tom/Downloads')).toEqual({
+				kind: 'personalFolder',
+				folder: 'Downloads'
+			});
+		});
+
+		// The two cases above are ALSO covered, independently, by the segment
+		// split-and-filter `homeItself`/`personalFolder` matching does regardless
+		// of whether `normalizeDocrootPath` collapses anything (an empty segment
+		// from a doubled `/` is dropped by the filter either way) — real,
+		// correct behaviour, but not a proof that the collapsing step itself is
+		// load-bearing. `systemRoot` compares the whole normalized string as one
+		// unit instead of segment by segment, so a doubled separator immediately
+		// before a single-segment root is the one case that genuinely has no
+		// fallback — this is the assertion that actually goes red without the
+		// collapsing step (verified by temporarily reverting it).
+		it('collapses a doubled separator immediately before a system root', () => {
+			expect(docrootRisk('//etc')).toEqual({ kind: 'systemRoot', root: '/etc' });
+		});
+
+		it('collapses a doubled trailing separator the same way as a single one', () => {
+			expect(docrootRisk('/Users/tom/Downloads//')).toEqual({
+				kind: 'personalFolder',
+				folder: 'Downloads'
+			});
+		});
+	});
+
+	describe('a leading ~ is deliberately not expanded', () => {
+		// Docroot::parse requires an absolute path, so a `~`-prefixed docroot
+		// already fails validation at Save regardless of this classifier — see
+		// the doc comment on docrootRisk for the full reasoning. Pinned here so
+		// that reasoning is a checked claim, not just a comment: if a future
+		// change to the ingress validator ever allowed `~` through unexpanded,
+		// this pairing would need to be revisited.
+		it('does not flag an unexpanded ~-relative path', () => {
+			expect(docrootRisk('~/Downloads')).toBeNull();
+			expect(docrootRisk('~')).toBeNull();
+		});
 	});
 });
 
