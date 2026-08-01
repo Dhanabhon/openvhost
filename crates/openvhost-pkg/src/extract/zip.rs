@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Hardened zip extraction: iterate the central directory only, validate
-//! every entry (reject-the-archive on any violation), then write. Symlink
-//! entries (S_IFLNK in external attrs) are skipped entirely — never
-//! honored, never materialized as a plain file. Encrypted entries are
-//! rejected. Never uses zip-rs's own `extract`/`extract_unwrapped_root_dir`
-//! helpers (historic `../`/dup handling) — this is a manual walk.
+//! every entry (reject-the-archive on any violation), then write. A symlink
+//! entry (S_IFLNK in external attrs) REJECTS the whole archive with a named
+//! reason — never silently skipped, never honored, never materialized as a
+//! plain file. Encrypted entries are rejected. Never uses zip-rs's own
+//! `extract`/`extract_unwrapped_root_dir` helpers (historic `../`/dup
+//! handling) — this is a manual walk.
 
 use std::collections::HashSet;
 use std::fs;
@@ -57,22 +58,22 @@ pub(crate) fn extract_zip(archive: &mut fs::File, dest: &Path) -> Result<(), Pkg
         return Err(reject("too many entries"));
     }
 
-    // Pass 1 (metadata-only): validate every entry, skip symlinks entirely,
-    // and stage the rest for the strip decision. `by_index_raw` (NOT
-    // `by_index`) is used deliberately: `by_index`'s password gate fails
-    // closed on an encrypted entry BEFORE handing back a `ZipFile` at all,
-    // which would make an `entry.encrypted()` check reached through
-    // `by_index` unreachable dead code — the archive would still get
-    // rejected (via `by_index`'s own generic error), but nothing in this
-    // file's own logic would ever exercise that rejection, and a future
-    // crate change that defers the password check to decompression time
-    // would silently stop rejecting at all. `by_index_raw` reads the SAME
-    // cached central-directory metadata (`name_raw`, `encrypted`,
-    // `unix_mode`, `size`) WITHOUT that password gate and WITHOUT
-    // decompressing or decrypting anything (confirmed empirically: it
-    // reports `encrypted() == true` for an encrypted entry instead of
-    // erroring), so the `encrypted()` check below is a real, reachable,
-    // directly-tested rejection.
+    // Pass 1 (metadata-only): validate every entry, reject the archive if
+    // it carries a symlink entry, and stage the rest for the strip
+    // decision. `by_index_raw` (NOT `by_index`) is used deliberately:
+    // `by_index`'s password gate fails closed on an encrypted entry BEFORE
+    // handing back a `ZipFile` at all, which would make an
+    // `entry.encrypted()` check reached through `by_index` unreachable
+    // dead code — the archive would still get rejected (via `by_index`'s
+    // own generic error), but nothing in this file's own logic would ever
+    // exercise that rejection, and a future crate change that defers the
+    // password check to decompression time would silently stop rejecting
+    // at all. `by_index_raw` reads the SAME cached central-directory
+    // metadata (`name_raw`, `encrypted`, `unix_mode`, `size`) WITHOUT that
+    // password gate and WITHOUT decompressing or decrypting anything
+    // (confirmed empirically: it reports `encrypted() == true` for an
+    // encrypted entry instead of erroring), so the `encrypted()` check
+    // below is a real, reachable, directly-tested rejection.
     struct Staged {
         rel: String,
         is_dir: bool,
@@ -106,10 +107,28 @@ pub(crate) fn extract_zip(archive: &mut fs::File, dest: &Path) -> Result<(), Pkg
         let mode = entry
             .unix_mode()
             .unwrap_or(if is_dir { 0o755 } else { 0o644 });
-        // Symlink entries (S14): skip entirely — never honored, never
-        // materialized as a plain file, whether or not the target escapes.
+        // Symlink entries (S14): reject the WHOLE archive, naming the
+        // reason. This walk used to `continue` past them silently, which is
+        // the same defect shape as a single-root strip that returns `Ok`
+        // with the payload one level too deep — a clean success and a tree
+        // missing something load-bearing. On the tar side those links are
+        // exactly what makes a relocatable macOS payload work (drop them and
+        // `mysqld` dies at exec on a missing `@loader_path` library), so a
+        // zip that carries them is not a zip we may quietly half-extract.
+        //
+        // Rejecting rather than materializing is the deliberate choice for
+        // now. No zip package we ship carries symlinks — our zip payloads
+        // are Windows PHP builds, and `targz.rs`'s `create_symlink` already
+        // refuses outright on Windows, where creating one needs privilege —
+        // so honoring them here would mean shipping a second, unexercised
+        // implementation of a security-relevant materialization order for
+        // zero present benefit. The containment rule itself
+        // (`validate::validate_symlink`) is already written and
+        // format-agnostic: the day a real zip payload needs links, wiring it
+        // up is mechanical, and THIS rejection is what makes that day
+        // visible instead of silent.
         if !is_dir && (mode & S_IFLNK) == S_IFLNK {
-            continue;
+            return Err(reject("symlink entries are not supported in zip archives"));
         }
         let rel = validate_entry_name(&name.replace('\\', "/"))?;
         if is_dir {
@@ -303,8 +322,14 @@ mod tests {
     }
 
     #[test]
-    fn skips_symlink_entries_entirely() {
-        // zip symlinks are NOT honored and NOT materialized as files (S14).
+    fn rejects_symlink_entries_with_a_named_reason() {
+        // This walk used to skip symlink entries silently and return `Ok`
+        // with a tree missing them — a clean success and, for any payload
+        // whose links are load-bearing, a dead binary. Assert the SPECIFIC
+        // rejection rather than `is_err()`: a bare error assertion would
+        // also pass if the archive happened to be rejected for an unrelated
+        // reason, and would keep passing if this check were quietly turned
+        // back into a `continue` while some other check did the rejecting.
         let bytes = zip_bytes(&[
             ZipSpec::File {
                 path: "real",
@@ -316,12 +341,12 @@ mod tests {
                 target: "real",
             },
         ]);
-        let dest = extract(&bytes).unwrap();
-        assert!(dest.path().join("real").is_file());
-        assert!(
-            !dest.path().join("link").exists(),
-            "symlink entry must be skipped"
-        );
+        match extract(&bytes) {
+            Err(PkgError::UnsafeArchive(msg)) => {
+                assert_eq!(msg, "symlink entries are not supported in zip archives")
+            }
+            other => panic!("expected the symlink rejection, got {other:?}"),
+        }
     }
 
     #[cfg(unix)]

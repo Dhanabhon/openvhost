@@ -351,23 +351,140 @@ pub(crate) fn stripped_rel(validated_raw: &str, strip: &StripInfo) -> Option<Str
         .map(|s| s.to_string())
 }
 
-/// Validate a symlink target (S14): relative, valid UTF-8, no `.`/`..`
-/// components (sibling/descendant only).
-pub(crate) fn validate_symlink_target(target: &str) -> Result<(), PkgError> {
+/// Validate one symlink entry (S14): the link's FINAL destination-relative
+/// path and its target, together, in ONE call.
+///
+/// # Why one function taking both
+///
+/// Containment is not expressible on the target alone — how far a target may
+/// ascend depends on how deep the link itself sits. A target-only entry
+/// point is callable without depth context, and calling one against a
+/// PRE-strip name over-permits by exactly the number of components
+/// [`strip_single_root`] removes: raw `pkg/bin/x -> ../../etc/passwd` looks
+/// contained at depth 2, then materializes at `bin/x`, where `../..` is the
+/// PARENT of the extraction root. Demanding the final rel in the signature
+/// makes that call impossible to write.
+///
+/// # The rule
+///
+/// Let `k` be the length of the target's LEADING contiguous run of `..`
+/// components, and `d` the number of components in the link's own directory.
+///
+/// 1. The target is non-empty and relative: no leading `/`, no `\`, no `:`,
+///    no empty component, no `.` component.
+/// 2. `..` appears ONLY in that leading run. Any `..` after a named
+///    component is rejected. **Load-bearing — see below.**
+/// 3. `k <= d`.
+/// 4. The resolved path is non-empty: a link resolving to the extraction
+///    root itself is refused. **Also load-bearing — see below.**
+/// 5. The resolved path satisfies [`MAX_DEPTH`] and [`MAX_REL_BYTES`], so a
+///    symlink cannot name a path [`validate_entry_name`] would have refused.
+///
+/// Measured against upstream `mysql-8.4.11-macos15-arm64.tar.gz`: all 34
+/// symlinks pass, no exceptions, and each of the 22 whose target contains
+/// `..` saturates `k == d` exactly — none of them even wants to reach the
+/// package root, let alone leave it.
+///
+/// # Why lexical normalization is NOT enough
+///
+/// The obvious rule — normalize the target against the link's own directory
+/// and require the result to stay under the extraction root — is UNSOUND.
+/// Lexical `..` cancellation assumes every preceding component is a real
+/// directory; a symlink component breaks that, so two INDIVIDUALLY CONTAINED
+/// links compose into an escape:
+///
+/// ```text
+/// root/a/b/up -> ../..                 normalizes to "."        (would pass)
+/// root/pwn    -> a/b/up/../../secret   normalizes to "a/secret" (would pass)
+/// ```
+///
+/// The kernel resolves `up` FIRST, so the following `../..` pops two levels
+/// above the root and reading `root/pwn` reads a file outside it — built on
+/// disk and read through during the audit of this rule. Materializing
+/// symlinks last does not close it either: that protects against
+/// write-through DURING extraction, not against traversal afterwards.
+///
+/// # Why this rule IS sound
+///
+/// It rejects the PRIMITIVE rather than the compositions. Under
+/// [`validate_entry_name`] every entry path is relative and `..`-free, so at
+/// the end of extraction every directory component of every materialized
+/// path is a REAL directory — directories via `create_dir_all`, files via
+/// `create_new`, symlinks last with `verify_real_ancestors` rejecting a
+/// symlinked ancestor. So `(../)^k` is only ever applied to a path made
+/// entirely of real directories, and `k <= d` keeps that ancestor at or
+/// below the root. The tail contains no `..`, so traversing it can only
+/// descend; an intermediate symlink in the tail is bound by this same rule,
+/// so by induction every hop lands at or below the root. **`..` is never
+/// applied to a path whose last component was a symlink** — that is the
+/// invariant. Chain length is irrelevant.
+///
+/// Clauses 2 and 4 each break the laundering pair above on their OWN — 2
+/// refuses `pwn` (its `..` follows named components), 4 refuses `up` (it
+/// resolves to the root itself). That redundancy is deliberate: **keep
+/// both.** Weakening either leaves a rule that still passes every acceptance
+/// test in this module and fails only in production.
+pub(crate) fn validate_symlink(link_rel: &str, target: &str) -> Result<(), PkgError> {
+    // The link's own final rel comes from `validate_entry_name` plus the
+    // single-root strip, so it is relative, `..`-free and non-empty. Fail
+    // closed rather than assume it.
+    if link_rel.is_empty() {
+        return Err(reject("empty symlink path"));
+    }
+
+    // Clause 1 — the shape of the target itself.
     if target.is_empty() {
         return Err(reject("empty symlink target"));
     }
     if target.starts_with('/') || target.contains('\\') || target.contains(':') {
         return Err(reject("absolute or non-relative symlink target"));
     }
-    for c in target.split('/') {
-        if c == "." || c == ".." || c.is_empty() {
-            return Err(reject("symlink target has '.'/'..'/empty component"));
+    let comps: Vec<&str> = target.split('/').collect();
+    for c in &comps {
+        if c.is_empty() {
+            return Err(reject("empty component in symlink target"));
+        }
+        if *c == "." {
+            return Err(reject("'.' component in symlink target"));
         }
     }
-    // No component above can ever be '.'/'..'  (checked in the loop just
-    // above), so the target can never lexically ascend out of wherever the
-    // link lives, regardless of nesting depth — nothing further to check.
+
+    // Clause 2 — `..` ONLY as a leading contiguous run. This is the clause
+    // that makes the whole rule sound (see "Why this rule IS sound" above);
+    // it is not a stylistic tidy-up of clause 3 and must not be folded into
+    // it.
+    let k = comps.iter().take_while(|c| **c == "..").count();
+    if comps[k..].contains(&"..") {
+        return Err(reject("'..' after a named component"));
+    }
+
+    // Clause 3 — that run may not out-ascend the link's own depth. `d` is
+    // measured on the FINAL rel; see the signature note above for what
+    // happens when a caller passes a pre-strip one.
+    let mut link_dir: Vec<&str> = link_rel.split('/').collect();
+    link_dir.pop(); // the link's own basename
+    let d = link_dir.len();
+    if k > d {
+        return Err(reject("symlink target ascends past the package root"));
+    }
+
+    // Clauses 4 and 5 — what the target actually names, once resolved
+    // against the link's directory. `k <= d` was just checked and
+    // `k <= comps.len()` holds by construction, so neither slice can panic.
+    let mut resolved: Vec<&str> = link_dir[..d - k].to_vec();
+    resolved.extend_from_slice(&comps[k..]);
+    if resolved.is_empty() {
+        return Err(reject("symlink target resolves to the package root itself"));
+    }
+    // Only the two size limits, deliberately: the reserved-device-name and
+    // trailing-dot rules govern entry NAMES (paths this extractor creates),
+    // whereas a symlink target is a path it merely points at.
+    if resolved.join("/").len() > MAX_REL_BYTES {
+        return Err(reject("symlink target path too long"));
+    }
+    if resolved.len() > MAX_DEPTH {
+        return Err(reject("symlink target nesting too deep"));
+    }
     Ok(())
 }
 
@@ -731,14 +848,241 @@ mod tests {
         assert_eq!(stripped_rel("other/thing", &strip), None);
     }
 
-    #[test]
-    fn symlink_targets() {
-        // sibling / descendant relative targets ok
-        assert!(validate_symlink_target("libfoo.so.1").is_ok());
-        assert!(validate_symlink_target("c/d").is_ok());
-        // absolute, parent-escaping, or dot components rejected
-        for tgt in ["/abs", "../../etc/passwd", "./x", "b/../x"] {
-            assert!(validate_symlink_target(tgt).is_err(), "reject {tgt}");
+    // -----------------------------------------------------------------
+    // The symlink containment rule (S14), clause by clause. `..` is allowed
+    // ONLY as a leading contiguous run, bounded by the link's own depth —
+    // see `validate_symlink`'s docs for the soundness argument, and for why
+    // clauses 2 and 4 are deliberately redundant.
+    // -----------------------------------------------------------------
+
+    /// The rejection message `validate_symlink` produced, so a test can
+    /// assert WHICH clause fired rather than merely that something failed.
+    /// Under a bare `is_err()` a rule with two independent clauses is
+    /// indistinguishable from a rule with one, which is exactly the
+    /// weakening these tests exist to notice.
+    #[track_caller]
+    fn reason(link_rel: &str, target: &str) -> String {
+        match validate_symlink(link_rel, target) {
+            Err(PkgError::UnsafeArchive(m)) => m,
+            other => panic!("expected UnsafeArchive for {link_rel} -> {target}, got {other:?}"),
         }
+    }
+
+    /// Every symlink upstream `mysql-8.4.11-macos15-arm64.tar.gz` ships, in
+    /// the `link -> target` form `tar -tv` prints it, read straight off the
+    /// real 167,977,240-byte tarball. Link paths are shown POST-STRIP — the
+    /// paths this extractor actually creates, which is the only depth the
+    /// containment rule is meaningful against.
+    ///
+    /// 34 entries, of which 22 contain `..`. Those 22 are the mechanism that
+    /// makes a relocatable macOS payload work: drop them and the install
+    /// still returns a clean `Ok`, but `mysqld` dies at exec on a missing
+    /// `@loader_path` library.
+    const REAL_MYSQL_LINKS: [&str; 34] = [
+        "bin/libprotobuf-lite.24.4.0.dylib -> ../lib/libprotobuf-lite.24.4.0.dylib",
+        "bin/libprotobuf.24.4.0.dylib -> ../lib/libprotobuf.24.4.0.dylib",
+        "lib/libcom_err.dylib -> libcom_err.3.0.dylib",
+        "lib/libcrypto.dylib -> libcrypto.3.dylib",
+        "lib/libfido2.1.dylib -> libfido2.1.15.0.dylib",
+        "lib/libfido2.dylib -> libfido2.1.dylib",
+        "lib/libgssapi_krb5.dylib -> libgssapi_krb5.2.2.dylib",
+        "lib/libk5crypto.dylib -> libk5crypto.3.1.dylib",
+        "lib/libkrb5.dylib -> libkrb5.3.3.dylib",
+        "lib/libkrb5support.dylib -> libkrb5support.1.1.dylib",
+        "lib/libmysqlclient.dylib -> libmysqlclient.24.dylib",
+        "lib/libprotobuf-lite.dylib -> libprotobuf-lite.24.4.0.dylib",
+        "lib/libprotobuf.dylib -> libprotobuf.24.4.0.dylib",
+        "lib/libssl.dylib -> libssl.3.dylib",
+        "lib/plugin/debug/libcom_err.3.0.dylib -> ../../../lib/libcom_err.3.0.dylib",
+        "lib/plugin/debug/libcrypto.3.dylib -> ../../../lib/libcrypto.3.dylib",
+        "lib/plugin/debug/libfido2.1.dylib -> ../../../lib/libfido2.1.dylib",
+        "lib/plugin/debug/libgssapi_krb5.2.2.dylib -> ../../../lib/libgssapi_krb5.2.2.dylib",
+        "lib/plugin/debug/libk5crypto.3.1.dylib -> ../../../lib/libk5crypto.3.1.dylib",
+        "lib/plugin/debug/libkrb5.3.3.dylib -> ../../../lib/libkrb5.3.3.dylib",
+        "lib/plugin/debug/libkrb5support.1.1.dylib -> ../../../lib/libkrb5support.1.1.dylib",
+        "lib/plugin/debug/libprotobuf-lite.24.4.0.dylib -> ../../../lib/libprotobuf-lite.24.4.0.dylib",
+        "lib/plugin/debug/libprotobuf.24.4.0.dylib -> ../../../lib/libprotobuf.24.4.0.dylib",
+        "lib/plugin/debug/libssl.3.dylib -> ../../../lib/libssl.3.dylib",
+        "lib/plugin/libcom_err.3.0.dylib -> ../../lib/libcom_err.3.0.dylib",
+        "lib/plugin/libcrypto.3.dylib -> ../../lib/libcrypto.3.dylib",
+        "lib/plugin/libfido2.1.dylib -> ../../lib/libfido2.1.dylib",
+        "lib/plugin/libgssapi_krb5.2.2.dylib -> ../../lib/libgssapi_krb5.2.2.dylib",
+        "lib/plugin/libk5crypto.3.1.dylib -> ../../lib/libk5crypto.3.1.dylib",
+        "lib/plugin/libkrb5.3.3.dylib -> ../../lib/libkrb5.3.3.dylib",
+        "lib/plugin/libkrb5support.1.1.dylib -> ../../lib/libkrb5support.1.1.dylib",
+        "lib/plugin/libprotobuf-lite.24.4.0.dylib -> ../../lib/libprotobuf-lite.24.4.0.dylib",
+        "lib/plugin/libprotobuf.24.4.0.dylib -> ../../lib/libprotobuf.24.4.0.dylib",
+        "lib/plugin/libssl.3.dylib -> ../../lib/libssl.3.dylib",
+    ];
+
+    /// Split one [`REAL_MYSQL_LINKS`] row into its (link rel, target) pair.
+    #[track_caller]
+    fn real_link(row: &str) -> (&str, &str) {
+        match row.split_once(" -> ") {
+            Some(pair) => pair,
+            None => panic!("malformed fixture row {row:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_every_symlink_in_the_real_mysql_payload() {
+        for row in REAL_MYSQL_LINKS {
+            let (link, target) = real_link(row);
+            assert!(
+                validate_symlink(link, target).is_ok(),
+                "must accept {link} -> {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_real_dotdot_target_saturates_the_links_own_depth() {
+        // Black-box proof that the rule is TIGHT against the real payload
+        // rather than merely permissive enough for it: each of the 22 real
+        // `..` targets uses exactly as much ascent as the link's own
+        // directory allows, so prepending ONE more `..` must trip clause 3.
+        // A rule that dropped `d` and simply allowed leading `..` would
+        // accept these too, and pass the acceptance test above unchanged.
+        let mut checked = 0usize;
+        for row in REAL_MYSQL_LINKS {
+            let (link, target) = real_link(row);
+            if !target.starts_with("../") {
+                continue;
+            }
+            checked += 1;
+            let one_more = format!("../{target}");
+            assert_eq!(
+                reason(link, &one_more),
+                "symlink target ascends past the package root",
+                "{link} -> {one_more} must not be accepted"
+            );
+        }
+        assert_eq!(checked, 22, "the real payload has 22 '..' targets");
+    }
+
+    #[test]
+    fn accepts_ascent_that_stays_inside_the_package() {
+        for (link, target) in [
+            ("lib/libfoo.dylib", "libfoo.1.dylib"),      // k = 0
+            ("bin/libfoo.dylib", "../lib/libfoo.dylib"), // k = 1 = d
+            ("lib/plugin/x.dylib", "../../lib/x.dylib"), // k = 2 = d
+            ("lib/plugin/debug/x", "../../../lib/x"),    // k = 3 = d
+            ("a/b/c/l", "../d"),                         // k = 1 < d = 3
+            ("a/b/l", ".."),                             // k = 1 < d = 2, empty tail
+        ] {
+            assert!(
+                validate_symlink(link, target).is_ok(),
+                "must accept {link} -> {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_absolute_dot_and_empty_target_components() {
+        // Clause 1 — retained verbatim from the pre-`..` rule.
+        assert_eq!(reason("a/l", ""), "empty symlink target");
+        for bad in ["/abs/path", "c:\\x", "b\\c", "x:stream"] {
+            assert_eq!(
+                reason("a/l", bad),
+                "absolute or non-relative symlink target",
+                "{bad}"
+            );
+        }
+        for bad in ["./x", "x/./y", "."] {
+            assert_eq!(
+                reason("a/l", bad),
+                "'.' component in symlink target",
+                "{bad}"
+            );
+        }
+        for bad in ["x//y", "x/"] {
+            assert_eq!(
+                reason("a/l", bad),
+                "empty component in symlink target",
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_dotdot_after_a_named_component() {
+        // Clause 2, the load-bearing one: `..` is legal only in the leading
+        // run, so no amount of in-root prefix can launder an ascent.
+        for (link, target) in [
+            ("a/b/l", "c/../d"),
+            ("a/b/l", "../c/../d"),
+            ("a/b/l", "c/.."),
+            ("a/b/l", "../../c/d/../../.."),
+            ("pwn", "a/b/up/../../secret"),
+        ] {
+            assert_eq!(
+                reason(link, target),
+                "'..' after a named component",
+                "{link} -> {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_ascent_past_the_package_root() {
+        // Clause 3, measured against the link's own directory depth.
+        for (link, target) in [
+            ("l", "../x"),                 // d = 0, k = 1
+            ("bin/x", "../../etc/passwd"), // d = 1, k = 2
+            ("a/b/c", "../../../x"),       // d = 2, k = 3
+        ] {
+            assert_eq!(
+                reason(link, target),
+                "symlink target ascends past the package root",
+                "{link} -> {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_target_that_resolves_to_the_package_root_itself() {
+        // Clause 4. `k == d` with an empty tail names the extraction root,
+        // which is the rung the laundering pair stands on.
+        for (link, target) in [("a/x", ".."), ("a/b/up", "../.."), ("a/b/c/x", "../../..")] {
+            assert_eq!(
+                reason(link, target),
+                "symlink target resolves to the package root itself",
+                "{link} -> {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_resolved_path_the_entry_name_rules_would_have_refused() {
+        // Clause 5 — a symlink must not be able to name a path
+        // `validate_entry_name` would have refused for an entry.
+        let deep = vec!["b"; MAX_DEPTH].join("/");
+        assert_eq!(reason("a/l", &deep), "symlink target nesting too deep");
+        let long = "b".repeat(MAX_REL_BYTES);
+        assert_eq!(reason("a/l", &long), "symlink target path too long");
+    }
+
+    #[test]
+    fn the_two_link_laundering_pair_is_rejected_at_the_primitive() {
+        // The escape a purely lexical containment rule accepts. Normalized
+        // against its own directory `up` reduces to "." and `pwn` reduces to
+        // "a/secret", so both look contained; on disk the kernel resolves
+        // `up` FIRST and `pwn`'s trailing `../..` pops two levels ABOVE the
+        // extraction root.
+        //
+        // Clause 4 refuses `up` and clause 2 refuses `pwn`, INDEPENDENTLY,
+        // and each is asserted here by its own exact message. Delete either
+        // clause and the corresponding call returns `Ok`, failing this test
+        // — which is precisely what a bare `is_err()` on the pair would not
+        // notice, because the surviving clause would still reject the other
+        // link.
+        assert_eq!(
+            reason("a/b/up", "../.."),
+            "symlink target resolves to the package root itself"
+        );
+        assert_eq!(
+            reason("pwn", "a/b/up/../../secret"),
+            "'..' after a named component"
+        );
     }
 }
