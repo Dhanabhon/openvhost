@@ -2839,7 +2839,7 @@ mod php_ipc_tests {
         for name in ["mysqld", "mysql", "mysqladmin"] {
             std::fs::write(bin_dir.join(name), b"#!/bin/sh\n").unwrap();
         }
-        let seed = openvhost_core::mysql::mysql_runtime_for_major(
+        let seed = openvhost_core::mysql::brew_mysql_runtime_for_major(
             &[prefix.path()],
             &openvhost_core::mysql::MysqlMajor::parse("8.4").unwrap(),
         )
@@ -2871,6 +2871,7 @@ mod php_ipc_tests {
                 mysqld: home.path().join("mysqld"),
                 mysql: home.path().join("mysql"),
                 mysqladmin: home.path().join("mysqladmin"),
+                source: openvhost_core::mysql::MysqlRuntimeSource::Homebrew,
             },
         ));
         assert_eq!(sup.snapshot().len(), 1);
@@ -3550,15 +3551,23 @@ fn mysql_rows(
     rows
 }
 
-/// Probe every known Homebrew prefix for installed MySQL runtimes. Mirrors
-/// `discover_all_php`'s `spawn_blocking` + `Handle::block_on` bridge exactly
-/// — see its doc comment for why.
-async fn discover_all_mysql()
--> Result<openvhost_core::Discovery<openvhost_core::mysql::MysqlRuntime>, IpcError> {
-    tauri::async_runtime::spawn_blocking(|| {
+/// Scan BOTH MySQL install sources — OpenVHost's own `<home>/packages/mysql/`
+/// tree and every known Homebrew prefix (MySQL-from-tarball design D3).
+/// Mirrors `discover_all_php`'s `spawn_blocking` + `Handle::block_on` bridge
+/// exactly — see its doc comment for why.
+///
+/// `home` is what makes the packaged tree visible; the [`PackagesRoot`] is
+/// minted from it and from nothing a caller supplies. A rescan that read only
+/// Homebrew would make a freshly installed packaged runtime vanish from the
+/// Databases page the moment the user pressed Rescan.
+async fn discover_all_mysql(
+    home: &Path,
+) -> Result<openvhost_core::Discovery<openvhost_core::mysql::MysqlRuntime>, IpcError> {
+    let packages = openvhost_core::PackagesRoot::from_home(home);
+    tauri::async_runtime::spawn_blocking(move || {
         let handle = tokio::runtime::Handle::current();
         let prefixes: Vec<&Path> = brew_prefixes();
-        openvhost_core::mysql::discover_mysql(&prefixes, &|bin| {
+        openvhost_core::mysql::discover_mysql(&packages, &prefixes, &|bin| {
             handle.block_on(openvhost_conf::probe_mysqld_version(bin))
         })
     })
@@ -3599,7 +3608,7 @@ pub(crate) async fn rescan_mysql_into_state(
         eprintln!("mysql: failed to sweep abandoned staging directories: {e}");
     }
 
-    let discovered = seeded_mysql(discover_all_mysql().await?, seed);
+    let discovered = seeded_mysql(discover_all_mysql(home).await?, seed);
     report_unidentified("MySQL", &discovered.unidentified);
     reconcile_mysql(runtimes, sup, home, discovered)
 }
@@ -4561,7 +4570,7 @@ pub async fn install_mysql(
     // See `install_php`'s matching block: `detected` is a stat of the formula
     // directory we asked brew to create, never a version probe. THIS is the
     // path the failure was reproduced on.
-    let seed = openvhost_core::mysql::mysql_runtime_for_major(&brew_prefixes(), &major);
+    let seed = openvhost_core::mysql::brew_mysql_runtime_for_major(&brew_prefixes(), &major);
     let detected = seed.is_some();
     rescan_mysql_into_state(runtimes.inner(), sup.inner(), &p.home, seed).await?;
 
@@ -4633,7 +4642,7 @@ async fn initialize_mysql_gate(major: String, home: &Path) -> InitializeMysqlGat
         }
     }
 
-    let discovered = match discover_all_mysql().await {
+    let discovered = match discover_all_mysql(home).await {
         Ok(d) => d,
         Err(e) => return Early(Err(e)),
     };
@@ -5245,6 +5254,7 @@ esac
             ),
             mysql: fake_cli(dir, "mysql", mysql_body),
             mysqladmin: fake_cli(dir, "mysqladmin", FAKE_MYSQLADMIN_BODY),
+            source: openvhost_core::mysql::MysqlRuntimeSource::Homebrew,
         }
     }
 
@@ -5412,6 +5422,7 @@ case "$*" in
 esac
 "#,
             ),
+            source: openvhost_core::mysql::MysqlRuntimeSource::Homebrew,
         }
     }
 
@@ -5426,6 +5437,7 @@ esac
             mysqld: PathBuf::from("/opt/homebrew/opt/mysql@8.4/bin/mysqld"),
             mysql: PathBuf::from("/opt/homebrew/opt/mysql@8.4/bin/mysql"),
             mysqladmin: PathBuf::from("/opt/homebrew/opt/mysql@8.4/bin/mysqladmin"),
+            source: openvhost_core::mysql::MysqlRuntimeSource::Homebrew,
         }];
 
         let rows = mysql_rows(home.path(), &installed);
@@ -5464,9 +5476,13 @@ esac
         for name in ["mysqld", "mysql", "mysqladmin"] {
             std::fs::write(bin_dir.join(name), b"#!/bin/sh\n").unwrap();
         }
-        let installed =
-            openvhost_core::mysql::discover_mysql(&[prefix.path()], &|_| Some("9.7".to_string()))
-                .runtimes;
+        let no_packages = tempfile::tempdir().unwrap();
+        let installed = openvhost_core::mysql::discover_mysql(
+            &openvhost_core::PackagesRoot::from_home(no_packages.path()),
+            &[prefix.path()],
+            &|_| Some("9.7".to_string()),
+        )
+        .runtimes;
         assert_eq!(installed.len(), 1);
 
         let home = tempfile::tempdir().unwrap();
@@ -5767,6 +5783,7 @@ esac
                 mysqld: home.path().join("mysqld"),
                 mysql: fake_mysql,
                 mysqladmin: home.path().join("mysqladmin"),
+                source: openvhost_core::mysql::MysqlRuntimeSource::Homebrew,
             },
         ])));
 
@@ -5843,6 +5860,7 @@ exit 1
                 mysqld: home.path().join("mysqld"),
                 mysql: fake_mysql,
                 mysqladmin: home.path().join("mysqladmin"),
+                source: openvhost_core::mysql::MysqlRuntimeSource::Homebrew,
             },
         ])));
 
@@ -5937,6 +5955,7 @@ exit 1
                 mysqld: home.path().join("mysqld"),
                 mysql: fake_mysql,
                 mysqladmin: home.path().join("mysqladmin"),
+                source: openvhost_core::mysql::MysqlRuntimeSource::Homebrew,
             },
         ])));
 

@@ -39,11 +39,11 @@ pub use mysql::{
     DatadirState, InstallLedger, LedgerEntry, LedgerWrite, MYSQL_CATALOGUE, MYSQL_PACKAGE_NAME,
     MYSQL_PACKAGES, MYSQL_WARMUP_BINARY, MysqlInitOutcome, MysqlInitStep, MysqlInstance,
     MysqlInstanceRepo, MysqlMajor, MysqlPackage, MysqlPackageInstall, MysqlPaths, MysqlRuntime,
-    PackageTarget, RootPassword, alter_user_sql, classify_datadir, discover_mysql,
-    finalize_staging, generate_root_password, install_mysql_package, mysql_brew_formula,
-    mysql_brew_install_spec, mysql_brew_uninstall_spec, mysql_package_for_host,
-    mysql_package_for_target, mysql_paths, mysql_runtime_for_major, remove_staging_dir,
-    staging_dir_path, sweep_stale_staging,
+    MysqlRuntimeSource, PackageTarget, RootPassword, alter_user_sql, brew_mysql_runtime_for_major,
+    classify_datadir, discover_mysql, finalize_staging, generate_root_password,
+    install_mysql_package, mysql_brew_formula, mysql_brew_install_spec, mysql_brew_uninstall_spec,
+    mysql_package_for_host, mysql_package_for_target, mysql_paths, packaged_mysql_runtime,
+    remove_staging_dir, staging_dir_path, sweep_stale_staging,
 };
 /// The package-pipeline types that appear in this crate's own public
 /// signatures, re-exported so the desktop app and the CLI need no direct

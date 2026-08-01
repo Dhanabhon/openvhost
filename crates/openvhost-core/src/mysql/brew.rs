@@ -338,7 +338,13 @@ mod tests {
         for name in ["mysqld", "mysql", "mysqladmin"] {
             std::fs::write(bin_dir.join(name), b"#!/bin/sh\n").unwrap();
         }
-        let found = crate::mysql::discover_mysql(&[dir.path()], &|_| Some("9.7".to_string()));
+        let found = crate::mysql::discover_mysql(
+            &openvhost_pkg::PackagesRoot::from_home(std::path::Path::new(
+                "/nonexistent/openvhost-home",
+            )),
+            &[dir.path()],
+            &|_| Some("9.7".to_string()),
+        );
         assert_eq!(found.runtimes.len(), 1, "got {found:?}");
 
         let err = mysql_brew_uninstall_spec(
@@ -470,7 +476,13 @@ mod tests {
         for name in ["mysqld", "mysql", "mysqladmin"] {
             std::fs::write(bin_dir.join(name), b"#!/bin/sh\n").unwrap();
         }
-        let found = crate::mysql::discover_mysql(&[dir.path()], &|_| Some("9.7".to_string()));
+        let found = crate::mysql::discover_mysql(
+            &openvhost_pkg::PackagesRoot::from_home(std::path::Path::new(
+                "/nonexistent/openvhost-home",
+            )),
+            &[dir.path()],
+            &|_| Some("9.7".to_string()),
+        );
         assert_eq!(found.runtimes.len(), 1, "got {found:?}");
         assert!(!found.runtimes[0].major.is_cataloged());
 

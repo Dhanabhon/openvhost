@@ -25,7 +25,10 @@ pub use brew::{
 pub use datadir::{
     DatadirState, MysqlPaths, classify_datadir, mysql_data_root, mysql_paths, sweep_stale_staging,
 };
-pub use discover::{MysqlRuntime, discover_mysql, mysql_runtime_for_major};
+pub use discover::{
+    MysqlRuntime, MysqlRuntimeSource, brew_mysql_runtime_for_major, discover_mysql,
+    packaged_mysql_runtime,
+};
 pub use init::{
     MysqlInitOutcome, MysqlInitStep, RootPassword, alter_user_sql, finalize_staging,
     generate_root_password, remove_staging_dir, staging_dir_path, write_generated_config,

@@ -61,7 +61,7 @@ use openvhost_core::mysql::{
     RootPassword, alter_user_sql, classify_datadir, discover_mysql, finalize_staging,
     generate_root_password, mysql_paths, staging_dir_path, write_generated_config,
 };
-use openvhost_core::{BREW_PREFIXES, Db};
+use openvhost_core::{BREW_PREFIXES, Db, PackagesRoot};
 use openvhost_proc::{
     OutputStream, ProcessDriver, ReadinessProbe, ServiceSpec, ServiceState, SpawnSpec,
     SpawnedChild, Supervisor, SupervisorEvent, TaskEvent, default_driver, run_task,
@@ -405,17 +405,24 @@ fn assert_no_secret(label: &str, text: &str, secret: &str) {
 // Async helpers.
 // ---------------------------------------------------------------------------
 
-/// Probe every known Homebrew prefix for an installed `mysql@8.4`, mirroring
+/// Scan both install sources for `mysql@8.4` — this hermetic home's own
+/// `packages/` tree and every known Homebrew prefix — mirroring
 /// `commands.rs::discover_all_mysql`'s `spawn_blocking` + `Handle::block_on`
 /// bridge exactly (`discover_mysql`'s probe closure must be synchronous;
 /// `probe_mysqld_version` is not).
-async fn discover_target_runtime() -> Option<MysqlRuntime> {
+///
+/// The hermetic home has no packaged MySQL, so in practice this resolves the
+/// machine's Homebrew keg — which is the point: MySQL-from-tarball design D3
+/// says a brew install keeps working, and this live proof is what says so
+/// against a real one.
+async fn discover_target_runtime(home: &Path) -> Option<MysqlRuntime> {
+    let packages = PackagesRoot::from_home(home);
     let prefixes: Vec<&'static Path> = BREW_PREFIXES.iter().map(Path::new).collect();
     let found = tokio::time::timeout(
         Duration::from_secs(15),
         tokio::task::spawn_blocking(move || {
             let handle = tokio::runtime::Handle::current();
-            discover_mysql(&prefixes, &|bin| {
+            discover_mysql(&packages, &prefixes, &|bin| {
                 handle.block_on(openvhost_conf::probe_mysqld_version(bin))
             })
         }),
@@ -815,8 +822,20 @@ async fn mysql_lifecycle_end_to_end_against_real_mysqld() {
         return;
     }
 
+    // ---- Hermetic home ----
+    //
+    // Created BEFORE discovery, not after: discovery now reads OpenVHost's own
+    // `<home>/packages/` tree as well as Homebrew (MySQL-from-tarball design
+    // D3), so it needs a home to read. This one has no packaged MySQL, which
+    // is exactly the shape D3 promises keeps working — a brew keg, found and
+    // driven end to end.
+    let home_dir = hermetic_home();
+    let home = home_dir.path();
+    openvhost_core::platform::macos::demo_stack::provision_home(home)
+        .expect("provision_home must succeed against a fresh tempdir");
+
     // ---- Discovery (spec D1) ----
-    let Some(runtime) = discover_target_runtime().await else {
+    let Some(runtime) = discover_target_runtime(home).await else {
         eprintln!(
             "SKIP mysql_live: mysql@8.4 is not installed (`brew install mysql@8.4`) — this test \
              does not install it; that is the controller's manual step"
@@ -841,11 +860,6 @@ async fn mysql_lifecycle_end_to_end_against_real_mysqld() {
     );
     let major = runtime.major.clone();
 
-    // ---- Hermetic home ----
-    let home_dir = hermetic_home();
-    let home = home_dir.path();
-    openvhost_core::platform::macos::demo_stack::provision_home(home)
-        .expect("provision_home must succeed against a fresh tempdir");
     let paths = mysql_paths(home, &major);
     paths
         .check_socket_lengths()
