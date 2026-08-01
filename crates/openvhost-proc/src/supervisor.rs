@@ -92,6 +92,36 @@ pub struct Supervisor {
     pub(crate) inner: Arc<Inner>,
 }
 
+/// May a service in `state` be forgotten by [`Supervisor::unregister`], and
+/// what is that state called in the refusal?
+///
+/// Exhaustive over [`ServiceState`] with **no wildcard arm**, deliberately:
+/// a new variant must fail to compile HERE rather than silently landing on
+/// whichever side a `_` arm happened to pick. Defaulting a new state to
+/// "removable" would let the supervisor forget a child it is still
+/// supervising — the one thing D4 says this guard exists to prevent — and
+/// defaulting it to "refused" would quietly make some future state
+/// un-uninstallable. Neither is a decision a wildcard should be making.
+///
+/// The decision and the human name of the state are produced by the SAME
+/// match, one arm each, so a state cannot be classified in one place and
+/// named in another that drifted from it.
+fn check_terminal(id: &str, state: &ServiceState) -> Result<(), ProcError> {
+    match state {
+        // Terminal: no child of ours is alive under this id, so the orphan
+        // registry has nothing to lose by the entry going away.
+        ServiceState::Stopped | ServiceState::Failed { .. } => Ok(()),
+        ServiceState::Starting => Err(ProcError::NotTerminal {
+            id: id.to_string(),
+            state: "starting",
+        }),
+        ServiceState::Running => Err(ProcError::NotTerminal {
+            id: id.to_string(),
+            state: "running",
+        }),
+    }
+}
+
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -187,6 +217,59 @@ impl Supervisor {
             status
         };
         let _ = self.inner.tx.send(SupervisorEvent::Registered { status });
+    }
+
+    /// Forget the service registered under `id` — the mirror of
+    /// [`Supervisor::register`] (package-uninstall design
+    /// `2026-07-31-p1-pkg-uninstall-design.md` D4).
+    ///
+    /// Refuses with [`ProcError::NotTerminal`], naming the state, unless the
+    /// service is `Stopped` or `Failed`; refuses with [`ProcError::NotFound`]
+    /// when nothing is registered under `id`. **An unknown id is an error, not
+    /// a silent success**: the caller asked the supervisor to forget something
+    /// it does not have, and answering `Ok` would hide a typo or a
+    /// double-uninstall behind a no-op.
+    ///
+    /// The lookup, the terminal-state check and the removal all happen under
+    /// ONE acquisition of the same `entries` mutex `register`/`start`/`stop`
+    /// use, which is what makes this safe against a concurrent start: either
+    /// `start` gets the lock first and writes `Starting` (so this call sees it
+    /// and refuses), or this call gets it first (so `start` then finds no
+    /// entry and returns `NotFound`). There is no interleaving in which a
+    /// service is both spawned and forgotten.
+    ///
+    /// Refusing on a live service is what keeps the crash-orphan registry
+    /// honest: it is keyed by the services being supervised, and the next
+    /// launch's reaper is identity-matched against exactly those records, so
+    /// forgetting a live child would leak it permanently.
+    ///
+    /// Deliberately does NOT touch the orphan registry itself.
+    /// `service_task::finish` already removes a service's record on the way
+    /// into a terminal state, so by the time this call is permitted there is
+    /// normally nothing left to remove; and a record that somehow outlived
+    /// that describes a process this supervisor could not confirm dead.
+    /// Deleting it here would convert a reapable orphan into a permanent
+    /// leak, which is the opposite of what unregistering should cost.
+    ///
+    /// On success, broadcasts [`SupervisorEvent::Unregistered`] exactly once,
+    /// after the lock is released — the same shape as `register`'s own emit.
+    /// A refused call broadcasts nothing at all.
+    pub fn unregister(&self, id: &str) -> Result<(), ProcError> {
+        {
+            let mut entries = self.inner.entries.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = entries
+                .get(id)
+                .ok_or_else(|| ProcError::NotFound(id.to_string()))?;
+            // Both fallible steps happen BEFORE the mutation: a refusal must
+            // leave the registry exactly as it found it.
+            check_terminal(id, &entry.state)?;
+            entries.remove(id);
+        }
+        let _ = self
+            .inner
+            .tx
+            .send(SupervisorEvent::Unregistered { id: id.to_string() });
+        Ok(())
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<SupervisorEvent> {
@@ -543,5 +626,292 @@ mod tests {
             rx.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    // ---------------------------------------------------------------------
+    // `unregister` (package-uninstall design D4).
+    // ---------------------------------------------------------------------
+
+    /// A `Failed` state with the shape a real failure produces, so the tests
+    /// below exercise the variant that carries data rather than only the
+    /// fieldless ones.
+    fn failed() -> ServiceState {
+        ServiceState::Failed {
+            exit: Some(1),
+            stderr_tail: vec!["boom".to_string()],
+        }
+    }
+
+    fn ids(sup: &Supervisor) -> Vec<String> {
+        sup.snapshot().into_iter().map(|s| s.id).collect()
+    }
+
+    /// The load-bearing refusal (D4): a service the supervisor is still
+    /// supervising must never be forgotten, and the error has to NAME the
+    /// state so the caller can tell the user what to do about it.
+    ///
+    /// VACUITY (neuter-and-watch-it-fail): `check_terminal`'s `Running` arm
+    /// was temporarily changed to `Ok(())` — this test failed on the
+    /// `expect_err`. Restoring it made it pass again.
+    #[tokio::test]
+    async fn unregister_refuses_a_running_service_and_names_the_state() {
+        let sup = Supervisor::new(default_driver());
+        sup.register(spec("svc-run"));
+        Inner::set_state(&sup.inner, "svc-run", ServiceState::Running, None);
+
+        let err = sup
+            .unregister("svc-run")
+            .expect_err("a running service must not be forgotten");
+
+        assert!(matches!(err, ProcError::NotTerminal { .. }));
+        let msg = err.to_string();
+        assert!(msg.contains("running"), "state not named in: {msg}");
+        assert!(msg.contains("svc-run"), "service not named in: {msg}");
+        // The refusal is not merely an `Err` — the entry is still there.
+        assert_eq!(ids(&sup), vec!["svc-run".to_string()]);
+    }
+
+    /// `Starting` is the state a service spends its whole spawn window in,
+    /// and the window where a child exists but has not been classified yet —
+    /// exactly when forgetting it would leak an orphan.
+    ///
+    /// VACUITY (neuter-and-watch-it-fail): `check_terminal`'s `Starting` arm
+    /// was temporarily changed to `Ok(())` — this test failed on the
+    /// `expect_err`. Restoring it made it pass again.
+    #[tokio::test]
+    async fn unregister_refuses_a_starting_service_and_names_the_state() {
+        let sup = Supervisor::new(default_driver());
+        sup.register(spec("svc-starting"));
+        Inner::set_state(&sup.inner, "svc-starting", ServiceState::Starting, None);
+
+        let err = sup
+            .unregister("svc-starting")
+            .expect_err("a starting service must not be forgotten");
+
+        assert!(matches!(err, ProcError::NotTerminal { .. }));
+        let msg = err.to_string();
+        assert!(msg.contains("starting"), "state not named in: {msg}");
+        assert!(msg.contains("svc-starting"), "service not named in: {msg}");
+        assert_eq!(ids(&sup), vec!["svc-starting".to_string()]);
+    }
+
+    /// A refusal must be inert on the event stream too: an observer that
+    /// dropped the row on a refused unregister would show a service that is
+    /// still very much registered as gone.
+    ///
+    /// VACUITY: the positive control is
+    /// `unregister_emits_unregistered_exactly_once` below — it proves this
+    /// same receiver DOES see an event when the call succeeds, so "no event"
+    /// here cannot pass because events never arrive at all. Separately
+    /// neuter-proven: `check_terminal`'s `Running` arm was temporarily
+    /// changed to `Ok(())` and this test failed on
+    /// `assert!(sup.unregister("svc-live").is_err())` — the refusal, and
+    /// therefore the silence, is genuinely this guard's doing.
+    #[tokio::test]
+    async fn a_refused_unregister_emits_nothing() {
+        let sup = Supervisor::new(default_driver());
+        sup.register(spec("svc-live"));
+        Inner::set_state(&sup.inner, "svc-live", ServiceState::Running, None);
+
+        let mut rx = sup.subscribe();
+        assert!(sup.unregister("svc-live").is_err());
+
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    /// The success path for both terminal states, asserted on `snapshot()` —
+    /// the thing every consumer actually reads — not on the `Result`.
+    ///
+    /// VACUITY (neuter-and-watch-it-fail): `entries.remove(id)` was
+    /// temporarily removed from `unregister` (leaving it to return `Ok`) —
+    /// this test failed on the FIRST `assert_eq!`, whose left side was
+    /// `["svc-failed", "svc-keep", "svc-stopped"]` against the asserted
+    /// `["svc-failed", "svc-keep"]`; the second never ran, since a failed
+    /// assertion ends the test. Restoring the removal made it pass again.
+    #[tokio::test]
+    async fn unregister_forgets_a_stopped_or_failed_service() {
+        let sup = Supervisor::new(default_driver());
+        sup.register(spec("svc-stopped"));
+        sup.register(spec("svc-failed"));
+        sup.register(spec("svc-keep"));
+        Inner::set_state(&sup.inner, "svc-failed", failed(), None);
+
+        sup.unregister("svc-stopped")
+            .expect("a stopped service is forgettable");
+        assert_eq!(
+            ids(&sup),
+            vec!["svc-failed".to_string(), "svc-keep".to_string()]
+        );
+
+        sup.unregister("svc-failed")
+            .expect("a failed service is forgettable");
+        assert_eq!(ids(&sup), vec!["svc-keep".to_string()]);
+    }
+
+    /// Exactly once — not zero (the row would linger in every observer that
+    /// only reacts to events) and not twice (a consumer that also drops a
+    /// LATER re-registration of the same id would lose a live row).
+    ///
+    /// VACUITY (neuter-and-watch-it-fail): the `tx.send` in `unregister` was
+    /// temporarily duplicated — this test failed on the trailing
+    /// `Empty` assertion, receiving a second `Unregistered`. Deleting the
+    /// send instead failed the first `try_recv`'s `expect`.
+    #[tokio::test]
+    async fn unregister_emits_unregistered_exactly_once() {
+        let sup = Supervisor::new(default_driver());
+        sup.register(spec("svc-once"));
+        let mut rx = sup.subscribe();
+
+        sup.unregister("svc-once").expect("stopped is forgettable");
+
+        match rx.try_recv().expect("expected a queued Unregistered event") {
+            SupervisorEvent::Unregistered { id } => assert_eq!(id, "svc-once"),
+            other => panic!("expected Unregistered, got {other:?}"),
+        }
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    /// An unknown id is a TYPED error, not a silent success — including the
+    /// second of two calls, which is the shape a double-click on an Uninstall
+    /// button takes. One event total, not two.
+    ///
+    /// VACUITY (neuter-and-watch-it-fail): `unregister`'s lookup was
+    /// temporarily changed to `let Some(entry) = entries.get(id) else {
+    /// return Ok(()) }` (a missing entry becoming a silent success) — this
+    /// test failed on the first `expect_err`, and it was the ONLY test in the
+    /// module that failed, so nothing else here covers that claim. Restoring
+    /// the `ok_or_else` made it pass again.
+    #[tokio::test]
+    async fn unregistering_an_unknown_id_is_a_typed_error() {
+        let sup = Supervisor::new(default_driver());
+
+        let err = sup
+            .unregister("never-registered")
+            .expect_err("an unknown id must not answer Ok");
+        assert!(matches!(err, ProcError::NotFound(ref id) if id == "never-registered"));
+
+        // ... and the same is true for the second of two calls. Subscribed
+        // AFTER the register so the only event this receiver can hold is the
+        // one the unregisters produce (a `Registered` would otherwise sit at
+        // the head of the queue and the "exactly one" assertion below would
+        // be reading the wrong event).
+        sup.register(spec("svc-twice"));
+        let mut rx = sup.subscribe();
+        sup.unregister("svc-twice").expect("first call succeeds");
+        let again = sup
+            .unregister("svc-twice")
+            .expect_err("the second call has nothing left to forget");
+        assert!(matches!(again, ProcError::NotFound(ref id) if id == "svc-twice"));
+
+        // Exactly one event across both calls: the failed second call must not
+        // tell observers to drop the row a second time.
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SupervisorEvent::Unregistered { .. })
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    /// Reentrancy, ordering A (a start wins the race): `start` writes
+    /// `Starting` synchronously under the entries lock BEFORE it returns, so
+    /// an `unregister` that arrives after it can only ever see a live service
+    /// and refuse. Deterministic — the spawned service task cannot run until
+    /// this test awaits, and it never does.
+    ///
+    /// VACUITY: the assertion is the same refusal
+    /// `unregister_refuses_a_starting_service_and_names_the_state` neuter-
+    /// proves; what this adds is that `start` really does publish `Starting`
+    /// before returning, which the trailing `snapshot()` assertion pins.
+    #[tokio::test]
+    async fn unregister_after_a_start_sees_starting_and_refuses() {
+        let sup = Supervisor::new(default_driver());
+        sup.register(spec("svc-race"));
+
+        sup.start("svc-race").expect("start dispatches");
+        let err = sup
+            .unregister("svc-race")
+            .expect_err("a service whose start was just dispatched is live");
+
+        assert!(matches!(err, ProcError::NotTerminal { state, .. } if state == "starting"));
+        assert_eq!(ids(&sup), vec!["svc-race".to_string()]);
+    }
+
+    /// Reentrancy, ordering B (the unregister wins): a later `start`/`stop`
+    /// must report the id as unknown rather than silently succeeding against
+    /// an entry that no longer exists.
+    ///
+    /// VACUITY (neuter-and-watch-it-fail): `entries.remove(id)` was
+    /// temporarily removed from `unregister` — this test failed on the first
+    /// `expect_err` (`start` still found the entry and returned `Ok`); the
+    /// `stop` half never ran. The same neuter also failed
+    /// `unregister_forgets_a_stopped_or_failed_service`,
+    /// `a_subscriber_that_misses_the_event_still_sees_it_gone_in_snapshot`
+    /// and `unregistering_an_unknown_id_is_a_typed_error`.
+    #[tokio::test]
+    async fn starting_or_stopping_a_forgotten_service_is_unknown() {
+        let sup = Supervisor::new(default_driver());
+        sup.register(spec("svc-gone"));
+        sup.unregister("svc-gone").expect("stopped is forgettable");
+
+        assert!(matches!(
+            sup.start("svc-gone").expect_err("start must not resurrect"),
+            ProcError::NotFound(_)
+        ));
+        assert!(matches!(
+            sup.stop("svc-gone").expect_err("stop must not resurrect"),
+            ProcError::NotFound(_)
+        ));
+    }
+
+    /// A subscriber that MISSES the event (it subscribed afterwards, or was
+    /// lagged out) must still be able to see the truth from `snapshot()` —
+    /// the tray relies on exactly this, recomputing from a snapshot rather
+    /// than applying event deltas.
+    #[tokio::test]
+    async fn a_subscriber_that_misses_the_event_still_sees_it_gone_in_snapshot() {
+        let sup = Supervisor::new(default_driver());
+        sup.register(spec("svc-missed"));
+        sup.unregister("svc-missed")
+            .expect("stopped is forgettable");
+
+        let mut rx = sup.subscribe();
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(ids(&sup).is_empty());
+    }
+
+    /// Re-registering an id that was forgotten is an ordinary registration —
+    /// the entry is fresh (no stale pid/log ring inherited), and observers
+    /// get the `Registered` that says so. This is the reinstall path.
+    #[tokio::test]
+    async fn an_id_can_be_registered_again_after_being_forgotten() {
+        let sup = Supervisor::new(default_driver());
+        sup.register(spec("svc-again"));
+        Inner::set_state(&sup.inner, "svc-again", failed(), None);
+        sup.unregister("svc-again").expect("failed is forgettable");
+
+        let mut rx = sup.subscribe();
+        sup.register(spec("svc-again"));
+
+        match rx.try_recv().expect("expected a queued Registered event") {
+            SupervisorEvent::Registered { status } => {
+                assert_eq!(status.id, "svc-again");
+                assert_eq!(status.state, ServiceState::Stopped);
+                assert_eq!(status.pid, None);
+            }
+            other => panic!("expected Registered, got {other:?}"),
+        }
+        assert_eq!(ids(&sup), vec!["svc-again".to_string()]);
     }
 }

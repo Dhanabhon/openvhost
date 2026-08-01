@@ -834,6 +834,16 @@ pub fn build<R: Runtime>(app: &AppHandle<R>, supervisor: Arc<Supervisor>) -> tau
                     true
                 }
                 Ok(SupervisorEvent::Registered { .. }) => true,
+                // A row DISAPPEARED (package-uninstall design D4). Same
+                // answer as `Registered` for the same reason, and it costs
+                // nothing extra here: the recompute below re-reads
+                // `snapshot()` wholesale, so a shrunken service set flows
+                // through `tray_model` → `apply` exactly like a grown one,
+                // and `apply`'s membership check (which compares the id set
+                // BOTH ways) turns it into a full `rebuild` — the only
+                // correct move, since the vanished row's `MenuItem` handle
+                // has to be removed from the native menu, not mutated.
+                Ok(SupervisorEvent::Unregistered { .. }) => true,
                 // A log line never changes a ServiceStatus's id/display_name/
                 // endpoint/pid/state — the only fields `tray_model` reads —
                 // so recomputing here would be a guaranteed-no-op diff at

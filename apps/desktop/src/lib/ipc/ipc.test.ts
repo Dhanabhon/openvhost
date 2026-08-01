@@ -20,12 +20,15 @@ import {
 	listServices,
 	onPhpInstallLog,
 	onServiceRegistered,
+	onServiceUnregistered,
 	onServiceState,
 	pendingInstall,
 	phpEnvironment,
 	planConfigApply,
 	rescanPhpRuntimes,
 	saveWebServerSettings,
+	uninstallPackage,
+	uninstallPlan,
 	webServerSettings
 } from './index';
 import type { WebServerSettingsDto } from './index';
@@ -469,6 +472,100 @@ describe('onServiceRegistered', () => {
 		await expect(onServiceRegistered(() => {})).rejects.toEqual({
 			kind: 'proc',
 			message: 'supervisor gone'
+		});
+	});
+});
+
+// Task 1 of the package-uninstall slice (`SupervisorEvent::Unregistered`):
+// the IPC half of a row DISAPPEARING. Same contract as `onServiceRegistered`,
+// on its own channel, carrying the id alone — there is no status left to send.
+describe('onServiceUnregistered', () => {
+	beforeEach(() => listenMock.mockReset());
+
+	it('resolves to the unlisten function the transport returns', async () => {
+		const unlisten = vi.fn();
+		listenMock.mockResolvedValueOnce(unlisten);
+		await expect(onServiceUnregistered(() => {})).resolves.toBe(unlisten);
+		expect(listenMock).toHaveBeenCalledWith('service-unregistered-event', expect.any(Function));
+	});
+
+	it('delivers the removed id to the callback', async () => {
+		const seen: unknown[] = [];
+		listenMock.mockImplementationOnce(async (_name: string, cb: (e: unknown) => void) => {
+			cb({ event: 'service-unregistered-event', id: 1, payload: { id: 'php-fpm-8.3' } });
+			return vi.fn();
+		});
+		await onServiceUnregistered((ev) => seen.push(ev));
+		expect(seen).toEqual([{ id: 'php-fpm-8.3' }]);
+	});
+
+	it('normalizes a raw transport failure into a core-variant IpcError', async () => {
+		listenMock.mockRejectedValueOnce(new Error('event transport down'));
+		await expect(onServiceUnregistered(() => {})).rejects.toEqual({
+			kind: 'core',
+			message: 'Error: event transport down'
+		});
+	});
+
+	it('passes an IpcError-shaped rejection through unchanged', async () => {
+		listenMock.mockRejectedValueOnce({ kind: 'proc', message: 'supervisor gone' });
+		await expect(onServiceUnregistered(() => {})).rejects.toEqual({
+			kind: 'proc',
+			message: 'supervisor gone'
+		});
+	});
+});
+
+// Package-uninstall design D2/D3/D6. These pin the two things a caller cannot
+// see from the store: the exact invoke name and argument shape (a typo there
+// is a runtime-only failure the type system cannot catch), and that a rejection
+// still arrives as an `IpcError`.
+describe('uninstallPlan', () => {
+	beforeEach(() => invokeMock.mockReset());
+
+	const plan = {
+		kind: 'mysql' as const,
+		major: '8.4',
+		removes: ['the Homebrew formula mysql@8.4'],
+		keeps: [{ what: 'Your databases', path: '/Users/x/.openvhost/data/mysql/8.4', headline: true }],
+		blockers: []
+	};
+
+	it('passes the kind and major through unchanged', async () => {
+		invokeMock.mockResolvedValueOnce(plan);
+		await expect(uninstallPlan('mysql', '8.4')).resolves.toEqual(plan);
+		expect(invokeMock).toHaveBeenCalledWith('uninstall_plan', { kind: 'mysql', major: '8.4' });
+	});
+
+	it('carries the blockers through rather than flattening them', async () => {
+		const blocked = {
+			...plan,
+			blockers: [{ kind: 'serviceNotTerminal', id: 'mysql-8.4', state: 'running' }]
+		};
+		invokeMock.mockResolvedValueOnce(blocked);
+		await expect(uninstallPlan('mysql', '8.4')).resolves.toEqual(blocked);
+	});
+
+	it('normalizes a non-IpcError rejection', async () => {
+		invokeMock.mockRejectedValueOnce('boom');
+		await expect(uninstallPlan('php', '8.3')).rejects.toEqual({ kind: 'core', message: 'boom' });
+	});
+});
+
+describe('uninstallPackage', () => {
+	beforeEach(() => invokeMock.mockReset());
+
+	it('passes the kind and major through unchanged', async () => {
+		invokeMock.mockResolvedValueOnce(null);
+		await expect(uninstallPackage('php', '8.3')).resolves.toBeUndefined();
+		expect(invokeMock).toHaveBeenCalledWith('uninstall_package', { kind: 'php', major: '8.3' });
+	});
+
+	it('rejects with the IpcError a refusal carries', async () => {
+		invokeMock.mockRejectedValueOnce({ kind: 'validation', message: 'php-fpm-8.3 is running' });
+		await expect(uninstallPackage('php', '8.3')).rejects.toEqual({
+			kind: 'validation',
+			message: 'php-fpm-8.3 is running'
 		});
 	});
 });

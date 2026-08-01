@@ -140,6 +140,21 @@ pub struct ServiceRegisteredEvent {
     pub status: ServiceStatus,
 }
 
+/// Emitted when [`openvhost_proc::SupervisorEvent::Unregistered`] fires — a
+/// service row was REMOVED (package-uninstall design
+/// `2026-07-31-p1-pkg-uninstall-design.md` D4: uninstalling a PHP or MySQL
+/// major must make its row leave the Services page and the tray without a
+/// restart, not leave it behind failing).
+///
+/// Carries the id alone, the mirror of [`ServiceRegisteredEvent`]'s full
+/// status: the row is gone, so there is no state left to describe, and every
+/// receiver's job is the same subtraction.
+#[derive(Debug, Clone, serde::Serialize, specta::Type, tauri_specta::Event)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceUnregisteredEvent {
+    pub id: String,
+}
+
 // These four commands must stay `async fn`: Tauri dispatches async commands
 // onto its own tokio runtime, which is what gives `Supervisor::start`'s
 // internal `tokio::spawn` a valid reactor to spawn onto. A sync `#[tauri::
@@ -1196,7 +1211,7 @@ pub struct ValidationReportDto {
 /// `None` early and the real value later: `Manager::manage` does not overwrite an
 /// existing value (its own doc example asserts `assert!(!app.manage(MyInt(1)))`),
 /// so the second call is a silent no-op that would pin every user to `None`.
-fn stack_paths<'a>(
+pub(crate) fn stack_paths<'a>(
     paths: &'a tauri::State<'_, Option<StackPaths>>,
 ) -> Result<&'a StackPaths, IpcError> {
     paths.inner().as_ref().ok_or_else(|| IpcError::Core {
@@ -1604,6 +1619,19 @@ pub async fn save_web_server_settings(
 pub struct PhpRuntimeDto {
     pub major: String,
     pub installed: bool,
+    /// Whether this build OFFERS this major — i.e. whether it is in
+    /// `openvhost_core::CATALOGUE`.
+    ///
+    /// The mirror of `MysqlInstanceDto::cataloged`, and it exists for the same
+    /// reason: `false` means the page must render the row (it is installed and
+    /// serving sites) while offering neither Install nor Uninstall for it.
+    /// Both spec builders refuse an out-of-catalogue major outright
+    /// (`php::brew::cataloged`), so an affordance the row cannot honour would
+    /// be a button whose only outcome is a validation error.
+    ///
+    /// Not derivable on the frontend: the catalogue is a Rust constant, and a
+    /// second copy of it in TypeScript would be a list to forget to update.
+    pub cataloged: bool,
     pub recommended: bool,
     /// A more precise version string than `major` (e.g. a patch level), when
     /// one is known. `None` does NOT mean anything is wrong with this row —
@@ -1662,7 +1690,11 @@ pub struct PhpInstallLogEvent {
 /// `openvhost_proc` has an identical helper, but it is `pub(crate)` there —
 /// this command builds its own event rather than relaying one off the
 /// supervisor's broadcast, so it needs its own clock read.
-fn now_ms() -> u64 {
+///
+/// `pub(crate)`: `uninstall.rs` streams `brew uninstall`'s output through
+/// these very same events (package-uninstall design D1 — the user who watched
+/// it arrive watches it leave, on one surface), so it stamps them the same way.
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -1695,6 +1727,11 @@ fn php_rows(
         PhpRuntimeDto {
             major: major.to_string(),
             installed: found.is_some(),
+            // The SAME expression the out-of-catalogue loop below uses to
+            // decide a row needs adding at all — one reading of the catalogue,
+            // so a row can never be appended as out-of-catalogue while
+            // reporting itself as offered.
+            cataloged: openvhost_core::CATALOGUE.contains(&major),
             recommended: Some(major) == newest,
             full_version: found.and_then(|_| {
                 full_versions
@@ -1741,13 +1778,11 @@ fn php_rows(
 /// tested, which is the kind of copy-paste drift the project's own
 /// coding-style rules warn against; this approach reuses `discover_php_in`
 /// untouched instead.
-async fn discover_all_php() -> Result<Vec<openvhost_core::PhpRuntime>, IpcError> {
+async fn discover_all_php()
+-> Result<openvhost_core::Discovery<openvhost_core::PhpRuntime>, IpcError> {
     tauri::async_runtime::spawn_blocking(|| {
         let handle = tokio::runtime::Handle::current();
-        let prefixes: Vec<&Path> = openvhost_core::BREW_PREFIXES
-            .iter()
-            .map(Path::new)
-            .collect();
+        let prefixes: Vec<&Path> = brew_prefixes();
         openvhost_core::discover_php_in(&prefixes, &|bin| {
             handle.block_on(openvhost_conf::probe_php_fpm_version(bin))
         })
@@ -1756,6 +1791,34 @@ async fn discover_all_php() -> Result<Vec<openvhost_core::PhpRuntime>, IpcError>
     .map_err(|e| IpcError::Core {
         message: format!("the PHP discovery task failed to run: {e}"),
     })
+}
+
+/// `openvhost_core::BREW_PREFIXES` as paths, in order. One expression, because
+/// discovery, the install-time path resolver and the uninstall's keg check must
+/// all look in the same places and in the same order or they disagree about
+/// which installation the app is talking about.
+fn brew_prefixes() -> Vec<&'static Path> {
+    openvhost_core::BREW_PREFIXES
+        .iter()
+        .map(Path::new)
+        .collect()
+}
+
+/// Report candidates a discovery pass could not identify.
+///
+/// Never propagated — a rescan is a read-mostly refresh and must not fail
+/// because one directory was unreadable — but never silently dropped either:
+/// this is the difference between "nothing is installed" and "I could not
+/// tell", and the whole reason `Discovery` is not a bare `Vec`. A candidate
+/// listed here holds the binaries the app needs; only its VERSION is unknown.
+fn report_unidentified(kind: &str, unidentified: &[PathBuf]) {
+    for dir in unidentified {
+        eprintln!(
+            "rescan: {kind} is installed at {} but its version could not be read — \
+             neither Homebrew's keg path nor the version probe answered; it is not listed",
+            dir.display()
+        );
+    }
 }
 
 /// Which majors in `found` were not already in `before` — the ones a rescan
@@ -1773,15 +1836,78 @@ async fn discover_all_php() -> Result<Vec<openvhost_core::PhpRuntime>, IpcError>
 /// gets registered; one already known, in whatever state, is left alone.
 ///
 /// A major present in `before` but missing from `found` (uninstalled outside
-/// the app) is likewise not returned here — there is no `Supervisor`
-/// unregister, and a row pointing at a now-missing binary simply fails
-/// honestly the next time it is started.
+/// the app) is likewise not returned here — that is the SUBTRACTION half of a
+/// rescan, and it belongs to [`vanished_service_ids`]/[`unregister_vanished`]
+/// below (package-uninstall design D5), not to this function.
 fn newly_installed_majors(before: &[String], found: &[String]) -> Vec<String> {
     found
         .iter()
         .filter(|major| !before.contains(major))
         .cloned()
         .collect()
+}
+
+/// Which of `registered`'s ids belong to this package family (by `prefix`) and
+/// name a major that is NOT in `found` — i.e. rows for a version that has
+/// disappeared from disk.
+///
+/// Pure and separately testable, which is the point: the dangerous mistake
+/// here is over-matching. `nginx`, `demo-ticker` and every MySQL row must be
+/// invisible to a PHP rescan (and vice versa), because the consequence of a
+/// wrong match is the supervisor forgetting a service the user is running.
+/// `strip_prefix` — not `contains`/`starts_with`-plus-slicing — is what makes
+/// the major exact rather than merely present.
+fn vanished_service_ids(registered: &[String], prefix: &str, found: &[String]) -> Vec<String> {
+    registered
+        .iter()
+        .filter(|id| {
+            id.strip_prefix(prefix)
+                .is_some_and(|major| !found.iter().any(|f| f == major))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Forget every supervisor row whose package is no longer installed — the
+/// reconciliation half of a rescan (package-uninstall design D5).
+///
+/// This is what makes an in-app uninstall and a `brew uninstall` run behind the
+/// app's back converge on the same observable state, and it fixes the
+/// pre-existing stale-row bug (a row pointing at a deleted binary, which used
+/// to survive forever and "simply fail honestly the next time it is started")
+/// as a side effect rather than leaving two divergent behaviours.
+///
+/// Every outcome is LOGGED, never propagated: a rescan is a read-mostly
+/// refresh and must not fail because one row could not be tidied.
+/// `NotTerminal` in particular is expected, not impossible — a pool whose
+/// binary was deleted out from under a running process keeps running (unix
+/// unlinks the path, not the inode), and `unregister` deliberately refuses to
+/// forget a child the supervisor is still supervising. Such a row is picked up
+/// by the next rescan after the user stops it.
+///
+/// Exhaustive over [`ProcError`] with no wildcard arm: a new failure mode must
+/// be classified here on purpose, not swallowed by a `_`.
+fn unregister_vanished(sup: &Supervisor, prefix: &str, found: &[String]) {
+    let registered: Vec<String> = sup.snapshot().into_iter().map(|s| s.id).collect();
+    for id in vanished_service_ids(&registered, prefix, found) {
+        match sup.unregister(&id) {
+            Ok(()) => eprintln!("rescan: {id} is no longer installed; removed its service row"),
+            // Started again between the snapshot and here, or still running
+            // from a deleted binary. Left alone on purpose; the next rescan
+            // after it stops will remove it.
+            Err(ProcError::NotTerminal { id, state }) => eprintln!(
+                "rescan: {id} is no longer installed but is {state}; leaving its row until it stops"
+            ),
+            // Raced by another rescan or by an in-app uninstall that got there
+            // first. Nothing to do and nothing wrong.
+            Err(ProcError::NotFound(id)) => {
+                eprintln!("rescan: {id} was already gone before it could be removed")
+            }
+            Err(ProcError::Io(e)) => {
+                eprintln!("rescan: failed to remove the service row for {id}: {e}")
+            }
+        }
+    }
 }
 
 /// Probe for installed PHP runtimes, write the result into the managed
@@ -1792,13 +1918,73 @@ fn newly_installed_majors(before: &[String], found: &[String]) -> Vec<String> {
 /// idempotent in the way it looks: it can silently erase a `Failed` row's
 /// stderr and exit code.
 ///
-/// Shared by `rescan_php_runtimes` and `install_php` so the two commands
-/// cannot register two different service shapes for the same version.
-async fn rescan_into_state(
+/// Majors that VANISHED are unregistered (package-uninstall design D5), so an
+/// in-app uninstall and a `brew uninstall` behind the app's back converge on
+/// the same observable state — see [`unregister_vanished`].
+///
+/// Shared by `rescan_php_runtimes`, `install_php` and `uninstall_package` so
+/// they cannot register two different service shapes for the same version.
+///
+/// `seed` is `Some` on exactly one path: an `install_php` that has just run
+/// `brew install php@<major>` itself. See [`seeded_php`].
+pub(crate) async fn rescan_into_state(
     runtimes: &RwLock<Option<InstalledRuntimes>>,
     sup: &Supervisor,
     paths: &StackPaths,
-) -> Result<Vec<openvhost_core::PhpRuntime>, IpcError> {
+    seed: Option<openvhost_core::PhpRuntime>,
+) -> Result<openvhost_core::Discovery<openvhost_core::PhpRuntime>, IpcError> {
+    let discovered = seeded_php(discover_all_php().await?, seed);
+    report_unidentified("PHP", &discovered.unidentified);
+    reconcile_php(runtimes, sup, paths, discovered)
+}
+
+/// Fold a runtime this app just installed ITSELF into a discovery result.
+///
+/// The seed is not another probe result to be merged on equal terms: it is the
+/// formula directory brew created in response to a `brew install php@<major>`
+/// this process ran, located by path. It exists because interrogating that
+/// binary afterwards is a lie waiting to happen — a freshly extracted binary's
+/// first execution can stall past the probe's bound (see
+/// `openvhost_core::keg`'s module docs for the measurement), and a killed probe
+/// used to read as "nothing installed".
+///
+/// Discovery still WINS when it found the major independently: it applies the
+/// prefix-priority and alias rules, and the seed is a naive first-hit. The seed
+/// only fills a gap.
+fn seeded_php(
+    mut discovered: openvhost_core::Discovery<openvhost_core::PhpRuntime>,
+    seed: Option<openvhost_core::PhpRuntime>,
+) -> openvhost_core::Discovery<openvhost_core::PhpRuntime> {
+    let Some(rt) = seed else {
+        return discovered;
+    };
+    // This candidate is identified now — by the install that produced it.
+    discovered
+        .unidentified
+        .retain(|dir| !rt.fpm_bin.starts_with(dir));
+    if !discovered.runtimes.iter().any(|r| r.major == rt.major) {
+        discovered.runtimes.push(rt);
+        discovered.runtimes.sort_by(|a, b| a.major.cmp(&b.major));
+    }
+    discovered
+}
+
+/// Everything a PHP rescan does with the discovery result: write the managed
+/// state, register what is new, forget what is gone.
+///
+/// Split from the probe above so this — the part with the actual reconciliation
+/// RULES in it — is testable against a synthetic runtime list, with no
+/// Homebrew on the machine and no process spawned. Without the split, the D5
+/// unregister step could be deleted from the rescan path and no test in this
+/// crate would notice, because the only way to reach it would be through a
+/// probe of the developer's own installed PHP versions.
+fn reconcile_php(
+    runtimes: &RwLock<Option<InstalledRuntimes>>,
+    sup: &Supervisor,
+    paths: &StackPaths,
+    discovered: openvhost_core::Discovery<openvhost_core::PhpRuntime>,
+) -> Result<openvhost_core::Discovery<openvhost_core::PhpRuntime>, IpcError> {
+    let php = discovered.runtimes.clone();
     let before: Vec<String> = runtimes
         .read()
         .map_err(|_| IpcError::Core {
@@ -1808,7 +1994,6 @@ async fn rescan_into_state(
         .map(|r| r.php.iter().map(|rt| rt.major.clone()).collect())
         .unwrap_or_default();
 
-    let php = discover_all_php().await?;
     let found: Vec<String> = php.iter().map(|rt| rt.major.clone()).collect();
     let new_majors = newly_installed_majors(&before, &found);
 
@@ -1830,8 +2015,13 @@ async fn rescan_into_state(
             sup.register(crate::stack::php_fpm_spec(&paths.home, rt));
         }
     }
+    // AFTER the registrations, not before: the two touch disjoint sets (a
+    // major cannot be both newly found and vanished), but ordering the
+    // subtraction last keeps the window in which a row is missing from the
+    // snapshot as short as possible for an observer watching the events.
+    unregister_vanished(sup, crate::stack::PHP_FPM_ID_PREFIX, &found);
 
-    Ok(php)
+    Ok(discovered)
 }
 
 /// `openvhost_core::BREW_PREFIXES` joined with `bin/brew`, so the UI can say
@@ -1908,7 +2098,9 @@ pub async fn rescan_php_runtimes(
     // now-current state is correct, not merely tolerable — refusing it
     // outright would trade a wrong answer for no answer.
     let _guard = lock.inner().guard.lock().await;
-    let installed = rescan_into_state(runtimes.inner(), sup.inner(), p).await?;
+    // No seed: nothing was installed here, and a seed is only ever a record of
+    // what THIS app just asked brew for.
+    let installed = rescan_into_state(runtimes.inner(), sup.inner(), p, None).await?;
     // See `php_rows`'s doc comment: there is no patch-level prober yet, so
     // there is nothing more precise than `major` to hand in here. An empty
     // map, not a `(major, major)` echo — `full_version` must read as
@@ -1916,7 +2108,7 @@ pub async fn rescan_php_runtimes(
     Ok(PhpEnvironmentDto {
         brew_found: openvhost_core::find_brew().is_some(),
         brew_searched: brew_searched_paths(),
-        runtimes: php_rows(&p.home, &installed, &[]),
+        runtimes: php_rows(&p.home, &installed.runtimes, &[]),
     })
 }
 
@@ -1984,23 +2176,67 @@ impl From<InstallKind> for InstallKindDto {
     }
 }
 
-/// What [`pending_install`] reports: which kind of install/init occupies
-/// `InstallLock`'s shared slot, and its label — e.g. `"8.4"` for a PHP
-/// install, `"MySQL 8.4"` for a MySQL install, `"MySQL 8.4 initialization"`
-/// for an init run (see `install_php`/`install_mysql`/`initialize_mysql`'s
-/// own `set_running` calls for the exact shapes).
+/// Which DIRECTION the run occupying `InstallLock`'s slot is going: putting a
+/// package on the machine or taking one off it (package-uninstall design D1 —
+/// an uninstall shares the lock, the abort handle and the live-output surface
+/// with an install).
+///
+/// A separate value rather than more `InstallKind` variants, and rather than a
+/// boolean: `kind` answers "PHP or MySQL" and this answers "arriving or
+/// leaving". Collapsing the second question into the first would give four
+/// variants that have to be kept in sync with two orthogonal facts, and
+/// collapsing it into a `bool` is the same shape this codebase has already had
+/// to unpick three times (a boolean where a state belongs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PackageOperation {
+    Install,
+    Uninstall,
+}
+
+/// Wire-safe copy of [`PackageOperation`] — same relationship
+/// [`InstallKindDto`] has to [`InstallKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub enum PackageOperationDto {
+    Install,
+    Uninstall,
+}
+
+impl From<PackageOperation> for PackageOperationDto {
+    fn from(op: PackageOperation) -> Self {
+        match op {
+            PackageOperation::Install => Self::Install,
+            PackageOperation::Uninstall => Self::Uninstall,
+        }
+    }
+}
+
+/// What [`pending_install`] reports: which kind of run occupies
+/// `InstallLock`'s shared slot, which direction it is going, and its label —
+/// e.g. `"8.4"` for a PHP install or uninstall, `"MySQL 8.4"` for a MySQL one,
+/// `"MySQL 8.4 initialization"` for an init run (see the `set_running` calls in
+/// `install_php`/`install_mysql`/`initialize_mysql`/`uninstall_package` for the
+/// exact shapes).
+///
+/// `operation` exists because the quit dialog's copy — "… is still installing.
+/// Quitting stops it immediately and discards the download/build in progress"
+/// — is simply false for a removal, where what is at risk is a
+/// half-uninstalled formula rather than a discarded download. The Rust side
+/// reports the distinction; rendering it is the dialog's own (owed) change.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, specta::Type)]
 pub struct PendingInstallDto {
     pub kind: InstallKindDto,
+    pub operation: PackageOperationDto,
     pub label: String,
 }
 
-/// The kind, label, and abort handle of the one install/init run
-/// `InstallLock` may have in flight, so `perform_quit` can abort it and
-/// `pending_install` can tell the user what they are about to lose,
+/// The kind, direction, label, and abort handle of the one install/uninstall/
+/// init run `InstallLock` may have in flight, so `perform_quit` can abort it
+/// and `pending_install` can tell the user what they are about to lose,
 /// regardless of kind.
 struct RunningInstall {
     kind: InstallKind,
+    operation: PackageOperation,
     label: String,
     abort: tokio::task::AbortHandle,
 }
@@ -2012,6 +2248,7 @@ impl InstallLock {
     pub(crate) fn set_running(
         &self,
         kind: InstallKind,
+        operation: PackageOperation,
         label: String,
         abort: tokio::task::AbortHandle,
     ) {
@@ -2019,7 +2256,12 @@ impl InstallLock {
             .running
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *slot = Some(RunningInstall { kind, label, abort });
+        *slot = Some(RunningInstall {
+            kind,
+            operation,
+            label,
+            abort,
+        });
     }
 
     fn clear_running(&self) {
@@ -2030,18 +2272,18 @@ impl InstallLock {
         *slot = None;
     }
 
-    /// The kind and label of whatever install/init run currently occupies
-    /// the slot, if any — `None` only when nothing is running. The
-    /// generalization (review fix wave Important 1) of the old PHP-only
-    /// `running_php_major`, which used to `.filter(|r| r.kind == InstallKind::Php)`
-    /// here and silently returned `None` for a MySQL occupant. The quit
-    /// dialog's copy reads this through the [`pending_install`] command.
-    pub(crate) fn running_install(&self) -> Option<(InstallKind, String)> {
+    /// The kind, direction and label of whatever run currently occupies the
+    /// slot, if any — `None` only when nothing is running. The generalization
+    /// (review fix wave Important 1) of the old PHP-only `running_php_major`,
+    /// which used to `.filter(|r| r.kind == InstallKind::Php)` here and
+    /// silently returned `None` for a MySQL occupant. The quit dialog's copy
+    /// reads this through the [`pending_install`] command.
+    pub(crate) fn running_install(&self) -> Option<(InstallKind, PackageOperation, String)> {
         self.running
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-            .map(|r| (r.kind, r.label.clone()))
+            .map(|r| (r.kind, r.operation, r.label.clone()))
     }
 
     /// A clone of the in-flight run's abort handle, if any, REGARDLESS of
@@ -2084,9 +2326,12 @@ impl InstallLock {
 /// longer find it either. Aborting here closes both: `AbortHandle::abort` is
 /// a no-op on an already-finished task, so this costs nothing on the normal
 /// path where `install_task.await` already completed it.
-struct RunningInstallGuard<'a> {
-    lock: &'a InstallLock,
-    abort: tokio::task::AbortHandle,
+///
+/// `pub(crate)`: `uninstall.rs` spawns its `brew uninstall` run exactly the
+/// same way and needs the identical guarantee — see its own use.
+pub(crate) struct RunningInstallGuard<'a> {
+    pub(crate) lock: &'a InstallLock,
+    pub(crate) abort: tokio::task::AbortHandle,
 }
 
 impl Drop for RunningInstallGuard<'_> {
@@ -2110,8 +2355,9 @@ pub async fn pending_install(
     Ok(lock
         .inner()
         .running_install()
-        .map(|(kind, label)| PendingInstallDto {
+        .map(|(kind, operation, label)| PendingInstallDto {
             kind: kind.into(),
+            operation: operation.into(),
             label,
         }))
 }
@@ -2215,6 +2461,7 @@ pub async fn install_php(
     let abort_handle = install_task.abort_handle();
     lock.inner().set_running(
         InstallKind::Php,
+        PackageOperation::Install,
         major.as_str().to_string(),
         abort_handle.clone(),
     );
@@ -2249,8 +2496,20 @@ pub async fn install_php(
 
     // Rescan even on a non-zero exit: brew can fail late having already
     // linked the formula, and the truth is on disk either way.
-    let found = rescan_into_state(runtimes.inner(), sup.inner(), p).await?;
-    let detected = found.iter().any(|r| r.major == major.as_str());
+    //
+    // `detected` comes from the SEED, not from the rescan's probe. We asked
+    // brew for `php@<major>`, so the question is decidable by looking at the
+    // formula directory brew was supposed to create — a stat, with no third
+    // "I could not tell" state hiding inside the boolean. Deriving it from a
+    // version probe instead is what made a successful `brew install mysql@8.4`
+    // report failure: the probe was killed at its 5 s bound during macOS's
+    // ~11.5 s first-run scan of the new binary, every single time.
+    let seed = openvhost_core::php_runtime_for_major(&brew_prefixes(), &major);
+    let detected = seed.is_some();
+    // Seeded so the MANAGED state and the supervisor row are right too, not
+    // just the answer: the apply pipeline reads that list, so a version missing
+    // from it is a version sites cannot be applied against.
+    rescan_into_state(runtimes.inner(), sup.inner(), p, seed).await?;
 
     Ok(InstallOutcomeDto {
         major: major.as_str().to_string(),
@@ -2265,6 +2524,16 @@ mod php_ipc_tests {
     use tauri::Manager;
 
     use super::*;
+
+    /// A complete discovery pass: every candidate was identified. The
+    /// reconcilers care only about `runtimes`, so tests about reconciliation
+    /// say so explicitly rather than leaving `unidentified` implied.
+    fn found<T>(runtimes: Vec<T>) -> openvhost_core::Discovery<T> {
+        openvhost_core::Discovery {
+            runtimes,
+            unidentified: vec![],
+        }
+    }
 
     #[test]
     fn every_catalogue_entry_is_listed_with_its_installed_state() {
@@ -2333,11 +2602,348 @@ mod php_ipc_tests {
     #[test]
     fn a_version_that_disappeared_is_not_treated_as_new() {
         // brew uninstall outside the app: 8.3 is gone from `found`. Nothing to
-        // register, and nothing to unregister either — the supervisor has no
-        // unregister, and a row pointing at a missing binary fails honestly.
+        // REGISTER — the subtraction half is `vanished_service_ids` below
+        // (package-uninstall design D5), not this function's job.
         let before = ["8.3".to_string(), "8.5".to_string()];
         let found = ["8.5".to_string()];
         assert!(newly_installed_majors(&before, &found).is_empty());
+    }
+
+    // ---- D5: a rescan converges with an external `brew uninstall` --------
+    //
+    // VACUITY (RED first): written before `vanished_service_ids` existed —
+    // they did not compile. Then neutered: replacing `strip_prefix` with
+    // `starts_with` + a `contains` check made
+    // `a_php_rescan_never_matches_a_mysql_or_nginx_row` fail by returning
+    // `mysql-8.4`, and dropping the `unregister_vanished` call from
+    // `rescan_into_state` made the supervisor-level test below fail.
+
+    #[test]
+    fn a_major_that_vanished_from_disk_is_the_one_that_gets_forgotten() {
+        let registered = [
+            "php-fpm-8.1".to_string(),
+            "php-fpm-8.3".to_string(),
+            "php-fpm-8.4".to_string(),
+        ];
+        let found = ["8.1".to_string(), "8.4".to_string()];
+        assert_eq!(
+            vanished_service_ids(&registered, crate::stack::PHP_FPM_ID_PREFIX, &found),
+            vec!["php-fpm-8.3".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_rescan_that_finds_everything_forgets_nothing() {
+        let registered = ["php-fpm-8.4".to_string()];
+        let found = ["8.4".to_string()];
+        assert!(
+            vanished_service_ids(&registered, crate::stack::PHP_FPM_ID_PREFIX, &found).is_empty()
+        );
+    }
+
+    #[test]
+    fn a_php_rescan_never_matches_a_mysql_or_nginx_row() {
+        // Over-matching here would let a PHP rescan unregister the user's
+        // database — the worst possible outcome of a "tidy up" pass.
+        let registered = [
+            "nginx".to_string(),
+            "demo-ticker".to_string(),
+            "mysql-8.4".to_string(),
+            "php-fpm-8.4".to_string(),
+        ];
+        assert!(
+            vanished_service_ids(
+                &registered,
+                crate::stack::PHP_FPM_ID_PREFIX,
+                &["8.4".into()]
+            )
+            .is_empty()
+        );
+        // ...and with NOTHING installed, still only this family's rows.
+        assert_eq!(
+            vanished_service_ids(&registered, crate::stack::PHP_FPM_ID_PREFIX, &[]),
+            vec!["php-fpm-8.4".to_string()]
+        );
+        assert_eq!(
+            vanished_service_ids(&registered, crate::stack::MYSQL_ID_PREFIX, &[]),
+            vec!["mysql-8.4".to_string()]
+        );
+    }
+
+    /// The WIRING, not just the helper: a rescan whose discovery no longer
+    /// returns 8.3 must leave no `php-fpm-8.3` row behind — the observable
+    /// state an external `brew uninstall` has to converge on (D5).
+    ///
+    /// Drives `reconcile_php`, the half of `rescan_into_state` that does not
+    /// probe. Going through `rescan_into_state` itself would probe the
+    /// developer's own Homebrew prefixes and assert nothing reproducible.
+    #[test]
+    fn a_rescan_registers_what_appeared_and_forgets_what_vanished() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: home.path().join("nginx"),
+            nginx_conf: home.path().join("nginx.conf"),
+        };
+        let sup = Supervisor::new(openvhost_proc::default_driver());
+        let rt = |major: &str| openvhost_core::PhpRuntime {
+            major: major.to_string(),
+            fpm_bin: home.path().join(format!("php-fpm-{major}")),
+        };
+
+        // Before: 8.3 installed and registered.
+        let runtimes = RwLock::new(None);
+        reconcile_php(&runtimes, &sup, &paths, found(vec![rt("8.3")])).unwrap();
+        assert_eq!(
+            sup.snapshot().iter().map(|s| &s.id).collect::<Vec<_>>(),
+            vec!["php-fpm-8.3"]
+        );
+
+        // After: 8.3 gone from disk, 8.4 appeared.
+        reconcile_php(&runtimes, &sup, &paths, found(vec![rt("8.4")])).unwrap();
+
+        assert_eq!(
+            sup.snapshot().iter().map(|s| &s.id).collect::<Vec<_>>(),
+            vec!["php-fpm-8.4"],
+            "the vanished major's row must be gone and the new one present"
+        );
+        let listed: Vec<String> = runtimes
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .php
+            .iter()
+            .map(|r| r.major.clone())
+            .collect();
+        assert_eq!(listed, vec!["8.4".to_string()]);
+    }
+
+    // ---- the install seed (fix R2, part 1) -------------------------------
+    //
+    // The seam between "the install knows what it asked brew for" and "the
+    // rescan reconciles what it can see". Driven through `seeded_*` +
+    // `reconcile_*` rather than the whole command, for the same reason the
+    // rescan tests above are: `rescan_*_into_state` probes the developer's own
+    // Homebrew and asserts nothing reproducible.
+
+    #[test]
+    fn a_seeded_install_is_registered_even_when_the_probe_told_us_nothing() {
+        // THE R2 failure, reproduced as a unit: brew installed the version,
+        // discovery could not identify it (probe killed at its 5 s bound during
+        // macOS's ~11.5 s first-run scan), and the app used to conclude
+        // "nothing installed" — leaving the managed runtime list empty, so the
+        // apply pipeline answered `MissingRuntime` for a version that was
+        // plainly there.
+        //
+        // VACUITY: replacing `seeded_php`'s body with `discovered` makes both
+        // assertions fail — no row, and an empty runtime list.
+        let home = tempfile::tempdir().unwrap();
+        let paths = StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: home.path().join("nginx"),
+            nginx_conf: home.path().join("nginx.conf"),
+        };
+        let sup = Supervisor::new(openvhost_proc::default_driver());
+        let runtimes = RwLock::new(None);
+
+        let candidate = home.path().join("opt/php@8.4");
+        let could_not_tell = openvhost_core::Discovery {
+            runtimes: vec![],
+            unidentified: vec![candidate.clone()],
+        };
+        let seed = openvhost_core::PhpRuntime {
+            major: "8.4".to_string(),
+            fpm_bin: candidate.join("sbin/php-fpm"),
+        };
+
+        let reconciled = reconcile_php(
+            &runtimes,
+            &sup,
+            &paths,
+            seeded_php(could_not_tell, Some(seed)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            sup.snapshot().iter().map(|s| &s.id).collect::<Vec<_>>(),
+            vec!["php-fpm-8.4"],
+            "an install this app performed must get its row"
+        );
+        let listed: Vec<String> = runtimes
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .php
+            .iter()
+            .map(|r| r.major.clone())
+            .collect();
+        assert_eq!(listed, vec!["8.4".to_string()]);
+        // And the candidate is no longer outstanding: the install identified it.
+        assert!(
+            reconciled.is_complete(),
+            "got {:?}",
+            reconciled.unidentified
+        );
+    }
+
+    #[test]
+    fn a_seed_never_displaces_what_discovery_found_for_itself() {
+        // Discovery applies the prefix-priority and alias rules; the seed is a
+        // naive first-prefix hit. Letting it win would move a runtime from a
+        // native keg onto a Rosetta one.
+        let discovered = openvhost_core::Discovery {
+            runtimes: vec![openvhost_core::PhpRuntime {
+                major: "8.4".to_string(),
+                fpm_bin: PathBuf::from("/opt/homebrew/opt/php@8.4/sbin/php-fpm"),
+            }],
+            unidentified: vec![],
+        };
+        let seeded = seeded_php(
+            discovered,
+            Some(openvhost_core::PhpRuntime {
+                major: "8.4".to_string(),
+                fpm_bin: PathBuf::from("/usr/local/opt/php@8.4/sbin/php-fpm"),
+            }),
+        );
+        assert_eq!(seeded.runtimes.len(), 1, "got {seeded:?}");
+        assert_eq!(
+            seeded.runtimes[0].fpm_bin,
+            PathBuf::from("/opt/homebrew/opt/php@8.4/sbin/php-fpm")
+        );
+    }
+
+    #[test]
+    fn no_seed_leaves_a_discovery_exactly_as_it_was() {
+        // Every path but an install passes `None`, and it must be inert there.
+        let discovered = openvhost_core::Discovery {
+            runtimes: vec![openvhost_core::PhpRuntime {
+                major: "8.4".to_string(),
+                fpm_bin: PathBuf::from("/opt/homebrew/opt/php@8.4/sbin/php-fpm"),
+            }],
+            unidentified: vec![PathBuf::from("/opt/homebrew/opt/php@8.1")],
+        };
+        assert_eq!(seeded_php(discovered.clone(), None), discovered);
+    }
+
+    #[test]
+    fn a_mysql_seed_behaves_the_same_way() {
+        // The family the failure was measured on. `MysqlRuntime` is built
+        // through the real `discover_mysql` against a fake prefix — the same
+        // discipline `mysql_rows_still_lists_an_out_of_catalogue_installed_major`
+        // uses — rather than a private constructor.
+        let prefix = tempfile::tempdir().unwrap();
+        let bin_dir = prefix.path().join("opt").join("mysql@8.4").join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        for name in ["mysqld", "mysql", "mysqladmin"] {
+            std::fs::write(bin_dir.join(name), b"#!/bin/sh\n").unwrap();
+        }
+        let seed = openvhost_core::mysql::mysql_runtime_for_major(
+            &[prefix.path()],
+            &openvhost_core::mysql::MysqlMajor::parse("8.4").unwrap(),
+        )
+        .expect("the formula directory is right there");
+
+        let could_not_tell = openvhost_core::Discovery {
+            runtimes: vec![],
+            unidentified: vec![prefix.path().join("opt/mysql@8.4")],
+        };
+        let seeded = seeded_mysql(could_not_tell, Some(seed));
+        assert_eq!(seeded.runtimes.len(), 1, "got {seeded:?}");
+        assert_eq!(seeded.runtimes[0].major.as_str(), "8.4");
+        assert!(seeded.is_complete(), "got {:?}", seeded.unidentified);
+    }
+
+    /// The MySQL mirror. A row is only ever REGISTERED for an initialized
+    /// datadir (spec D6), but forgetting one whose binaries vanished is
+    /// unconditional — otherwise the Databases page keeps a row nothing can
+    /// start, which is exactly the divergence D5 ends.
+    #[test]
+    fn a_mysql_rescan_forgets_a_row_whose_major_vanished() {
+        let home = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(openvhost_proc::default_driver());
+        let major = openvhost_core::mysql::MysqlMajor::parse("8.4").unwrap();
+        sup.register(crate::stack::mysql_spec(
+            home.path(),
+            &openvhost_core::mysql::MysqlRuntime {
+                major,
+                mysqld: home.path().join("mysqld"),
+                mysql: home.path().join("mysql"),
+                mysqladmin: home.path().join("mysqladmin"),
+            },
+        ));
+        assert_eq!(sup.snapshot().len(), 1);
+
+        let runtimes = RwLock::new(None);
+        reconcile_mysql(&runtimes, &sup, home.path(), found(vec![])).unwrap();
+
+        assert!(sup.snapshot().is_empty(), "got {:?}", sup.snapshot());
+    }
+
+    #[test]
+    fn a_terminal_row_for_a_vanished_major_is_removed_from_the_supervisor() {
+        let sup = Supervisor::new(openvhost_proc::default_driver());
+        sup.register(crate::stack::php_fpm_spec(
+            Path::new("/tmp/ovh"),
+            &openvhost_core::PhpRuntime {
+                major: "8.3".into(),
+                fpm_bin: PathBuf::from("/nonexistent/php-fpm"),
+            },
+        ));
+        assert_eq!(sup.snapshot().len(), 1);
+
+        unregister_vanished(&sup, crate::stack::PHP_FPM_ID_PREFIX, &["8.4".to_string()]);
+
+        assert!(
+            sup.snapshot().is_empty(),
+            "a row whose major is gone must not survive a rescan: {:?}",
+            sup.snapshot()
+        );
+    }
+
+    /// D5's "expect a `NotTerminal` for a major whose pool is still running,
+    /// and log it rather than treating it as impossible". A rescan must never
+    /// fail — or forget a live child — because of one stubborn row.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_live_row_for_a_vanished_major_is_left_alone_rather_than_forgotten() {
+        let sup = Supervisor::new(openvhost_proc::default_driver());
+        sup.register(openvhost_proc::ServiceSpec {
+            id: "php-fpm-8.3".into(),
+            display_name: "PHP-FPM 8.3".into(),
+            endpoint: None,
+            spawn: openvhost_proc::SpawnSpec {
+                program: PathBuf::from("/bin/sleep"),
+                args: vec![OsString::from("30")],
+                cwd: None,
+                env: vec![],
+            },
+            readiness: openvhost_proc::ReadinessProbe::default(),
+            grace: openvhost_proc::DEFAULT_GRACE,
+        });
+        sup.start("php-fpm-8.3").expect("start");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match sup.snapshot()[0].state {
+                    ServiceState::Starting | ServiceState::Running => return,
+                    ServiceState::Stopped | ServiceState::Failed { .. } => {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the child must come up");
+
+        unregister_vanished(&sup, crate::stack::PHP_FPM_ID_PREFIX, &[]);
+
+        assert_eq!(
+            sup.snapshot().len(),
+            1,
+            "the supervisor must never forget a child it is still supervising"
+        );
+        let _ = sup.stop("php-fpm-8.3");
     }
 
     #[test]
@@ -2362,6 +2968,35 @@ mod php_ipc_tests {
         }];
         let rows = php_rows(Path::new("/tmp/ovh"), &installed, &[("7.4", "7.4.33")]);
         assert!(rows.iter().any(|r| r.major == "7.4" && r.installed));
+    }
+
+    #[test]
+    fn every_row_says_whether_this_build_offers_that_major() {
+        // The row must carry this, because the CATALOGUE is a Rust constant
+        // and the page has to hide both Install and Uninstall for a major
+        // neither spec builder will compose a command for
+        // (`php::brew::cataloged` refuses both). The MySQL page has had this
+        // since its own slice; PHP simply never got told.
+        //
+        // VACUITY: hard-coding `cataloged: true` in `php_rows`' build closure
+        // fails the 7.4 assertion; hard-coding `false` fails the 8.4 one.
+        let installed = vec![openvhost_core::PhpRuntime {
+            major: "7.4".into(),
+            fpm_bin: PathBuf::from("/opt/homebrew/opt/php@7.4/sbin/php-fpm"),
+        }];
+        let rows = php_rows(Path::new("/tmp/ovh"), &installed, &[]);
+        let hand_installed = rows.iter().find(|r| r.major == "7.4").unwrap();
+        assert!(hand_installed.installed);
+        assert!(
+            !hand_installed.cataloged,
+            "a hand-installed 7.4 must render with no Install/Uninstall affordance"
+        );
+        // And every catalogue row says so — checked against the constant, not
+        // against a copy of it, so adding a major cannot leave one row lying.
+        for major in openvhost_core::CATALOGUE {
+            let row = rows.iter().find(|r| r.major == major).unwrap();
+            assert!(row.cataloged, "{major} is in the catalogue");
+        }
     }
 
     #[test]
@@ -2466,7 +3101,12 @@ mod php_ipc_tests {
         let lock = InstallLock::default();
         let task = tokio::spawn(std::future::pending::<()>());
         let abort = task.abort_handle();
-        lock.set_running(InstallKind::Php, "8.4".to_string(), abort.clone());
+        lock.set_running(
+            InstallKind::Php,
+            PackageOperation::Install,
+            "8.4".to_string(),
+            abort.clone(),
+        );
 
         {
             let _guard = RunningInstallGuard { lock: &lock, abort };
@@ -2498,6 +3138,70 @@ mod php_ipc_tests {
     // EITHER kind must be rejected while the other is running.
     // -------------------------------------------------------------------
 
+    /// The same generalization, one axis further out (package-uninstall
+    /// design D1: "one lock means an install and an uninstall can never
+    /// interleave"). An uninstall that ran while an install was mid-build
+    /// would have brew fighting itself over the same Cellar.
+    ///
+    /// Asserts the mechanism `uninstall_package` uses, the way the two tests
+    /// below assert `install_php`'s and `install_mysql`'s — the commands
+    /// themselves take a `tauri::AppHandle` (`Wry`), which
+    /// `tauri::test::mock_builder` cannot produce, so none of the three can be
+    /// invoked directly from a test.
+    #[tokio::test]
+    async fn an_uninstall_is_rejected_while_an_install_holds_the_lock() {
+        let lock = InstallLock::default();
+        let held = lock.guard.lock().await;
+        lock.set_running(
+            InstallKind::Php,
+            PackageOperation::Install,
+            "8.4".to_string(),
+            tokio::spawn(std::future::pending::<()>()).abort_handle(),
+        );
+
+        assert!(
+            lock.guard.try_lock().is_err(),
+            "uninstall_package's try_lock must fail while an install holds the guard"
+        );
+
+        drop(held);
+        assert!(
+            lock.guard.try_lock().is_ok(),
+            "and must succeed once the install is done"
+        );
+    }
+
+    /// The mirror image: an install must be refused while an uninstall is in
+    /// flight, and the quit dialog must see the occupant tagged as a REMOVAL
+    /// rather than as an install.
+    #[tokio::test]
+    async fn an_install_is_rejected_while_an_uninstall_holds_the_lock() {
+        let lock = InstallLock::default();
+        let held = lock.guard.lock().await;
+        lock.set_running(
+            InstallKind::Php,
+            PackageOperation::Uninstall,
+            "8.4".to_string(),
+            tokio::spawn(std::future::pending::<()>()).abort_handle(),
+        );
+
+        assert!(
+            lock.guard.try_lock().is_err(),
+            "install_php's try_lock must fail while an uninstall holds the guard"
+        );
+        assert_eq!(
+            lock.running_install(),
+            Some((
+                InstallKind::Php,
+                PackageOperation::Uninstall,
+                "8.4".to_string()
+            ))
+        );
+        assert!(lock.running_abort_handle().is_some());
+
+        drop(held);
+    }
+
     /// Mirrors `rescan_blocks_while_an_install_holds_the_lock` above, but
     /// holds the guard the way `install_mysql` would (a DIFFERENT kind) and
     /// asserts `install_php`'s own `try_lock` guard refuses to proceed —
@@ -2509,6 +3213,7 @@ mod php_ipc_tests {
         let held = lock.guard.lock().await;
         lock.set_running(
             InstallKind::Mysql,
+            PackageOperation::Install,
             "MySQL 8.4".to_string(),
             tokio::spawn(std::future::pending::<()>()).abort_handle(),
         );
@@ -2522,7 +3227,11 @@ mod php_ipc_tests {
         // filter hid a MySQL label entirely instead of tagging it).
         assert_eq!(
             lock.running_install(),
-            Some((InstallKind::Mysql, "MySQL 8.4".to_string()))
+            Some((
+                InstallKind::Mysql,
+                PackageOperation::Install,
+                "MySQL 8.4".to_string()
+            ))
         );
         // The kind-agnostic abort handle (what `perform_quit` uses) must
         // still find something to abort.
@@ -2539,6 +3248,7 @@ mod php_ipc_tests {
         let held = lock.guard.lock().await;
         lock.set_running(
             InstallKind::Php,
+            PackageOperation::Install,
             "8.4".to_string(),
             tokio::spawn(std::future::pending::<()>()).abort_handle(),
         );
@@ -2549,7 +3259,11 @@ mod php_ipc_tests {
         );
         assert_eq!(
             lock.running_install(),
-            Some((InstallKind::Php, "8.4".to_string()))
+            Some((
+                InstallKind::Php,
+                PackageOperation::Install,
+                "8.4".to_string()
+            ))
         );
 
         drop(held);
@@ -2568,6 +3282,7 @@ mod php_ipc_tests {
         let lock = InstallLock::default();
         lock.set_running(
             InstallKind::Mysql,
+            PackageOperation::Install,
             "MySQL 8.4 initialization".to_string(),
             tokio::spawn(std::future::pending::<()>()).abort_handle(),
         );
@@ -2579,6 +3294,7 @@ mod php_ipc_tests {
             pending,
             Some(PendingInstallDto {
                 kind: InstallKindDto::Mysql,
+                operation: PackageOperationDto::Install,
                 label: "MySQL 8.4 initialization".to_string(),
             }),
             "a MySQL occupant must be visible, correctly tagged — the whole \
@@ -2837,13 +3553,11 @@ fn mysql_rows(
 /// Probe every known Homebrew prefix for installed MySQL runtimes. Mirrors
 /// `discover_all_php`'s `spawn_blocking` + `Handle::block_on` bridge exactly
 /// — see its doc comment for why.
-async fn discover_all_mysql() -> Result<Vec<openvhost_core::mysql::MysqlRuntime>, IpcError> {
+async fn discover_all_mysql()
+-> Result<openvhost_core::Discovery<openvhost_core::mysql::MysqlRuntime>, IpcError> {
     tauri::async_runtime::spawn_blocking(|| {
         let handle = tokio::runtime::Handle::current();
-        let prefixes: Vec<&Path> = openvhost_core::BREW_PREFIXES
-            .iter()
-            .map(Path::new)
-            .collect();
+        let prefixes: Vec<&Path> = brew_prefixes();
         openvhost_core::mysql::discover_mysql(&prefixes, &|bin| {
             handle.block_on(openvhost_conf::probe_mysqld_version(bin))
         })
@@ -2866,19 +3580,64 @@ async fn discover_all_mysql() -> Result<Vec<openvhost_core::mysql::MysqlRuntime>
 /// always registered), a MySQL major can be installed for a long time
 /// before ever being initialized, so "was this major known before" is not
 /// the same question as "does it already have a row".
-async fn rescan_mysql_into_state(
+///
+/// Majors that VANISHED are unregistered, exactly as the PHP rescan does
+/// (package-uninstall design D5). D5 names only `rescan_php_runtimes`, but the
+/// principle it states — "an in-app uninstall and a `brew uninstall` run behind
+/// the app's back must leave the same observable state" — is not PHP-specific,
+/// and leaving MySQL out would preserve on the Databases page exactly the
+/// divergent behaviour D5 exists to end.
+pub(crate) async fn rescan_mysql_into_state(
     runtimes: &RwLock<Option<Vec<openvhost_core::mysql::MysqlRuntime>>>,
     sup: &Supervisor,
     home: &Path,
-) -> Result<Vec<openvhost_core::mysql::MysqlRuntime>, IpcError> {
+    seed: Option<openvhost_core::mysql::MysqlRuntime>,
+) -> Result<openvhost_core::Discovery<openvhost_core::mysql::MysqlRuntime>, IpcError> {
     if let Err(e) =
         openvhost_core::mysql::sweep_stale_staging(&openvhost_core::mysql::mysql_data_root(home))
     {
         eprintln!("mysql: failed to sweep abandoned staging directories: {e}");
     }
 
-    let found = discover_all_mysql().await?;
+    let discovered = seeded_mysql(discover_all_mysql().await?, seed);
+    report_unidentified("MySQL", &discovered.unidentified);
+    reconcile_mysql(runtimes, sup, home, discovered)
+}
 
+/// The MySQL mirror of [`seeded_php`] — see it for why an install records what
+/// it asked brew for instead of interrogating the binary afterwards. This is
+/// the family the failure was actually MEASURED on: `mysqld` is 55 MB, its
+/// first execution took 11.53 s under Gatekeeper's scan, and the 5 s probe
+/// bound meant a real, successful `brew install mysql@8.4` reported
+/// `detected: false` every time.
+fn seeded_mysql(
+    mut discovered: openvhost_core::Discovery<openvhost_core::mysql::MysqlRuntime>,
+    seed: Option<openvhost_core::mysql::MysqlRuntime>,
+) -> openvhost_core::Discovery<openvhost_core::mysql::MysqlRuntime> {
+    let Some(rt) = seed else {
+        return discovered;
+    };
+    discovered
+        .unidentified
+        .retain(|dir| !rt.mysqld.starts_with(dir));
+    if !discovered.runtimes.iter().any(|r| r.major == rt.major) {
+        discovered.runtimes.push(rt);
+        discovered.runtimes.sort_by(|a, b| a.major.cmp(&b.major));
+    }
+    discovered
+}
+
+/// Everything a MySQL rescan does with the discovery result — the mirror of
+/// [`reconcile_php`], split out for the identical reason: the reconciliation
+/// rules must be testable without MySQL installed and without spawning a
+/// version probe.
+fn reconcile_mysql(
+    runtimes: &RwLock<Option<Vec<openvhost_core::mysql::MysqlRuntime>>>,
+    sup: &Supervisor,
+    home: &Path,
+    discovered: openvhost_core::Discovery<openvhost_core::mysql::MysqlRuntime>,
+) -> Result<openvhost_core::Discovery<openvhost_core::mysql::MysqlRuntime>, IpcError> {
+    let found = discovered.runtimes.clone();
     *runtimes.write().map_err(|_| IpcError::Core {
         message: "mysql runtime list is poisoned".into(),
     })? = Some(found.clone());
@@ -2886,7 +3645,7 @@ async fn rescan_mysql_into_state(
     let already_registered: std::collections::HashSet<String> =
         sup.snapshot().into_iter().map(|s| s.id).collect();
     for rt in &found {
-        let id = format!("mysql-{}", rt.major.as_str());
+        let id = crate::stack::mysql_service_id(rt.major.as_str());
         if already_registered.contains(&id) {
             continue;
         }
@@ -2894,8 +3653,14 @@ async fn rescan_mysql_into_state(
             sup.register(crate::stack::mysql_spec(home, rt));
         }
     }
+    // See `rescan_into_state`'s matching call for why this comes last.
+    let majors: Vec<String> = found
+        .iter()
+        .map(|rt| rt.major.as_str().to_string())
+        .collect();
+    unregister_vanished(sup, crate::stack::MYSQL_ID_PREFIX, &majors);
 
-    Ok(found)
+    Ok(discovered)
 }
 
 /// Look up a cached, already-discovered runtime by major — used by the
@@ -3680,11 +4445,12 @@ pub async fn rescan_mysql(
 ) -> Result<MysqlEnvironmentDto, IpcError> {
     let p = stack_paths(&paths)?;
     let _guard = lock.inner().guard.lock().await;
-    let installed = rescan_mysql_into_state(runtimes.inner(), sup.inner(), &p.home).await?;
+    // No seed — see `rescan_php_runtimes`'s matching call.
+    let installed = rescan_mysql_into_state(runtimes.inner(), sup.inner(), &p.home, None).await?;
     Ok(MysqlEnvironmentDto {
         brew_found: openvhost_core::find_brew().is_some(),
         brew_searched: brew_searched_paths(),
-        instances: mysql_rows(&p.home, &installed),
+        instances: mysql_rows(&p.home, &installed.runtimes),
     })
 }
 
@@ -3768,6 +4534,7 @@ pub async fn install_mysql(
     let abort_handle = install_task.abort_handle();
     lock.inner().set_running(
         InstallKind::Mysql,
+        PackageOperation::Install,
         format!("MySQL {}", major.as_str()),
         abort_handle.clone(),
     );
@@ -3791,8 +4558,12 @@ pub async fn install_mysql(
     };
     let _ = pump.await;
 
-    let found = rescan_mysql_into_state(runtimes.inner(), sup.inner(), &p.home).await?;
-    let detected = found.iter().any(|r| r.major.as_str() == major.as_str());
+    // See `install_php`'s matching block: `detected` is a stat of the formula
+    // directory we asked brew to create, never a version probe. THIS is the
+    // path the failure was reproduced on.
+    let seed = openvhost_core::mysql::mysql_runtime_for_major(&brew_prefixes(), &major);
+    let detected = seed.is_some();
+    rescan_mysql_into_state(runtimes.inner(), sup.inner(), &p.home, seed).await?;
 
     Ok(MysqlInstallOutcomeDto {
         major: major.as_str().to_string(),
@@ -3866,7 +4637,7 @@ async fn initialize_mysql_gate(major: String, home: &Path) -> InitializeMysqlGat
         Ok(d) => d,
         Err(e) => return Early(Err(e)),
     };
-    let Some(runtime) = discovered.into_iter().find(|rt| rt.major == major) else {
+    let Some(runtime) = discovered.runtimes.into_iter().find(|rt| rt.major == major) else {
         return Early(Err(IpcError::Core {
             message: format!("MySQL {} is not installed", major.as_str()),
         }));
@@ -3921,6 +4692,7 @@ pub async fn initialize_mysql(
     let abort_handle = init_task.abort_handle();
     lock.inner().set_running(
         InstallKind::Mysql,
+        PackageOperation::Install,
         format!("MySQL {} initialization", major_for_upsert.as_str()),
         abort_handle.clone(),
     );
@@ -4693,7 +5465,8 @@ esac
             std::fs::write(bin_dir.join(name), b"#!/bin/sh\n").unwrap();
         }
         let installed =
-            openvhost_core::mysql::discover_mysql(&[prefix.path()], &|_| Some("9.7".to_string()));
+            openvhost_core::mysql::discover_mysql(&[prefix.path()], &|_| Some("9.7".to_string()))
+                .runtimes;
         assert_eq!(installed.len(), 1);
 
         let home = tempfile::tempdir().unwrap();

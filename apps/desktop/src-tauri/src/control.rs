@@ -408,6 +408,18 @@ impl<R: Runtime> DesktopHandler<R> {
                     code: ErrorCode::OperationFailed,
                     message: format!("could not {} '{id}': {io}", target.verb()),
                 },
+                // Only `Supervisor::unregister` produces this, and `kick`
+                // calls `start`/`stop` — so this is unreachable today. It is
+                // still handled honestly rather than collapsed into a
+                // wildcard: the whole point of the exhaustive match here is
+                // that a future `ProcError` variant has to be considered at
+                // this seam, and `{e}` carries the supervisor's own wording
+                // (which already names the service and its state) instead of
+                // inventing a second phrasing that could drift from it.
+                e @ ProcError::NotTerminal { .. } => Outcome::Refused {
+                    code: ErrorCode::OperationFailed,
+                    message: format!("could not {} '{id}': {e}", target.verb()),
+                },
             };
         }
         if !wait {
@@ -452,6 +464,30 @@ impl<R: Runtime> DesktopHandler<R> {
                 // id cannot describe the transition being waited on.
                 Ok(Ok(SupervisorEvent::Registered { .. })) => None,
                 Ok(Ok(SupervisorEvent::Log { .. })) => None,
+                // The service being waited on was REMOVED (an in-app
+                // uninstall — package-uninstall design D4). The wait can
+                // never be satisfied now: no further event will ever carry
+                // this id, and the `Lagged` arm below would re-read a row
+                // that no longer exists (`None`, i.e. "keep waiting") and
+                // burn the whole 45s deadline before answering `Timeout`.
+                // `UnknownService` is the honest code — by the time this is
+                // read, the id genuinely names nothing.
+                //
+                // Reachable only by racing a GUI uninstall against a CLI
+                // verb: `unregister` refuses a non-terminal service, so the
+                // transition either already resolved (its `StateChanged` is
+                // AHEAD of this event in the same broadcast stream and
+                // returned above) or this receiver was lagged past it.
+                Ok(Ok(SupervisorEvent::Unregistered { id: gone })) if gone == id => {
+                    return Outcome::Refused {
+                        code: ErrorCode::UnknownService,
+                        message: format!(
+                            "'{id}' was removed while waiting for it to become {}",
+                            target.state_name()
+                        ),
+                    };
+                }
+                Ok(Ok(SupervisorEvent::Unregistered { .. })) => None,
                 // A chatty service can push this receiver past the broadcast
                 // channel's capacity, and the dropped events may include the
                 // very one being waited for. Re-read the authoritative state
@@ -658,7 +694,17 @@ fn mutates(req: &Request) -> bool {
 /// The wire-ish name of a state, for human messages only.
 ///
 /// Exhaustive over [`ServiceState`], like every other match in this module.
-fn state_label(state: &ServiceState) -> &'static str {
+/// The app's ONE vocabulary for a service state, shared by `openvhost status`
+/// and by the uninstall refusal that names a service which is not stopped
+/// (package-uninstall design D3).
+///
+/// `pub(crate)` rather than duplicated: `openvhost_proc`'s own
+/// `check_terminal` deliberately kept its naming table private (it produces
+/// `ProcError::NotTerminal`'s `&'static str`), so widening this one is what
+/// stops the desktop crate from growing a third, drifting table. Exhaustive
+/// with no wildcard arm — a new [`ServiceState`] must be given a name here on
+/// purpose, not inherit some other state's.
+pub(crate) fn state_label(state: &ServiceState) -> &'static str {
     match state {
         ServiceState::Stopped => "stopped",
         ServiceState::Starting => "starting",
@@ -1548,6 +1594,98 @@ mod tests {
         assert!(message.contains("starting"), "{message}");
 
         sup.stop("mysql-8.4").expect("cleanup stop");
+    }
+
+    /// A service UNREGISTERED while a verb waits on it (a GUI uninstall
+    /// racing `openvhost start`, package-uninstall design D4) must be
+    /// answered at once. Before `Unregistered` existed this could not happen;
+    /// now, the wrong handling — treating it as "not a resolution" — would
+    /// make the CLI sit on a dead id for the full 45s and then blame a
+    /// timeout, because no further event can ever carry that id and the
+    /// `Lagged` re-read finds no row either.
+    ///
+    /// Drives `await_settled` directly: the arm is only reachable when the
+    /// removal is observed AFTER the wait began, which a full `execute` round
+    /// trip cannot stage deterministically (`unregister` refuses a
+    /// non-terminal service, so a genuine in-flight transition never reaches
+    /// it — only a lagged receiver does).
+    ///
+    /// VACUITY (neuter-and-watch-it-fail): the `Unregistered` arm was
+    /// temporarily changed to `None` (keep waiting) — this test failed with
+    /// `ErrorCode::Timeout` and a "did not become running within" message,
+    /// after burning the full 500ms deadline instead of answering in <50ms.
+    /// Restoring the arm made it pass again.
+    #[tokio::test]
+    async fn a_service_removed_mid_wait_is_answered_at_once_not_left_to_time_out() {
+        let (_app, sup, handler) = handler();
+        sup.register(registered_only_spec("php-fpm-8.3"));
+
+        // Subscribed BEFORE the removal, exactly as `transition` subscribes
+        // before it kicks — so this receiver holds the `Unregistered`.
+        let rx = sup.subscribe();
+        sup.unregister("php-fpm-8.3")
+            .expect("a stopped service is forgettable");
+
+        let began = Instant::now();
+        let outcome = handler
+            .await_settled(
+                rx,
+                Target::Running,
+                "php-fpm-8.3",
+                Duration::from_millis(500),
+            )
+            .await;
+        let elapsed = began.elapsed();
+
+        match outcome {
+            Outcome::Refused { code, message } => {
+                assert_eq!(code, ErrorCode::UnknownService);
+                assert!(message.contains("php-fpm-8.3"), "{message}");
+                assert!(message.contains("removed"), "{message}");
+            }
+            Outcome::Reached { .. } => panic!("a removed service was never reached"),
+        }
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "must answer immediately, took {elapsed:?}"
+        );
+    }
+
+    /// The other half of the arm above: an `Unregistered` for a DIFFERENT
+    /// service is none of this wait's business and must not resolve it.
+    /// Without the `gone == id` guard, uninstalling PHP 8.3 would abort an
+    /// unrelated `openvhost start nginx` that happened to be in flight.
+    ///
+    /// VACUITY (neuter-and-watch-it-fail): the guard was temporarily dropped
+    /// (making every `Unregistered` resolve the wait) — this test failed with
+    /// `ErrorCode::UnknownService` naming `nginx-not-touched`, a service that
+    /// was never removed. Restoring the guard made it pass again.
+    #[tokio::test]
+    async fn an_unregistered_event_for_another_service_does_not_resolve_this_wait() {
+        let (_app, sup, handler) = handler();
+        sup.register(registered_only_spec("nginx-not-touched"));
+        sup.register(registered_only_spec("php-fpm-8.3"));
+
+        let rx = sup.subscribe();
+        sup.unregister("php-fpm-8.3")
+            .expect("a stopped service is forgettable");
+
+        let outcome = handler
+            .await_settled(
+                rx,
+                Target::Running,
+                "nginx-not-touched",
+                Duration::from_millis(300),
+            )
+            .await;
+
+        match outcome {
+            Outcome::Refused { code, message } => {
+                assert_eq!(code, ErrorCode::Timeout, "{message}");
+                assert!(message.contains("nginx-not-touched"), "{message}");
+            }
+            Outcome::Reached { .. } => panic!("nothing started this service"),
+        }
     }
 
     /// A start whose child exits **cleanly** before it is ever ready must not

@@ -8,6 +8,7 @@
 		onQuitRequested,
 		onServiceRegistered,
 		onServiceState,
+		onServiceUnregistered,
 		pendingInstall,
 		quitDialogReady,
 		type IpcError,
@@ -78,51 +79,54 @@
 	// page that happened to trigger the install (see `ServicesStore.
 	// applyRegistered`'s doc comment for why `reload()` is still kept there
 	// too, as a synchronous guarantee independent of event-delivery timing).
+	// `onServiceUnregistered` is its mirror, for the same reason in reverse:
+	// an uninstalled version's row must DISAPPEAR everywhere, not linger
+	// offering Start for a binary that is gone.
 	onMount(() => {
-		let unlistenState: (() => void) | null = null;
-		let unlistenRegistered: (() => void) | null = null;
+		let unlistens: Array<() => void> = [];
 		let disposed = false;
 
 		void (async () => {
-			// Tracked outside the try so a failure registering the SECOND listener
-			// can still tear down the first rather than leaking it.
-			let stopState: (() => void) | null = null;
+			// Accumulated as each subscription resolves, so a failure registering
+			// the Nth listener can still tear down the N-1 that already registered
+			// rather than leaking them. A list rather than one variable per
+			// listener: there are three of them now (state, registered,
+			// unregistered), and the per-variable shape multiplied a case into the
+			// disposal path, the catch, and the cleanup for every one added.
+			const stops: Array<() => void> = [];
 			try {
 				// Subscribe BEFORE the snapshot, keeping the ordering the Services page used:
 				// a state change (or a registration) landing mid-fetch at least reaches the
 				// listener.
-				stopState = await onServiceState((ev) => servicesStore.applyState(ev));
-				const stopRegistered = await onServiceRegistered((ev) =>
-					servicesStore.applyRegistered(ev.status)
-				);
+				stops.push(await onServiceState((ev) => servicesStore.applyState(ev)));
+				stops.push(await onServiceRegistered((ev) => servicesStore.applyRegistered(ev.status)));
+				// The removal half (package-uninstall design D4): a service the user
+				// uninstalled must leave the Services page and the titlebar count
+				// without a relaunch, on every route.
+				stops.push(await onServiceUnregistered((ev) => servicesStore.applyUnregistered(ev.id)));
 				// `await` means teardown may already have run (dev HMR disposes this layout).
-				// Drop both listeners immediately rather than leaking them past the cleanup.
+				// Drop every listener immediately rather than leaking them past the cleanup.
 				if (disposed) {
-					stopState();
-					stopRegistered();
+					for (const stop of stops) stop();
 					return;
 				}
-				unlistenState = stopState;
-				unlistenRegistered = stopRegistered;
+				unlistens = stops;
 				// Resolves rather than rejects — the store captures load failures on
 				// `error`, which the Services page's banner renders.
 				await servicesStore.loadServices();
 			} catch (e) {
-				// Only `onServiceState`/`onServiceRegistered` can land here, and the ipc
-				// barrel normalizes it. Tear down whichever listener DID register so a
-				// partial failure (state subscribed, registered-subscribe threw) cannot
-				// leak one past this closure.
-				stopState?.();
+				// Only the `on*` subscriptions can land here, and the ipc barrel
+				// normalizes it. Tear down whichever listeners DID register so a
+				// partial failure cannot leak them past this closure.
+				for (const stop of stops) stop();
 				servicesStore.fail(e as IpcError);
 			}
 		})();
 
 		return () => {
 			disposed = true;
-			unlistenState?.();
-			unlistenRegistered?.();
-			unlistenState = null;
-			unlistenRegistered = null;
+			for (const stop of unlistens) stop();
+			unlistens = [];
 		};
 	});
 

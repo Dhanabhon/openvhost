@@ -34,6 +34,10 @@ mod stack;
 // menu-event router — see its own module docs for the breakdown.
 mod tray;
 
+// Removing an installed PHP or MySQL major (package-uninstall design). Its own
+// module rather than more of `commands.rs`, which is already ~7,700 lines.
+mod uninstall;
+
 // Demo-ticker only (spec D8) — see `demo_ticker_spec`'s own `#[cfg(debug_assertions)]`
 // gate for why this whole import is gated identically: a release build never
 // constructs a `ServiceSpec` for it at all, so these would otherwise be
@@ -93,11 +97,14 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::list_log_sources,
             commands::read_log_window,
             commands::reveal_log_folder,
+            uninstall::run::uninstall_plan,
+            uninstall::run::uninstall_package,
         ])
         .events(collect_events![
             commands::ServiceStateEvent,
             commands::ServiceLogEvent,
             commands::ServiceRegisteredEvent,
+            commands::ServiceUnregisteredEvent,
             commands::PhpInstallLogEvent,
             commands::MysqlInstallLogEvent,
             commands::MysqlInitLogEvent,
@@ -424,6 +431,10 @@ pub fn run() {
                                         }
                                         Ok(SupervisorEvent::Registered { status }) => {
                                             let _ = commands::ServiceRegisteredEvent { status }
+                                                .emit(&handle);
+                                        }
+                                        Ok(SupervisorEvent::Unregistered { id }) => {
+                                            let _ = commands::ServiceUnregisteredEvent { id }
                                                 .emit(&handle);
                                         }
                                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {

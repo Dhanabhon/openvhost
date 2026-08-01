@@ -65,10 +65,12 @@ pub trait TraySink {
 ///    state, not the whole model, and the rest of a busy stack's rows stay
 ///    silent.
 /// 2. **A membership change is a [`TraySink::rebuild`], never a mutation.**
-///    If the SET of row ids differs (a service was registered after
-///    launch — spec D2's whole reason `SupervisorEvent::Registered` exists —
-///    there is no removal path today, but this checks the set both ways
-///    rather than assuming growth-only), every other diff is skipped: there
+///    If the SET of row ids differs — a service was registered after launch
+///    (spec D2's whole reason `SupervisorEvent::Registered` exists) or
+///    UNregistered after launch (`SupervisorEvent::Unregistered`, the
+///    package-uninstall slice's D4; this rule was written to check the set
+///    both ways before any removal path existed, and that is now load-bearing
+///    rather than defensive) — every other diff is skipped: there
 ///    is no existing `MenuItem` handle for a brand-new row to mutate, so
 ///    the only correct move is to hand the whole fresh model to the real
 ///    sink and let it reconstruct the row section (and resync everything
@@ -416,10 +418,10 @@ mod tests {
         assert_eq!(sink.calls(), vec![Call::Rebuild(new)]);
     }
 
-    /// The set-difference check must catch a REMOVAL too, not just growth —
-    /// `Supervisor::register` never un-registers a service today, but
-    /// `apply` is a general-purpose pure function and should not assume
-    /// that invariant holds forever.
+    /// The set-difference check must catch a REMOVAL too, not just growth.
+    /// Written defensively when nothing could remove a service; now the
+    /// direct path for `SupervisorEvent::Unregistered` (package-uninstall
+    /// design D4), which the tray subscriber turns into exactly this diff.
     #[test]
     fn a_removed_service_id_also_triggers_rebuild() {
         let old = model(
@@ -438,6 +440,43 @@ mod tests {
             IconState::Running,
             false,
             true,
+        );
+        let sink = RecordingSink::default();
+        apply(&old, &new, &sink);
+        assert_eq!(sink.calls(), vec![Call::Rebuild(new)]);
+    }
+
+    /// Removing the LAST row is still a membership change, not a no-op: the
+    /// empty-set case is where a "did anything get added?" style check would
+    /// quietly do nothing and leave a stale `MenuItem` in the native menu
+    /// pointing at a service that no longer exists — clicking it would
+    /// dispatch a verb for an unregistered id.
+    ///
+    /// VACUITY (neuter-and-watch-it-fail): `membership_changed` was
+    /// temporarily computed as `new_ids.iter().any(|id| !old_ids.contains(id))`
+    /// (growth-only) — this test failed, recording
+    /// `[Summary("No services registered"), StartAllEnabled(false)]` against
+    /// the asserted single `Rebuild`: the granular path resyncs the aggregate
+    /// fields and then finds no `new` rows to diff at all, so the departed
+    /// row's `MenuItem` is never removed from the menu. (The same neuter also
+    /// failed `a_removed_service_id_also_triggers_rebuild`, there with a
+    /// genuinely empty call list.) Restoring the set comparison made both
+    /// pass again.
+    #[test]
+    fn removing_the_only_service_still_triggers_rebuild() {
+        let old = model(
+            vec![row("php-fpm-8.3", "Start php-fpm-8.3 — Stopped", true)],
+            "All stopped",
+            IconState::Stopped,
+            true,
+            false,
+        );
+        let new = model(
+            Vec::new(),
+            "No services registered",
+            IconState::Stopped,
+            false,
+            false,
         );
         let sink = RecordingSink::default();
         apply(&old, &new, &sink);

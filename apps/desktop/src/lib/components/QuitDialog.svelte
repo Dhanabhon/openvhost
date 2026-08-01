@@ -3,6 +3,7 @@
 	import { onMount } from 'svelte';
 	import Button from './Button.svelte';
 	import { formatNameList } from '$lib/services.derive';
+	import { pendingOperationCopy, type PendingOperation } from '$lib/quit.derive';
 
 	let {
 		pending,
@@ -14,19 +15,26 @@
 	}: {
 		/** Display names of services a quit would stop. Empty = nothing to lose. */
 		pending: readonly string[];
-		/** The install/init currently in flight via Homebrew, if any — PHP or
-		 *  MySQL alike (review fix wave, Important 1). A build/init in progress
-		 *  is invisible to `pending` — it is not a supervised service — so
-		 *  without this a quit would silently discard it mid-work.
+		/** The Homebrew run currently occupying `InstallLock`'s single slot, if
+		 *  any — a PHP or MySQL install, a MySQL init, or (since the
+		 *  package-uninstall slice) a `brew uninstall`. None of them is a
+		 *  supervised service, so all of them are invisible to `pending`; without
+		 *  this the quit confirmation would say "nothing will be interrupted"
+		 *  while one was about to be killed mid-work.
 		 *
-		 *  `label`'s shape differs deliberately by kind, mirroring exactly what
-		 *  the Rust side already tracks (`InstallLock`'s `set_running` call
-		 *  sites): a PHP install's label is the BARE major (`"8.4"`), because
-		 *  this component itself supplies the leading "PHP" word below; a
-		 *  MySQL install's or init's label ALREADY reads as a complete phrase
-		 *  (`"MySQL 8.4"`, `"MySQL 8.4 initialization"`), so rendering it
-		 *  verbatim is correct and prepending another "MySQL" would double it. */
-		pendingInstall?: { kind: 'php' | 'mysql'; label: string } | null;
+		 *  `operation` is REQUIRED, not optional, and that is the fix for the
+		 *  branch review's HIGH: this prop used to be `{ kind, label }`, Rust had
+		 *  been sending `operation` end to end for a while, and TypeScript
+		 *  accepted the extra field in silence (no excess-property check on a
+		 *  variable) — so an uninstall was narrated with the install sentence,
+		 *  every clause of it false. Requiring the field makes `+layout.svelte`'s
+		 *  hand-off of the generated `PendingInstallDto` a compile-time seam.
+		 *
+		 *  The sentence itself lives in `quit.derive.ts` (including why PHP's
+		 *  label needs a leading word and MySQL's does not) so it can be asserted
+		 *  as words, and so the two operations can be proven never to collapse
+		 *  onto one wording. */
+		pendingInstall?: PendingOperation | null;
 		/** True while `confirmQuit` is in flight — services are being stopped. */
 		quitting?: boolean;
 		/** A failed quit attempt, rendered in place rather than as a page banner:
@@ -39,9 +47,17 @@
 	const hasPending = $derived(pending.length > 0);
 	const hasInstall = $derived(pendingInstall !== null);
 	/** "Stop and quit" whenever there is something to stop — a running service
-	 *  OR an install in flight — otherwise a button promising to stop nothing
-	 *  is a small lie the user notices. */
+	 *  OR a Homebrew run in flight — otherwise a button promising to stop
+	 *  nothing is a small lie the user notices. Deliberately the same label for
+	 *  an install and an uninstall: both are stopped, and only the CONSEQUENCE
+	 *  differs, which is what the sentence above the buttons explains. */
 	const confirmLabel = $derived(hasPending || hasInstall ? 'Stop and quit' : 'Quit');
+	/** The in-flight sentence, split at the label so it can keep the mono face.
+	 *  Every word of it comes from `quit.derive.ts`; this component chooses only
+	 *  where the three parts sit. */
+	const installCopy = $derived(
+		pendingInstall === null ? null : pendingOperationCopy(pendingInstall)
+	);
 
 	let dialog = $state<HTMLElement | null>(null);
 
@@ -144,18 +160,15 @@
 		{:else if !pendingInstall}
 			No services are running. Nothing will be interrupted.
 		{/if}
-		{#if pendingInstall}
-			<!-- PHP's label is bare (e.g. "8.4"), so this component supplies the
-			     leading word itself; MySQL's label already reads as a complete
-			     phrase ("MySQL 8.4", "MySQL 8.4 initialization"), so prepending
-			     another "MySQL" here would double it — see the prop's own doc
-			     comment. The PHP branch is byte-identical to the copy this
-			     dialog has always rendered. -->
-			{hasPending ? ' ' : ''}{pendingInstall.kind === 'php'
-				? 'PHP '
-				: ''}<span class="mono">{pendingInstall.label}</span> is still installing. Quitting
-			stops it immediately and discards the download/build in progress — there is no resuming it, only
-			starting over.
+		{#if installCopy}
+			<!-- No branching on `kind` or `operation` here, on purpose: this
+			     template used to pick the leading word itself and hardcode the
+			     rest of the sentence, which is how an uninstall came to be
+			     narrated as an install. The three parts arrive already decided
+			     (`quit.derive.ts`), and the only choice left in markup is that
+			     the label wears the mono face. -->
+			{hasPending ? ' ' : ''}{installCopy.lead}<span class="mono">{installCopy.label}</span
+			>{installCopy.rest}
 		{/if}
 	</p>
 

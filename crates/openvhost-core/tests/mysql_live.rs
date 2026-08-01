@@ -424,6 +424,7 @@ async fn discover_target_runtime() -> Option<MysqlRuntime> {
     .expect("mysql discovery timed out")
     .expect("the discovery blocking task panicked");
     found
+        .runtimes
         .into_iter()
         .find(|rt| rt.major.as_str() == TARGET_MAJOR)
 }
@@ -593,7 +594,15 @@ async fn wait_state(
             {
                 return state;
             }
-            Ok(Ok(_)) => continue,
+            // Exhaustive rather than `Ok(Ok(_))`: a new `SupervisorEvent`
+            // variant must fail to compile HERE too. A wildcard would keep
+            // compiling and keep skipping — which is correct for THIS helper
+            // (it only ever waits on states), but it is exactly how a variant
+            // that a future waiter DOES need slips past unnoticed.
+            Ok(Ok(SupervisorEvent::StateChanged { .. }))
+            | Ok(Ok(SupervisorEvent::Log { .. }))
+            | Ok(Ok(SupervisorEvent::Registered { .. }))
+            | Ok(Ok(SupervisorEvent::Unregistered { .. })) => continue,
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
             Ok(Err(e)) => panic!("event channel closed while waiting on '{id}': {e}"),
             Err(_) => panic!("timed out waiting for a matching state on '{id}'"),

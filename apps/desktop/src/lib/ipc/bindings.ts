@@ -199,6 +199,7 @@ export const commands = {
 	 */
 	pendingInstall: () => typedError<{
 	kind: InstallKindDto,
+	operation: PackageOperationDto,
 	label: string,
 } | null, IpcError>(__TAURI_INVOKE("pending_install")),
 	/**
@@ -297,6 +298,29 @@ export const commands = {
 	 *  `open_site`/`open_homebrew_site` above.
 	 */
 	revealLogFolder: (source: LogSourceDto) => typedError<null, IpcError>(__TAURI_INVOKE("reveal_log_folder", { source })),
+	/**
+	 *  What an uninstall of `major` would remove, keep, and refuse to do.
+	 * 
+	 *  A PURE QUERY: it spawns nothing and changes nothing. It reads the
+	 *  supervisor's snapshot, the site list and Homebrew's `opt` links, and derives
+	 *  paths — that is all — so the Languages/Databases pages can call it on mount
+	 *  to decide a disabled state as cheaply as they call it to fill a confirmation
+	 *  dialog. `Target::keg_provenance` is a `canonicalize`, not a process: cheap
+	 *  enough for a mount, which is why the aliased-keg refusal can be a BLOCKER
+	 *  (the action is disabled with an explanation) rather than a surprise at
+	 *  confirm time.
+	 */
+	uninstallPlan: (kind: PackageKind, major: string) => typedError<UninstallPlan, IpcError>(__TAURI_INVOKE("uninstall_plan", { kind, major })),
+	/**
+	 *  Remove `major`: refuse if anything depends on it, otherwise
+	 *  `brew uninstall`, then drop the config this app generated and the service
+	 *  row.
+	 * 
+	 *  Re-checks the blockers itself — the plan the dialog was built from may be
+	 *  stale — and streams brew's output through the same events `install_php`
+	 *  uses, so the Languages/Databases pages need no second log channel.
+	 */
+	uninstallPackage: (kind: PackageKind, major: string) => typedError<null, IpcError>(__TAURI_INVOKE("uninstall_package", { kind, major })),
 };
 
 /** Events */
@@ -308,6 +332,7 @@ export const events = {
 	serviceLogEvent: makeEvent<ServiceLogEvent>("service-log-event"),
 	serviceRegisteredEvent: makeEvent<ServiceRegisteredEvent>("service-registered-event"),
 	serviceStateEvent: makeEvent<ServiceStateEvent>("service-state-event"),
+	serviceUnregisteredEvent: makeEvent<ServiceUnregisteredEvent>("service-unregistered-event"),
 };
 
 /* Types */
@@ -332,6 +357,73 @@ export type ApplyOutcomeDto = {
 export type ApplyPlanDto = {
 	changes: FileChangeDto[],
 };
+
+/**
+ *  Why an uninstall is refused (design D3). Both are refusals, not warnings,
+ *  and there is deliberately no `--force`: a user who wants the version gone
+ *  can stop the service or change the sites first, which is the same work with
+ *  the consequences visible.
+ */
+export type Blocker = 
+/**
+ *  The version's service is not in a terminal state. Never auto-stopped:
+ *  stopping a database mid-write as a side effect of a menu click is
+ *  exactly the surprise this app should not spring.
+ */
+{ kind: "serviceNotTerminal"; id: string; state: string } | 
+/**
+ *  Sites are still set to this PHP major. Never silently repointed: that
+ *  would edit the user's configuration without asking AND could move a
+ *  site onto a PHP version its code does not run on.
+ */
+{ kind: "sitesPinned"; domains: string[] } | 
+/**
+ *  The keg `brew uninstall <formula>` would remove belongs to a DIFFERENT
+ *  formula — brew has aliased this version's name onto another one.
+ * 
+ *  Not hypothetical, and the reason this variant exists: on a machine where
+ *  Homebrew's unversioned `php` is 8.5.9, `brew info php@8.5` reports
+ *  `Aliases: php@8.5` and `/opt/homebrew/opt/php@8.5` resolves to
+ *  `Cellar/php/8.5.9`. This app would discover 8.5, offer Uninstall, say it
+ *  removes "the `php@8.5` formula" — and `brew uninstall php@8.5` would
+ *  resolve the alias and remove the user's **linked `php`**, breaking `php`
+ *  system-wide. The string shown and the keg removed are not the same
+ *  thing.
+ * 
+ *  A refusal, like every other blocker (D3), extending "never destroy user
+ *  data" to "never destroy the user's environment". A user who does mean it
+ *  runs `brew uninstall <owner>` themselves, where the consequence is
+ *  visible.
+ */
+{ kind: "foreignKeg"; 
+/**  What this app would have passed to `brew uninstall`, e.g. `php@8.5`. */
+formula: string; 
+/**
+ *  The formula that actually owns the keg, e.g. `php` — what would be
+ *  removed.
+ */
+owner: string; 
+/**  The keg itself, e.g. `/opt/homebrew/Cellar/php/8.5.9`. */
+keg: string } | 
+/**
+ *  Nothing under any known Homebrew prefix resolved to a keg for this
+ *  formula, so this app cannot say what `brew uninstall <formula>` would
+ *  remove.
+ * 
+ *  Deliberately NOT folded into "fine, proceed". An absent or unreadable
+ *  `opt` link is no evidence that the name is safe to hand to brew — brew
+ *  resolves its own aliases from its taps whether or not a link exists
+ *  here, so the [`ForeignKeg`](Blocker::ForeignKeg) danger is fully present
+ *  in this case too, just unprovable. Refusing fails visibly and leaves the
+ *  user a manual path; proceeding would fail quietly and take their `php`
+ *  with it.
+ */
+{ kind: "unknownKeg"; formula: string; 
+/**
+ *  Every `opt` path that was looked at, so the refusal is diagnosable
+ *  rather than merely discouraging.
+ */
+searched: string[] };
 
 /**
  *  Basic environment facts, assembled by core (not by the Tauri command —
@@ -412,6 +504,35 @@ export type IpcError =
  *  the UI can mark it instead of showing a generic banner.
  */
 { kind: "validation"; field: string; message: string };
+
+/**
+ *  One thing that SURVIVES the uninstall, in the user's words.
+ * 
+ *  `path` is `Some` for anything that lives on disk (so design D6's dialog can
+ *  say "they stay in `<home>/data/mysql/8.4`" rather than a vague
+ *  reassurance), and `None` for things that have no path — a row in state.db,
+ *  a setting on every site. It is NOT an existence check: naming where a
+ *  directory would be is true whether or not it has been created yet, and
+ *  stat-ing here would make a pure query depend on the moment it ran.
+ */
+export type KeptItem = {
+	what: string,
+	path: string | null,
+	/**
+	 *  The one item the confirmation's headline sentence is ABOUT — "Your
+	 *  databases are not touched — they stay in `<path>`". Exactly one entry
+	 *  per plan carries it.
+	 * 
+	 *  An explicit flag rather than "whichever entry happens to come first
+	 *  with a path", which is what the UI used to do. Under that rule a
+	 *  reorder of this list silently changed which directory a destructive
+	 *  dialog reassures the user about, and the only thing that would fail was
+	 *  a full-vector `assert_eq!` whose natural fix — update the expected
+	 *  vector — carries no signal at all that the dialog just started naming
+	 *  `my.cnf` as the place the user's databases live.
+	 */
+	headline: boolean,
+};
 
 export type LogLevel = "info" | "warn" | "error";
 
@@ -638,14 +759,38 @@ export type MysqlInstanceDto = {
 export type MysqlResetOutcomeDto = { kind: "reset" } | { kind: "authFailed"; detail: string };
 
 /**
- *  What [`pending_install`] reports: which kind of install/init occupies
- *  `InstallLock`'s shared slot, and its label — e.g. `"8.4"` for a PHP
- *  install, `"MySQL 8.4"` for a MySQL install, `"MySQL 8.4 initialization"`
- *  for an init run (see `install_php`/`install_mysql`/`initialize_mysql`'s
- *  own `set_running` calls for the exact shapes).
+ *  Which family of package an uninstall targets.
+ * 
+ *  Exhaustively matched everywhere with **no wildcard arm** — adding a variant
+ *  must break the build in [`Target::parse`] and [`inventory`], because the
+ *  alternative (a `_` arm) is an uninstall that reports success having removed
+ *  nothing.
+ */
+export type PackageKind = "php" | "mysql";
+
+/**
+ *  Wire-safe copy of [`PackageOperation`] — same relationship
+ *  [`InstallKindDto`] has to [`InstallKind`].
+ */
+export type PackageOperationDto = "install" | "uninstall";
+
+/**
+ *  What [`pending_install`] reports: which kind of run occupies
+ *  `InstallLock`'s shared slot, which direction it is going, and its label —
+ *  e.g. `"8.4"` for a PHP install or uninstall, `"MySQL 8.4"` for a MySQL one,
+ *  `"MySQL 8.4 initialization"` for an init run (see the `set_running` calls in
+ *  `install_php`/`install_mysql`/`initialize_mysql`/`uninstall_package` for the
+ *  exact shapes).
+ * 
+ *  `operation` exists because the quit dialog's copy — "… is still installing.
+ *  Quitting stops it immediately and discards the download/build in progress"
+ *  — is simply false for a removal, where what is at risk is a
+ *  half-uninstalled formula rather than a discarded download. The Rust side
+ *  reports the distinction; rendering it is the dialog's own (owed) change.
  */
 export type PendingInstallDto = {
 	kind: InstallKindDto,
+	operation: PackageOperationDto,
 	label: string,
 };
 
@@ -682,6 +827,21 @@ export type PhpInstallLogEvent = {
 export type PhpRuntimeDto = {
 	major: string,
 	installed: boolean,
+	/**
+	 *  Whether this build OFFERS this major — i.e. whether it is in
+	 *  `openvhost_core::CATALOGUE`.
+	 * 
+	 *  The mirror of `MysqlInstanceDto::cataloged`, and it exists for the same
+	 *  reason: `false` means the page must render the row (it is installed and
+	 *  serving sites) while offering neither Install nor Uninstall for it.
+	 *  Both spec builders refuse an out-of-catalogue major outright
+	 *  (`php::brew::cataloged`), so an affordance the row cannot honour would
+	 *  be a button whose only outcome is a validation error.
+	 * 
+	 *  Not derivable on the frontend: the catalogue is a Rust constant, and a
+	 *  second copy of it in TypeScript would be a list to forget to update.
+	 */
+	cataloged: boolean,
 	recommended: boolean,
 	/**
 	 *  A more precise version string than `major` (e.g. a patch level), when
@@ -771,6 +931,21 @@ export type ServiceStatus = {
 };
 
 /**
+ *  Emitted when [`openvhost_proc::SupervisorEvent::Unregistered`] fires — a
+ *  service row was REMOVED (package-uninstall design
+ *  `2026-07-31-p1-pkg-uninstall-design.md` D4: uninstalling a PHP or MySQL
+ *  major must make its row leave the Services page and the tray without a
+ *  restart, not leave it behind failing).
+ * 
+ *  Carries the id alone, the mirror of [`ServiceRegisteredEvent`]'s full
+ *  status: the row is gone, so there is no state left to describe, and every
+ *  receiver's job is the same subtraction.
+ */
+export type ServiceUnregisteredEvent = {
+	id: string,
+};
+
+/**
  *  Summed resident memory of the supervised services.
  * 
  *  `bytes` and `process_count` are both u64/u32 crossing a
@@ -815,6 +990,24 @@ export type SiteInput = {
 	webServer: string,
 	phpVersion: string,
 	enabled: boolean,
+};
+
+/**
+ *  What an uninstall would do, for the confirmation dialog and for the
+ *  disabled state. Produced by the pure-query command `uninstall_plan`.
+ */
+export type UninstallPlan = {
+	kind: PackageKind,
+	major: string,
+	/**  Human-readable, in the order the executor performs them. */
+	removes: string[],
+	/**  What survives, with paths where they exist. */
+	keeps: KeptItem[],
+	/**
+	 *  Empty => may proceed. Non-empty => the action is refused, and these say
+	 *  why and what to do about it.
+	 */
+	blockers: Blocker[],
 };
 
 export type ValidationReportDto = {

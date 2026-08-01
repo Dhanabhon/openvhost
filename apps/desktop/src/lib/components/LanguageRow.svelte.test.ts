@@ -20,6 +20,9 @@ function r(
 	return {
 		major,
 		installed,
+		// See `row()` in languages.svelte.test.ts — catalogued is the default;
+		// `cataloged: false` is the hand-installed row that gets no Uninstall.
+		cataloged: true,
 		recommended: false,
 		fullVersion: null,
 		path: installed ? `/opt/homebrew/opt/php@${major}/sbin/php-fpm` : null,
@@ -31,8 +34,13 @@ function r(
 
 function renderRow(props: {
 	row: PhpRuntimeDto;
+	/** Defaults to TRUE — the ordinary case, a version this build manages. The
+	 *  out-of-catalogue tests below pass `false` explicitly, which is the point:
+	 *  the row cannot decide this for itself, so it must be told. */
+	cataloged?: boolean;
 	serviceState?: ServiceStatus['state'] | null;
 	installing?: string;
+	uninstalling?: string;
 	log?: UiLog[];
 	error?: string;
 	outcome?: InstallOutcomeDto | null;
@@ -40,16 +48,28 @@ function renderRow(props: {
 	return render(LanguageRow, {
 		props: {
 			row: props.row,
+			cataloged: props.cataloged ?? true,
 			serviceState: props.serviceState ?? null,
 			installing: props.installing ?? '',
+			uninstalling: props.uninstalling ?? '',
 			log: props.log ?? [],
 			error: props.error ?? '',
 			outcome: props.outcome ?? null,
 			onInstall: () => {},
+			onUninstall: () => {},
 			onStart: () => {},
 			onStop: () => {}
 		}
 	}).body;
+}
+
+/** Just the Uninstall button's own opening tag, so a `disabled` assertion can
+ *  fail for the reason it names rather than matching some other button on the
+ *  row (`renderRow` output now holds two). */
+function uninstallTag(body: string, major: string): string {
+	const match = body.match(new RegExp(`<button[^>]*data-testid="uninstall-${major}"[^>]*>`));
+	if (!match) throw new Error(`expected an Uninstall button for ${major}`);
+	return match[0];
 }
 
 describe('LanguageRow', () => {
@@ -329,5 +349,121 @@ describe('the pool status pill', () => {
 			outcome: { major: '8.4', exitCode: 0, detected: true }
 		});
 		expect(out).toContain('8.4.13');
+	});
+});
+
+// Package-uninstall design D6: an installed major gets an Uninstall action.
+// Every assertion below is about the ACTION — the confirmation it opens is
+// `UninstallDialog.svelte`'s own test file, and the copy is
+// `uninstall.derive.test.ts`'s.
+describe('LanguageRow — the Uninstall action', () => {
+	it('offers Uninstall for an installed major', () => {
+		const body = renderRow({ row: r('8.3', true), serviceState: { kind: 'stopped' } });
+		expect(body).toContain('data-testid="uninstall-8.3"');
+	});
+
+	// The Install and Uninstall branches are mutually exclusive by construction;
+	// this pins that, because a row offering to uninstall something that was
+	// never installed would call a command that can only fail.
+	it('offers no Uninstall for a major that is not installed', () => {
+		const body = renderRow({ row: r('8.3', false) });
+		expect(body).toContain('data-testid="install-8.3"');
+		expect(body).not.toContain('data-testid="uninstall-8.3"');
+	});
+
+	// An installed major whose pool has no supervisor row yet (or whose
+	// snapshot has not arrived) still gets the action: that is exactly the
+	// state a user most wants out of.
+	it('offers Uninstall even with no service state for the row', () => {
+		const body = renderRow({ row: r('8.3', true), serviceState: null });
+		expect(body).toContain('data-testid="uninstall-8.3"');
+	});
+
+	it('keeps the Start/Stop control alongside it', () => {
+		const body = renderRow({ row: r('8.3', true), serviceState: { kind: 'stopped' } });
+		expect(body).toContain('data-testid="start-php-fpm-8.3"');
+		expect(body).toContain('data-testid="uninstall-8.3"');
+	});
+
+	it('is enabled when nothing is in flight', () => {
+		const body = renderRow({ row: r('8.3', true), serviceState: null });
+		expect(uninstallTag(body, '8.3')).not.toContain('disabled');
+	});
+
+	// One `InstallLock` serializes brew installs and brew uninstalls, so an
+	// uninstall pressed during an install would only queue on a mutex with no
+	// feedback — the same reasoning that already disables "Check again".
+	it('is disabled while an install is running', () => {
+		const body = renderRow({ row: r('8.3', true), serviceState: null, installing: '8.4' });
+		expect(uninstallTag(body, '8.3')).toContain('disabled');
+	});
+
+	it('is disabled while ANOTHER major is being uninstalled', () => {
+		const body = renderRow({ row: r('8.3', true), serviceState: null, uninstalling: '8.4' });
+		expect(uninstallTag(body, '8.3')).toContain('disabled');
+		// …and says nothing about itself: this row is not the one going away.
+		expect(uninstallTag(body, '8.3')).not.toContain('Uninstalling');
+	});
+
+	it('is disabled and says what it is doing while THIS major is uninstalled', () => {
+		const body = renderRow({ row: r('8.3', true), serviceState: null, uninstalling: '8.3' });
+		expect(uninstallTag(body, '8.3')).toContain('disabled');
+		expect(body).toContain('Uninstalling…');
+	});
+
+	it('names the version in its accessible label', () => {
+		const body = renderRow({ row: r('8.3', true), serviceState: null });
+		expect(uninstallTag(body, '8.3')).toContain('aria-label="Uninstall PHP 8.3"');
+	});
+});
+
+// The branch review's MEDIUM. `php_rows` lists an installed major from OUTSIDE
+// the catalogue — a hand-installed `php@7.4`, or one a later catalogue drops —
+// with `installed: true`, so it does not vanish from the page while it is still
+// serving sites. The row then offered Uninstall, `Target::parse` refused the
+// major it was never going to accept, and the dialog opened only to say "This
+// could not be checked, so nothing has been changed."
+describe('LanguageRow — an installed major this build does not manage', () => {
+	it('offers no Uninstall, because the command could only refuse it', () => {
+		const body = renderRow({ row: r('7.4', true), cataloged: false, serviceState: null });
+		expect(body).not.toContain('data-testid="uninstall-7.4"');
+	});
+
+	// Absent affordance, present explanation — the one thing this page has got
+	// wrong twice before (C2/C3). The note has to name the real command, or it
+	// is not a next action.
+	it('says why, and hands over the command that does work', () => {
+		const body = renderRow({ row: r('7.4', true), cataloged: false, serviceState: null });
+		expect(body).toContain('data-testid="php-out-of-catalogue-7.4"');
+		expect(body).toContain('brew uninstall php@7.4');
+		expect(body).toContain('Check again');
+	});
+
+	// It is still a real, supervised pool. Removing its lifecycle control would
+	// trade a dead button for a dead row.
+	it('keeps its Start/Stop control', () => {
+		const body = renderRow({
+			row: r('7.4', true, { serviceId: 'php-fpm-7.4' }),
+			cataloged: false,
+			serviceState: { kind: 'stopped' }
+		});
+		expect(body).toContain('data-testid="start-php-fpm-7.4"');
+	});
+
+	// The guard is `installed && cataloged`, and both halves have to matter. A
+	// managed major keeps its button; an unmanaged one loses it; and the note
+	// belongs to the unmanaged row only.
+	it('leaves a managed major untouched: button present, note absent', () => {
+		const body = renderRow({ row: r('8.3', true), cataloged: true, serviceState: null });
+		expect(body).toContain('data-testid="uninstall-8.3"');
+		expect(body).not.toContain('data-testid="php-out-of-catalogue-8.3"');
+	});
+
+	// A not-installed row is a catalogue row by construction (only installed
+	// majors can fall outside it), so it must not sprout the note.
+	it('says nothing about the catalogue for a version that is not installed', () => {
+		const body = renderRow({ row: r('8.4', false), cataloged: true });
+		expect(body).not.toContain('data-testid="php-out-of-catalogue-8.4"');
+		expect(body).toContain('data-testid="install-8.4"');
 	});
 });

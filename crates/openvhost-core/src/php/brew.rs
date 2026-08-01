@@ -2,29 +2,40 @@
 //! Homebrew as a PHP source: which versions we offer, where brew lives, and
 //! the exact command that installs one.
 //!
-//! SECURITY: this module composes the argv. A caller supplies a version, never
-//! a formula and never a flag. Arguments are passed as a vector rather than
-//! through a shell, which stops command injection — but not flag injection, so
-//! `PhpMajor::parse` enforces the shape AND membership of [`CATALOGUE`].
-//!
-//! SECURITY: [`brew_install_spec`] also requires `brew` to be an absolute
-//! path. An empty or relative leading component in `PATH` is resolved by
-//! `exec` as the current working directory, and brew shells out to `git` and
-//! `curl` — so a relative `brew` path would turn the composed `PATH` into a
-//! PATH-hijack primitive for anyone who controls a file in the CWD.
+//! SECURITY: a caller supplies a version, never a formula and never a flag —
+//! `PhpMajor::parse` enforces the shape AND membership of [`CATALOGUE`], which
+//! is what defeats flag injection (argv alone stops command injection but not
+//! `--build-from-source`). The argv/env itself is composed by
+//! [`crate::brew_cmd::brew_spec`], the one chokepoint for every `brew`
+//! invocation in this crate — see that module for the absolute-`brew`-path and
+//! composed-`PATH` rationale that used to be duplicated here.
 
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use openvhost_proc::SpawnSpec;
 
 use super::BREW_PREFIXES;
+use crate::brew_cmd::{BrewVerb, brew_spec};
 use crate::error::CoreError;
 
 /// The versions this build offers. Hand-maintained: asking `brew` would mean
 /// spawning a process on a path that has to stay cheap, and a stale entry
 /// fails loudly at install time rather than silently.
 pub const CATALOGUE: [&str; 5] = ["8.1", "8.2", "8.3", "8.4", "8.5"];
+
+/// The shared "well-formed but not offered by this build" error — used by both
+/// [`PhpMajor::parse`]'s layer-2 check and [`cataloged`]'s guard, so the two
+/// call sites can never drift to different wording for the identical condition.
+/// Mirrors `mysql::brew::not_cataloged_error` exactly.
+fn not_cataloged_error(version: &str) -> CoreError {
+    CoreError::Validation {
+        field: "php_version",
+        reason: format!(
+            "PHP {version} is not offered by this build (offered: {})",
+            CATALOGUE.join(", ")
+        ),
+    }
+}
 
 /// A PHP `major.minor` this build offers. Parsing enforces the shape;
 /// membership of [`CATALOGUE`] enforces the policy.
@@ -53,19 +64,54 @@ impl PhpMajor {
         // Layer 2: policy. Shape alone would still let a flag-shaped-but-numeric
         // value, or a version we have never tested, reach `brew install`.
         if !CATALOGUE.contains(&s) {
-            return Err(CoreError::Validation {
-                field: "php_version",
-                reason: format!(
-                    "PHP {s} is not offered by this build (offered: {})",
-                    CATALOGUE.join(", ")
-                ),
-            });
+            return Err(not_cataloged_error(s));
         }
         Ok(Self(s.to_string()))
     }
 
+    /// The ONLY way to obtain an out-of-catalogue `PhpMajor`, and it exists
+    /// solely so [`cataloged`]'s guard can be proven to fire.
+    ///
+    /// `#[cfg(test)]` deliberately: production has exactly one constructor
+    /// today, and this must never become a second, more permissive path into a
+    /// child process's argv (which is precisely the hole
+    /// `MysqlMajor::from_probe` opened on the MySQL side — see that type's doc
+    /// comment). Widening this to `pub(crate)` for a discovery path is exactly
+    /// the refactor the guard is defending against; if that day comes, the
+    /// guard is already there and this test hook can go.
+    #[cfg(test)]
+    fn out_of_catalogue(s: &str) -> Self {
+        Self(s.to_string())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Whether this major is one [`CATALOGUE`] offers. Mirrors
+    /// `MysqlMajor::is_cataloged`.
+    pub fn is_cataloged(&self) -> bool {
+        CATALOGUE.contains(&self.0.as_str())
+    }
+}
+
+/// The catalogue gate both spec builders share.
+///
+/// Re-checks membership rather than trusting the caller to have obtained
+/// `major` via [`PhpMajor::parse`]. Today `parse` IS the only production
+/// constructor, so this cannot fire — and that is exactly the argument the
+/// MySQL side made before it turned out to be false: `MysqlMajor` grew a
+/// discovery-only `from_probe`, `MysqlRuntime.major` is a `pub` field, and an
+/// out-of-catalogue major could reach `brew`'s argv without ever passing
+/// `parse`. `PhpRuntime.major` is an untyped `String` today, so the symmetry
+/// refactor that types it — and adds `PhpMajor::from_probe` alongside — would
+/// reopen the identical hole here. Provenance is never assumed; the guarantee
+/// is enforced at the boundary that needs it.
+fn cataloged(major: &PhpMajor) -> Result<(), CoreError> {
+    if major.is_cataloged() {
+        Ok(())
+    } else {
+        Err(not_cataloged_error(major.as_str()))
     }
 }
 
@@ -78,65 +124,39 @@ pub fn find_brew() -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// The command that installs `major`. Composed here — the formula name is
-/// never accepted from a caller.
-///
-/// INVARIANT: `brew` must be an absolute path with a real parent directory.
-/// `Path::new("brew").parent()` is `Some("")`, not `None`, so a naive
-/// `unwrap_or_default()` fallback never fires for a relative or bare-filename
-/// path — the composed `PATH` would then start with an empty (or `.`)
-/// leading component. `exec` resolves an empty/`.` leading `PATH` component
-/// as the current working directory, and brew shells out to `git` and
-/// `curl`, so that would hand execution of `git`/`curl` to whoever controls
-/// a file in the process's CWD. Rejecting non-absolute input here — rather
-/// than trusting callers — is what keeps that primitive from ever reaching
-/// argv.
+/// The Homebrew formula that provides `major` — THE definition. A formula name
+/// is never accepted from a caller, only derived from a catalogue-gated
+/// [`PhpMajor`], and the install spec, the uninstall spec and any UI that
+/// names the formula to a user all read it from here, so the string shown and
+/// the string executed are one expression rather than two that can drift.
+pub fn brew_formula(major: &PhpMajor) -> String {
+    format!("php@{}", major.as_str())
+}
+
+/// The command that installs `major`. Composed via
+/// [`crate::brew_cmd::brew_spec`] — see that module for the absolute-`brew`
+/// invariant and the composed `PATH` this used to spell out inline.
 pub fn brew_install_spec(brew: &Path, major: &PhpMajor) -> Result<SpawnSpec, CoreError> {
-    if !brew.is_absolute() {
-        return Err(CoreError::Validation {
-            field: "brew_path",
-            reason: format!("{} is not an absolute path", brew.display()),
-        });
-    }
-    let brew_bin = match brew.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => {
-            return Err(CoreError::Validation {
-                field: "brew_path",
-                reason: format!("{} has no parent directory", brew.display()),
-            });
-        }
-    };
+    cataloged(major)?;
+    brew_spec(brew, BrewVerb::Install, &brew_formula(major))
+}
 
-    // brew shells out to git, curl and friends, resolved through THIS PATH —
-    // so it inherits the same rule `discover.rs` documents for php-fpm and
-    // nginx: never resolve anything through the process's ambient PATH,
-    // because a ServBay install shadows binaries there. Composed from a
-    // fixed baseline (brew's own bin, then the standard system dirs) rather
-    // than appending the parent's inherited PATH: that inherited value is
-    // attacker-influenced environment the app does not control, and brew's
-    // own prefix does not ship git/curl/tar — prepending it would not have
-    // closed the gap, only hidden it behind "PATH looks populated".
-    let mut path = OsString::from(brew_bin);
-    path.push(":/usr/bin:/bin:/usr/sbin:/sbin");
-
-    Ok(SpawnSpec {
-        program: brew.to_path_buf(),
-        args: vec![
-            OsString::from("install"),
-            OsString::from(format!("php@{}", major.as_str())),
-        ],
-        cwd: None,
-        env: vec![
-            // Without this, pressing Install can spend five minutes updating
-            // Homebrew itself before starting the work the user asked for.
-            (
-                OsString::from("HOMEBREW_NO_AUTO_UPDATE"),
-                OsString::from("1"),
-            ),
-            (OsString::from("PATH"), path),
-        ],
-    })
+/// The command that REMOVES `major` (package-uninstall design D1: uninstall is
+/// `brew uninstall`, mirroring install through the same composer, so the two
+/// cannot drift in how they reach `brew`).
+///
+/// No `--ignore-dependencies` and no `--force`: if brew refuses because another
+/// formula depends on this one, that refusal is the caller's to surface
+/// verbatim. Nothing here checks that the formula is currently installed —
+/// `brew uninstall` on a keg that is already gone fails loudly by itself, which
+/// is more honest than this crate second-guessing brew's own state.
+///
+/// Catalogue-gated by [`cataloged`], like the install spec — see that
+/// function for why the "`PhpMajor` has exactly one constructor" argument is
+/// not load-bearing enough to rest on.
+pub fn brew_uninstall_spec(brew: &Path, major: &PhpMajor) -> Result<SpawnSpec, CoreError> {
+    cataloged(major)?;
+    brew_spec(brew, BrewVerb::Uninstall, &brew_formula(major))
 }
 
 #[cfg(test)]
@@ -210,6 +230,127 @@ mod tests {
         // Pinned exactly. This test fails the moment anyone adds a flag —
         // which is both a security property and a no-surprises property.
         assert_eq!(args, vec!["install".to_string(), "php@8.3".to_string()]);
+    }
+
+    #[test]
+    fn the_uninstall_command_is_exactly_uninstall_and_the_formula() {
+        let spec = brew_uninstall_spec(
+            std::path::Path::new("/opt/homebrew/bin/brew"),
+            &PhpMajor::parse("8.3").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            spec.program,
+            std::path::PathBuf::from("/opt/homebrew/bin/brew")
+        );
+        let args: Vec<String> = spec
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        // Pinned exactly, like the install spec above. Design D1: NO
+        // `--ignore-dependencies`, NO `--force` — brew's refusal is surfaced
+        // verbatim, never overridden. This test fails the moment anyone adds
+        // one.
+        assert_eq!(args, vec!["uninstall".to_string(), "php@8.3".to_string()]);
+    }
+
+    #[test]
+    fn install_and_uninstall_name_the_same_formula() {
+        // The two specs must agree on the target: an uninstall that removed a
+        // different formula than the install created would be catastrophic and
+        // silent. Both derive it from `formula`, and this pins that they do.
+        let major = PhpMajor::parse("8.4").unwrap();
+        let brew = std::path::Path::new("/opt/homebrew/bin/brew");
+        let installed = brew_install_spec(brew, &major).unwrap();
+        let removed = brew_uninstall_spec(brew, &major).unwrap();
+        assert_eq!(installed.args[1], removed.args[1]);
+        assert_eq!(installed.args[1].to_string_lossy(), "php@8.4");
+    }
+
+    #[test]
+    fn a_relative_brew_path_is_refused_for_an_uninstall_too() {
+        for bad in ["brew", "./brew", "bin/brew", ""] {
+            assert!(
+                brew_uninstall_spec(std::path::Path::new(bad), &PhpMajor::parse("8.3").unwrap())
+                    .is_err(),
+                "accepted {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_cataloged_distinguishes_offered_from_merely_shape_valid() {
+        assert!(PhpMajor::parse("8.4").unwrap().is_cataloged());
+        assert!(!PhpMajor::out_of_catalogue("7.4").is_cataloged());
+    }
+
+    #[test]
+    fn refuses_to_compose_an_install_spec_for_an_out_of_catalogue_major() {
+        // The guard `mysql::brew::cataloged` already carries, carried across.
+        // `PhpMajor::parse` is the only PRODUCTION constructor today, so this
+        // value can only be built by the `#[cfg(test)]` hook — which is the
+        // point: the day a symmetry refactor adds `PhpMajor::from_probe` (as
+        // the MySQL side did), an out-of-catalogue formula would otherwise
+        // reach `brew`'s argv with nothing in between.
+        //
+        // VACUITY: deleting `cataloged(major)?;` from `brew_install_spec` makes
+        // this test fail with a composed `["install", "php@7.4"]` spec.
+        let err = brew_install_spec(
+            Path::new("/opt/homebrew/bin/brew"),
+            &PhpMajor::out_of_catalogue("7.4"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CoreError::Validation {
+                    field: "php_version",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn refuses_to_compose_an_uninstall_spec_for_an_out_of_catalogue_major() {
+        // The half that matters most: an uninstall names a formula that is
+        // about to be DELETED. `php@7.4` here would be a `brew uninstall` of a
+        // formula this build never installed and has never tested removing.
+        //
+        // VACUITY: deleting `cataloged(major)?;` from `brew_uninstall_spec`
+        // makes this test fail with a composed `["uninstall", "php@7.4"]`.
+        let err = brew_uninstall_spec(
+            Path::new("/opt/homebrew/bin/brew"),
+            &PhpMajor::out_of_catalogue("7.4"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CoreError::Validation {
+                    field: "php_version",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn the_catalogue_refusal_is_worded_identically_wherever_it_is_raised() {
+        // One `not_cataloged_error`, three call sites (parse's layer 2 and the
+        // two spec guards). Pinned so a future edit cannot leave a user reading
+        // two different sentences for one condition.
+        let from_parse = PhpMajor::parse("7.4").unwrap_err().to_string();
+        let from_guard = brew_uninstall_spec(
+            Path::new("/opt/homebrew/bin/brew"),
+            &PhpMajor::out_of_catalogue("7.4"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(from_parse, from_guard);
     }
 
     #[test]

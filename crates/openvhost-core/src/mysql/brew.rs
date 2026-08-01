@@ -2,20 +2,17 @@
 //! Homebrew as a MySQL source: which major we offer, and the exact command
 //! that installs it.
 //!
-//! SECURITY: mirrors `crate::php::brew` exactly — see its module doc comment
-//! for the full PATH-hijack rationale. The short version: this module
-//! composes the argv, a caller supplies only a version (never a formula,
-//! never a flag), arguments go through a `Vec`, never a shell, and
-//! [`mysql_brew_install_spec`] requires `brew` to be an absolute path for
-//! the identical reason `crate::php::brew_install_spec` does (a relative
-//! leading `PATH` component resolves to the CWD, and brew shells out to
-//! `git`/`curl`).
+//! SECURITY: a caller supplies only a version — never a formula, never a flag
+//! — and [`MysqlMajor`]'s constructors are what defeat flag injection. The
+//! argv/env is composed by [`crate::brew_cmd::brew_spec`], the one chokepoint
+//! shared with `crate::php::brew`; see that module for the absolute-`brew`
+//! path and composed-`PATH` rationale this file used to duplicate.
 
-use std::ffi::OsString;
 use std::path::Path;
 
 use openvhost_proc::SpawnSpec;
 
+use crate::brew_cmd::{BrewVerb, brew_spec};
 use crate::error::CoreError;
 
 /// The MySQL majors this build offers to INSTALL. Deliberately a single
@@ -151,65 +148,55 @@ impl MysqlMajor {
     }
 }
 
-/// The command that installs `major`. Composed here — the formula name is
-/// never accepted from a caller. Mirrors [`crate::php::brew_install_spec`]
-/// byte-for-byte apart from the formula prefix (`mysql@` vs `php@`) and the
-/// major type; see its doc comment for the full PATH-hijack rationale. `brew`
-/// itself is located via the EXISTING [`crate::find_brew`] — Homebrew's own
-/// location is not PHP-specific, so this module does not duplicate that
-/// lookup for MySQL.
+/// The Homebrew formula that provides `major` — THE definition, so the string
+/// a dialog shows the user and the string that reaches `brew`'s argv are one
+/// expression rather than two that can drift.
 ///
-/// Re-checks [`MysqlMajor::is_cataloged`] itself before composing anything,
-/// rather than trusting the caller to have obtained `major` via `parse`: a
-/// `MysqlMajor` built by the discovery-only `from_probe` can reach here
-/// through [`crate::mysql::MysqlRuntime`]'s `pub major` field just as easily
-/// as one built by `parse` can, and the two are indistinguishable at the
-/// type level once constructed. See [`MysqlMajor`]'s doc comment.
+/// Deliberately infallible and catalogue-free: naming the formula for a
+/// discovered-but-not-offered major (spec D1's "honest display, no support
+/// burden") is a display question, never a permission one. The permission
+/// question is [`cataloged`] below, which the two spec builders apply.
+pub fn mysql_brew_formula(major: &MysqlMajor) -> String {
+    format!("mysql@{}", major.as_str())
+}
+
+/// The catalogue gate both spec builders share.
+///
+/// Re-checks [`MysqlMajor::is_cataloged`] itself rather than trusting the
+/// caller to have obtained `major` via `parse`: a `MysqlMajor` built by the
+/// discovery-only `from_probe` can reach here through
+/// [`crate::mysql::MysqlRuntime`]'s `pub major` field just as easily as one
+/// built by `parse` can, and the two are indistinguishable at the type level
+/// once constructed. See [`MysqlMajor`]'s doc comment.
+fn cataloged(major: &MysqlMajor) -> Result<(), CoreError> {
+    if major.is_cataloged() {
+        Ok(())
+    } else {
+        Err(not_cataloged_error(major.as_str()))
+    }
+}
+
+/// The command that installs `major`. Composed via
+/// [`crate::brew_cmd::brew_spec`] — the same chokepoint
+/// [`crate::php::brew_install_spec`] uses; see that module for the
+/// absolute-`brew` invariant and the composed `PATH`. `brew` itself is located
+/// via the EXISTING [`crate::find_brew`] — Homebrew's own location is not
+/// PHP-specific, so this module does not duplicate that lookup for MySQL.
 pub fn mysql_brew_install_spec(brew: &Path, major: &MysqlMajor) -> Result<SpawnSpec, CoreError> {
-    if !major.is_cataloged() {
-        return Err(not_cataloged_error(major.as_str()));
-    }
-    if !brew.is_absolute() {
-        return Err(CoreError::Validation {
-            field: "brew_path",
-            reason: format!("{} is not an absolute path", brew.display()),
-        });
-    }
-    let brew_bin = match brew.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => {
-            return Err(CoreError::Validation {
-                field: "brew_path",
-                reason: format!("{} has no parent directory", brew.display()),
-            });
-        }
-    };
+    cataloged(major)?;
+    brew_spec(brew, BrewVerb::Install, &mysql_brew_formula(major))
+}
 
-    // Composed from a fixed baseline, never the process's own ambient PATH —
-    // see `crate::php::brew_install_spec`'s doc comment for why (a ServBay
-    // install shadows binaries there, and brew's children — git, curl, tar —
-    // would inherit the same shadowing if the parent's PATH were appended).
-    let mut path = OsString::from(brew_bin);
-    path.push(":/usr/bin:/bin:/usr/sbin:/sbin");
-
-    Ok(SpawnSpec {
-        program: brew.to_path_buf(),
-        args: vec![
-            OsString::from("install"),
-            OsString::from(format!("mysql@{}", major.as_str())),
-        ],
-        cwd: None,
-        env: vec![
-            // Without this, pressing Install can spend several minutes
-            // updating Homebrew itself before starting the work the user
-            // asked for.
-            (
-                OsString::from("HOMEBREW_NO_AUTO_UPDATE"),
-                OsString::from("1"),
-            ),
-            (OsString::from("PATH"), path),
-        ],
-    })
+/// The command that REMOVES `major` (package-uninstall design D1).
+///
+/// Removes the *engine*, never the data: `brew uninstall mysql@8.4` deletes
+/// binaries and has no idea `<home>/data/mysql/8.4` exists. That separation is
+/// the whole reason design D2 can promise a user's databases survive an
+/// uninstall — nothing in this argv can reach the datadir. No
+/// `--ignore-dependencies`, no `--force`, same as the PHP side.
+pub fn mysql_brew_uninstall_spec(brew: &Path, major: &MysqlMajor) -> Result<SpawnSpec, CoreError> {
+    cataloged(major)?;
+    brew_spec(brew, BrewVerb::Uninstall, &mysql_brew_formula(major))
 }
 
 #[cfg(test)]
@@ -308,6 +295,67 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert_eq!(args, vec!["install".to_string(), "mysql@8.4".to_string()]);
+    }
+
+    #[test]
+    fn the_uninstall_command_is_exactly_uninstall_and_the_formula() {
+        let spec = mysql_brew_uninstall_spec(
+            std::path::Path::new("/opt/homebrew/bin/brew"),
+            &MysqlMajor::parse("8.4").unwrap(),
+        )
+        .unwrap();
+        let args: Vec<String> = spec
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        // Design D1: no `--ignore-dependencies`, no `--force`. Also note what
+        // is NOT here: nothing that names a datadir. `brew uninstall` cannot
+        // reach `<home>/data/mysql/<major>` even in principle.
+        assert_eq!(args, vec!["uninstall".to_string(), "mysql@8.4".to_string()]);
+    }
+
+    #[test]
+    fn install_and_uninstall_name_the_same_formula() {
+        let major = MysqlMajor::parse("8.4").unwrap();
+        let brew = std::path::Path::new("/opt/homebrew/bin/brew");
+        let installed = mysql_brew_install_spec(brew, &major).unwrap();
+        let removed = mysql_brew_uninstall_spec(brew, &major).unwrap();
+        assert_eq!(installed.args[1], removed.args[1]);
+        assert_eq!(installed.args[1].to_string_lossy(), "mysql@8.4");
+    }
+
+    #[test]
+    fn refuses_to_compose_an_uninstall_spec_for_an_out_of_catalogue_major() {
+        // The same escape `refuses_to_compose_an_install_spec_for_an_out_of_catalogue_major`
+        // guards, on the uninstall side: `from_probe` builds a `MysqlMajor` for
+        // any shape-valid probed version and `MysqlRuntime.major` is `pub`, so
+        // a discovered 9.x runtime could otherwise hand its major straight to
+        // this function without ever passing `parse`.
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join("opt").join("mysql@9.7").join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        for name in ["mysqld", "mysql", "mysqladmin"] {
+            std::fs::write(bin_dir.join(name), b"#!/bin/sh\n").unwrap();
+        }
+        let found = crate::mysql::discover_mysql(&[dir.path()], &|_| Some("9.7".to_string()));
+        assert_eq!(found.runtimes.len(), 1, "got {found:?}");
+
+        let err = mysql_brew_uninstall_spec(
+            std::path::Path::new("/opt/homebrew/bin/brew"),
+            &found.runtimes[0].major,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CoreError::Validation {
+                    field: "mysql_version",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -423,12 +471,12 @@ mod tests {
             std::fs::write(bin_dir.join(name), b"#!/bin/sh\n").unwrap();
         }
         let found = crate::mysql::discover_mysql(&[dir.path()], &|_| Some("9.7".to_string()));
-        assert_eq!(found.len(), 1, "got {found:?}");
-        assert!(!found[0].major.is_cataloged());
+        assert_eq!(found.runtimes.len(), 1, "got {found:?}");
+        assert!(!found.runtimes[0].major.is_cataloged());
 
         let err = mysql_brew_install_spec(
             std::path::Path::new("/opt/homebrew/bin/brew"),
-            &found[0].major,
+            &found.runtimes[0].major,
         )
         .unwrap_err();
         assert!(

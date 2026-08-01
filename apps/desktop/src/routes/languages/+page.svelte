@@ -4,11 +4,13 @@
 	import { onPhpInstallLog, openHomebrewSite } from '$lib/ipc';
 	import { languagesStore as store } from '$lib/languages.shared.svelte';
 	import { servicesStore } from '$lib/services.shared.svelte';
+	import { uninstallStore } from '$lib/uninstall.shared.svelte';
 	import { runningCount } from '$lib/services.derive';
 	import AppShell from '$lib/components/AppShell.svelte';
 	import Button from '$lib/components/Button.svelte';
 	import LanguageRow from '$lib/components/LanguageRow.svelte';
 	import LanguagesEmpty from '$lib/components/LanguagesEmpty.svelte';
+	import UninstallDialog from '$lib/components/UninstallDialog.svelte';
 
 	const running = $derived(runningCount(servicesStore.services));
 
@@ -60,13 +62,49 @@
 		await servicesStore.reload();
 	}
 
+	/**
+	 * Opens the uninstall confirmation (design D6). Uninstalls nothing: the
+	 * plan behind the dialog is a pure, spawn-free query, and `brew uninstall`
+	 * only runs once the user confirms in the dialog itself.
+	 */
+	async function onUninstall(major: string): Promise<void> {
+		await uninstallStore.request('php', major);
+	}
+
+	/**
+	 * The dialog's confirm. Re-reads the PHP environment on success so the row
+	 * flips back to "not installed" — the supervisor row disappearing is NOT
+	 * this page's job: `SupervisorEvent::Unregistered` reaches
+	 * `ServicesStore.applyUnregistered` through the layout's subscription, on
+	 * every route (Task 1). `servicesStore.reload()` is kept for the same
+	 * reason `onInstall` keeps it: a synchronous guarantee at the one moment
+	 * this page KNOWS the registered set changed, independent of how long the
+	 * event takes to round-trip.
+	 */
+	async function onConfirmUninstall(): Promise<void> {
+		const uninstalled = await uninstallStore.confirm();
+		if (uninstalled) {
+			await store.refresh();
+			await servicesStore.reload();
+		}
+	}
+
 	onMount(() => {
 		let unlisten: (() => void) | null = null;
 		let disposed = false;
 
 		void (async () => {
 			try {
-				const stop = await onPhpInstallLog((ev) => store.appendLog(ev.major, ev.line));
+				// One channel, two operations: `uninstall_package` streams on the
+				// SAME `php-install-log` event `install_php` uses (design D1 — one
+				// lock, one output surface), so the line is routed by whichever
+				// operation currently holds that lock. `UninstallStore.appendLog`
+				// re-checks the same condition itself, so this routing is a
+				// convenience, not the guard.
+				const stop = await onPhpInstallLog((ev) => {
+					if (uninstallStore.uninstalling !== '') uninstallStore.appendLog(ev.major, ev.line);
+					else store.appendLog(ev.major, ev.line);
+				});
 				// Mirrors services/+page.svelte's onServiceLog wiring: this page can
 				// unmount while the listener registration is still in flight.
 				if (disposed) {
@@ -174,14 +212,17 @@
 					{#each store.env.runtimes as runtime (runtime.major)}
 						<LanguageRow
 							row={runtime}
+							cataloged={runtime.cataloged}
 							serviceState={runtime.serviceId === null
 								? null
 								: (servicesStore.services.find((s) => s.id === runtime.serviceId)?.state ?? null)}
 							installing={store.installing}
+							uninstalling={uninstallStore.uninstalling}
 							log={store.logFor(runtime.major)}
 							error={runtime.major === lastAttempted ? store.error : ''}
 							outcome={store.outcome}
 							onInstall={(major) => void onInstall(major)}
+							onUninstall={(major) => void onUninstall(major)}
 							onStart={(id) => void servicesStore.start(id)}
 							onStop={(id) => void servicesStore.stop(id)}
 						/>
@@ -191,6 +232,21 @@
 		{/if}
 	</section>
 </AppShell>
+
+<!-- Rendered at the page level, outside `AppShell`, like every other modal in
+     this app: `uninstallStore` is shared with the Databases page, and only one
+     of the two routes is ever mounted, so this can never double up. -->
+{#if uninstallStore.isOpen}
+	<UninstallDialog
+		plan={uninstallStore.plan}
+		planning={uninstallStore.planning}
+		uninstalling={uninstallStore.uninstalling !== ''}
+		error={uninstallStore.error}
+		log={uninstallStore.log}
+		onCancel={() => uninstallStore.close()}
+		onConfirm={() => void onConfirmUninstall()}
+	/>
+{/if}
 
 <style>
 	/* Same recipe as ServicesPanel.svelte's `.strip-head`/`.panel`/`.rowlist`/`.empty` —

@@ -16,6 +16,7 @@
 		type MysqlInitFailure,
 		type UiLog
 	} from '$lib/databases.derive';
+	import { uninstallActionDisabled, uninstallConfirmLabel } from '$lib/uninstall.derive';
 	import Button from './Button.svelte';
 	import LogPane from './LogPane.svelte';
 	import MysqlCredentials from './MysqlCredentials.svelte';
@@ -32,6 +33,7 @@
 		initLog,
 		initFailure,
 		initError = '',
+		uninstallingMajor = '',
 		catalogedMajorsList,
 		serviceState,
 		password,
@@ -46,6 +48,7 @@
 		verifyError,
 		onInstall,
 		onInitialize,
+		onUninstall,
 		onStart,
 		onStop,
 		onReveal,
@@ -83,6 +86,11 @@
 		 *  `installedNotInitialized` with nothing else to say why the click did
 		 *  not work. */
 		initError?: string;
+		/** The major being UNINSTALLED anywhere in the app, '' when idle — a
+		 *  state rather than a boolean for the same reason `installingMajor` is
+		 *  one: this row must tell "somebody else is busy" (disabled) from "it
+		 *  is me" (disabled AND labelled "Uninstalling…"). */
+		uninstallingMajor?: string;
 		/** Every major THIS build offers to manage — for the out-of-catalogue
 		 *  row's one-line explanation (spec D1). */
 		catalogedMajorsList: string[];
@@ -111,6 +119,10 @@
 		verifyError: string;
 		onInstall: (major: string) => void;
 		onInitialize: (major: string) => void;
+		/** Opens the uninstall confirmation (package-uninstall design D6).
+		 *  Uninstalls nothing on its own: the plan behind the dialog is a pure
+		 *  query, and `brew uninstall` only runs on the dialog's own confirm. */
+		onUninstall: (major: string) => void;
 		onStart: (serviceId: string) => void;
 		onStop: (serviceId: string) => void;
 		onReveal: (major: string) => void;
@@ -133,6 +145,17 @@
 	let confirmingReset = $state(false);
 
 	const anyInstallOrInitRunning = $derived(installingMajor !== '' || initializingMajor !== '');
+	/** Page-wide, not per-row: `brew install`, `brew uninstall` and the staged
+	 *  init all serialize behind one `InstallLock` (design D1), so a second
+	 *  action would only queue on a mutex. Includes this row's own uninstall,
+	 *  so a double-click cannot reach the command twice. */
+	const uninstallDisabled = $derived(
+		uninstallActionDisabled({
+			installingMajor,
+			initializingMajor,
+			uninstallingMajor
+		})
+	);
 
 	const rowInstallOutcome = $derived(
 		installOutcome !== null && installOutcome.major === instance.major ? installOutcome : null
@@ -267,6 +290,25 @@
 				{/if}
 			{:else}
 				{unreachableMysqlRowState(rowState)}
+			{/if}
+			{#if instance.installed}
+				<!-- Last in the row, after whatever the lifecycle offers: the rare,
+				     destructive control. Present for EVERY installed managed major,
+				     including one whose datadir is foreign (design D6/D2 — removing
+				     the engine never touches a datadir, so a datadir this app
+				     refuses to adopt is no reason to trap its binaries either) and
+				     one that was never initialized. Opens a confirmation; it
+				     uninstalls nothing by itself. -->
+				<Button
+					variant="quiet"
+					size="sm"
+					testId="uninstall-{instance.major}"
+					ariaLabel="Uninstall MySQL {instance.major}"
+					disabled={uninstallDisabled}
+					onclick={() => onUninstall(instance.major)}
+				>
+					{uninstallConfirmLabel(uninstallingMajor === instance.major)}
+				</Button>
 			{/if}
 		</div>
 	</div>
@@ -424,9 +466,12 @@
 		background: var(--vh-surface-2);
 		border: 1px solid var(--vh-border);
 	}
+	/* `gap` since the uninstall slice: an installed row can now hold two
+	   controls (the lifecycle action and Uninstall) rather than one. */
 	.row-actions {
 		display: flex;
 		justify-content: flex-end;
+		gap: var(--vh-space-2);
 	}
 	/* Plain secondary text, not a tinted box — this is a fact, not an alarm
 	   (the Homebrew disclosure, the out-of-catalogue explanation, "install

@@ -14,6 +14,7 @@ import { render } from 'svelte/server';
 import DatabasesPage from './+page.svelte';
 import { databasesStore } from '$lib/databases.shared.svelte';
 import { servicesStore } from '$lib/services.shared.svelte';
+import { uninstallStore } from '$lib/uninstall.shared.svelte';
 import type { MysqlEnvironmentDto, MysqlInstanceDto, ServiceStatus } from '$lib/ipc';
 
 function instance(overrides: Partial<MysqlInstanceDto> = {}): MysqlInstanceDto {
@@ -59,6 +60,12 @@ beforeEach(() => {
 	databasesStore.verifyError = {};
 	servicesStore.services = [];
 	servicesStore.error = null;
+	uninstallStore.target = null;
+	uninstallStore.plan = null;
+	uninstallStore.planning = false;
+	uninstallStore.uninstalling = '';
+	uninstallStore.error = '';
+	uninstallStore.log = [];
 });
 
 describe('the /databases route', () => {
@@ -179,5 +186,135 @@ describe('the /databases route', () => {
 		);
 		expect(anchor).toBeDefined();
 		expect(anchor?.[1]).toContain('aria-current="page"');
+	});
+});
+
+/** Just the Uninstall button's own opening tag for `major`. */
+function uninstallTag(body: string, major: string): string {
+	const match = body.match(new RegExp(`<button[^>]*data-testid="uninstall-${major}"[^>]*>`));
+	if (!match) throw new Error(`expected an Uninstall button for ${major}`);
+	return match[0];
+}
+
+// Package-uninstall design D6, at the route layer — the page's own glue, which
+// is what per-component tests structurally cannot see.
+describe('the /databases route — uninstall', () => {
+	const installed = instance({
+		installed: true,
+		datadirState: { kind: 'initialized' },
+		serviceId: 'mysql-8.4',
+		socketPath: '/Users/x/.openvhost/run/mysql-8.4.sock'
+	});
+
+	it('offers Uninstall on an installed row', () => {
+		databasesStore.env = env(true, [installed]);
+		const { body } = render(DatabasesPage);
+		expect(body).toContain('data-testid="uninstall-8.4"');
+	});
+
+	it('offers no Uninstall on a row that is not installed', () => {
+		databasesStore.env = env(true, [instance({ installed: false })]);
+		const { body } = render(DatabasesPage);
+		expect(body).not.toContain('data-testid="uninstall-8.4"');
+	});
+
+	it('disables Uninstall while an install is running', () => {
+		databasesStore.env = env(true, [installed]);
+		databasesStore.installing = '8.4';
+		const { body } = render(DatabasesPage);
+		expect(uninstallTag(body, '8.4')).toContain('disabled');
+	});
+
+	it('disables Uninstall while an initialize is running', () => {
+		databasesStore.env = env(true, [installed]);
+		databasesStore.initializing = '8.4';
+		const { body } = render(DatabasesPage);
+		expect(uninstallTag(body, '8.4')).toContain('disabled');
+	});
+
+	// The cross-page property the SHARED uninstall store exists for: one
+	// `InstallLock` covers PHP and MySQL alike, so a PHP uninstall must disable
+	// this page's buttons too.
+	it('disables Uninstall while a PHP uninstall is running on the other page', () => {
+		databasesStore.env = env(true, [installed]);
+		uninstallStore.uninstalling = '8.3';
+		const { body } = render(DatabasesPage);
+		expect(uninstallTag(body, '8.4')).toContain('disabled');
+	});
+
+	it('leaves Uninstall enabled when nothing is in flight', () => {
+		databasesStore.env = env(true, [installed]);
+		const { body } = render(DatabasesPage);
+		expect(uninstallTag(body, '8.4')).not.toContain('disabled');
+	});
+
+	it('renders no confirmation until one is requested', () => {
+		databasesStore.env = env(true, [installed]);
+		const { body } = render(DatabasesPage);
+		expect(body).not.toContain('data-testid="uninstall-dialog"');
+	});
+
+	// The single most important assertion in this slice's UI: the datadir
+	// sentence is the ONLY place a user learns their databases survive.
+	it('renders the confirmation and says the databases are kept, naming the datadir', () => {
+		databasesStore.env = env(true, [installed]);
+		uninstallStore.target = { kind: 'mysql', major: '8.4' };
+		uninstallStore.plan = {
+			kind: 'mysql',
+			major: '8.4',
+			removes: ['the Homebrew formula mysql@8.4', 'the supervisor entry mysql-8.4'],
+			keeps: [
+				{ what: 'Your databases', path: '/Users/x/.openvhost/data/mysql/8.4', headline: true },
+				{ what: 'The stored root password', path: null, headline: false }
+			],
+			blockers: []
+		};
+		const { body } = render(DatabasesPage);
+		expect(body).toContain('data-testid="uninstall-dialog"');
+		expect(body).toContain('Uninstall MySQL 8.4?');
+		expect(body).toContain('Your databases are not touched');
+		expect(body).toContain('/Users/x/.openvhost/data/mysql/8.4');
+		expect(body).toContain('root password is kept');
+	});
+
+	it('offers no way to proceed while the server is still running', () => {
+		databasesStore.env = env(true, [installed]);
+		uninstallStore.target = { kind: 'mysql', major: '8.4' };
+		uninstallStore.plan = {
+			kind: 'mysql',
+			major: '8.4',
+			removes: [],
+			keeps: [],
+			blockers: [{ kind: 'serviceNotTerminal', id: 'mysql-8.4', state: 'running' }]
+		};
+		const { body } = render(DatabasesPage);
+		expect(body).toContain('data-testid="uninstall-refused"');
+		expect(body).toContain('mysql-8.4 is running');
+		expect(body).not.toContain('data-testid="uninstall-confirm"');
+	});
+});
+
+// Task 1's wiring, observed from this page rather than re-implemented.
+describe('the /databases route — a service that disappears', () => {
+	const installed = instance({
+		installed: true,
+		datadirState: { kind: 'initialized' },
+		serviceId: 'mysql-8.4',
+		socketPath: '/Users/x/.openvhost/run/mysql-8.4.sock'
+	});
+
+	it('drops the pill and its control without a page reload', () => {
+		databasesStore.env = env(true, [installed]);
+		servicesStore.services = [svc('mysql-8.4', { kind: 'running' })];
+		const before = render(DatabasesPage).body;
+		expect(before).toContain('data-testid="mysql-pill-8.4"');
+		expect(before).toContain('data-testid="stop-mysql-8.4"');
+
+		// Exactly what the layout does on `SupervisorEvent::Unregistered`.
+		servicesStore.applyUnregistered('mysql-8.4');
+
+		const after = render(DatabasesPage).body;
+		expect(after).not.toContain('data-testid="mysql-pill-8.4"');
+		expect(after).not.toContain('data-testid="stop-mysql-8.4"');
 	});
 });

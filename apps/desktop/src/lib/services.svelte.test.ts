@@ -171,6 +171,68 @@ describe('ServicesStore.applyRegistered', () => {
 	});
 });
 
+// Task 1 of the package-uninstall slice (`SupervisorEvent::Unregistered`):
+// the mirror of `applyRegistered`. Without this half, uninstalling a PHP
+// major would leave its row on the Services page (and in the titlebar count)
+// until the next relaunch — the exact "it simply fails honestly the next time
+// it is started" behaviour the slice exists to end.
+describe('ServicesStore.applyUnregistered', () => {
+	it('drops the service that was removed', async () => {
+		const store = new ServicesStore(
+			api({
+				listServices: vi.fn(async () => [svc('nginx', 'running'), svc('php-fpm-8.3', 'stopped')])
+			})
+		);
+		await store.loadServices();
+		store.applyUnregistered('php-fpm-8.3');
+		expect(store.services.map((s) => s.id)).toEqual(['nginx']);
+	});
+
+	it('leaves every other service untouched', async () => {
+		const store = new ServicesStore(
+			api({
+				listServices: vi.fn(async () => [
+					svc('nginx', 'running'),
+					svc('php-fpm-8.3', 'stopped'),
+					svc('php-fpm-8.4', 'running')
+				])
+			})
+		);
+		await store.loadServices();
+		store.applyUnregistered('php-fpm-8.3');
+		expect(store.services.map((s) => [s.id, s.state.kind])).toEqual([
+			['nginx', 'running'],
+			['php-fpm-8.4', 'running']
+		]);
+	});
+
+	// The event is broadcast to every subscriber, and this store may never
+	// have loaded the id (a snapshot still in flight, or a service registered
+	// and removed between two loads). Dropping nothing must be silent, not a
+	// throw that lands on the error banner.
+	it('is a no-op for an id it does not know, including a repeat', async () => {
+		const store = new ServicesStore(api());
+		await store.loadServices(); // seeds ['demo-ticker']
+		store.applyUnregistered('never-seen');
+		expect(store.services.map((s) => s.id)).toEqual(['demo-ticker']);
+		store.applyUnregistered('demo-ticker');
+		store.applyUnregistered('demo-ticker');
+		expect(store.services).toEqual([]);
+		expect(store.error).toBeNull();
+	});
+
+	// Spec D2: an uninstall keeps the logs — they are usually WHY the user
+	// uninstalled. The store's feed is history, not a live view of the
+	// registry, so removing a row must not retroactively erase what it said.
+	it('does not touch the log feed', async () => {
+		const store = new ServicesStore(api());
+		await store.loadServices();
+		store.applyLog({ id: 'demo-ticker', tsMs: 1, level: 'error', line: 'why it died' });
+		store.applyUnregistered('demo-ticker');
+		expect(store.logs.map((l) => l.line)).toEqual(['why it died']);
+	});
+});
+
 describe('ServicesStore.reload', () => {
 	// I1's cheap fix: `reload()` is the escape hatch a caller (the Languages
 	// page, after a successful install/rescan) uses to see a newly-registered

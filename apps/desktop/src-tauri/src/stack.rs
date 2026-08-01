@@ -76,10 +76,48 @@ pub struct StackPaths {
 /// Portable data construction — like `StackPaths`, only building the STACK
 /// (`macos_stack`) is platform-specific today; this row-shape function is
 /// not.
+/// The `<prefix><major>` shape of every php-fpm service id. Split out as a
+/// constant so the uninstall/rescan reconciliation can recognise one of OUR
+/// pool rows (and strip the major back off it) without re-typing the literal
+/// that [`php_fpm_service_id`] builds — the two must agree or a reconciliation
+/// pass would either miss rows or match the wrong ones.
+pub(crate) const PHP_FPM_ID_PREFIX: &str = "php-fpm-";
+
+/// The `<prefix><major>` shape of every MySQL service id — see
+/// [`PHP_FPM_ID_PREFIX`].
+pub(crate) const MYSQL_ID_PREFIX: &str = "mysql-";
+
+/// The supervisor id for one PHP major's pool. THE definition — every other
+/// site (the uninstall inventory, the rescan reconciliation, the DTO the
+/// Languages page drives start/stop from) derives it from here rather than
+/// re-spelling the format string, because an id built two ways is an id that
+/// eventually names two different rows.
+pub fn php_fpm_service_id(major: &str) -> String {
+    format!("{PHP_FPM_ID_PREFIX}{major}")
+}
+
+/// The supervisor id for one MySQL major — see [`php_fpm_service_id`].
+pub fn mysql_service_id(major: &str) -> String {
+    format!("{MYSQL_ID_PREFIX}{major}")
+}
+
+/// The generated php-fpm pool config for one major: the file `php_fpm_spec`
+/// spawns against, and the file an uninstall removes.
+///
+/// `openvhost_conf::PhpFpmRuntime::generate_pool_config` derives the same path
+/// independently (that crate cannot depend on this one), which is exactly the
+/// drift this function's own test pins shut — see
+/// `the_pool_config_path_matches_the_confs_independent_render`.
+pub fn php_pool_config_path(home: &Path, major: &str) -> PathBuf {
+    home.join("config/generated/php")
+        .join(major)
+        .join("php-fpm.conf")
+}
+
 pub fn php_fpm_spec(home: &Path, rt: &PhpRuntime) -> ServiceSpec {
     ensure_php_fpm_log_dir(home, &rt.major);
     ServiceSpec {
-        id: format!("php-fpm-{}", rt.major),
+        id: php_fpm_service_id(&rt.major),
         display_name: format!("PHP-FPM {}", rt.major),
         endpoint: Some(format!("run/php-fpm-{}.sock", rt.major)),
         spawn: SpawnSpec {
@@ -89,8 +127,7 @@ pub fn php_fpm_spec(home: &Path, rt: &PhpRuntime) -> ServiceSpec {
                 OsString::from("-O"),
                 OsString::from("-n"),
                 OsString::from("-y"),
-                home.join(format!("config/generated/php/{}/php-fpm.conf", rt.major))
-                    .into_os_string(),
+                php_pool_config_path(home, &rt.major).into_os_string(),
             ],
             cwd: None,
             env: vec![],
@@ -206,7 +243,7 @@ pub fn mysql_spec(home: &Path, rt: &MysqlRuntime) -> ServiceSpec {
     let mut defaults_file_arg = OsString::from("--defaults-file=");
     defaults_file_arg.push(paths.my_cnf.as_os_str());
     ServiceSpec {
-        id: format!("mysql-{}", rt.major.as_str()),
+        id: mysql_service_id(rt.major.as_str()),
         display_name: format!("MySQL {}", rt.major.as_str()),
         endpoint: Some("127.0.0.1:3306".to_string()),
         spawn: SpawnSpec {
@@ -273,7 +310,10 @@ fn discover_installed_php(
     prefixes: &[&Path],
     probe: &dyn Fn(&Path) -> Option<String>,
 ) -> Vec<PhpRuntime> {
-    openvhost_core::discover_php_in(prefixes, probe)
+    // `.runtimes`: startup only needs what was positively identified.
+    // `Discovery::unidentified` is reported by the rescan path, which is the
+    // one a user can act on (`report_unidentified` in `commands.rs`).
+    openvhost_core::discover_php_in(prefixes, probe).runtimes
 }
 
 /// The MySQL discovery walk `macos_stack` performs at startup, factored out
@@ -287,7 +327,8 @@ fn discover_installed_mysql(
     prefixes: &[&Path],
     probe: &dyn Fn(&Path) -> Option<String>,
 ) -> Vec<MysqlRuntime> {
-    openvhost_core::mysql::discover_mysql(prefixes, probe)
+    // `.runtimes` — see `discover_installed_php`.
+    openvhost_core::mysql::discover_mysql(prefixes, probe).runtimes
 }
 
 /// Sweep abandoned MySQL staging directories (spec D2: "swept on rescan")
@@ -558,6 +599,70 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o700, "got {mode:o}");
+    }
+
+    /// `php_pool_config_path` and `openvhost_conf`'s pool renderer derive the
+    /// same path independently (that crate cannot depend on this one). If they
+    /// drift, php-fpm is spawned against a file nothing ever wrote — and an
+    /// uninstall deletes a file php-fpm never read. Both failures are silent,
+    /// so pin them against each other through the REAL renderer.
+    ///
+    /// VACUITY (neuter-and-watch-it-fail): changed `php_pool_config_path` to
+    /// join `"php-fpm.con"` — this test failed with the two paths differing;
+    /// restoring it made it pass.
+    #[test]
+    fn the_pool_config_path_matches_the_confs_independent_render() {
+        use openvhost_conf::{PhpRuntimeAdapter, PhpUpstream};
+
+        let home = PathBuf::from("/tmp/ovh");
+        let rendered = openvhost_conf::PhpFpmRuntime
+            .generate_pool_config(
+                &home,
+                "8.4",
+                &PhpUpstream::UnixSocket(home.join("run/php-fpm-8.4.sock")),
+            )
+            .expect("render must succeed")
+            .expect("the unix path always yields a pool file");
+        assert_eq!(rendered.path, php_pool_config_path(&home, "8.4"));
+    }
+
+    /// The id an uninstall/rescan strips a major back out of must be the id
+    /// the spec registers. Asserted through the real `php_fpm_spec`/
+    /// `mysql_spec`, not against a literal, so a change to either builder has
+    /// to keep the prefix constants honest.
+    #[test]
+    fn service_ids_round_trip_through_their_prefixes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let php = php_fpm_spec(
+            tmp.path(),
+            &PhpRuntime {
+                major: "8.4".to_string(),
+                fpm_bin: PathBuf::from("/opt/homebrew/opt/php@8.4/sbin/php-fpm"),
+            },
+        );
+        // The literal, not just the round trip: a service id is a user-facing
+        // argument (`openvhost start php-fpm-8.4`) and a tray row, so renaming
+        // it is a breaking change that must be made on purpose. Deriving both
+        // sides from one constant makes drift impossible but a RENAME silent,
+        // which is what this line catches.
+        assert_eq!(php.id, "php-fpm-8.4");
+        assert_eq!(php.id.strip_prefix(PHP_FPM_ID_PREFIX), Some("8.4"));
+
+        let major = openvhost_core::mysql::MysqlMajor::parse("8.4").expect("valid major");
+        let mysql = mysql_spec(
+            tmp.path(),
+            &MysqlRuntime {
+                major,
+                mysqld: PathBuf::from("/opt/homebrew/opt/mysql@8.4/bin/mysqld"),
+                mysql: PathBuf::from("/opt/homebrew/opt/mysql@8.4/bin/mysql"),
+                mysqladmin: PathBuf::from("/opt/homebrew/opt/mysql@8.4/bin/mysqladmin"),
+            },
+        );
+        assert_eq!(mysql.id, "mysql-8.4");
+        assert_eq!(mysql.id.strip_prefix(MYSQL_ID_PREFIX), Some("8.4"));
+        // ...and the php prefix must NOT match a mysql row, or a PHP rescan
+        // would happily unregister the database.
+        assert_eq!(mysql.id.strip_prefix(PHP_FPM_ID_PREFIX), None);
     }
 
     /// The paths handed to the UI must be the SAME ones baked into the specs.

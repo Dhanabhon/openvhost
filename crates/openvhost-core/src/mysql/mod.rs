@@ -13,11 +13,14 @@ mod discover;
 mod init;
 mod repo;
 
-pub use brew::{MYSQL_CATALOGUE, MysqlMajor, mysql_brew_install_spec};
+pub use brew::{
+    MYSQL_CATALOGUE, MysqlMajor, mysql_brew_formula, mysql_brew_install_spec,
+    mysql_brew_uninstall_spec,
+};
 pub use datadir::{
     DatadirState, MysqlPaths, classify_datadir, mysql_data_root, mysql_paths, sweep_stale_staging,
 };
-pub use discover::{MysqlRuntime, discover_mysql};
+pub use discover::{MysqlRuntime, discover_mysql, mysql_runtime_for_major};
 pub use init::{
     MysqlInitOutcome, MysqlInitStep, RootPassword, alter_user_sql, finalize_staging,
     generate_root_password, remove_staging_dir, staging_dir_path, write_generated_config,
