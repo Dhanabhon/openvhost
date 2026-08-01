@@ -209,4 +209,52 @@ describe('the narrow-width layout stays wired to its container', () => {
 		);
 		expect(panel).toMatch(/container-type:\s*inline-size|container:\s*[\w-]+\s*\/\s*inline-size/);
 	});
+
+	// The other half of the same silence. The wiring above can't drop, but the NUMBER can go
+	// stale: widen a track, add a column, lengthen a button label, and the one-line row costs
+	// more than the width at which it wraps — so it goes back to overflowing `.panel`'s
+	// `overflow: hidden` and eating Delete, with no failing test and nothing to see until
+	// someone narrows the window. This re-derives the cost from the stylesheet itself.
+	it('keeps the one-line cost below the width at which the row wraps', () => {
+		const css = read('./SiteListRow.svelte');
+		const tokens = readFileSync(new URL('../styles/tokens.css', import.meta.url), 'utf8');
+		const resolve = (decl: string) =>
+			/^\d+px$/.test(decl)
+				? Number(decl.slice(0, -2))
+				: Number(
+						tokens.match(
+							new RegExp(`${decl.match(/var\((--[\w-]+)\)/)?.[1] ?? '\0'}:\\s*(\\d+)px`)
+						)?.[1]
+					);
+
+		const tracks = (css.match(/grid-template-columns:\s*([^;]+);/)?.[1] ?? '')
+			.replace(/minmax\(\s*(\d+px)[^)]*\)/g, '$1') // a track's floor is its minmax minimum
+			.trim()
+			.split(/\s+/);
+		const floors = tracks.filter((t) => /^\d+px$/.test(t)).map((t) => Number(t.slice(0, -2)));
+		// The one content-sized track is the actions; its floor lives on the element itself.
+		const actionFloor = Number(css.match(/\.row-actions\s*\{[\s\S]*?min-width:\s*(\d+)px/)?.[1]);
+		const rowRule = css.match(/\.row\s*\{[\s\S]*?\}/)?.[0] ?? '';
+		const gap = resolve(rowRule.match(/\bgap:\s*([^;]+);/)?.[1]?.trim() ?? '');
+		const padX = resolve(rowRule.match(/padding:\s*\S+\s+([^;]+);/)?.[1]?.trim() ?? '');
+		const wrapsBelow = Number(css.match(/@container\s+[\w-]+\s*\(width\s*<\s*(\d+)px\)/)?.[1]);
+
+		// Without this, a regex that silently stops matching yields 0 and the assertion below
+		// passes for the wrong reason — a test that cannot fail, dressed as one that can.
+		expect({ floors: floors.length, autos: tracks.filter((t) => t === 'auto').length }).toEqual({
+			floors: tracks.length - 1,
+			autos: 1
+		});
+		for (const [name, n] of Object.entries({ actionFloor, gap, padX, wrapsBelow })) {
+			expect(n, `${name} should have been read out of the stylesheet`).toBeGreaterThan(0);
+		}
+
+		const oneLineCost =
+			floors.reduce((a, b) => a + b, 0) + actionFloor + (tracks.length - 1) * gap + 2 * padX;
+		expect(
+			wrapsBelow,
+			`the row costs ${oneLineCost}px on one line but only wraps below ${wrapsBelow}px — ` +
+				`raise the @container threshold above ${oneLineCost}`
+		).toBeGreaterThanOrEqual(oneLineCost);
+	});
 });
