@@ -131,7 +131,15 @@ struct ClaimedPath {
 
 /// What offering an entry to [`SeenPaths`] resolved to. Deliberately an enum
 /// with no catch-all: a caller must decide what to do with EVERY outcome, and
-/// a future outcome must not compile until every walk handles it.
+/// a future outcome must not compile until every caller handles it.
+///
+/// **Only `targz.rs` uses this today.** `zip.rs` still has its own local
+/// collision set, which is behaviourally equivalent for anything zip can
+/// deliver — the `zip` reader collapses same-named central-directory records
+/// into one entry, so the repeated-directory-header case this type exists for
+/// is unreachable there. Two policies where the design wants one; unify when
+/// someone next owns `zip.rs`, and until then do not read this doc as a claim
+/// about both walks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Admission {
     /// Nothing had claimed this destination path; it is now claimed.
