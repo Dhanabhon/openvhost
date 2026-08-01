@@ -338,9 +338,7 @@ describe('DatabasesStore — cancel an install', () => {
 	});
 
 	it('settles the row with a cancelled outcome, and leaves it installable again', async () => {
-		const s = new DatabasesStore(
-			api({ installMysql: vi.fn(async () => cancelled()) })
-		);
+		const s = new DatabasesStore(api({ installMysql: vi.fn(async () => cancelled()) }));
 		await s.install('8.4');
 		expect(s.installOutcome?.result).toEqual({ kind: 'cancelled' });
 		expect(s.installing).toBe('');

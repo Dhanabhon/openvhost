@@ -83,9 +83,7 @@ describe('mysqlInstallProgressLabel', () => {
 	});
 
 	it('names the declared size when the server gave one', () => {
-		expect(mysqlInstallProgressLabel({ kind: 'started', total: 1536 }, null)).toContain(
-			'1.50 KiB'
-		);
+		expect(mysqlInstallProgressLabel({ kind: 'started', total: 1536 }, null)).toContain('1.50 KiB');
 	});
 
 	it('says so honestly when the server declared no size, and invents no number', () => {
@@ -168,9 +166,7 @@ describe('mysqlInstallResultNotice', () => {
 		expect(notice.body).toMatch(/not a slow or broken connection/i);
 		// And it must not be confusable with the two failures that ARE about
 		// the transfer.
-		expect(notice.title).not.toBe(
-			mysqlInstallResultNotice({ kind: 'stalled', detail: 'x' }).title
-		);
+		expect(notice.title).not.toBe(mysqlInstallResultNotice({ kind: 'stalled', detail: 'x' }).title);
 		expect(notice.title).not.toBe(
 			mysqlInstallResultNotice({ kind: 'failed', reason: 'network error: reset' }).title
 		);
