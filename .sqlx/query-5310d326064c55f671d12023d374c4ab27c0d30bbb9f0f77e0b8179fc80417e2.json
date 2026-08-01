@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO installed_packages (name, major, version, installed_at) VALUES (?, ?, ?, ?) ON CONFLICT(name, major, version) DO UPDATE SET installed_at = excluded.installed_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "5310d326064c55f671d12023d374c4ab27c0d30bbb9f0f77e0b8179fc80417e2"
+}

@@ -2837,17 +2837,23 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "dirs",
+ "flate2",
+ "hex",
  "libc",
  "openvhost-conf",
+ "openvhost-pkg",
  "openvhost-proc",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "similar",
  "specta",
  "sqlx",
+ "tar",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
