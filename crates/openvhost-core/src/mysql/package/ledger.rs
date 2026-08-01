@@ -33,6 +33,19 @@ use crate::error::CoreError;
 /// relaxing one silently relaxes the other.
 const MAX_COMPONENT_BYTES: usize = 64;
 
+/// Reserved Windows device basenames, checked without a trailing extension.
+///
+/// Mirrors `openvhost-pkg`'s own list in value. An independent constant in an
+/// independent crate for the same reason [`MAX_COMPONENT_BYTES`] is one — that
+/// crate's copy is `pub(crate)` and unimportable, and coupling the two would
+/// mean relaxing one silently relaxes the other. What must NOT diverge is the
+/// SET, and `the_write_guard_refuses_everything_the_installer_refuses` is what
+/// keeps the two lists honest with each other.
+const RESERVED_STEMS: [&str; 24] = [
+    "con", "prn", "aux", "nul", "com0", "com1", "com2", "com3", "com4", "com5", "com6", "com7",
+    "com8", "com9", "lpt0", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
 /// Reject anything that is not a safe single path component.
 ///
 /// Applied on write AND on read. On write because these values name the
@@ -40,6 +53,13 @@ const MAX_COMPONENT_BYTES: usize = 64;
 /// path the installer would accept; on read because a row is only as
 /// trustworthy as the file it came from, and a hand-edited `state.db` is
 /// precisely what re-validation exists to catch.
+///
+/// AUDIT F3: the reserved-device-name rule below was missing, so this guard
+/// diverged from `openvhost_pkg::request::validate_component` in exactly the
+/// direction the paragraph above says it must not — `record("nul", …)`
+/// succeeded where the installer refuses `nul`. Inert on macOS, live on
+/// Windows, and the divergence itself is the defect: the write-side check earns
+/// its keep only by accepting precisely what the installer accepts.
 fn check_component(field: &'static str, s: &str) -> Result<(), CoreError> {
     let bad = |reason: String| CoreError::Validation { field, reason };
     if s.is_empty() || s.len() > MAX_COMPONENT_BYTES {
@@ -57,6 +77,13 @@ fn check_component(field: &'static str, s: &str) -> Result<(), CoreError> {
         return Err(bad(format!(
             "{s:?} must not start with . or - or end with ."
         )));
+    }
+    // The stem is everything before the first dot: `nul.tar` names the same
+    // device as `nul` on Windows. The charset rule above already forced lower
+    // case, so no case folding is needed here.
+    let stem = s.split('.').next().unwrap_or(s);
+    if RESERVED_STEMS.contains(&stem) {
+        return Err(bad(format!("{s:?} is a reserved device name")));
     }
     Ok(())
 }
@@ -120,7 +147,21 @@ impl InstallLedger {
     /// Re-recording the same triple replaces the timestamp rather than
     /// duplicating the row: a reinstall of the same version is one fact about
     /// when it most recently landed, not two.
-    pub async fn record(&self, name: &str, major: &str, version: &str) -> Result<i64, CoreError> {
+    ///
+    /// `pub(crate)`, not `pub` (audit F3). The only writer is
+    /// `crate::mysql::package::install::install_entry`, whose three components
+    /// are `&'static str` from the compiled-in catalogue — so "is
+    /// [`check_component`] alone enough to sit between a caller's string and a
+    /// derived path?" stops being a question anything outside this crate can
+    /// ask. The guard stays and is now complete; this narrows who can lean on
+    /// it. `get`/`list` remain public: reading is where a hand-edited
+    /// `state.db` has to be re-validated, and that is a service to callers.
+    pub(crate) async fn record(
+        &self,
+        name: &str,
+        major: &str,
+        version: &str,
+    ) -> Result<i64, CoreError> {
         check_component("package_name", name)?;
         check_component("package_major", major)?;
         check_component("package_version", version)?;
@@ -337,6 +378,92 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 0, "a refused write must not reach the table");
+    }
+
+    /// AUDIT F3: this guard's own header says a ledger row can never disagree
+    /// with a path the installer would accept — and it did, for every reserved
+    /// Windows device name. `record("nul", …)` succeeded where
+    /// `openvhost_pkg::request::validate_component("nul")` refuses.
+    ///
+    /// The sweep is over the whole list rather than one example, and covers
+    /// `nul.tar` too: the rule is about the STEM before the first dot, so a
+    /// check that compared the whole string would pass on `nul` and let
+    /// `nul.tar` through.
+    #[tokio::test]
+    async fn the_write_guard_refuses_everything_the_installer_refuses() {
+        let (db, ledger) = ledger().await;
+        let reserved = [
+            "con", "prn", "aux", "nul", "com0", "com1", "com2", "com3", "com4", "com5", "com6",
+            "com7", "com8", "com9", "lpt0", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7",
+            "lpt8", "lpt9",
+        ];
+        for name in reserved {
+            for spelling in [
+                name.to_string(),
+                format!("{name}.tar"),
+                format!("{name}.8.4"),
+            ] {
+                assert!(
+                    ledger.record(&spelling, "8.4", "8.4.11").await.is_err(),
+                    "accepted reserved name {spelling:?}"
+                );
+                assert!(
+                    ledger.record("mysql", &spelling, "8.4.11").await.is_err(),
+                    "accepted reserved major {spelling:?}"
+                );
+                assert!(
+                    ledger.record("mysql", "8.4", &spelling).await.is_err(),
+                    "accepted reserved version {spelling:?}"
+                );
+            }
+        }
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM installed_packages")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "a refused write must not reach the table");
+    }
+
+    /// Non-vacuity twin: the rule bites on the reserved STEM and nothing else.
+    /// A guard that rejected every name containing those letters would pass the
+    /// sweep above and break every real package.
+    #[tokio::test]
+    async fn a_name_that_merely_contains_a_reserved_word_is_still_accepted() {
+        let (_db, ledger) = ledger().await;
+        for ok in ["console", "aux-tools", "nullify", "com10", "lpt", "mysql"] {
+            assert!(
+                ledger.record(ok, "8.4", "8.4.11").await.is_ok(),
+                "refused legitimate name {ok:?}"
+            );
+        }
+    }
+
+    /// And a reserved name that reached the table anyway — a hand-edited
+    /// `state.db`, the case the read-side re-validation exists for — is refused
+    /// on the way out rather than handed back as a path component.
+    #[tokio::test]
+    async fn a_reserved_name_written_by_hand_is_refused_on_read() {
+        let (db, ledger) = ledger().await;
+        sqlx::query(
+            "INSERT INTO installed_packages (name, major, version, installed_at) \
+             VALUES ('mysql', '8.4', 'nul', 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let err = ledger.get("mysql", "8.4", "nul").await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CoreError::Validation {
+                    field: "package_version",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+        assert!(ledger.list("mysql").await.is_err());
     }
 
     #[tokio::test]

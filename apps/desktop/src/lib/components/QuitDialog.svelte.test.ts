@@ -176,14 +176,38 @@ describe('QuitDialog', () => {
 		expect(t).not.toContain('No services are running');
 	});
 
-	it('names an in-flight MySQL initialization using its own complete label', () => {
+	// Audit F1: an initialization used to reach here tagged `install`, with the
+	// word "initialization" smuggled into the label, and was therefore rendered
+	// "MySQL 8.4 initialization is still installing" — the visible half of a
+	// collapse whose invisible half let `cancel_mysql_install` abort it.
+	it('narrates an in-flight MySQL initialization as a set-up, not an install', () => {
 		const t = text(
 			html({
 				pending: [],
-				pendingInstall: { kind: 'mysql', operation: 'install', label: 'MySQL 8.4 initialization' }
+				pendingInstall: { kind: 'mysql', operation: 'initialize', label: 'MySQL 8.4' }
 			})
 		);
-		expect(t).toContain('MySQL 8.4 initialization is still installing');
+		expect(t).toContain('MySQL 8.4 is still being set up');
+		expect(t).not.toContain('is still installing');
+		expect(t).not.toContain('No services are running');
+	});
+
+	it('offers Stop and quit when only an initialization is in flight', () => {
+		const m = html({
+			pending: [],
+			pendingInstall: { kind: 'mysql', operation: 'initialize', label: 'MySQL 8.4' }
+		});
+		expect(m).toContain('Stop and quit');
+		expect(m).not.toContain('>Quit<');
+	});
+
+	// The rendered proof that the component branches on all three: same kind,
+	// same label, three different paragraphs.
+	it('renders a different body for each of the three operations', () => {
+		const bodies = (['install', 'uninstall', 'initialize'] as const).map((operation) =>
+			text(html({ pending: [], pendingInstall: { kind: 'mysql', operation, label: 'MySQL 8.4' } }))
+		);
+		expect(new Set(bodies).size).toBe(3);
 	});
 
 	it('offers Stop and quit when only a MySQL install is in flight, no services', () => {
@@ -224,7 +248,7 @@ describe('an uninstall in flight is not narrated as an install', () => {
 
 	// The rendered proof that the component branches at all: same kind, same
 	// label, different operation — two different paragraphs on screen.
-	it('renders a different body for the two operations', () => {
+	it('renders a different body for an install and a removal', () => {
 		const installing = text(
 			html({ pending: [], pendingInstall: { ...removal, operation: 'install' } })
 		);

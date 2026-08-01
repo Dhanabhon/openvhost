@@ -40,8 +40,8 @@ use openvhost_proc::Supervisor;
 use tauri_specta::Event;
 
 use crate::commands::{
-    InstallKind, InstallLock, IpcError, PackageOperation, RunningInstallGuard, now_ms,
-    rescan_mysql_into_state, stack_paths,
+    InstallLock, IpcError, MYSQL_INSTALL_RUN, RunningInstallGuard, now_ms, rescan_mysql_into_state,
+    stack_paths,
 };
 use crate::stack::StackPaths;
 use openvhost_core::Db;
@@ -317,6 +317,125 @@ pub(crate) fn install_failure(e: openvhost_core::CoreError) -> MysqlInstallResul
     }
 }
 
+/// Forward a `Downloaded` at most this often.
+///
+/// ~30 events across the measured 6.4-second transfer, which is smoother than
+/// any progress bar needs and three orders of magnitude below what the
+/// downloader produces.
+const DOWNLOAD_EVENT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// …and additionally whenever this much of the declared total has arrived
+/// since the last one, so a transfer far faster than
+/// [`DOWNLOAD_EVENT_INTERVAL`] still animates. Caps the whole download at ~100
+/// byte-count events.
+const DOWNLOAD_EVENT_FRACTION: u64 = 100;
+
+/// Decides which of `openvhost-pkg`'s progress events actually cross to the
+/// webview (audit F2).
+///
+/// **What is thrown away and what is not.** `Downloaded` is a running byte
+/// count: dropping one costs nothing, because the next one carries the same
+/// fact brought up to date. Every other variant is a *pipeline transition* —
+/// `Started`, `Verified`, `Extracted`, `Linked` each happen exactly once and
+/// each is the only announcement of itself. `Verified` in particular is the
+/// event golden rule 6 exists to make observable, so it is forwarded
+/// unconditionally, no timer consulted.
+///
+/// A withheld byte count is not simply lost either: the next transition
+/// flushes it first, so the bar reaches the total before "Verified" replaces
+/// it. Without that, a download whose last chunk landed 20 ms after the
+/// previous emit would visibly finish at 98%.
+///
+/// `now` is a parameter rather than read inside, for the reason
+/// `package_offer_for` takes an explicit target: a clock read internally is a
+/// clock a test cannot move, and "does this actually suppress anything" is the
+/// only question worth asking of a throttle.
+#[derive(Debug)]
+pub(crate) struct ProgressThrottle {
+    /// When the last `Downloaded` was forwarded; `None` until the first one,
+    /// which always is.
+    last_emit: Option<std::time::Instant>,
+    /// The byte count that last crossed the wire.
+    last_bytes: u64,
+    /// The most recent byte count that did NOT, awaiting a flush.
+    withheld: Option<u64>,
+    /// The server's declared length, from `Started` — absent when it declared
+    /// none, in which case only the interval rule applies.
+    total: Option<u64>,
+}
+
+impl ProgressThrottle {
+    pub(crate) fn new() -> Self {
+        Self {
+            last_emit: None,
+            last_bytes: 0,
+            withheld: None,
+            total: None,
+        }
+    }
+
+    /// What should cross the wire for `progress`, in order. Usually nothing.
+    pub(crate) fn admit(
+        &mut self,
+        progress: openvhost_core::Progress,
+        now: std::time::Instant,
+    ) -> Vec<openvhost_core::Progress> {
+        use openvhost_core::Progress as P;
+        // Exhaustive, no wildcard: a sixth pipeline stage must be classified as
+        // "throttleable" or "always" deliberately, and the safe default for a
+        // one-shot transition is `always`, not silence.
+        match progress {
+            P::Downloaded { bytes } => {
+                if self.should_emit(bytes, now) {
+                    self.mark_emitted(bytes, now);
+                    vec![P::Downloaded { bytes }]
+                } else {
+                    self.withheld = Some(bytes);
+                    Vec::new()
+                }
+            }
+            transition @ (P::Started { .. } | P::Verified | P::Extracted | P::Linked) => {
+                if let P::Started { total } = &transition {
+                    self.total = *total;
+                }
+                match self.withheld.take() {
+                    Some(bytes) => {
+                        self.mark_emitted(bytes, now);
+                        vec![P::Downloaded { bytes }, transition]
+                    }
+                    None => vec![transition],
+                }
+            }
+        }
+    }
+
+    fn should_emit(&self, bytes: u64, now: std::time::Instant) -> bool {
+        // The first byte count always crosses: it is what replaces
+        // "Preparing the download…" on the row.
+        let Some(last) = self.last_emit else {
+            return true;
+        };
+        if now.duration_since(last) >= DOWNLOAD_EVENT_INTERVAL {
+            return true;
+        }
+        match self.total {
+            // `.max(1)` so a total under 100 bytes gives a 1-byte step rather
+            // than a 0-byte one, which would make this rule always true and
+            // the throttle a no-op for small payloads.
+            Some(total) => {
+                bytes.saturating_sub(self.last_bytes) >= (total / DOWNLOAD_EVENT_FRACTION).max(1)
+            }
+            None => false,
+        }
+    }
+
+    fn mark_emitted(&mut self, bytes: u64, now: std::time::Instant) {
+        self.last_emit = Some(now);
+        self.last_bytes = bytes;
+        self.withheld = None;
+    }
+}
+
 /// Install a catalogued MySQL major from the pinned upstream tarball, streaming
 /// [`MysqlInstallProgressEvent`] as the pipeline advances, then rescan so the
 /// freshly installed runtime is picked up.
@@ -392,26 +511,39 @@ async fn run_install(
     let spawn_root = openvhost_core::PackagesRoot::from_home(home);
 
     let task = tokio::spawn(async move {
+        // Audit F2: `openvhost-pkg` emits one `Downloaded` per stream chunk,
+        // unthrottled — order 10³–10⁴ of them at roughly 500–2000/s against the
+        // measured 167,977,240-byte payload. That cost nothing while nothing
+        // consumed `Progress`; this is its first consumer, and every event
+        // forwarded here becomes a Tauri event and a `$state` write on the
+        // webview's main thread. The throttle is app-side deliberately: the
+        // pipeline's job is to report the truth as it happens, and deciding how
+        // often a *user interface* needs to hear it is this layer's decision,
+        // not the downloader's.
+        let mut throttle = ProgressThrottle::new();
         openvhost_core::mysql::install_mysql_package(
             &spawn_major,
             &spawn_root,
             &ledger,
             move |progress| {
-                let _ = MysqlInstallProgressEvent {
-                    major: for_event.clone(),
-                    ts_ms: now_ms(),
-                    progress: progress.into(),
+                for progress in throttle.admit(progress, std::time::Instant::now()) {
+                    let _ = MysqlInstallProgressEvent {
+                        major: for_event.clone(),
+                        ts_ms: now_ms(),
+                        progress: progress.into(),
+                    }
+                    .emit(&emitter);
                 }
-                .emit(&emitter);
             },
         )
         .await
     });
 
     let abort_handle = task.abort_handle();
+    let (kind, operation) = MYSQL_INSTALL_RUN;
     lock.set_running(
-        InstallKind::Mysql,
-        PackageOperation::Install,
+        kind,
+        operation,
         format!("MySQL {}", major.as_str()),
         abort_handle.clone(),
     );
@@ -463,17 +595,27 @@ async fn run_install(
 /// empty or holds a different run, so the UI can say "it had already finished"
 /// instead of implying it stopped something.
 ///
-/// **Kind- and direction-checked.** `InstallLock`'s slot is shared with
-/// `install_php` and `uninstall_package`, and a Cancel button on the Databases
-/// page must never abort somebody else's run just because it happens to hold
-/// the lock. The check and the abort happen under one lock acquisition
-/// (`InstallLock::abort_running_if`) so the slot cannot change in between.
+/// **Kind- and operation-checked.** `InstallLock`'s slot is shared with
+/// `install_php`, `uninstall_package` and `initialize_mysql`, and a Cancel
+/// button on the Databases page must never abort somebody else's run just
+/// because it happens to hold the lock. The check and the abort happen under
+/// one lock acquisition (`InstallLock::abort_running_if`) so the slot cannot
+/// change in between.
+///
+/// SECURITY (audit F1): that guarantee was *stated* here before it was
+/// *enforced*. `initialize_mysql` tagged its own run with the identical
+/// `(Mysql, Install)` pair — the labels differed, the discriminators did not,
+/// and `abort_running_if` compares only the discriminators — so this command
+/// aborted datadir initializations. Unreachable through the shipped UI, but
+/// every Tauri command is reachable from the webview, which is this project's
+/// standing assumption. The fix is `PackageOperation::Initialize` plus the two
+/// named pairs in `commands.rs`; this command fires on [`MYSQL_INSTALL_RUN`]
+/// and nothing else.
 #[tauri::command]
 #[specta::specta]
 pub async fn cancel_mysql_install(lock: tauri::State<'_, InstallLock>) -> Result<bool, IpcError> {
-    Ok(lock
-        .inner()
-        .abort_running_if(InstallKind::Mysql, PackageOperation::Install))
+    let (kind, operation) = MYSQL_INSTALL_RUN;
+    Ok(lock.inner().abort_running_if(kind, operation))
 }
 
 #[cfg(test)]
@@ -838,6 +980,194 @@ mod tests {
                 &major,
                 Some(openvhost_core::mysql::PackageTarget::MacosArm64)
             )
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Group 5 — the progress throttle (audit F2). The download emits one
+    // `Downloaded` per stream chunk; the webview must not see them all.
+    // ------------------------------------------------------------------
+
+    use openvhost_core::Progress as P;
+    use std::time::{Duration, Instant};
+
+    /// Feed a whole event sequence through one throttle and collect what
+    /// crossed the wire, with `step` of wall clock between events.
+    fn forwarded(events: Vec<P>, step: Duration) -> Vec<P> {
+        let mut throttle = ProgressThrottle::new();
+        let start = Instant::now();
+        let mut out = Vec::new();
+        for (i, ev) in events.into_iter().enumerate() {
+            out.extend(throttle.admit(ev, start + step * (i as u32)));
+        }
+        out
+    }
+
+    /// The measured shape: 167,977,240 bytes in ~6.4 s. At 64 KiB per chunk
+    /// that is ~2 560 events; a 200 ms interval over 6.4 s allows ~32, and the
+    /// 1 % rule allows ~100, so the ceiling is ~100 either way.
+    #[test]
+    fn a_real_sized_download_does_not_flood_the_webview() {
+        const TOTAL: u64 = 167_977_240;
+        const CHUNK: u64 = 64 * 1024;
+        let chunks = TOTAL.div_ceil(CHUNK);
+        let mut events = vec![P::Started { total: Some(TOTAL) }];
+        for i in 1..=chunks {
+            events.push(P::Downloaded {
+                bytes: (i * CHUNK).min(TOTAL),
+            });
+        }
+        events.push(P::Verified);
+
+        // 6.4 s spread across the ~2 561 events.
+        let step = Duration::from_micros(6_400_000 / (chunks + 2));
+        let out = forwarded(events, step);
+        let downloaded = out
+            .iter()
+            .filter(|p| matches!(p, P::Downloaded { .. }))
+            .count();
+
+        assert!(
+            downloaded <= 120,
+            "forwarded {downloaded} byte-count events for a {chunks}-chunk download"
+        );
+        // ...and it is a throttle, not a mute button: the bar must still move.
+        assert!(downloaded >= 20, "only {downloaded} byte-count events");
+    }
+
+    /// The one that must never be throttled. Suppressing `Verified` would make
+    /// the SHA-256 check unobservable, which is the entire guarantee golden
+    /// rule 6 buys.
+    #[test]
+    fn every_pipeline_transition_crosses_however_fast_they_arrive() {
+        // A WITHHELD byte count sits in front of every transition here — a
+        // 10 000-byte total makes the fraction rule a 100-byte step and no wall
+        // clock passes — so each transition is taken through the flush path
+        // rather than the trivial one. Without that, a throttle that swallowed
+        // a transition whenever it had a count in hand would pass this test;
+        // measured, it did.
+        let total = Some(10_000);
+        let out = forwarded(
+            vec![
+                P::Started { total },
+                P::Downloaded { bytes: 1 }, // first — always forwarded
+                P::Downloaded { bytes: 2 }, // withheld
+                P::Verified,
+                P::Downloaded { bytes: 3 }, // withheld
+                P::Extracted,
+                P::Downloaded { bytes: 4 }, // withheld
+                P::Linked,
+            ],
+            Duration::ZERO,
+        );
+        for expected in [P::Started { total }, P::Verified, P::Extracted, P::Linked] {
+            assert!(
+                out.contains(&expected),
+                "{expected:?} was swallowed: {out:?}"
+            );
+        }
+    }
+
+    /// A byte count withheld by the throttle must still reach the UI before
+    /// the next transition, or the bar finishes short of 100 % and stays there
+    /// under a "Verified" caption.
+    #[test]
+    fn the_final_byte_count_is_flushed_before_the_transition_that_follows_it() {
+        // The real shape of the end of a download: a 10 000-byte total makes
+        // the fraction rule a 100-byte step, no wall clock passes, and the
+        // LAST chunk is small — so nothing but the flush can release it. This
+        // is the "finishes at 98% under a Verified caption" case.
+        let out = forwarded(
+            vec![
+                P::Started {
+                    total: Some(10_000),
+                },
+                P::Downloaded { bytes: 1 },     // first — always forwarded
+                P::Downloaded { bytes: 2 },     // withheld, and superseded below
+                P::Downloaded { bytes: 9_999 }, // crosses on the fraction rule
+                P::Downloaded { bytes: 10_000 }, // a 1-byte step: withheld
+                P::Verified,
+            ],
+            Duration::ZERO,
+        );
+
+        assert_eq!(
+            out,
+            vec![
+                P::Started {
+                    total: Some(10_000)
+                },
+                P::Downloaded { bytes: 1 },
+                // No `bytes: 2` — a withheld count is REPLACED by the next one,
+                // never queued, or the flush would replay stale numbers.
+                P::Downloaded { bytes: 9_999 },
+                P::Downloaded { bytes: 10_000 },
+                P::Verified,
+            ],
+            "the total must arrive, and arrive before Verified"
+        );
+    }
+
+    /// The flush specifically, with no rule able to release the count on its
+    /// own: a total the fraction rule cannot trigger on, and no time passing.
+    #[test]
+    fn a_count_no_rule_would_release_is_still_flushed_by_the_next_transition() {
+        let out = forwarded(
+            vec![
+                P::Started { total: None },
+                P::Downloaded { bytes: 1 }, // first — forwarded
+                P::Downloaded { bytes: 2 }, // no total, no time: withheld
+                P::Verified,
+            ],
+            Duration::ZERO,
+        );
+        assert_eq!(
+            out,
+            vec![
+                P::Started { total: None },
+                P::Downloaded { bytes: 1 },
+                P::Downloaded { bytes: 2 },
+                P::Verified,
+            ]
+        );
+    }
+
+    /// Non-vacuity, stated directly: without a total and without wall clock,
+    /// intermediate counts really are suppressed. If this ever passes with
+    /// every count present, the throttle has stopped throttling.
+    #[test]
+    fn byte_counts_are_actually_suppressed_between_the_first_and_the_flush() {
+        let mut events = vec![P::Started { total: None }];
+        for bytes in 1..=50 {
+            events.push(P::Downloaded { bytes });
+        }
+        let out = forwarded(events, Duration::ZERO);
+        let downloaded = out
+            .iter()
+            .filter(|p| matches!(p, P::Downloaded { .. }))
+            .count();
+        assert_eq!(downloaded, 1, "expected only the first count: {out:?}");
+    }
+
+    /// Time alone releases a count when the server declared no length — the
+    /// only rule available on that path.
+    #[test]
+    fn the_interval_alone_releases_a_count_when_no_total_was_declared() {
+        let out = forwarded(
+            vec![
+                P::Started { total: None },
+                P::Downloaded { bytes: 1 },
+                P::Downloaded { bytes: 2 },
+            ],
+            DOWNLOAD_EVENT_INTERVAL,
+        );
+        assert_eq!(
+            out,
+            vec![
+                P::Started { total: None },
+                P::Downloaded { bytes: 1 },
+                P::Downloaded { bytes: 2 },
+            ]
         );
     }
 

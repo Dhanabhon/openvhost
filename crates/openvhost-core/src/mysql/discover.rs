@@ -209,8 +209,17 @@ fn current_version(link: &Path) -> Option<String> {
     let target = std::fs::read_link(link).ok()?;
     let mut components = target.components();
     // `Component::Normal` alone rejects `..` (ParentDir), `/` (RootDir) and a
-    // Windows prefix; the `is_some` check below rejects `a/b`. `./a` normalises
-    // to a single `Normal("a")` and is accepted, which is correct.
+    // Windows prefix; the `is_some` check below rejects `a/b`.
+    //
+    // `./a` is REJECTED, not accepted. std normalises `.` away everywhere
+    // EXCEPT at the start of a path, so `Path::new("./a").components()` yields
+    // `[CurDir, Normal("a")]` and the pattern below does not match. (A previous
+    // version of this comment claimed the opposite; it was wrong, and a wrong
+    // premise here is exactly what a future refactor would "correct" in the
+    // permissive direction.) Refusing it is right regardless: `openvhost-pkg`
+    // writes the bare version string and nothing else, so the accepted set is
+    // exactly "one plain directory name" — see
+    // `a_current_link_spelled_with_a_leading_dot_segment_is_refused`.
     let Some(Component::Normal(name)) = components.next() else {
         return None;
     };
@@ -1067,26 +1076,38 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_current_link_that_escapes_its_major_directory_is_refused() {
+    fn a_tampered_current_link_is_refused_and_reported() {
         // The `current` link is the one value in this walk a hand-edit can
-        // point anywhere, and it is joined onto a path. Every escape shape must
-        // be refused BEFORE that join.
+        // point anywhere, and it is joined onto a path. Every shape that is not
+        // a plain version directory name must be refused BEFORE that join.
         //
-        // Each case plants a REAL tree at the escape destination — three
-        // working binaries — so an unguarded join would genuinely resolve and
-        // hand back a runtime filed under 8.4 whose binaries are somebody
-        // else's. Pointing `current` at a path that does not exist would pass
-        // against no guard at all, because `runtime_in`'s `is_file` checks
-        // would refuse it anyway.
+        // Each case plants a REAL tree at the destination — three working
+        // binaries — so an unguarded join would genuinely resolve and hand back
+        // a runtime filed under 8.4 whose binaries are somebody else's.
+        // Pointing `current` at a path that does not exist would pass against
+        // no guard at all, because `runtime_in`'s `is_file` checks would refuse
+        // it anyway. That includes the `..` case: `packages/mysql/bin/` is
+        // planted below precisely so `…/8.4/../bin/mysqld` resolves.
         //
-        // VACUITY, measured: `current_version`'s single-component rule and
-        // `packaged_mysql_runtime`'s structural parent check are each
-        // INDEPENDENTLY sufficient — removing either alone leaves this test
-        // green. Removing BOTH fails it, reporting an 8.4 runtime whose
-        // `mysqld` is `…/mysql/8.4/../8.0/8.0.40/bin/mysqld` and whose
-        // recorded version is the literal string `"../8.0/8.0.40"`. They are
-        // belt and braces on purpose, and this is the measurement that says
-        // so rather than an assumption.
+        // VACUITY, re-measured after the audit corrected an over-claim here.
+        // The previous note said the two guards — `current_version`'s
+        // single-`Component::Normal` rule and `packaged_mysql_runtime`'s
+        // structural parent check — were "each INDEPENDENTLY sufficient". That
+        // is true only of the first three targets:
+        //
+        //   * the three multi-component/absolute targets: removing EITHER guard
+        //     alone leaves this test green; removing BOTH fails it, reporting an
+        //     8.4 runtime whose `mysqld` is `…/mysql/8.4/../8.0/8.0.40/bin/mysqld`
+        //     and whose recorded version is the literal `"../8.0/8.0.40"`.
+        //   * a bare `..`: only the single-component rule refuses it. Its
+        //     LEXICAL parent (`…/mysql/8.4/..`.parent() == `…/mysql/8.4`) IS this
+        //     major's directory, so the structural check passes it — remove the
+        //     single-component rule and this case alone fails, handing back an
+        //     8.4 runtime rooted one level up, at `packages/mysql/`, with the
+        //     literal version `".."`.
+        //
+        // So they are belt and braces, not interchangeable, and the order
+        // matters. This is the measurement, not an assumption.
         let outside = tempfile::tempdir().unwrap();
         let decoy = outside.path().join("decoy");
         std::fs::create_dir_all(decoy.join("bin")).unwrap();
@@ -1094,18 +1115,31 @@ mod tests {
             std::fs::write(decoy.join("bin").join(name), b"decoy\n").unwrap();
         }
 
-        let escapes = [
+        let tampered = [
             // A sibling major's real version directory, reached with `..`.
             "../8.0/8.0.40".to_string(),
             "8.4.11/../../8.0/8.0.40".to_string(),
             // Straight out of the home entirely, absolute.
             decoy.display().to_string(),
+            // Not an escape from the tree, but not a version directory either:
+            // it names the package root, one level above every version.
+            "..".to_string(),
         ];
-        for target in escapes {
+        for target in tampered {
             let home = tempfile::tempdir().unwrap();
             let root = PackagesRoot::from_home(home.path());
             install_fake_package(&root, "8.4", "8.4.11", "8.4.11 server\n", &ALL_THREE);
             install_fake_package(&root, "8.0", "8.0.40", "8.0.40 server\n", &ALL_THREE);
+            // What a bare `..` would reach: `packages/mysql/bin/`. Ignored by
+            // the walk itself (`bin` is not `major.minor`-shaped), so planting
+            // it creates no runtime of its own — it exists only so the `..`
+            // case has something real to resolve to, the way the decoy above
+            // does for the absolute case.
+            let sibling_bin = root.as_path().join(MYSQL_PACKAGE_NAME).join("bin");
+            std::fs::create_dir_all(&sibling_bin).unwrap();
+            for name in ALL_THREE {
+                std::fs::write(sibling_bin.join(name), b"sibling\n").unwrap();
+            }
             point_current(&root, "8.4", &target);
 
             let found = discover_mysql(&root, &[], &no_probe);
@@ -1122,6 +1156,39 @@ mod tests {
                 "current -> {target:?} was refused but not reported: {found:?}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_current_link_spelled_with_a_leading_dot_segment_is_refused() {
+        // `./8.4.11` resolves, on any filesystem, to exactly the directory
+        // `8.4.11` next to the link — so this is the one shape that is
+        // harmless AND rejected, and it is here because the reason it is
+        // rejected was documented wrongly.
+        //
+        // std normalises `.` away everywhere except at the START of a path, so
+        // `Path::new("./8.4.11").components()` is `[CurDir, Normal("8.4.11")]`,
+        // not the single `Normal` the old comment claimed. The behaviour was
+        // always right; only the explanation was wrong, and an unpinned
+        // behaviour explained wrongly is how a refactor "fixes" a guard in the
+        // permissive direction.
+        //
+        // Pinning the strictness is deliberate: `openvhost-pkg` writes the bare
+        // version and nothing else, so widening the accepted set buys nothing
+        // and costs the single-component rule its meaning.
+        let home = tempfile::tempdir().unwrap();
+        let root = PackagesRoot::from_home(home.path());
+        install_fake_package(&root, "8.4", "8.4.11", "8.4.11 server\n", &ALL_THREE);
+        point_current(&root, "8.4", "./8.4.11");
+
+        let found = discover_mysql(&root, &[], &no_probe);
+        assert!(found.runtimes.is_empty(), "got {found:?}");
+        assert!(
+            found
+                .unidentified
+                .contains(&root.major_dir(MYSQL_PACKAGE_NAME, "8.4")),
+            "got {found:?}"
+        );
     }
 
     #[cfg(unix)]

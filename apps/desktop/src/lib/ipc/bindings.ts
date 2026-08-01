@@ -242,11 +242,22 @@ export const commands = {
 	 *  empty or holds a different run, so the UI can say "it had already finished"
 	 *  instead of implying it stopped something.
 	 * 
-	 *  **Kind- and direction-checked.** `InstallLock`'s slot is shared with
-	 *  `install_php` and `uninstall_package`, and a Cancel button on the Databases
-	 *  page must never abort somebody else's run just because it happens to hold
-	 *  the lock. The check and the abort happen under one lock acquisition
-	 *  (`InstallLock::abort_running_if`) so the slot cannot change in between.
+	 *  **Kind- and operation-checked.** `InstallLock`'s slot is shared with
+	 *  `install_php`, `uninstall_package` and `initialize_mysql`, and a Cancel
+	 *  button on the Databases page must never abort somebody else's run just
+	 *  because it happens to hold the lock. The check and the abort happen under
+	 *  one lock acquisition (`InstallLock::abort_running_if`) so the slot cannot
+	 *  change in between.
+	 * 
+	 *  SECURITY (audit F1): that guarantee was *stated* here before it was
+	 *  *enforced*. `initialize_mysql` tagged its own run with the identical
+	 *  `(Mysql, Install)` pair — the labels differed, the discriminators did not,
+	 *  and `abort_running_if` compares only the discriminators — so this command
+	 *  aborted datadir initializations. Unreachable through the shipped UI, but
+	 *  every Tauri command is reachable from the webview, which is this project's
+	 *  standing assumption. The fix is `PackageOperation::Initialize` plus the two
+	 *  named pairs in `commands.rs`; this command fires on [`MYSQL_INSTALL_RUN`]
+	 *  and nothing else.
 	 */
 	cancelMysqlInstall: () => typedError<boolean, IpcError>(__TAURI_INVOKE("cancel_mysql_install")),
 	/**
@@ -971,21 +982,24 @@ export type PackageKind = "php" | "mysql";
  *  Wire-safe copy of [`PackageOperation`] — same relationship
  *  [`InstallKindDto`] has to [`InstallKind`].
  */
-export type PackageOperationDto = "install" | "uninstall";
+export type PackageOperationDto = "install" | "uninstall" | "initialize";
 
 /**
  *  What [`pending_install`] reports: which kind of run occupies
- *  `InstallLock`'s shared slot, which direction it is going, and its label —
- *  e.g. `"8.4"` for a PHP install or uninstall, `"MySQL 8.4"` for a MySQL one,
- *  `"MySQL 8.4 initialization"` for an init run (see the `set_running` calls in
+ *  `InstallLock`'s shared slot, what it is doing, and its label — e.g. `"8.4"`
+ *  for a PHP install or uninstall, `"MySQL 8.4"` for a MySQL install,
+ *  uninstall or initialization (see the `set_running` calls in
  *  `install_php`/`install_mysql`/`initialize_mysql`/`uninstall_package` for the
  *  exact shapes).
  * 
  *  `operation` exists because the quit dialog's copy — "… is still installing.
  *  Quitting stops it immediately and discards the download/build in progress"
  *  — is simply false for a removal, where what is at risk is a
- *  half-uninstalled formula rather than a discarded download. The Rust side
- *  reports the distinction; rendering it is the dialog's own (owed) change.
+ *  half-uninstalled formula rather than a discarded download, and false again
+ *  for an initialization, where nothing has been downloaded and nothing is
+ *  half-removed. The label no longer carries that fact in prose (it used to
+ *  read `"MySQL 8.4 initialization"`): `operation` carries it, which is the
+ *  only place [`InstallLock::abort_running_if`] can see it — audit F1.
  */
 export type PendingInstallDto = {
 	kind: InstallKindDto,

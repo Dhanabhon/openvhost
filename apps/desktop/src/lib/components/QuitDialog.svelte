@@ -15,12 +15,12 @@
 	}: {
 		/** Display names of services a quit would stop. Empty = nothing to lose. */
 		pending: readonly string[];
-		/** The Homebrew run currently occupying `InstallLock`'s single slot, if
-		 *  any — a PHP or MySQL install, a MySQL init, or (since the
-		 *  package-uninstall slice) a `brew uninstall`. None of them is a
-		 *  supervised service, so all of them are invisible to `pending`; without
-		 *  this the quit confirmation would say "nothing will be interrupted"
-		 *  while one was about to be killed mid-work.
+		/** The package run currently occupying `InstallLock`'s single slot, if
+		 *  any — a PHP or MySQL install, a MySQL datadir initialization, or a
+		 *  `brew uninstall`. None of them is a supervised service, so all of them
+		 *  are invisible to `pending`; without this the quit confirmation would
+		 *  say "nothing will be interrupted" while one was about to be killed
+		 *  mid-work.
 		 *
 		 *  `operation` is REQUIRED, not optional, and that is the fix for the
 		 *  branch review's HIGH: this prop used to be `{ kind, label }`, Rust had
@@ -32,8 +32,9 @@
 		 *
 		 *  The sentence itself lives in `quit.derive.ts` (including why PHP's
 		 *  label needs a leading word and MySQL's does not) so it can be asserted
-		 *  as words, and so the two operations can be proven never to collapse
-		 *  onto one wording. */
+		 *  as words, and so no two operations can collapse onto one wording —
+		 *  there are three since the security audit gave an initialization its
+		 *  own `PackageOperation`. */
 		pendingInstall?: PendingOperation | null;
 		/** True while `confirmQuit` is in flight — services are being stopped. */
 		quitting?: boolean;
