@@ -361,10 +361,13 @@
 		   268px = the original 232px (measured, not derived — the confirm state plus a
 		   little air) PLUS one icon-only button's width (View logs, spec D6 — a second icon
 		   button alongside Open, ~30px including its `gap: 4px` neighbour). Verified against
-		   a 964px content width (1180px window minus the rail) — which left the row 2px of
-		   slack, so every narrower window clipped this group off the right edge. The wrapped
-		   layout at the bottom of this block is what handles those widths; this floor still
-		   applies there and is simply never the binding constraint. */
+		   a "964px content width (1180px window minus the rail)" — a figure that never
+		   described this row. `.content` is not the row: the panel takes 24px of margin on
+		   each side and 1px of border, so at a 1180px window the row itself gets 914px and
+		   was ALREADY clipping this group by ~48px. The real break-even is a 1228px window;
+		   measure the row, never the column it sits in. The wrapped layout at the bottom of
+		   this block is what handles everything below that; this floor still applies there
+		   and is simply never the binding constraint. */
 		min-width: 268px;
 		display: flex;
 		gap: 4px;
