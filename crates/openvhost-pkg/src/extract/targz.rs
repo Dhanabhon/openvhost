@@ -4,7 +4,6 @@
 //! only then does pass 2 write. Never uses tar-rs `unpack` (RUSTSEC-2021-0080
 //! link traversal) — a manual walk applying the `validate` primitives.
 
-use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -13,8 +12,8 @@ use flate2::read::GzDecoder;
 
 use super::common::{clamp_mode, copy_capped, reject, set_dir_mode, set_file_mode};
 use super::validate::{
-    MAX_ENTRIES, MAX_TOTAL_BYTES, RawEntry, StripInfo, collision_key, strip_single_root,
-    stripped_rel, validate_entry_name, validate_symlink_target,
+    Admission, EntryClass, MAX_ENTRIES, MAX_TOTAL_BYTES, RawEntry, SeenPaths, StripInfo,
+    strip_single_root, stripped_rel, validate_entry_name, validate_symlink_target,
 };
 use crate::error::PkgError;
 
@@ -91,11 +90,11 @@ fn plan_targz(archive: &mut fs::File) -> Result<(Vec<PlannedEntry>, StripInfo), 
         MAX_TOTAL_BYTES,
     ));
 
-    // First collect raw (rel, is_dir) for the strip decision + kind metadata.
+    // First collect raw (rel, class) for the strip decision + kind metadata.
     struct Staged {
         rel: String,
         kind: PlannedKind,
-        is_dir: bool,
+        class: EntryClass,
     }
     let mut staged: Vec<Staged> = Vec::new();
     let mut count = 0usize;
@@ -158,8 +157,8 @@ fn plan_targz(archive: &mut fs::File) -> Result<(Vec<PlannedEntry>, StripInfo), 
             }
             _ => return Err(reject("disallowed entry type (device/fifo/sparse)")),
         };
-        let is_dir = matches!(kind, PlannedKind::Dir);
-        staged.push(Staged { rel, kind, is_dir });
+        let class = classify(&kind);
+        staged.push(Staged { rel, kind, class });
     }
 
     // The single-root-strip decision (S18) — including `root` itself — is
@@ -170,22 +169,28 @@ fn plan_targz(archive: &mut fs::File) -> Result<(Vec<PlannedEntry>, StripInfo), 
         .iter()
         .map(|s| RawEntry {
             rel: s.rel.clone(),
-            is_dir: s.is_dir,
+            is_dir: s.class.is_dir(),
         })
         .collect();
     let strip = strip_single_root(&mut raws);
 
     // Collision check on final paths, computed via the shared deterministic
     // transform — never a fuzzy re-match, so pass 2 can reproduce the exact
-    // same rel from the raw archive name alone.
-    let mut seen: HashSet<String> = HashSet::new();
+    // same rel from the raw archive name alone. `SeenPaths` owns the whole
+    // collide-or-not policy (see its docs for the one accepted repeat);
+    // this walk only decides what to do with each outcome.
+    let mut seen = SeenPaths::new();
     let mut plan: Vec<PlannedEntry> = Vec::with_capacity(staged.len());
     for s in staged {
         let Some(rel) = stripped_rel(&s.rel, &strip) else {
             continue; // the stripped root dir itself
         };
-        if !seen.insert(collision_key(&rel)) {
-            return Err(reject(format!("path collision: {rel}")));
+        match seen.admit(&rel, s.class)? {
+            Admission::Fresh => {}
+            // Drop the duplicate: the first occurrence already plans this
+            // directory, and the plan is meant to be 1:1 with the
+            // destination tree.
+            Admission::RepeatedDirHeader => continue,
         }
         // Hardlink targets are an independent field (not covered by
         // `strip_single_root`'s all-entries-share-root check), so recompute
@@ -203,6 +208,22 @@ fn plan_targz(archive: &mut fs::File) -> Result<(Vec<PlannedEntry>, StripInfo), 
         plan.push(PlannedEntry { rel, kind });
     }
     Ok((plan, strip))
+}
+
+/// Classify a planned entry for [`SeenPaths::admit`] and the single-root
+/// strip. EXHAUSTIVE over [`PlannedKind`] with no wildcard arm, deliberately:
+/// the collision set's one exemption is keyed on "every occurrence is a
+/// DIRECTORY entry", so a symlink or hardlink must be provably a
+/// non-directory here rather than incidentally rejected later by whatever
+/// `symlink(2)`/`fs::copy` happens to do about an existing path. A kind
+/// added in future fails to compile until it is classified.
+fn classify(kind: &PlannedKind) -> EntryClass {
+    match kind {
+        PlannedKind::Dir => EntryClass::Directory,
+        PlannedKind::File { .. } | PlannedKind::Symlink { .. } | PlannedKind::Hardlink { .. } => {
+            EntryClass::NonDirectory
+        }
+    }
 }
 
 fn link_target(entry: &tar::Entry<'_, impl Read>) -> Result<String, PkgError> {
@@ -739,6 +760,300 @@ mod tests {
             },
         ]);
         assert!(extract(&bytes).is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // Real-payload shapes. Fixtures below replay the entry shapes Slice 0
+    // measured in the REAL upstream `mysql-8.4.11-macos15-arm64.tar.gz`,
+    // offline: its top-level component is never declared by a directory
+    // entry of its own, and `<top>/bin/` appears five separate times (raw
+    // tar lines 1, 24, 26, 92, 279), `<top>/lib/` four times.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn accepts_repeated_directory_headers() {
+        // Repeating a directory header is idempotent and benign — tar
+        // producers do it routinely. Before this fix the case-folded
+        // duplicate check read it as `path collision: bin` and rejected the
+        // whole archive (Slice 0, variant B).
+        let bytes = targz_bytes(&[
+            TarSpec::Dir {
+                path: "mysql-8.4.11-macos15-arm64/",
+            },
+            TarSpec::Dir {
+                path: "mysql-8.4.11-macos15-arm64/bin/",
+            },
+            TarSpec::File {
+                path: "mysql-8.4.11-macos15-arm64/bin/mysqld",
+                data: b"ELF",
+                mode: 0o755,
+            },
+            TarSpec::Dir {
+                path: "mysql-8.4.11-macos15-arm64/bin/",
+            },
+            TarSpec::Dir {
+                path: "mysql-8.4.11-macos15-arm64/lib/",
+            },
+            TarSpec::Dir {
+                path: "mysql-8.4.11-macos15-arm64/bin/",
+            },
+            TarSpec::File {
+                path: "mysql-8.4.11-macos15-arm64/lib/libmysqlclient.dylib",
+                data: b"MACH",
+                mode: 0o755,
+            },
+            TarSpec::Dir {
+                path: "mysql-8.4.11-macos15-arm64/lib/",
+            },
+        ]);
+        let dest = extract(&bytes).unwrap();
+        assert!(dest.path().join("bin/mysqld").is_file());
+        assert!(dest.path().join("lib/libmysqlclient.dylib").is_file());
+    }
+
+    #[test]
+    fn strips_a_single_root_with_no_directory_header_of_its_own() {
+        // Slice 0's control pair: variant C (no explicit root dir entry)
+        // and variant D (C plus that one header) BOTH returned `Ok` — C
+        // just put every file one level too deep, so discovery found no
+        // `bin/mysqld`. Assert the resulting TREE, never `is_ok()`: `Ok`
+        // cannot tell the two apart.
+        let bytes = targz_bytes(&[
+            TarSpec::Dir {
+                path: "mysql-8.4.11-macos15-arm64/bin/",
+            },
+            TarSpec::File {
+                path: "mysql-8.4.11-macos15-arm64/bin/mysqld",
+                data: b"ELF",
+                mode: 0o755,
+            },
+            TarSpec::File {
+                path: "mysql-8.4.11-macos15-arm64/LICENSE",
+                data: b"GPL",
+                mode: 0o644,
+            },
+        ]);
+        let dest = extract(&bytes).unwrap();
+        assert!(
+            dest.path().join("bin/mysqld").is_file(),
+            "payload must land at the package root"
+        );
+        assert!(
+            !dest.path().join("mysql-8.4.11-macos15-arm64").exists(),
+            "payload must not land one level too deep"
+        );
+    }
+
+    #[test]
+    fn upstream_shape_repeated_dir_headers_and_an_implicit_root() {
+        // Both fixes at once, in the order the real archive presents them:
+        // the first entry is `<top>/bin/`, `<top>/` itself is never
+        // declared, and `<top>/bin/` recurs.
+        let bytes = targz_bytes(&[
+            TarSpec::Dir {
+                path: "mysql-8.4.11-macos15-arm64/bin/",
+            },
+            TarSpec::File {
+                path: "mysql-8.4.11-macos15-arm64/bin/mysqld",
+                data: b"ELF",
+                mode: 0o755,
+            },
+            TarSpec::Dir {
+                path: "mysql-8.4.11-macos15-arm64/lib/",
+            },
+            TarSpec::Dir {
+                path: "mysql-8.4.11-macos15-arm64/bin/",
+            },
+            TarSpec::File {
+                path: "mysql-8.4.11-macos15-arm64/lib/libssl.3.dylib",
+                data: b"MACH",
+                mode: 0o755,
+            },
+            TarSpec::Dir {
+                path: "mysql-8.4.11-macos15-arm64/lib/",
+            },
+        ]);
+        let dest = extract(&bytes).unwrap();
+        assert!(dest.path().join("bin/mysqld").is_file());
+        assert!(dest.path().join("lib/libssl.3.dylib").is_file());
+        assert!(!dest.path().join("mysql-8.4.11-macos15-arm64").exists());
+    }
+
+    #[test]
+    fn keeps_a_lone_top_level_file_instead_of_stripping_it_away() {
+        // The strip's third state: an entry NAMING the shared top-level
+        // component that is not a directory is payload, not a wrapper.
+        // Stripping it would silently delete it and still return `Ok`, so
+        // assert the tree.
+        let bytes = targz_bytes(&[TarSpec::File {
+            path: "only.txt",
+            data: b"payload",
+            mode: 0o644,
+        }]);
+        let dest = extract(&bytes).unwrap();
+        assert_eq!(
+            std::fs::read(dest.path().join("only.txt")).unwrap(),
+            b"payload"
+        );
+    }
+
+    /// Assert the SPECIFIC collision rejection, never merely `is_err()`.
+    /// A bare `is_err()` here would also be satisfied by the extractor
+    /// blundering into an `EEXIST` from `create_new`/`symlink(2)` while
+    /// materializing a duplicate it should have refused to plan — which is
+    /// a coincidence of the filesystem, not a check.
+    fn assert_path_collision(bytes: &[u8], rel: &str) {
+        match extract(bytes) {
+            Err(PkgError::UnsafeArchive(msg)) => {
+                assert_eq!(msg, format!("path collision: {rel}"));
+            }
+            other => panic!("expected UnsafeArchive(\"path collision: {rel}\"), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_two_files_with_the_same_name() {
+        // tar (unlike zip, whose reader collapses same-named central
+        // directory records into one) can genuinely carry two identically
+        // named file entries. Still a collision.
+        let bytes = targz_bytes(&[
+            TarSpec::Dir { path: "p/" },
+            TarSpec::File {
+                path: "p/a",
+                data: b"first",
+                mode: 0o644,
+            },
+            TarSpec::File {
+                path: "p/a",
+                data: b"second",
+                mode: 0o644,
+            },
+        ]);
+        assert_path_collision(&bytes, "a");
+    }
+
+    #[test]
+    fn rejects_a_file_colliding_with_a_directory_in_either_order() {
+        let dir_then_file = targz_bytes(&[
+            TarSpec::Dir { path: "p/" },
+            TarSpec::Dir { path: "p/a/" },
+            TarSpec::File {
+                path: "p/a",
+                data: b"x",
+                mode: 0o644,
+            },
+        ]);
+        assert_path_collision(&dir_then_file, "a");
+
+        let file_then_dir = targz_bytes(&[
+            TarSpec::Dir { path: "p/" },
+            TarSpec::File {
+                path: "p/a",
+                data: b"x",
+                mode: 0o644,
+            },
+            TarSpec::Dir { path: "p/a/" },
+        ]);
+        assert_path_collision(&file_then_dir, "a");
+    }
+
+    #[test]
+    fn rejects_a_symlink_or_hardlink_colliding_with_a_directory() {
+        // The auditor's case. A directory header followed by a SYMLINK of
+        // the same name must be rejected by the collision check itself,
+        // keyed on the entry kind — not left to `symlink(2)` returning
+        // EEXIST, and not silently dropped as if it were a benign repeat
+        // (which would yield a clean `Ok` and a package missing a link its
+        // binaries need to load).
+        let symlink = targz_bytes(&[
+            TarSpec::Dir { path: "p/" },
+            TarSpec::Dir { path: "p/a/" },
+            TarSpec::Symlink {
+                path: "p/a",
+                target: "real",
+            },
+        ]);
+        assert_path_collision(&symlink, "a");
+
+        let hardlink = targz_bytes(&[
+            TarSpec::Dir { path: "p/" },
+            TarSpec::File {
+                path: "p/real",
+                data: b"x",
+                mode: 0o644,
+            },
+            TarSpec::Dir { path: "p/a/" },
+            TarSpec::Hardlink {
+                path: "p/a",
+                target: "p/real",
+            },
+        ]);
+        assert_path_collision(&hardlink, "a");
+    }
+
+    #[test]
+    fn rejects_case_folded_collision_between_two_different_directory_names() {
+        // The nearest neighbour to the repeated-directory-header
+        // relaxation: two directory entries, both directories, but
+        // GENUINELY DIFFERENT names that fold together on APFS/NTFS.
+        // Accepting a repeat must not accept this.
+        let bytes = targz_bytes(&[
+            TarSpec::Dir { path: "p/" },
+            TarSpec::Dir { path: "p/Bin/" },
+            TarSpec::Dir { path: "p/bin/" },
+        ]);
+        assert_path_collision(&bytes, "bin");
+    }
+
+    #[test]
+    fn a_repeated_directory_header_cannot_launder_a_later_file() {
+        // The smuggling property, end to end: no number of benign repeats
+        // turns the claimed directory into something a file may take over.
+        let bytes = targz_bytes(&[
+            TarSpec::Dir { path: "p/" },
+            TarSpec::Dir { path: "p/bin/" },
+            TarSpec::Dir { path: "p/bin/" },
+            TarSpec::Dir { path: "p/bin/" },
+            TarSpec::File {
+                path: "p/bin",
+                data: b"smuggled",
+                mode: 0o755,
+            },
+        ]);
+        assert_path_collision(&bytes, "bin");
+    }
+
+    #[test]
+    fn a_repeated_directory_header_is_dropped_from_the_plan_not_planned_twice() {
+        // The duplicate must be DROPPED, not materialized twice: pass 2
+        // creates directories from the plan, and the plan is meant to be
+        // 1:1 with the destination tree. Inspect the plan directly — a
+        // doubly-planned directory is invisible in the resulting tree,
+        // because `create_dir_all` is idempotent.
+        let bytes = targz_bytes(&[
+            TarSpec::Dir { path: "p/" },
+            TarSpec::Dir { path: "p/bin/" },
+            TarSpec::Dir { path: "p/bin/" },
+            TarSpec::Dir { path: "p/bin/" },
+            TarSpec::File {
+                path: "p/bin/mysqld",
+                data: b"ELF",
+                mode: 0o755,
+            },
+        ]);
+        let mut tf = temp_file_with(&bytes);
+        tf.as_file_mut().seek(SeekFrom::Start(0)).unwrap();
+        let (plan, _strip) = plan_targz(tf.as_file_mut()).unwrap();
+        assert_eq!(
+            plan.iter().filter(|e| e.rel == "bin").count(),
+            1,
+            "three `bin/` headers must yield exactly one planned directory, got plan {plan:?}"
+        );
+        assert_eq!(
+            plan.iter().filter(|e| e.rel == "bin/mysqld").count(),
+            1,
+            "the file must survive"
+        );
     }
 
     #[cfg(target_os = "macos")]

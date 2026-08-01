@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Pure path/entry validation — the extractor's trusted core. No I/O.
 
+use std::collections::HashMap;
+
 use unicode_normalization::UnicodeNormalization;
 
 use crate::error::PkgError;
@@ -94,43 +96,218 @@ pub(crate) fn collision_key(rel: &str) -> String {
     rel.nfc().collect::<String>().to_lowercase()
 }
 
+/// Whether an archive entry is a directory entry or anything else. A
+/// two-variant enum rather than a `bool` on purpose: callers must classify
+/// their own entry kinds through an EXHAUSTIVE match (see `targz`'s
+/// `classify`), so a kind that is not a directory — a regular file, a
+/// symlink, a hardlink, or any kind added later — cannot reach
+/// [`SeenPaths::admit`] wearing a `true` someone forgot to update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EntryClass {
+    /// A directory entry, and nothing else.
+    Directory,
+    /// Every other entry kind: regular file, symlink, hardlink.
+    NonDirectory,
+}
+
+impl EntryClass {
+    /// Directories are the only entries the single-root-strip rule may treat
+    /// as a wrapper. Kept here so the strip's notion of "directory" and the
+    /// collision set's cannot drift apart.
+    pub(crate) fn is_dir(self) -> bool {
+        matches!(self, EntryClass::Directory)
+    }
+}
+
+/// One destination path already claimed by an accepted entry, kept whole
+/// (not just its folded [`collision_key`]) so a repeat can be compared
+/// against the ORIGINAL spelling rather than merely against its fold.
+#[derive(Debug)]
+struct ClaimedPath {
+    /// The exact validated rel that claimed this key.
+    rel: String,
+    class: EntryClass,
+}
+
+/// What offering an entry to [`SeenPaths`] resolved to. Deliberately an enum
+/// with no catch-all: a caller must decide what to do with EVERY outcome, and
+/// a future outcome must not compile until every walk handles it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Admission {
+    /// Nothing had claimed this destination path; it is now claimed.
+    Fresh,
+    /// A repeated DIRECTORY header for a path already claimed by a
+    /// byte-identical DIRECTORY header. Idempotent — the caller must DROP
+    /// the duplicate rather than materialize it twice; the first occurrence
+    /// already plans that directory.
+    RepeatedDirHeader,
+}
+
+/// The set of destination paths an archive has already claimed (S12), and
+/// the place that decides whether a second entry naming the same path is a
+/// collision or a benign repeat.
+///
+/// Collision detection is case-folded and NFC-normalized ([`collision_key`])
+/// because APFS/NTFS are case-insensitive by default and APFS folds NFC/NFD:
+/// two entries that merely LOOK distinct in the archive can still be the
+/// same file on disk.
+///
+/// **The one accepted repeat.** [`SeenPaths::admit`] returns
+/// [`Admission::RepeatedDirHeader`] only when the incoming entry and the
+/// claim it lands on are BOTH [`EntryClass::Directory`] AND their validated
+/// rels are byte-identical. Real tar producers emit a directory header more
+/// than once as a matter of course — upstream
+/// `mysql-8.4.11-macos15-arm64.tar.gz` declares `<top>/bin/` five times and
+/// `<top>/lib/` four — and repeating an idempotent "make this directory"
+/// instruction claims nothing new.
+///
+/// **Everything else still rejects**, and the match in `admit` spells the
+/// alternatives out one by one rather than leaving them to a guard: any
+/// [`EntryClass::NonDirectory`] on EITHER side (file/file, file/dir and
+/// dir/file, symlink/dir, hardlink/dir), and two directories whose names
+/// differ but fold together (`Bin` vs `bin`) — genuinely different names
+/// that would silently become one entry on a case-folding volume.
+///
+/// **Why nothing can be smuggled through the relaxation.** The exemption is
+/// keyed on the ENTRY KIND of every occurrence, never on "this key has been
+/// seen before": the only arm that can return anything but an error requires
+/// `Directory` on both sides, so a non-directory meets exactly the rejection
+/// it met before this relaxation existed, whatever preceded it. That arm
+/// also leaves the claim untouched, so no sequence of repeats can downgrade
+/// a claimed directory into something a later entry may take over.
+#[derive(Debug, Default)]
+pub(crate) struct SeenPaths {
+    claimed: HashMap<String, ClaimedPath>,
+}
+
+impl SeenPaths {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Offer a validated, post-strip destination-relative path. `Err` means
+    /// the whole archive is rejected.
+    pub(crate) fn admit(&mut self, rel: &str, class: EntryClass) -> Result<Admission, PkgError> {
+        let key = collision_key(rel);
+        let Some(prior) = self.claimed.get(&key) else {
+            self.claimed.insert(
+                key,
+                ClaimedPath {
+                    rel: rel.to_string(),
+                    class,
+                },
+            );
+            return Ok(Admission::Fresh);
+        };
+        match (prior.class, class) {
+            // The ONLY exemption: a directory entry repeating a directory
+            // entry of the exact same name. Note this arm does not touch the
+            // claim.
+            (EntryClass::Directory, EntryClass::Directory) if prior.rel == rel => {
+                Ok(Admission::RepeatedDirHeader)
+            }
+            // Two directories whose names merely FOLD together are two
+            // different names, not a repeat.
+            (EntryClass::Directory, EntryClass::Directory) => {
+                Err(reject(&format!("path collision: {rel}")))
+            }
+            // Anything that is not a directory, on either side.
+            (EntryClass::Directory, EntryClass::NonDirectory)
+            | (EntryClass::NonDirectory, EntryClass::Directory)
+            | (EntryClass::NonDirectory, EntryClass::NonDirectory) => {
+                Err(reject(&format!("path collision: {rel}")))
+            }
+        }
+    }
+}
+
+/// What an archive's entries say about the single top-level component they
+/// all share — the three-state answer the single-top-dir strip rule (S18)
+/// actually needs. Collapsing it to the two-state "is there an explicit
+/// directory header?" is what let a real upstream tarball install one level
+/// too deep and still report success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootShape {
+    /// A directory entry names the shared root.
+    ExplicitDir,
+    /// NO entry names the shared root, but every entry nests beneath it, so
+    /// it is a directory by implication. Producers routinely omit the
+    /// header: upstream `mysql-8.4.11-macos15-arm64.tar.gz` never declares
+    /// its own top-level directory, and Slice 0's control run confirmed that
+    /// one missing header was the entire difference between a correct tree
+    /// and a payload one level too deep.
+    ImpliedByChildren,
+    /// An entry names the shared root and it is NOT a directory — a lone
+    /// top-level file, or a file that other entries claim to nest under.
+    /// That entry is payload, not a wrapper; stripping would delete it
+    /// (`stripped_rel` maps the root itself to `None`) and still return
+    /// `Ok`.
+    NotADirectory,
+}
+
 /// Apply the single-top-dir strip rule (S18): if EVERY entry shares one
-/// top-level component AND that component appears as an explicit directory
-/// entry, remove that leading component from all entries. Returns the
-/// decision as [`StripInfo`] — computing `root` here, ONCE, rather than
-/// leaving each format walk (`targz`, `zip`) recompute it independently
-/// from `entries[0]` (two copies of the same logic that could silently
-/// drift apart). Entries are already name-validated.
+/// top-level component and that component is a directory — declared or
+/// implied ([`RootShape`]) — remove that leading component from all entries.
+/// Returns the decision as [`StripInfo`] — computing `root` here, ONCE,
+/// rather than leaving each format walk (`targz`, `zip`) recompute it
+/// independently from `entries[0]` (two copies of the same logic that could
+/// silently drift apart). Entries are already name-validated.
+///
+/// The in-place rewrite of `entries` goes through [`stripped_rel`], the same
+/// transform both format walks use to compute an entry's final rel, so the
+/// mutation here and the paths actually materialized cannot disagree.
 pub(crate) fn strip_single_root(entries: &mut [RawEntry]) -> StripInfo {
     let root = entries
         .first()
         .map(|e| top(&e.rel).to_string())
         .unwrap_or_default();
-    let stripped = strip_single_root_vec(entries, &root);
-    StripInfo { stripped, root }
+    let info = StripInfo {
+        stripped: should_strip(entries, &root),
+        root,
+    };
+    if info.stripped {
+        for e in entries.iter_mut() {
+            // `None` here is the root entry itself, which the strip drops.
+            e.rel = stripped_rel(&e.rel, &info).unwrap_or_default();
+        }
+    }
+    info
 }
 
 fn top(rel: &str) -> &str {
     rel.split('/').next().unwrap_or(rel)
 }
 
-fn strip_single_root_vec(entries: &mut [RawEntry], root: &str) -> bool {
+fn should_strip(entries: &[RawEntry], root: &str) -> bool {
     if entries.is_empty() || root.is_empty() {
         return false;
     }
-    let all_share = entries.iter().all(|e| top(&e.rel) == root);
-    let root_is_dir_entry = entries
-        .iter()
-        .any(|e| e.is_dir && e.rel.trim_end_matches('/') == root);
-    // Reject the degenerate "single top-level file" case: not a dir → no strip.
-    if !all_share || !root_is_dir_entry {
+    if !entries.iter().all(|e| top(&e.rel) == root) {
         return false;
     }
-    let prefix = format!("{root}/");
-    for e in entries.iter_mut() {
-        e.rel = e.rel.strip_prefix(&prefix).unwrap_or("").to_string();
+    match root_shape(entries, root) {
+        RootShape::ExplicitDir | RootShape::ImpliedByChildren => true,
+        RootShape::NotADirectory => false,
     }
-    true
+}
+
+/// Classify the shared top-level component from the entries that name it.
+/// A non-directory naming the root is decisive and outranks any directory
+/// entry for the same path — such an archive is self-contradictory, and
+/// declining to strip makes the contradiction surface as a collision
+/// rejection instead of two silently dropped entries.
+fn root_shape(entries: &[RawEntry], root: &str) -> RootShape {
+    let mut shape = RootShape::ImpliedByChildren;
+    for e in entries {
+        if e.rel.trim_end_matches('/') != root {
+            continue;
+        }
+        if !e.is_dir {
+            return RootShape::NotADirectory;
+        }
+        shape = RootShape::ExplicitDir;
+    }
+    shape
 }
 
 /// The single-root-strip (S18) decision, captured as data so a second walk
@@ -293,6 +470,223 @@ mod tests {
             is_dir: false,
         }];
         assert!(!strip_single_root(&mut single_file).stripped);
+    }
+
+    // ----------------------------------------------------------------
+    // SeenPaths: the collision policy and its ONE exemption.
+    // ----------------------------------------------------------------
+
+    fn dir(seen: &mut SeenPaths, rel: &str) -> Result<Admission, PkgError> {
+        seen.admit(rel, EntryClass::Directory)
+    }
+    fn non_dir(seen: &mut SeenPaths, rel: &str) -> Result<Admission, PkgError> {
+        seen.admit(rel, EntryClass::NonDirectory)
+    }
+
+    #[test]
+    fn a_repeated_directory_header_is_admitted_as_a_repeat() {
+        // Upstream mysql-8.4.11-macos15-arm64.tar.gz declares `<top>/bin/`
+        // five separate times (raw tar lines 1, 24, 26, 92, 279).
+        let mut seen = SeenPaths::new();
+        assert_eq!(dir(&mut seen, "bin").unwrap(), Admission::Fresh);
+        for _ in 0..4 {
+            assert_eq!(
+                dir(&mut seen, "bin").unwrap(),
+                Admission::RepeatedDirHeader,
+                "a repeated directory header is idempotent"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_colliding_with_a_file_is_rejected() {
+        let mut seen = SeenPaths::new();
+        assert_eq!(non_dir(&mut seen, "a").unwrap(), Admission::Fresh);
+        match non_dir(&mut seen, "a") {
+            Err(PkgError::UnsafeArchive(m)) => assert_eq!(m, "path collision: a"),
+            other => panic!("expected a collision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_non_directory_colliding_with_a_directory_is_rejected_in_either_order() {
+        // The auditor's case: whatever the NON-directory is — regular file,
+        // symlink, hardlink — it is `EntryClass::NonDirectory` and takes the
+        // same rejection. Nothing here relies on `symlink(2)` returning
+        // EEXIST later.
+        let mut dir_first = SeenPaths::new();
+        assert_eq!(dir(&mut dir_first, "a").unwrap(), Admission::Fresh);
+        assert!(non_dir(&mut dir_first, "a").is_err(), "dir then non-dir");
+
+        let mut file_first = SeenPaths::new();
+        assert_eq!(non_dir(&mut file_first, "a").unwrap(), Admission::Fresh);
+        assert!(dir(&mut file_first, "a").is_err(), "non-dir then dir");
+    }
+
+    #[test]
+    fn two_directories_whose_names_only_fold_together_are_rejected() {
+        // Both sides are directories, so only the byte-identical-name
+        // requirement stands between this and the exemption. `Bin` and `bin`
+        // are genuinely different names that become one entry on APFS/NTFS.
+        let mut case = SeenPaths::new();
+        assert_eq!(dir(&mut case, "Bin").unwrap(), Admission::Fresh);
+        match dir(&mut case, "bin") {
+            Err(PkgError::UnsafeArchive(m)) => assert_eq!(m, "path collision: bin"),
+            other => panic!("expected a collision, got {other:?}"),
+        }
+
+        // Same for NFC vs NFD spellings of the same-looking name.
+        let mut norm = SeenPaths::new();
+        assert_eq!(dir(&mut norm, "caf\u{e9}").unwrap(), Admission::Fresh);
+        assert!(dir(&mut norm, "cafe\u{301}").is_err());
+    }
+
+    #[test]
+    fn repeated_directory_headers_cannot_launder_a_later_non_directory() {
+        // The smuggling property. The exemption arm never mutates the claim,
+        // so no number of benign repeats turns the claimed directory into
+        // something a file may take over.
+        let mut seen = SeenPaths::new();
+        assert_eq!(dir(&mut seen, "bin").unwrap(), Admission::Fresh);
+        for _ in 0..50 {
+            assert_eq!(dir(&mut seen, "bin").unwrap(), Admission::RepeatedDirHeader);
+        }
+        match non_dir(&mut seen, "bin") {
+            Err(PkgError::UnsafeArchive(m)) => assert_eq!(m, "path collision: bin"),
+            other => panic!("a file must still collide after any number of repeats, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn distinct_paths_are_all_fresh() {
+        // Guards the opposite failure: a collision set that rejected
+        // everything would pass every test above.
+        let mut seen = SeenPaths::new();
+        for rel in ["bin", "bin/mysqld", "lib", "lib/plugin", "share/doc"] {
+            assert_eq!(dir(&mut seen, rel).unwrap(), Admission::Fresh, "{rel}");
+        }
+    }
+
+    #[test]
+    fn entry_class_reports_only_directory_as_a_directory() {
+        assert!(EntryClass::Directory.is_dir());
+        assert!(!EntryClass::NonDirectory.is_dir());
+    }
+
+    // ----------------------------------------------------------------
+    // strip_single_root: the three-state root shape.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn strips_a_shared_root_that_has_no_directory_entry_of_its_own() {
+        // The real upstream MySQL shape: one top-level component, never
+        // declared. Before this fix the strip was skipped, every file landed
+        // one level too deep, and the install still returned `Ok`.
+        let mut entries = vec![
+            RawEntry {
+                rel: "mysql-8.4.11-macos15-arm64/bin".into(),
+                is_dir: true,
+            },
+            RawEntry {
+                rel: "mysql-8.4.11-macos15-arm64/bin/mysqld".into(),
+                is_dir: false,
+            },
+            RawEntry {
+                rel: "mysql-8.4.11-macos15-arm64/LICENSE".into(),
+                is_dir: false,
+            },
+        ];
+        let strip = strip_single_root(&mut entries);
+        assert!(strip.stripped);
+        assert_eq!(strip.root, "mysql-8.4.11-macos15-arm64");
+        assert_eq!(entries[1].rel, "bin/mysqld");
+    }
+
+    #[test]
+    fn does_not_strip_when_an_entry_names_the_root_and_is_not_a_directory() {
+        // Third state. Stripping here would map the root entry to `None`
+        // (see `stripped_rel`) and DELETE the payload while still reporting
+        // success — the same silent shape as the bug above, inverted.
+        let mut lone_file = vec![RawEntry {
+            rel: "only.txt".into(),
+            is_dir: false,
+        }];
+        assert!(!strip_single_root(&mut lone_file).stripped);
+        assert_eq!(lone_file[0].rel, "only.txt", "must not be rewritten away");
+
+        // A file that other entries claim to nest under: self-contradictory.
+        // Declining to strip lets the contradiction surface as a collision
+        // instead of two silently dropped entries.
+        let mut file_with_children = vec![
+            RawEntry {
+                rel: "x".into(),
+                is_dir: false,
+            },
+            RawEntry {
+                rel: "x/y".into(),
+                is_dir: false,
+            },
+        ];
+        assert!(!strip_single_root(&mut file_with_children).stripped);
+
+        // A non-directory naming the root outranks a directory entry for the
+        // same path, whichever order they appear in.
+        for order in [[true, false], [false, true]] {
+            let mut both = vec![
+                RawEntry {
+                    rel: "p".into(),
+                    is_dir: order[0],
+                },
+                RawEntry {
+                    rel: "p".into(),
+                    is_dir: order[1],
+                },
+                RawEntry {
+                    rel: "p/child".into(),
+                    is_dir: false,
+                },
+            ];
+            assert!(!strip_single_root(&mut both).stripped, "order {order:?}");
+        }
+    }
+
+    #[test]
+    fn does_not_strip_when_entries_do_not_share_one_top_level_component() {
+        let mut entries = vec![
+            RawEntry {
+                rel: "bin/php".into(),
+                is_dir: false,
+            },
+            RawEntry {
+                rel: "lib/x.so".into(),
+                is_dir: false,
+            },
+        ];
+        assert!(!strip_single_root(&mut entries).stripped);
+        assert_eq!(entries[0].rel, "bin/php");
+    }
+
+    #[test]
+    fn the_in_place_rewrite_agrees_with_stripped_rel() {
+        // The rewrite goes through `stripped_rel`, so the mutated entries and
+        // the paths each format walk materializes cannot disagree.
+        let raw = ["p", "p/a", "p/a/b"];
+        let mut entries: Vec<RawEntry> = raw
+            .iter()
+            .map(|r| RawEntry {
+                rel: (*r).to_string(),
+                is_dir: !r.contains('.'),
+            })
+            .collect();
+        let strip = strip_single_root(&mut entries);
+        assert!(strip.stripped);
+        for (i, r) in raw.iter().enumerate() {
+            assert_eq!(
+                entries[i].rel,
+                stripped_rel(r, &strip).unwrap_or_default(),
+                "{r}"
+            );
+        }
     }
 
     #[test]
