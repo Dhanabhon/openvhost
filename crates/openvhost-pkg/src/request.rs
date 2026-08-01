@@ -26,6 +26,13 @@ pub struct InstallRequest {
     pub(crate) url: url::Url,
     pub(crate) sha256: String,
     pub(crate) format: ArchiveFormat,
+    /// Optional: a binary inside the package tree to exec once in staging so
+    /// macOS pays its first-execution signature check during the install
+    /// rather than on the user's first "Start" (see
+    /// [`InstallRequest::with_warmup_binary`]). `None` — the default — skips
+    /// the step entirely. Package-specific by design: this pipeline carries
+    /// nginx and PHP as well as MySQL, and each names its own (or none).
+    pub(crate) warmup_bin: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +158,74 @@ pub(crate) fn validate_https_url(u: &url::Url) -> Result<(), PkgError> {
     }
 }
 
+/// Longest accepted warm-up path, in bytes. Matches the extractor's own
+/// per-entry cap (`extract::validate::MAX_REL_BYTES`) in value but is
+/// deliberately an independent constant: a path this crate will hand to
+/// `exec` is a different trust question from a path it will `create`, and
+/// coupling them would mean one relaxing silently relaxes the other.
+const MAX_WARMUP_REL_BYTES: usize = 240;
+/// Deepest accepted warm-up path, in components. `bin/mysqld` is 2;
+/// `Contents/MacOS/foo` is 3. Nothing legitimate needs 8.
+const MAX_WARMUP_DEPTH: usize = 8;
+
+/// Validate a warm-up binary path: a `/`-separated RELATIVE path inside the
+/// installed package tree, e.g. `bin/mysqld`.
+///
+/// This is a parse-only charset+shape guard on a value that later becomes
+/// `argv[0]` of a real `exec`, so it is deliberately narrow: ASCII
+/// `[A-Za-z0-9._-]` per component plus `/` separators, no `.`/`..`/empty
+/// component, no absolute path, no backslash, no NUL, no leading `-` on any
+/// component (so a component can never be mistaken for a flag by anything
+/// downstream that re-splits the path). Containment is re-checked against
+/// the real, symlink-resolved staging tree at warm-up time — this check is
+/// the cheap first gate, not the only one.
+fn validate_warmup_rel(s: &str) -> Result<PathBuf, PkgError> {
+    let bad = |reason: &'static str| PkgError::InvalidWarmupPath {
+        value: s.to_string(),
+        reason,
+    };
+    if s.is_empty() {
+        return Err(bad("must not be empty"));
+    }
+    if s.len() > MAX_WARMUP_REL_BYTES {
+        return Err(bad("path too long"));
+    }
+    if s.contains('\0') {
+        return Err(bad("must not contain NUL"));
+    }
+    if s.contains('\\') {
+        return Err(bad("must not contain a backslash"));
+    }
+    if s.starts_with('/') {
+        return Err(bad("must be relative, not absolute"));
+    }
+    let comps: Vec<&str> = s.split('/').collect();
+    if comps.len() > MAX_WARMUP_DEPTH {
+        return Err(bad("too many path components"));
+    }
+    for c in &comps {
+        if c.is_empty() {
+            return Err(bad("empty path component"));
+        }
+        if *c == "." || *c == ".." {
+            return Err(bad("must not contain a . or .. component"));
+        }
+        if c.starts_with('-') {
+            return Err(bad("path component must not start with '-'"));
+        }
+        if !c
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        {
+            return Err(bad("only [A-Za-z0-9._-] allowed in path components"));
+        }
+    }
+    // Built component-by-component rather than `PathBuf::from(s)` so the
+    // separator is the platform's, and so nothing but the components this
+    // loop just validated can end up in the result.
+    Ok(comps.iter().collect())
+}
+
 fn validate_sha256(s: &str) -> Result<(), PkgError> {
     if s.len() == 64
         && s.bytes()
@@ -184,7 +259,34 @@ impl InstallRequest {
             url: parsed,
             sha256: sha256.to_string(),
             format,
+            warmup_bin: None,
         })
+    }
+
+    /// Name a binary inside the package tree — a relative, `/`-separated
+    /// path such as `bin/mysqld` — to exec once, in staging, immediately
+    /// before the atomic rename.
+    ///
+    /// **Why:** macOS charges a Gatekeeper/XProtect signature check on the
+    /// FIRST execution of a new binary. Measured on a freshly extracted
+    /// 67 MB `mysqld`: 1.877 s cold, 13.7 ms warm (137x) — and the
+    /// validation survives `rename(2)`, so paying it in staging (749 ms)
+    /// makes the first exec after the rename warm (13.6 ms). Spending it
+    /// here puts it behind the progress the user is already watching instead
+    /// of turning their first "Start MySQL" into an unexplained pause.
+    ///
+    /// **This is an optimization and only an optimization.** A warm-up that
+    /// is missing, not executable, exits non-zero, rejects `--version`,
+    /// hangs, or is killed for outliving its budget is logged and ignored —
+    /// it can never fail an install. An [`InstallRequest`] that never calls
+    /// this skips the step entirely.
+    ///
+    /// Returns [`PkgError::InvalidWarmupPath`] if `rel_path` is not a safe
+    /// relative path (see the boundary rules at the top of this module —
+    /// this value ends up as `argv[0]` of a real `exec`).
+    pub fn with_warmup_binary(mut self, rel_path: &str) -> Result<Self, PkgError> {
+        self.warmup_bin = Some(validate_warmup_rel(rel_path)?);
+        Ok(self)
     }
 }
 
@@ -306,6 +408,76 @@ mod tests {
                 )
                 .is_err(),
                 "should reject name {bad:?}"
+            );
+        }
+    }
+
+    fn req() -> InstallRequest {
+        InstallRequest::new(
+            "mysql",
+            "8.4",
+            "8.4.11",
+            "https://cdn.mysql.example/mysql.tar.gz",
+            &"a".repeat(64),
+            ArchiveFormat::TarGz,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_request_names_no_warmup_binary_by_default() {
+        assert_eq!(req().warmup_bin, None);
+    }
+
+    #[test]
+    fn accepts_real_warmup_binary_paths() {
+        for good in [
+            "bin/mysqld",
+            "sbin/nginx",
+            "bin/php-fpm",
+            "mysqld",
+            "Contents/MacOS/Some_App.helper",
+            "bin/php8.4",
+        ] {
+            let r = req()
+                .with_warmup_binary(good)
+                .unwrap_or_else(|e| panic!("should accept {good:?}: {e}"));
+            assert_eq!(
+                r.warmup_bin,
+                Some(good.split('/').collect::<PathBuf>()),
+                "{good:?} must round-trip component-for-component"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_dangerous_warmup_binary_paths() {
+        for bad in [
+            "",
+            "/bin/sh",
+            "../../../bin/sh",
+            "bin/../../sh",
+            "bin/./sh",
+            "bin//sh",
+            "bin/",
+            "bin\\sh",
+            "bin/sh\0",
+            "bin/-rf",
+            "-rf",
+            "bin/my sqld",
+            "bin/mysqld;rm",
+            "bin/$(whoami)",
+            "bin/mysqld\n--defaults-file=/etc/shadow",
+            "a/b/c/d/e/f/g/h/i",
+            &"a".repeat(241),
+        ] {
+            let err = req()
+                .with_warmup_binary(bad)
+                .err()
+                .unwrap_or_else(|| panic!("should reject warm-up path {bad:?}"));
+            assert!(
+                matches!(err, PkgError::InvalidWarmupPath { .. }),
+                "wrong variant for {bad:?}: {err:?}"
             );
         }
     }

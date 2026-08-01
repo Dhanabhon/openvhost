@@ -3,6 +3,16 @@
 
 use std::path::PathBuf;
 
+/// Average transfer rate in KiB/s, guarding the degenerate `elapsed == 0`
+/// case (a stall detected before the clock advanced a measurable amount)
+/// rather than rendering `inf`/`NaN` into a user-facing error message.
+fn kib_per_sec(bytes: u64, elapsed_secs: f64) -> f64 {
+    if elapsed_secs <= 0.0 {
+        return 0.0;
+    }
+    (bytes as f64 / 1024.0) / elapsed_secs
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PkgError {
     #[error("invalid path component {value:?}: {reason}")]
@@ -11,8 +21,28 @@ pub enum PkgError {
     InvalidUrl(&'static str),
     #[error("sha256 must be 64 lowercase hex characters")]
     InvalidSha256,
+    #[error("invalid warm-up binary path {value:?}: {reason}")]
+    InvalidWarmupPath { value: String, reason: &'static str },
     #[error("network error: {0}")]
     Network(String),
+    /// The transfer stopped making progress. Deliberately NOT
+    /// [`PkgError::Network`]: a stall and a slow-but-healthy connection used
+    /// to be indistinguishable to the user (a fixed whole-request wall clock
+    /// turned "your link is slower than 1.5 Mbit/s" into a generic network
+    /// fault), so this variant carries what actually happened — how far the
+    /// download got, how fast it was going, and how long it was silent.
+    #[error(
+        "download stalled after {received} of {} bytes: {:.0} KiB/s over {elapsed_secs:.1}s, \
+         then no data for {stall_secs:.1}s",
+        match expected { Some(n) => n.to_string(), None => "unknown".to_string() },
+        kib_per_sec(*received, *elapsed_secs)
+    )]
+    DownloadStalled {
+        received: u64,
+        expected: Option<u64>,
+        elapsed_secs: f64,
+        stall_secs: f64,
+    },
     #[error("download exceeded the {cap}-byte size cap")]
     TooLarge { cap: u64 },
     #[error("sha256 mismatch: expected {expected}, got {actual}")]

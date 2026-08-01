@@ -8,6 +8,13 @@ publish.workspace = true
 [dependencies]
 thiserror.workspace = true
 tokio.workspace = true
+# The post-extract warm-up exec (install.rs) goes through the supervisor's
+# process driver rather than spawning a child here: repo rule — EVERY child
+# process in the codebase is spawned through openvhost-proc. That buys the
+# warm-up its own process group (so a hung probe's whole tree is killed, not
+# just the direct child) and the allow-list environment, for free. Acyclic:
+# openvhost-proc depends on no other workspace crate.
+openvhost-proc = { path = "../openvhost-proc" }
 reqwest = { version = "0.12", default-features = false, features = ["native-tls", "stream"] }
 futures-util = "0.3"
 sha2 = "0.10"
