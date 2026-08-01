@@ -1,7 +1,8 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { onMysqlInitLog, onMysqlInstallLog, openHomebrewSite } from '$lib/ipc';
+	import { onMysqlInitLog, onMysqlInstallLog, onMysqlInstallProgress } from '$lib/ipc';
+	import { subscribeDatabaseEvents } from '$lib/databases.listeners';
 	import { databasesStore as store } from '$lib/databases.shared.svelte';
 	import { servicesStore } from '$lib/services.shared.svelte';
 	import { uninstallStore } from '$lib/uninstall.shared.svelte';
@@ -94,32 +95,24 @@
 	}
 
 	onMount(() => {
-		let unlistenInstall: (() => void) | null = null;
-		let unlistenInit: (() => void) | null = null;
+		// Every subscription lives in `databases.listeners.ts`, NOT inline here:
+		// `onMount` does not run under `svelte/server`, so anything written in
+		// this closure is untestable by construction — a neuter experiment
+		// severed the progress callback and the whole suite stayed green. What
+		// remains here is only the part a DOM would be needed to test anyway:
+		// calling it, and calling its disposer.
+		let release: (() => void) | null = null;
 		let disposed = false;
 
 		void (async () => {
 			try {
-				// One channel, two operations: `uninstall_package` streams a MySQL
-				// uninstall on the SAME `mysql-install-log` event `install_mysql`
-				// uses (design D1 — one lock, one output surface), so the line is
-				// routed by whichever operation currently holds that lock.
-				// `UninstallStore.appendLog` re-checks the same condition itself,
-				// so this routing is a convenience, not the guard.
-				const stopInstall = await onMysqlInstallLog((ev) => {
-					if (uninstallStore.uninstalling !== '') uninstallStore.appendLog(ev.major, ev.line);
-					else store.appendInstallLog(ev.major, ev.line);
-				});
-				const stopInit = await onMysqlInitLog((ev) => store.appendInitLog(ev.major, ev.line));
-				// Mirrors languages/+page.svelte's onMount wiring: this page can
-				// unmount while the listener registrations are still in flight.
-				if (disposed) {
-					stopInstall();
-					stopInit();
-					return;
-				}
-				unlistenInstall = stopInstall;
-				unlistenInit = stopInit;
+				const stop = await subscribeDatabaseEvents(
+					{ onMysqlInstallLog, onMysqlInstallProgress, onMysqlInitLog },
+					store,
+					uninstallStore,
+					() => disposed
+				);
+				release = stop;
 				await store.refresh();
 			} catch (e) {
 				store.fail(e);
@@ -128,10 +121,8 @@
 
 		return () => {
 			disposed = true;
-			unlistenInstall?.();
-			unlistenInit?.();
-			unlistenInstall = null;
-			unlistenInit = null;
+			release?.();
+			release = null;
 		};
 	});
 </script>
@@ -163,73 +154,68 @@
 					{store.error}
 				</div>
 			{/if}
-			<DatabasesEmpty
-				brewFound={store.brewFound}
-				anyInstalled={store.anyInstalled}
-				brewSearched={store.env.brewSearched}
-				installing={store.installing || store.initializing}
-				onRescan={() => void onRescan()}
-				onOpenBrewSite={() => void openHomebrewSite().catch((e) => store.fail(e))}
-			/>
-			{#if store.brewFound}
-				<!-- Shown for every brewFound state (both "brew, no MySQL yet" and
-				     "brew, already installed") so it never sits next to
-				     `DatabasesEmpty`'s own no-brew copy of the same control —
-				     mirrors Languages' C2 fix exactly. -->
-				<div class="check-again">
-					<Button
-						size="sm"
-						testId="databases-check-again-header"
-						disabled={store.installing !== '' || store.initializing !== ''}
-						onclick={() => void onRescan()}
-					>
-						Check again
-					</Button>
-				</div>
-			{/if}
-			{#if store.brewFound || store.anyInstalled}
-				<div class="rowlist">
-					{#each store.env.instances as instance (instance.major)}
-						<MysqlRow
-							{instance}
-							brewFound={store.brewFound}
-							installingMajor={store.installing}
-							installLog={store.installLogFor(instance.major)}
-							installOutcome={store.installOutcome}
-							installError={instance.major === lastInstallAttempted ? store.error : ''}
-							initializingMajor={store.initializing}
-							initLog={store.initLogFor(instance.major)}
-							initFailure={store.initFailureFor(instance.major)}
-							initError={instance.major === lastInitAttempted ? store.error : ''}
-							uninstallingMajor={uninstallStore.uninstalling}
-							{catalogedMajorsList}
-							serviceState={instance.serviceId === null
-								? null
-								: (servicesStore.services.find((s) => s.id === instance.serviceId)?.state ?? null)}
-							password={store.passwords[instance.major]}
-							revealed={store.revealed[instance.major] ?? false}
-							revealing={store.revealing[instance.major] ?? false}
-							passwordError={store.passwordError[instance.major] ?? ''}
-							resetting={store.resetting[instance.major] ?? false}
-							resetOutcome={store.resetOutcome[instance.major]}
-							resetError={store.resetError[instance.major] ?? ''}
-							verifying={store.verifying[instance.major] ?? false}
-							verifyResult={store.verifyResult[instance.major]}
-							verifyError={store.verifyError[instance.major] ?? ''}
-							onInstall={(major) => void onInstall(major)}
-							onInitialize={(major) => void onInitialize(major)}
-							onUninstall={(major) => void onUninstall(major)}
-							onStart={(id) => void servicesStore.start(id)}
-							onStop={(id) => void servicesStore.stop(id)}
-							onReveal={(major) => void store.reveal(major)}
-							onHide={(major) => store.forgetPassword(major)}
-							onCopyPassword={(major) => void onCopyPassword(major)}
-							onReset={(major) => void store.resetPassword(major)}
-							onVerify={(major) => void store.verifyConnection(major)}
-						/>
-					{/each}
-				</div>
-			{/if}
+			<DatabasesEmpty anyInstalled={store.anyInstalled} />
+			<!-- Unconditional since the move off Homebrew: `DatabasesEmpty` no
+			     longer renders a rescan control of its own (it had one only inside
+			     the no-brew guide, which is gone), so this can never sit beside a
+			     duplicate. -->
+			<div class="check-again">
+				<Button
+					size="sm"
+					testId="databases-check-again-header"
+					disabled={store.installing !== '' || store.initializing !== ''}
+					onclick={() => void onRescan()}
+				>
+					Check again
+				</Button>
+			</div>
+			<!-- Also unconditional. It used to be gated on `brewFound`, which is
+			     the exact gate this slice removes: a machine with no Homebrew can
+			     now install MySQL, so hiding every row from it would hide the only
+			     control that does the job. -->
+			<div class="rowlist">
+				{#each store.env.instances as instance (instance.major)}
+					<MysqlRow
+						{instance}
+						installingMajor={store.installing}
+						installProgress={store.installProgress}
+						installTotal={store.installTotal}
+						cancellingInstall={store.cancellingInstall}
+						installOutcome={store.installOutcome}
+						installError={instance.major === lastInstallAttempted ? store.error : ''}
+						initializingMajor={store.initializing}
+						initLog={store.initLogFor(instance.major)}
+						initFailure={store.initFailureFor(instance.major)}
+						initError={instance.major === lastInitAttempted ? store.error : ''}
+						uninstallingMajor={uninstallStore.uninstalling}
+						{catalogedMajorsList}
+						serviceState={instance.serviceId === null
+							? null
+							: (servicesStore.services.find((s) => s.id === instance.serviceId)?.state ?? null)}
+						password={store.passwords[instance.major]}
+						revealed={store.revealed[instance.major] ?? false}
+						revealing={store.revealing[instance.major] ?? false}
+						passwordError={store.passwordError[instance.major] ?? ''}
+						resetting={store.resetting[instance.major] ?? false}
+						resetOutcome={store.resetOutcome[instance.major]}
+						resetError={store.resetError[instance.major] ?? ''}
+						verifying={store.verifying[instance.major] ?? false}
+						verifyResult={store.verifyResult[instance.major]}
+						verifyError={store.verifyError[instance.major] ?? ''}
+						onInstall={(major) => void onInstall(major)}
+						onCancelInstall={() => void store.cancelInstall()}
+						onInitialize={(major) => void onInitialize(major)}
+						onUninstall={(major) => void onUninstall(major)}
+						onStart={(id) => void servicesStore.start(id)}
+						onStop={(id) => void servicesStore.stop(id)}
+						onReveal={(major) => void store.reveal(major)}
+						onHide={(major) => store.forgetPassword(major)}
+						onCopyPassword={(major) => void onCopyPassword(major)}
+						onReset={(major) => void store.resetPassword(major)}
+						onVerify={(major) => void store.verifyConnection(major)}
+					/>
+				{/each}
+			</div>
 		{/if}
 	</section>
 </AppShell>

@@ -1,0 +1,62 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT name, major, version, installed_at FROM installed_packages WHERE name = ? AND major = ? AND version = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "name",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "installed_packages",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "name": "major",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "installed_packages",
+            "name": "major"
+          }
+        }
+      },
+      {
+        "name": "version",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "installed_packages",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "name": "installed_at",
+        "ordinal": 3,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "installed_packages",
+            "name": "installed_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "88753bf030a5bd0e978f999dccb170b636a48c4670b1078682237bc60dfaf503"
+}

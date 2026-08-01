@@ -20,6 +20,10 @@ use openvhost_core::{
 // home is the `site` submodule (Tasks 2-3), and it stays that way rather than
 // growing `lib.rs`'s re-export list for a type only this one command needs.
 use openvhost_core::site::scaffold::{ScaffoldOutcome, ScaffoldStep, scaffold, scaffold_path};
+// The MySQL package surface lives in its own sibling module (this file is
+// already ~8 200 lines); only the two DTOs a `MysqlInstanceDto` embeds are
+// named here.
+use crate::mysql_pkg::{MysqlPackageOfferDto, MysqlRuntimeSourceDto};
 
 use crate::stack::StackPaths;
 
@@ -2176,21 +2180,36 @@ impl From<InstallKind> for InstallKindDto {
     }
 }
 
-/// Which DIRECTION the run occupying `InstallLock`'s slot is going: putting a
-/// package on the machine or taking one off it (package-uninstall design D1 —
-/// an uninstall shares the lock, the abort handle and the live-output surface
-/// with an install).
+/// WHAT the run occupying `InstallLock`'s slot is doing: putting a package on
+/// the machine, taking one off it, or setting one up (package-uninstall design
+/// D1 — an uninstall shares the lock, the abort handle and the live-output
+/// surface with an install; a MySQL datadir initialization shares all three
+/// too).
 ///
 /// A separate value rather than more `InstallKind` variants, and rather than a
-/// boolean: `kind` answers "PHP or MySQL" and this answers "arriving or
-/// leaving". Collapsing the second question into the first would give four
-/// variants that have to be kept in sync with two orthogonal facts, and
+/// boolean: `kind` answers "PHP or MySQL" and this answers "arriving, leaving
+/// or being set up". Collapsing the second question into the first would give
+/// six variants that have to be kept in sync with two orthogonal facts, and
 /// collapsing it into a `bool` is the same shape this codebase has already had
 /// to unpick three times (a boolean where a state belongs).
+///
+/// SECURITY (audit F1, MySQL-from-tarball fix wave). [`Initialize`] exists
+/// because `initialize_mysql` used to tag its run `(Mysql, Install)` — the
+/// exact pair [`cancel_mysql_install`] fires on. The two runs differed only in
+/// their `label`, which [`InstallLock::abort_running_if`] does not and must not
+/// consult, so a `cancel_mysql_install` call — reachable from the webview even
+/// though the shipped UI offers no such button during an init — aborted a
+/// datadir initialization it was never meant to reach. **Every distinct run
+/// that can hold this slot must be distinguishable HERE, in the discriminators,
+/// not merely in prose a human reads.**
+///
+/// [`Initialize`]: PackageOperation::Initialize
+/// [`cancel_mysql_install`]: crate::mysql_pkg::cancel_mysql_install
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PackageOperation {
     Install,
     Uninstall,
+    Initialize,
 }
 
 /// Wire-safe copy of [`PackageOperation`] — same relationship
@@ -2200,6 +2219,7 @@ pub(crate) enum PackageOperation {
 pub enum PackageOperationDto {
     Install,
     Uninstall,
+    Initialize,
 }
 
 impl From<PackageOperation> for PackageOperationDto {
@@ -2207,22 +2227,47 @@ impl From<PackageOperation> for PackageOperationDto {
         match op {
             PackageOperation::Install => Self::Install,
             PackageOperation::Uninstall => Self::Uninstall,
+            PackageOperation::Initialize => Self::Initialize,
         }
     }
 }
 
+/// The `(kind, operation)` pair a MySQL **install** run is tagged with, and the
+/// same pair the Databases page's Cancel button
+/// ([`crate::mysql_pkg::cancel_mysql_install`]) fires on.
+///
+/// One definition rather than two spellings at two call sites: the button and
+/// the run it is meant to stop cannot drift apart if they read the same value,
+/// and — the audit F1 lesson — a run that is NOT an install is then visibly a
+/// *different value* rather than an identical pair wearing different prose.
+pub(crate) const MYSQL_INSTALL_RUN: (InstallKind, PackageOperation) =
+    (InstallKind::Mysql, PackageOperation::Install);
+
+/// The `(kind, operation)` pair a MySQL **datadir initialization** run is
+/// tagged with ([`initialize_mysql`]).
+///
+/// Deliberately distinct from [`MYSQL_INSTALL_RUN`]; that distinctness is the
+/// audit F1 fix, and `a_mysql_init_is_not_tagged_as_an_install` is what says so
+/// — retagging an init back to `PackageOperation::Install` fails that test
+/// rather than silently re-arming the cancel.
+pub(crate) const MYSQL_INIT_RUN: (InstallKind, PackageOperation) =
+    (InstallKind::Mysql, PackageOperation::Initialize);
+
 /// What [`pending_install`] reports: which kind of run occupies
-/// `InstallLock`'s shared slot, which direction it is going, and its label —
-/// e.g. `"8.4"` for a PHP install or uninstall, `"MySQL 8.4"` for a MySQL one,
-/// `"MySQL 8.4 initialization"` for an init run (see the `set_running` calls in
+/// `InstallLock`'s shared slot, what it is doing, and its label — e.g. `"8.4"`
+/// for a PHP install or uninstall, `"MySQL 8.4"` for a MySQL install,
+/// uninstall or initialization (see the `set_running` calls in
 /// `install_php`/`install_mysql`/`initialize_mysql`/`uninstall_package` for the
 /// exact shapes).
 ///
 /// `operation` exists because the quit dialog's copy — "… is still installing.
 /// Quitting stops it immediately and discards the download/build in progress"
 /// — is simply false for a removal, where what is at risk is a
-/// half-uninstalled formula rather than a discarded download. The Rust side
-/// reports the distinction; rendering it is the dialog's own (owed) change.
+/// half-uninstalled formula rather than a discarded download, and false again
+/// for an initialization, where nothing has been downloaded and nothing is
+/// half-removed. The label no longer carries that fact in prose (it used to
+/// read `"MySQL 8.4 initialization"`): `operation` carries it, which is the
+/// only place [`InstallLock::abort_running_if`] can see it — audit F1.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, specta::Type)]
 pub struct PendingInstallDto {
     pub kind: InstallKindDto,
@@ -2298,6 +2343,45 @@ impl InstallLock {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .map(|r| r.abort.clone())
+    }
+
+    /// Abort the in-flight run **only if** it is the given kind and direction,
+    /// reporting whether anything was actually aborted.
+    ///
+    /// The user-facing cancel (`cancel_mysql_install`) needs this rather than a
+    /// bare `running_abort_handle()`: the slot is shared across PHP, MySQL,
+    /// install and uninstall, and a Cancel button on the Databases page must
+    /// never abort somebody else's run just because it happens to hold the
+    /// lock. Check and abort happen under ONE acquisition of `running`, so the
+    /// occupant cannot change between the two — reading the kind and then
+    /// fetching the handle would be a real race, however narrow.
+    ///
+    /// Both discriminators must match — deliberately full equality on the two
+    /// enums rather than "is it MySQL", so a third `InstallKind` or a third
+    /// `PackageOperation` cannot start matching a cancel that was never meant
+    /// for it.
+    ///
+    /// **`label` is deliberately NOT consulted**, and that is why audit F1 was
+    /// a real hole rather than a cosmetic one: `initialize_mysql` used to tag
+    /// its run with the same `(Mysql, Install)` pair `cancel_mysql_install`
+    /// fires on and rely on a different label to tell them apart, so the
+    /// guarantee stated above was false for exactly one caller. Runs are now
+    /// tagged from the named [`MYSQL_INSTALL_RUN`]/[`MYSQL_INIT_RUN`] pairs;
+    /// the tests immediately following `pending_install`'s own cover every
+    /// occupant this call must refuse.
+    pub(crate) fn abort_running_if(&self, kind: InstallKind, operation: PackageOperation) -> bool {
+        let slot = self
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(running) = slot.as_ref() else {
+            return false;
+        };
+        let is_target = running.kind == kind && running.operation == operation;
+        if is_target {
+            running.abort.abort();
+        }
+        is_target
     }
 }
 
@@ -2839,7 +2923,7 @@ mod php_ipc_tests {
         for name in ["mysqld", "mysql", "mysqladmin"] {
             std::fs::write(bin_dir.join(name), b"#!/bin/sh\n").unwrap();
         }
-        let seed = openvhost_core::mysql::mysql_runtime_for_major(
+        let seed = openvhost_core::mysql::brew_mysql_runtime_for_major(
             &[prefix.path()],
             &openvhost_core::mysql::MysqlMajor::parse("8.4").unwrap(),
         )
@@ -2871,6 +2955,7 @@ mod php_ipc_tests {
                 mysqld: home.path().join("mysqld"),
                 mysql: home.path().join("mysql"),
                 mysqladmin: home.path().join("mysqladmin"),
+                source: openvhost_core::mysql::MysqlRuntimeSource::Homebrew,
             },
         ));
         assert_eq!(sup.snapshot().len(), 1);
@@ -3283,7 +3368,7 @@ mod php_ipc_tests {
         lock.set_running(
             InstallKind::Mysql,
             PackageOperation::Install,
-            "MySQL 8.4 initialization".to_string(),
+            "MySQL 8.4".to_string(),
             tokio::spawn(std::future::pending::<()>()).abort_handle(),
         );
         app.manage(lock);
@@ -3295,10 +3380,41 @@ mod php_ipc_tests {
             Some(PendingInstallDto {
                 kind: InstallKindDto::Mysql,
                 operation: PackageOperationDto::Install,
-                label: "MySQL 8.4 initialization".to_string(),
+                label: "MySQL 8.4".to_string(),
             }),
             "a MySQL occupant must be visible, correctly tagged — the whole \
              point of the generalization"
+        );
+    }
+
+    /// The quit dialog must be able to say an INITIALIZATION is in flight, not
+    /// "MySQL 8.4 is still installing" — which is what it said before audit F1,
+    /// because the fact lived in a label the dialog rendered as an install
+    /// sentence. The operation now crosses the wire as its own value.
+    #[tokio::test]
+    async fn pending_install_reports_an_initialization_as_an_initialization() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let lock = InstallLock::default();
+        let (kind, operation) = MYSQL_INIT_RUN;
+        lock.set_running(
+            kind,
+            operation,
+            "MySQL 8.4".to_string(),
+            tokio::spawn(std::future::pending::<()>()).abort_handle(),
+        );
+        app.manage(lock);
+
+        let pending = pending_install(app.state::<InstallLock>()).await.unwrap();
+
+        assert_eq!(
+            pending,
+            Some(PendingInstallDto {
+                kind: InstallKindDto::Mysql,
+                operation: PackageOperationDto::Initialize,
+                label: "MySQL 8.4".to_string(),
+            })
         );
     }
 
@@ -3312,6 +3428,110 @@ mod php_ipc_tests {
         let pending = pending_install(app.state::<InstallLock>()).await.unwrap();
 
         assert!(pending.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // abort_running_if — the user-facing cancel.
+    //
+    // AUDIT F1 + branch review: this function had NO test at all (grep
+    // returned its definition and its one call site), and the guarantee its
+    // doc comment stated — "a Cancel button on the Databases page must never
+    // abort somebody else's run" — was FALSE, because `initialize_mysql`
+    // tagged its run with the identical `(Mysql, Install)` pair
+    // `cancel_mysql_install` fires on. Two gates landed on the same function
+    // from opposite directions; these are the tests that were missing.
+    // -------------------------------------------------------------------
+
+    /// Whether a spawned run is still going. Deliberately not a bare
+    /// `is_finished()` the instant after the call: `AbortHandle::abort` is
+    /// asynchronous, so an already-aborted task would still report "alive"
+    /// for a moment and every refusal assertion below would pass vacuously.
+    /// Waiting on the handle instead means an abort that DID fire settles it
+    /// well inside the window, and a run nobody touched never settles at all.
+    async fn still_running(task: &mut tokio::task::JoinHandle<()>) -> bool {
+        tokio::time::timeout(std::time::Duration::from_millis(200), task)
+            .await
+            .is_err()
+    }
+
+    /// The positive case, stated first so the refusals below cannot pass by
+    /// aborting nothing whatsoever.
+    #[tokio::test]
+    async fn a_cancel_aborts_the_run_it_names_and_reports_that_it_did() {
+        let lock = InstallLock::default();
+        let task = tokio::spawn(std::future::pending::<()>());
+        let (kind, operation) = MYSQL_INSTALL_RUN;
+        lock.set_running(
+            kind,
+            operation,
+            "MySQL 8.4".to_string(),
+            task.abort_handle(),
+        );
+
+        assert!(
+            lock.abort_running_if(kind, operation),
+            "the cancel must report that it stopped the install it named"
+        );
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the run did not settle after the cancel fired");
+        match result {
+            Err(join_err) => assert!(join_err.is_cancelled(), "got {join_err:?}"),
+            Ok(()) => panic!("the cancel returned true but the run ran to completion"),
+        }
+    }
+
+    /// The whole point of the pair check: every occupant that is NOT the one
+    /// `cancel_mysql_install` names must survive it, and the call must say so.
+    ///
+    /// `(Mysql, Initialize)` is the audit F1 case. `(Php, Install)` differs
+    /// only in kind, `(Mysql, Uninstall)` only in operation — so a check that
+    /// dropped either discriminator fails here.
+    #[tokio::test]
+    async fn a_cancel_leaves_every_run_but_the_one_it_names_alone() {
+        let (cancel_kind, cancel_operation) = MYSQL_INSTALL_RUN;
+        for (kind, operation) in [
+            (InstallKind::Php, PackageOperation::Install),
+            (InstallKind::Php, PackageOperation::Uninstall),
+            (InstallKind::Mysql, PackageOperation::Uninstall),
+            MYSQL_INIT_RUN,
+        ] {
+            let lock = InstallLock::default();
+            let mut task = tokio::spawn(std::future::pending::<()>());
+            lock.set_running(kind, operation, "occupant".to_string(), task.abort_handle());
+
+            assert!(
+                !lock.abort_running_if(cancel_kind, cancel_operation),
+                "a MySQL-install cancel claimed it stopped a {kind:?}/{operation:?} run"
+            );
+            assert!(
+                still_running(&mut task).await,
+                "a MySQL-install cancel ABORTED a {kind:?}/{operation:?} run"
+            );
+            task.abort();
+        }
+    }
+
+    /// The audit F1 finding, stated as the value it turns on rather than only
+    /// as behaviour: an initialization and an install must not be the same
+    /// `(kind, operation)` pair. Retagging the init run back to
+    /// `PackageOperation::Install` — the shape that shipped — fails here.
+    #[test]
+    fn a_mysql_init_is_not_tagged_as_an_install() {
+        assert_ne!(
+            MYSQL_INIT_RUN, MYSQL_INSTALL_RUN,
+            "an initialization tagged as an install is cancellable by \
+             cancel_mysql_install, whatever its label says"
+        );
+        assert_eq!(MYSQL_INIT_RUN.1, PackageOperation::Initialize);
+    }
+
+    #[tokio::test]
+    async fn a_cancel_with_nothing_running_reports_that_it_stopped_nothing() {
+        let lock = InstallLock::default();
+        let (kind, operation) = MYSQL_INSTALL_RUN;
+        assert!(!lock.abort_running_if(kind, operation));
     }
 }
 
@@ -3376,6 +3596,25 @@ pub struct MysqlInstanceDto {
     pub socket_path: Option<String>,
     pub service_id: Option<String>,
     pub datadir_state: MysqlDatadirStateDto,
+    /// WHERE the installed binaries came from — OpenVHost's own package tree or
+    /// a Homebrew keg (MySQL-from-tarball design D3). `None` when nothing is
+    /// installed for this major.
+    ///
+    /// Two install sources coexist by design during the migration, and the
+    /// owner will be running a brew 8.4 and a packaged 8.4 at the same time, so
+    /// "which mysqld am I actually running" is a question this page has to be
+    /// able to answer without the user guessing from a path.
+    pub source: Option<MysqlRuntimeSourceDto>,
+    /// Whether THIS BUILD publishes a verified package for this major on THIS
+    /// host, and which version it would install.
+    ///
+    /// Distinct from `cataloged`: that says "this build manages the major",
+    /// this says "and there are bytes for your architecture". An Intel Mac gets
+    /// `Unavailable` for a fully cataloged 8.4 — Oracle's x86_64 build exists
+    /// but never went through the signature check the pin rests on — and the
+    /// row renders that as an honest absence with Homebrew as the remaining
+    /// route, never as a broken Install button.
+    pub offer: MysqlPackageOfferDto,
 }
 
 /// What the Databases page needs to decide which state to show (spec D6).
@@ -3388,17 +3627,14 @@ pub struct MysqlEnvironmentDto {
     pub instances: Vec<MysqlInstanceDto>,
 }
 
-/// Mirrors `InstallOutcomeDto` for MySQL (spec D7's `install_mysql`).
-#[derive(Debug, Clone, serde::Serialize, specta::Type)]
-#[serde(rename_all = "camelCase")]
-pub struct MysqlInstallOutcomeDto {
-    pub major: String,
-    pub exit_code: Option<i32>,
-    pub detected: bool,
-}
-
-/// One line of `brew install mysql@<major>`'s output, forwarded live while an
-/// install runs. Same shape and reasoning as [`PhpInstallLogEvent`].
+/// One line of a MySQL package operation's output, forwarded live while it
+/// runs. Same shape and reasoning as [`PhpInstallLogEvent`].
+///
+/// Since the MySQL-from-tarball slice this carries **`brew uninstall`'s output
+/// only**: installing no longer runs a child process at all, and its progress
+/// arrives as typed [`crate::mysql_pkg::MysqlInstallProgressEvent`] states
+/// instead of prose. The channel name is unchanged because the uninstall path
+/// still uses it (package-uninstall design D1 — one lock, one output surface).
 #[derive(Debug, Clone, serde::Serialize, specta::Type, tauri_specta::Event)]
 #[serde(rename_all = "camelCase")]
 pub struct MysqlInstallLogEvent {
@@ -3522,6 +3758,8 @@ fn mysql_rows(
             major: major.as_str().to_string(),
             cataloged: major.is_cataloged(),
             installed: found.is_some(),
+            source: found.map(|rt| MysqlRuntimeSourceDto::from(&rt.source)),
+            offer: crate::mysql_pkg::package_offer(major),
             path: found.map(|rt| rt.mysqld.display().to_string()),
             socket_path: registered.then(|| mp.socket.display().to_string()),
             // Same `mysql-<major>` shape `crate::stack::mysql_spec` builds —
@@ -3550,15 +3788,23 @@ fn mysql_rows(
     rows
 }
 
-/// Probe every known Homebrew prefix for installed MySQL runtimes. Mirrors
-/// `discover_all_php`'s `spawn_blocking` + `Handle::block_on` bridge exactly
-/// — see its doc comment for why.
-async fn discover_all_mysql()
--> Result<openvhost_core::Discovery<openvhost_core::mysql::MysqlRuntime>, IpcError> {
-    tauri::async_runtime::spawn_blocking(|| {
+/// Scan BOTH MySQL install sources — OpenVHost's own `<home>/packages/mysql/`
+/// tree and every known Homebrew prefix (MySQL-from-tarball design D3).
+/// Mirrors `discover_all_php`'s `spawn_blocking` + `Handle::block_on` bridge
+/// exactly — see its doc comment for why.
+///
+/// `home` is what makes the packaged tree visible; the [`PackagesRoot`] is
+/// minted from it and from nothing a caller supplies. A rescan that read only
+/// Homebrew would make a freshly installed packaged runtime vanish from the
+/// Databases page the moment the user pressed Rescan.
+async fn discover_all_mysql(
+    home: &Path,
+) -> Result<openvhost_core::Discovery<openvhost_core::mysql::MysqlRuntime>, IpcError> {
+    let packages = openvhost_core::PackagesRoot::from_home(home);
+    tauri::async_runtime::spawn_blocking(move || {
         let handle = tokio::runtime::Handle::current();
         let prefixes: Vec<&Path> = brew_prefixes();
-        openvhost_core::mysql::discover_mysql(&prefixes, &|bin| {
+        openvhost_core::mysql::discover_mysql(&packages, &prefixes, &|bin| {
             handle.block_on(openvhost_conf::probe_mysqld_version(bin))
         })
     })
@@ -3599,7 +3845,7 @@ pub(crate) async fn rescan_mysql_into_state(
         eprintln!("mysql: failed to sweep abandoned staging directories: {e}");
     }
 
-    let discovered = seeded_mysql(discover_all_mysql().await?, seed);
+    let discovered = seeded_mysql(discover_all_mysql(home).await?, seed);
     report_unidentified("MySQL", &discovered.unidentified);
     reconcile_mysql(runtimes, sup, home, discovered)
 }
@@ -4454,124 +4700,6 @@ pub async fn rescan_mysql(
     })
 }
 
-/// Install a MySQL major via Homebrew, streaming its output live, then
-/// rescan so a freshly installed version (if it appears) is picked up —
-/// mirrors `install_php` exactly, sharing `InstallLock` (decision 5) — see
-/// `InstallKind`'s doc comment for why the quit dialog's PHP-specific copy
-/// is unaffected by this.
-#[tauri::command]
-#[specta::specta]
-pub async fn install_mysql(
-    app: tauri::AppHandle,
-    major: String,
-    runtimes: tauri::State<'_, RwLock<Option<Vec<openvhost_core::mysql::MysqlRuntime>>>>,
-    paths: tauri::State<'_, Option<StackPaths>>,
-    sup: tauri::State<'_, Arc<Supervisor>>,
-    lock: tauri::State<'_, InstallLock>,
-) -> Result<MysqlInstallOutcomeDto, IpcError> {
-    // The catalogue gate, before anything else happens (decision 2).
-    let major = openvhost_core::mysql::MysqlMajor::parse(&major)?;
-
-    let Ok(_guard) = lock.inner().guard.try_lock() else {
-        return Err(IpcError::Core {
-            message: "an install is already running".into(),
-        });
-    };
-
-    let p = stack_paths(&paths)?;
-
-    let before: Vec<String> = runtimes
-        .read()
-        .map_err(|_| IpcError::Core {
-            message: "mysql runtime list is poisoned".into(),
-        })?
-        .clone()
-        .unwrap_or_default()
-        .iter()
-        .map(|rt| rt.major.as_str().to_string())
-        .collect();
-
-    if before.iter().any(|m| m == major.as_str()) {
-        return Err(IpcError::Core {
-            message: format!("MySQL {} is already installed", major.as_str()),
-        });
-    }
-
-    let brew = openvhost_core::find_brew().ok_or_else(|| IpcError::Core {
-        message: format!(
-            "Homebrew was not found. Looked for bin/brew under: {}",
-            openvhost_core::BREW_PREFIXES.join(", ")
-        ),
-    })?;
-
-    let spec = openvhost_core::mysql::mysql_brew_install_spec(&brew, &major)?;
-    let (tx, mut rx) = tokio::sync::mpsc::channel(256);
-
-    let emitter = app.clone();
-    let for_event = major.as_str().to_string();
-    let pump = tokio::spawn(async move {
-        while let Some(ev) = rx.recv().await {
-            if let openvhost_proc::TaskEvent::Line { stream, text } = ev {
-                let _ = MysqlInstallLogEvent {
-                    major: for_event.clone(),
-                    ts_ms: now_ms(),
-                    stream: match stream {
-                        openvhost_proc::TaskStream::Stdout => "stdout".into(),
-                        openvhost_proc::TaskStream::Stderr => "stderr".into(),
-                    },
-                    line: text,
-                }
-                .emit(&emitter);
-            }
-        }
-    });
-
-    let install_task = tokio::spawn(openvhost_proc::run_task(
-        openvhost_proc::default_driver(),
-        spec,
-        tx,
-    ));
-    let abort_handle = install_task.abort_handle();
-    lock.inner().set_running(
-        InstallKind::Mysql,
-        PackageOperation::Install,
-        format!("MySQL {}", major.as_str()),
-        abort_handle.clone(),
-    );
-    let _running_guard = RunningInstallGuard {
-        lock: lock.inner(),
-        abort: abort_handle,
-    };
-
-    let exit_code = match install_task.await {
-        Ok(result) => result?,
-        Err(join_err) if join_err.is_cancelled() => {
-            return Err(IpcError::Proc {
-                message: "the install was aborted because the app is quitting".into(),
-            });
-        }
-        Err(join_err) => {
-            return Err(IpcError::Proc {
-                message: format!("the install task ended unexpectedly: {join_err}"),
-            });
-        }
-    };
-    let _ = pump.await;
-
-    // See `install_php`'s matching block: `detected` is a stat of the formula
-    // directory we asked brew to create, never a version probe. THIS is the
-    // path the failure was reproduced on.
-    let seed = openvhost_core::mysql::mysql_runtime_for_major(&brew_prefixes(), &major);
-    let detected = seed.is_some();
-    rescan_mysql_into_state(runtimes.inner(), sup.inner(), &p.home, seed).await?;
-
-    Ok(MysqlInstallOutcomeDto {
-        major: major.as_str().to_string(),
-        exit_code,
-        detected,
-    })
-}
-
 /// `initialize_mysql`'s pre-flight decision: either the command should
 /// return immediately with no app/spawn involvement at all (decision 2's
 /// catalogue rejection, or an already-answered `AlreadyInitialized`/
@@ -4594,6 +4722,41 @@ enum InitializeMysqlGate {
     // `large_enum_variant` flags the size gap — box it rather than pay that
     // gap's cost on every `Early` value too.
     Proceed(Box<MysqlInitCtx>),
+}
+
+/// Tag `InstallLock`'s shared slot as a MySQL datadir initialization for
+/// `major`.
+///
+/// SECURITY (audit F1). A named function rather than a `set_running` call
+/// inlined in [`initialize_mysql`], for the same reason
+/// [`initialize_mysql_gate`] exists: the command takes an `AppHandle<Wry>`,
+/// which `tauri::test::mock_builder` cannot produce, so its body is
+/// unreachable from a test and an inlined tag is a value **no test can see**.
+/// That is precisely how the init run came to carry the same
+/// `(Mysql, Install)` pair `cancel_mysql_install` fires on, differing only in
+/// a `label` that `InstallLock::abort_running_if` neither reads nor should.
+/// Retagging an initialization as an install *here* means editing this
+/// function, and `a_running_mysql_init_survives_the_databases_page_cancel`
+/// fails.
+///
+/// BYPASSING this helper — tagging inline in `initialize_mysql`, the shape the
+/// bug originally had — is invisible to that test, because `initialize_mysql`
+/// takes `AppHandle<Wry>` and no test can reach its body. What catches it is
+/// the COMPILER: `PackageOperation::Initialize`, `MYSQL_INIT_RUN` and this
+/// function would all become dead code, and `-D warnings` turns those three
+/// lints into hard errors. That is stronger than a test — it cannot go
+/// vacuous — but it holds only while none of the three gains a second
+/// non-test user. If one ever does, this seam needs a real test instead.
+fn set_running_mysql_init(
+    lock: &InstallLock,
+    major: &openvhost_core::mysql::MysqlMajor,
+    abort: tokio::task::AbortHandle,
+) {
+    let (kind, operation) = MYSQL_INIT_RUN;
+    // The label no longer says "initialization": `operation` carries that, and
+    // the quit dialog reads it. Saying it twice is how it came to be said in
+    // the one place nothing checks.
+    lock.set_running(kind, operation, format!("MySQL {}", major.as_str()), abort);
 }
 
 /// Server-side catalogue gate (decision 2): `MysqlMajor::parse` — the
@@ -4633,7 +4796,7 @@ async fn initialize_mysql_gate(major: String, home: &Path) -> InitializeMysqlGat
         }
     }
 
-    let discovered = match discover_all_mysql().await {
+    let discovered = match discover_all_mysql(home).await {
         Ok(d) => d,
         Err(e) => return Early(Err(e)),
     };
@@ -4690,12 +4853,7 @@ pub async fn initialize_mysql(
 
     let init_task = tokio::spawn(run_mysql_init(*ctx, log));
     let abort_handle = init_task.abort_handle();
-    lock.inner().set_running(
-        InstallKind::Mysql,
-        PackageOperation::Install,
-        format!("MySQL {} initialization", major_for_upsert.as_str()),
-        abort_handle.clone(),
-    );
+    set_running_mysql_init(lock.inner(), &major_for_upsert, abort_handle.clone());
     let _running_guard = RunningInstallGuard {
         lock: lock.inner(),
         abort: abort_handle,
@@ -5245,6 +5403,7 @@ esac
             ),
             mysql: fake_cli(dir, "mysql", mysql_body),
             mysqladmin: fake_cli(dir, "mysqladmin", FAKE_MYSQLADMIN_BODY),
+            source: openvhost_core::mysql::MysqlRuntimeSource::Homebrew,
         }
     }
 
@@ -5412,6 +5571,7 @@ case "$*" in
 esac
 "#,
             ),
+            source: openvhost_core::mysql::MysqlRuntimeSource::Homebrew,
         }
     }
 
@@ -5426,6 +5586,7 @@ esac
             mysqld: PathBuf::from("/opt/homebrew/opt/mysql@8.4/bin/mysqld"),
             mysql: PathBuf::from("/opt/homebrew/opt/mysql@8.4/bin/mysql"),
             mysqladmin: PathBuf::from("/opt/homebrew/opt/mysql@8.4/bin/mysqladmin"),
+            source: openvhost_core::mysql::MysqlRuntimeSource::Homebrew,
         }];
 
         let rows = mysql_rows(home.path(), &installed);
@@ -5464,9 +5625,13 @@ esac
         for name in ["mysqld", "mysql", "mysqladmin"] {
             std::fs::write(bin_dir.join(name), b"#!/bin/sh\n").unwrap();
         }
-        let installed =
-            openvhost_core::mysql::discover_mysql(&[prefix.path()], &|_| Some("9.7".to_string()))
-                .runtimes;
+        let no_packages = tempfile::tempdir().unwrap();
+        let installed = openvhost_core::mysql::discover_mysql(
+            &openvhost_core::PackagesRoot::from_home(no_packages.path()),
+            &[prefix.path()],
+            &|_| Some("9.7".to_string()),
+        )
+        .runtimes;
         assert_eq!(installed.len(), 1);
 
         let home = tempfile::tempdir().unwrap();
@@ -5767,6 +5932,7 @@ esac
                 mysqld: home.path().join("mysqld"),
                 mysql: fake_mysql,
                 mysqladmin: home.path().join("mysqladmin"),
+                source: openvhost_core::mysql::MysqlRuntimeSource::Homebrew,
             },
         ])));
 
@@ -5843,6 +6009,7 @@ exit 1
                 mysqld: home.path().join("mysqld"),
                 mysql: fake_mysql,
                 mysqladmin: home.path().join("mysqladmin"),
+                source: openvhost_core::mysql::MysqlRuntimeSource::Homebrew,
             },
         ])));
 
@@ -5937,6 +6104,7 @@ exit 1
                 mysqld: home.path().join("mysqld"),
                 mysql: fake_mysql,
                 mysqladmin: home.path().join("mysqladmin"),
+                source: openvhost_core::mysql::MysqlRuntimeSource::Homebrew,
             },
         ])));
 
@@ -5957,6 +6125,113 @@ exit 1
             !detail.contains(password.expose()),
             "the stored password leaked into a failure detail: {detail:?}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Audit F1 (BLOCKING): `cancel_mysql_install` aborted datadir
+    // initializations.
+    //
+    // `initialize_mysql` itself is unreachable from a test (it needs an
+    // `AppHandle<Wry>`), so what is driven here is the exact function it
+    // calls to tag the shared slot — see `set_running_mysql_init`'s doc
+    // comment for why the tag lives in a function at all.
+    // ------------------------------------------------------------------
+
+    /// A mock-runtime app managing `lock`, so the real
+    /// `cancel_mysql_install` command can be invoked. It takes only a
+    /// `tauri::State` (no `AppHandle`), so unlike `initialize_mysql` it IS
+    /// reachable from a test — which is why the tag, not the cancel, is the
+    /// half that needed extracting.
+    fn app_with(lock: InstallLock) -> tauri::App<tauri::test::MockRuntime> {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(lock);
+        app
+    }
+
+    /// The blocker, end to end through both real functions: tag the slot the
+    /// way `initialize_mysql` does, then invoke the actual
+    /// `cancel_mysql_install` command. The initialization must be untouched.
+    ///
+    /// Before the fix `set_running_mysql_init`'s body was
+    /// `set_running(Mysql, Install, "MySQL 8.4 initialization", …)`, which this
+    /// cancel matched on both discriminators — the label was the only
+    /// difference and nothing compares labels.
+    #[tokio::test]
+    async fn a_running_mysql_init_survives_the_databases_page_cancel() {
+        let lock = InstallLock::default();
+        let init = tokio::spawn(std::future::pending::<()>());
+        let major = openvhost_core::mysql::MysqlMajor::parse("8.4").unwrap();
+        set_running_mysql_init(&lock, &major, init.abort_handle());
+        let app = app_with(lock);
+
+        let stopped = crate::mysql_pkg::cancel_mysql_install(app.state::<InstallLock>())
+            .await
+            .unwrap();
+
+        assert!(
+            !stopped,
+            "the Databases page's cancel claimed it stopped a datadir initialization"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), init)
+                .await
+                .is_err(),
+            "the Databases page's cancel ABORTED a datadir initialization"
+        );
+    }
+
+    /// Non-vacuity twin: the same command, against the run it IS for, must
+    /// still stop it. Without this, a `cancel_mysql_install` that aborted
+    /// nothing at all would pass the test above.
+    #[tokio::test]
+    async fn the_same_cancel_still_stops_a_real_mysql_install() {
+        let lock = InstallLock::default();
+        let install = tokio::spawn(std::future::pending::<()>());
+        let (kind, operation) = MYSQL_INSTALL_RUN;
+        lock.set_running(
+            kind,
+            operation,
+            "MySQL 8.4".to_string(),
+            install.abort_handle(),
+        );
+        let app = app_with(lock);
+
+        assert!(
+            crate::mysql_pkg::cancel_mysql_install(app.state::<InstallLock>())
+                .await
+                .unwrap()
+        );
+
+        match tokio::time::timeout(std::time::Duration::from_secs(5), install)
+            .await
+            .expect("the install did not settle after its own cancel fired")
+        {
+            Err(join_err) => assert!(join_err.is_cancelled(), "got {join_err:?}"),
+            Ok(()) => panic!("the cancel returned true but the install ran to completion"),
+        }
+    }
+
+    /// And the label an initialization carries no longer smuggles the
+    /// operation into prose — `PackageOperation` carries it, which is the only
+    /// place `abort_running_if` can see it.
+    #[tokio::test]
+    async fn an_initialization_is_tagged_as_one_and_labelled_plainly() {
+        let lock = InstallLock::default();
+        let init = tokio::spawn(std::future::pending::<()>());
+        let major = openvhost_core::mysql::MysqlMajor::parse("8.4").unwrap();
+        set_running_mysql_init(&lock, &major, init.abort_handle());
+
+        assert_eq!(
+            lock.running_install(),
+            Some((
+                InstallKind::Mysql,
+                PackageOperation::Initialize,
+                "MySQL 8.4".to_string()
+            ))
+        );
+        init.abort();
     }
 }
 

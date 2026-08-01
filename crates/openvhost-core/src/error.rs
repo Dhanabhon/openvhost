@@ -63,6 +63,35 @@ pub enum CoreError {
         /// `"a directory"`, or `"a special file"`.
         found: &'static str,
     },
+    /// This build publishes no verified package for the requested runtime on
+    /// this host (MySQL-from-tarball design D2).
+    ///
+    /// Deliberately NOT [`CoreError::Validation`]: the request is well formed
+    /// and the version may even be one this build otherwise offers — we simply
+    /// have no artifact whose provenance was checked for that architecture,
+    /// and shipping an unverified pin so the table looks symmetrical is
+    /// exactly what golden rule 6 exists to prevent. The user gets an honest
+    /// refusal instead of another architecture's binaries.
+    #[error("this build has no verified {name} {version} package for {target}")]
+    NoPackageForTarget {
+        /// The package tree name, e.g. `"mysql"`.
+        name: &'static str,
+        /// The version or series that was asked for.
+        version: String,
+        /// The target that could not be served — a
+        /// [`crate::PackageTarget::as_str`] value, or `"this host"` when this
+        /// binary was built for a platform the programme publishes nothing
+        /// for.
+        target: &'static str,
+    },
+    /// A package download, verification, extraction or install failed.
+    ///
+    /// Wraps `openvhost-pkg`'s typed error rather than flattening it to a
+    /// string: the desktop layer has to be able to tell a SHA-256 mismatch
+    /// from a network fault, because a payload that failed verification and a
+    /// download that timed out must not look the same to a user.
+    #[error("package: {0}")]
+    Package(#[from] openvhost_pkg::PkgError),
 }
 
 /// Maps the crate-shared hardened atomic write's error (`crate::atomicfile`)

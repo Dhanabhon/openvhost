@@ -23,7 +23,7 @@ import {
 } from './quit.derive';
 
 const KINDS: PendingOperationKind[] = ['php', 'mysql'];
-const OPERATIONS: PackageOperation[] = ['install', 'uninstall'];
+const OPERATIONS: PackageOperation[] = ['install', 'uninstall', 'initialize'];
 
 /** Every kind × operation combination, with the label shape that kind really
  *  carries (PHP bare, MySQL a complete phrase — see `PendingOperation`). */
@@ -55,13 +55,14 @@ describe('the label, and the word this UI supplies in front of it', () => {
 		expect(sentence).not.toContain('MySQL MySQL');
 	});
 
-	it("renders a MySQL init's own complete label verbatim", () => {
+	it("renders a MySQL init's label verbatim, without the word it no longer carries", () => {
 		const sentence = pendingOperationSentence({
 			kind: 'mysql',
-			operation: 'install',
-			label: 'MySQL 8.4 initialization'
+			operation: 'initialize',
+			label: 'MySQL 8.4'
 		});
-		expect(sentence).toContain('MySQL 8.4 initialization');
+		expect(sentence).toContain('MySQL 8.4');
+		expect(sentence).not.toContain('MySQL MySQL');
 	});
 
 	it('never re-words the label', () => {
@@ -123,13 +124,48 @@ describe('an uninstall in flight — the HIGH the branch review found', () => {
 	});
 });
 
-describe('the two operations never collapse onto one sentence', () => {
+// The security audit's F1. In Rust an initialization used to be tagged
+// `(Mysql, Install)` and told apart from a real install only by its label —
+// which `InstallLock::abort_running_if` does not compare, so
+// `cancel_mysql_install` aborted initializations. The Rust fix gave it its own
+// `PackageOperation`, and this is the sentence that arrived with it: an
+// initialization is neither an install nor a removal, and saying it "is still
+// installing" was the visible half of the same collapse.
+describe('an initialization in flight', () => {
+	const init: PendingOperation = { kind: 'mysql', operation: 'initialize', label: 'MySQL 8.4' };
+
+	it('does not borrow either of the other two sentences', () => {
+		const sentence = pendingOperationSentence(init);
+		expect(sentence).not.toContain('is still installing');
+		expect(sentence).not.toContain('is still being removed');
+		expect(sentence).not.toContain('download/build');
+		expect(sentence).not.toContain('half-removed');
+	});
+
+	it('says what is actually happening, and names it', () => {
+		const sentence = pendingOperationSentence(init);
+		expect(sentence).toContain('MySQL 8.4');
+		expect(sentence).toContain('is still being set up');
+	});
+
+	// Nothing is downloaded and no databases exist yet, so the honest cost is
+	// the wait — and the leftover staging folder really is swept at next launch
+	// (`sweep_stale_staging`), so promising that is not a guess.
+	it('is honest that nothing of the user’s is at risk, and points forward', () => {
+		const sentence = pendingOperationSentence(init);
+		expect(sentence).toContain('nothing of yours is lost');
+		expect(sentence).toContain('cleared the next time OpenVHost starts');
+		expect(sentence).toContain('Set it up again');
+	});
+});
+
+describe('the three operations never collapse onto one sentence', () => {
 	// THE distinctness sweep, pairwise over every kind × operation pair rather
-	// than "each is non-empty". A dialog that rendered one sentence for both
-	// directions — the shipped bug — passes every non-emptiness check ever
+	// than "each is non-empty". A dialog that rendered one sentence for two
+	// operations — the shipped bug — passes every non-emptiness check ever
 	// written and fails only here.
 	it('gives every pair of combinations a different sentence', () => {
-		expect(EVERY_COMBINATION.length).toBe(4);
+		expect(EVERY_COMBINATION.length).toBe(6);
 		for (let i = 0; i < EVERY_COMBINATION.length; i += 1) {
 			for (let j = i + 1; j < EVERY_COMBINATION.length; j += 1) {
 				expect(pendingOperationSentence(EVERY_COMBINATION[i])).not.toBe(
@@ -141,12 +177,15 @@ describe('the two operations never collapse onto one sentence', () => {
 
 	// The subtler collapse: two sentences that differ only because the LABEL
 	// differs, while the consequence they describe is identical. Comparing
-	// `rest` — the part after the label — is what catches it.
+	// `rest` — the part after the label — is what catches it, and it is the
+	// exact shape of the audit F1 bug one layer down (two runs distinguished
+	// only by prose).
 	it('describes a different consequence, not merely a different subject', () => {
 		for (const kind of KINDS) {
-			const install = pendingOperationCopy({ kind, operation: 'install', label: 'x' });
-			const uninstall = pendingOperationCopy({ kind, operation: 'uninstall', label: 'x' });
-			expect(install.rest).not.toBe(uninstall.rest);
+			const rests = OPERATIONS.map(
+				(operation) => pendingOperationCopy({ kind, operation, label: 'x' }).rest
+			);
+			expect(new Set(rests).size).toBe(OPERATIONS.length);
 		}
 	});
 

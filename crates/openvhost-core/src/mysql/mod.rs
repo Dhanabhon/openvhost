@@ -11,6 +11,11 @@ mod brew;
 mod datadir;
 mod discover;
 mod init;
+// MySQL from OpenVHost's own package tree — the compiled-in catalogue, the
+// wiring to `openvhost-pkg`'s verified download pipeline, and the install
+// ledger. Homebrew (`brew`, above) stays as a parallel source during the
+// migration; see `package`'s own header and design D3/D7.
+mod package;
 mod repo;
 
 pub use brew::{
@@ -20,9 +25,17 @@ pub use brew::{
 pub use datadir::{
     DatadirState, MysqlPaths, classify_datadir, mysql_data_root, mysql_paths, sweep_stale_staging,
 };
-pub use discover::{MysqlRuntime, discover_mysql, mysql_runtime_for_major};
+pub use discover::{
+    MysqlRuntime, MysqlRuntimeSource, brew_mysql_runtime_for_major, discover_mysql,
+    packaged_mysql_runtime,
+};
 pub use init::{
     MysqlInitOutcome, MysqlInitStep, RootPassword, alter_user_sql, finalize_staging,
     generate_root_password, remove_staging_dir, staging_dir_path, write_generated_config,
+};
+pub use package::{
+    InstallLedger, LedgerEntry, LedgerWrite, MYSQL_PACKAGE_NAME, MYSQL_PACKAGES,
+    MYSQL_WARMUP_BINARY, MysqlPackage, MysqlPackageInstall, PackageTarget, install_mysql_package,
+    mysql_package_for_host, mysql_package_for_target,
 };
 pub use repo::{MysqlInstance, MysqlInstanceRepo};

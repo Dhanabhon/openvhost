@@ -5,6 +5,7 @@ import type {
 	MysqlConnectionProofDto,
 	MysqlEnvironmentDto,
 	MysqlInitOutcomeDto,
+	MysqlInstallOutcomeDto,
 	MysqlInstanceDto,
 	MysqlResetOutcomeDto
 } from './ipc';
@@ -19,6 +20,37 @@ function instance(overrides: Partial<MysqlInstanceDto> = {}): MysqlInstanceDto {
 		socketPath: null,
 		serviceId: null,
 		datadirState: { kind: 'notInitialized' },
+		source: null,
+		offer: { kind: 'available', version: '8.4.11' },
+		...overrides
+	};
+}
+
+/** A promise plus its own resolver, so a test can hold an install open and
+ *  release it deliberately. Written as a helper rather than a `let release`
+ *  captured in a callback: TypeScript cannot see through the callback and
+ *  narrows the binding to `null`, which is a real readability tax on every such
+ *  test. */
+function deferred(): { promise: Promise<void>; release: () => void } {
+	let release = (): void => {};
+	const promise = new Promise<void>((r) => {
+		release = r;
+	});
+	return { promise, release };
+}
+
+/** A settled `cancelled` outcome, the shape `install()` resolves with once the
+ *  backend's abort handle has fired. */
+function cancelled(): MysqlInstallOutcomeDto {
+	return { major: '8.4', result: { kind: 'cancelled' } };
+}
+
+/** A settled install outcome. `installed` by default — the failure shapes are
+ *  named explicitly by the tests that care. */
+function installed(overrides: Partial<MysqlInstallOutcomeDto> = {}): MysqlInstallOutcomeDto {
+	return {
+		major: '8.4',
+		result: { kind: 'installed', version: '8.4.11', detected: true, ledger: { kind: 'recorded' } },
 		...overrides
 	};
 }
@@ -36,7 +68,8 @@ function api(overrides: Partial<DatabasesApi> = {}): DatabasesApi {
 	return {
 		mysqlEnvironment: vi.fn(async () => env([])),
 		rescanMysql: vi.fn(async () => env([])),
-		installMysql: vi.fn(async () => ({ major: '8.4', exitCode: 0, detected: true })),
+		installMysql: vi.fn(async () => installed()),
+		cancelMysqlInstall: vi.fn(async () => true),
 		initializeMysql: vi.fn(async () => ({ kind: 'initialized' }) as MysqlInitOutcomeDto),
 		mysqlRootPassword: vi.fn(async () => FAKE_REVEALED),
 		resetMysqlRootPassword: vi.fn(async () => ({ kind: 'reset' }) as MysqlResetOutcomeDto),
@@ -129,7 +162,7 @@ describe('DatabasesStore — install', () => {
 				installMysql: vi.fn(async () => {
 					calls += 1;
 					await new Promise((r) => setTimeout(r, 5));
-					return { major: '8.4', exitCode: 0, detected: true };
+					return installed();
 				})
 			})
 		);
@@ -176,6 +209,53 @@ describe('DatabasesStore — install', () => {
 		expect(s.installLogFor('8.5')).toEqual([]);
 	});
 
+	it('remembers the pipeline state as each event arrives', () => {
+		const s = new DatabasesStore(api());
+		s.applyInstallProgress({ kind: 'started', total: 4096 });
+		expect(s.installProgress).toEqual({ kind: 'started', total: 4096 });
+		s.applyInstallProgress({ kind: 'downloaded', bytes: 1024 });
+		expect(s.installProgress).toEqual({ kind: 'downloaded', bytes: 1024 });
+		s.applyInstallProgress({ kind: 'verified' });
+		expect(s.installProgress).toEqual({ kind: 'verified' });
+	});
+
+	// No later event repeats the declared length, so losing it here means every
+	// subsequent byte reading has no denominator and the bar cannot be drawn.
+	it('keeps the declared total across every later event', () => {
+		const s = new DatabasesStore(api());
+		s.applyInstallProgress({ kind: 'started', total: 4096 });
+		s.applyInstallProgress({ kind: 'downloaded', bytes: 1024 });
+		s.applyInstallProgress({ kind: 'verified' });
+		expect(s.installTotal).toBe(4096);
+	});
+
+	it('leaves the total null when the server declared none, rather than guessing', async () => {
+		const s = new DatabasesStore(api());
+		s.applyInstallProgress({ kind: 'started', total: null });
+		s.applyInstallProgress({ kind: 'downloaded', bytes: 1024 });
+		expect(s.installTotal).toBeNull();
+	});
+
+	// The "drop the previous verdict as the run STARTS" rule: a stale
+	// "Checksum verified" from the last attempt sitting above this attempt's
+	// first byte is exactly the confusion that rule exists to prevent.
+	it('clears the previous run\u2019s progress as a new install starts, not when it ends', async () => {
+		const s = new DatabasesStore(
+			api({
+				installMysql: vi.fn(async () => {
+					// Observed mid-flight: by the time the call is running, last
+					// attempt's state must already be gone.
+					expect(s.installProgress).toBeNull();
+					expect(s.installTotal).toBeNull();
+					return installed();
+				})
+			})
+		);
+		s.applyInstallProgress({ kind: 'started', total: 4096 });
+		s.applyInstallProgress({ kind: 'verified' });
+		await s.install('8.4');
+	});
+
 	it('caps the install log so a long install cannot grow without bound', () => {
 		const s = new DatabasesStore(api());
 		for (let i = 0; i < 500; i += 1) s.appendInstallLog('8.4', `line ${i}`);
@@ -198,6 +278,116 @@ describe('DatabasesStore — install', () => {
 		await s.install('8.4');
 		expect(calls).toBe(2);
 		expect(s.env?.instances[0].installed).toBe(true);
+	});
+});
+
+describe('DatabasesStore — cancel an install', () => {
+	// MANDATORY. Nothing bounds the download by wall clock (only a 30 s idle
+	// window) and `openvhost-pkg`'s install permit is process-wide and taken
+	// BEFORE staging, so a server dribbling one byte every 29 s holds it
+	// effectively forever and starves every later install. This is the only way
+	// a user gets that permit back.
+	it('reaches the backend while an install is in flight', async () => {
+		const cancelMysqlInstall = vi.fn(async () => true);
+		const held = deferred();
+		const s = new DatabasesStore(
+			api({
+				cancelMysqlInstall,
+				installMysql: vi.fn(async () => {
+					await held.promise;
+					return cancelled();
+				})
+			})
+		);
+		const running = s.install('8.4');
+		await s.cancelInstall();
+		expect(cancelMysqlInstall).toHaveBeenCalledTimes(1);
+		expect(s.cancellingInstall).toBe(true);
+		held.release();
+		await running;
+	});
+
+	it('does nothing when no install is running — there is no permit to reclaim', async () => {
+		const cancelMysqlInstall = vi.fn(async () => false);
+		const s = new DatabasesStore(api({ cancelMysqlInstall }));
+		await s.cancelInstall();
+		expect(cancelMysqlInstall).not.toHaveBeenCalled();
+		expect(s.cancellingInstall).toBe(false);
+	});
+
+	// A second press must not fire a second abort: by then the first one is
+	// already unwinding a staging directory.
+	it('is idempotent while the first cancel is still settling', async () => {
+		const cancelMysqlInstall = vi.fn(async () => true);
+		const held = deferred();
+		const s = new DatabasesStore(
+			api({
+				cancelMysqlInstall,
+				installMysql: vi.fn(async () => {
+					await held.promise;
+					return cancelled();
+				})
+			})
+		);
+		const running = s.install('8.4');
+		await s.cancelInstall();
+		await s.cancelInstall();
+		expect(cancelMysqlInstall).toHaveBeenCalledTimes(1);
+		held.release();
+		await running;
+	});
+
+	it('settles the row with a cancelled outcome, and leaves it installable again', async () => {
+		const s = new DatabasesStore(api({ installMysql: vi.fn(async () => cancelled()) }));
+		await s.install('8.4');
+		expect(s.installOutcome?.result).toEqual({ kind: 'cancelled' });
+		expect(s.installing).toBe('');
+		expect(s.cancellingInstall).toBe(false);
+	});
+
+	// The window is small but real: this store sets `installing` synchronously,
+	// before the backend has recorded the run's abort handle, so a very fast
+	// press can arrive at an empty slot. Leaving the button reading
+	// "Cancelling…" over a run that is still going would be a lie.
+	it('puts the button back when nothing was actually stopped', async () => {
+		const held = deferred();
+		const s = new DatabasesStore(
+			api({
+				cancelMysqlInstall: vi.fn(async () => false),
+				installMysql: vi.fn(async () => {
+					await held.promise;
+					return installed();
+				})
+			})
+		);
+		const running = s.install('8.4');
+		await s.cancelInstall();
+		expect(s.cancellingInstall).toBe(false);
+		expect(s.error).toBe('');
+		held.release();
+		await running;
+	});
+
+	it('reports a failed cancel rather than pretending it worked', async () => {
+		const held = deferred();
+		const s = new DatabasesStore(
+			api({
+				cancelMysqlInstall: vi.fn(async () => {
+					throw { kind: 'core', message: 'the install lock is poisoned' };
+				}),
+				installMysql: vi.fn(async () => {
+					await held.promise;
+					return installed();
+				})
+			})
+		);
+		const running = s.install('8.4');
+		await s.cancelInstall();
+		expect(s.error).toContain('poisoned');
+		// And the button goes back to being pressable, since nothing was stopped.
+		expect(s.cancellingInstall).toBe(false);
+		held.release();
+		await running;
 	});
 });
 

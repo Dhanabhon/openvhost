@@ -218,13 +218,48 @@ export const commands = {
 	 */
 	rescanMysql: () => typedError<MysqlEnvironmentDto, IpcError>(__TAURI_INVOKE("rescan_mysql")),
 	/**
-	 *  Install a MySQL major via Homebrew, streaming its output live, then
-	 *  rescan so a freshly installed version (if it appears) is picked up —
-	 *  mirrors `install_php` exactly, sharing `InstallLock` (decision 5) — see
-	 *  `InstallKind`'s doc comment for why the quit dialog's PHP-specific copy
-	 *  is unaffected by this.
+	 *  Install a catalogued MySQL major from the pinned upstream tarball, streaming
+	 *  [`MysqlInstallProgressEvent`] as the pipeline advances, then rescan so the
+	 *  freshly installed runtime is picked up.
+	 * 
+	 *  **No Homebrew.** `major` is parsed through the catalogue-gated
+	 *  `MysqlMajor::parse` and nothing else a caller supplies reaches the pipeline:
+	 *  the URL and the SHA-256 come only from the compiled-in catalogue, so there
+	 *  is no argument over IPC that can change which bytes are fetched or what they
+	 *  must hash to.
+	 * 
+	 *  The run is **spawned**, not awaited inline, so its `AbortHandle` can be
+	 *  recorded — that handle is what [`cancel_mysql_install`] and `perform_quit`
+	 *  both fire. Dropping the install future removes the RAII staging directory
+	 *  and releases `openvhost-pkg`'s process-wide install permit; without a handle
+	 *  there would be no way to make either happen.
 	 */
 	installMysql: (major: string) => typedError<MysqlInstallOutcomeDto, IpcError>(__TAURI_INVOKE("install_mysql", { major })),
+	/**
+	 *  Cancel an in-flight MySQL install, if one is running.
+	 * 
+	 *  Returns whether anything was actually cancelled — `false` when the slot is
+	 *  empty or holds a different run, so the UI can say "it had already finished"
+	 *  instead of implying it stopped something.
+	 * 
+	 *  **Kind- and operation-checked.** `InstallLock`'s slot is shared with
+	 *  `install_php`, `uninstall_package` and `initialize_mysql`, and a Cancel
+	 *  button on the Databases page must never abort somebody else's run just
+	 *  because it happens to hold the lock. The check and the abort happen under
+	 *  one lock acquisition (`InstallLock::abort_running_if`) so the slot cannot
+	 *  change in between.
+	 * 
+	 *  SECURITY (audit F1): that guarantee was *stated* here before it was
+	 *  *enforced*. `initialize_mysql` tagged its own run with the identical
+	 *  `(Mysql, Install)` pair — the labels differed, the discriminators did not,
+	 *  and `abort_running_if` compares only the discriminators — so this command
+	 *  aborted datadir initializations. Unreachable through the shipped UI, but
+	 *  every Tauri command is reachable from the webview, which is this project's
+	 *  standing assumption. The fix is `PackageOperation::Initialize` plus the two
+	 *  named pairs in `commands.rs`; this command fires on [`MYSQL_INSTALL_RUN`]
+	 *  and nothing else.
+	 */
+	cancelMysqlInstall: () => typedError<boolean, IpcError>(__TAURI_INVOKE("cancel_mysql_install")),
 	/**
 	 *  Drives Task 4's staged-init sequence for one MySQL major (spec D2),
 	 *  streaming log events live, exactly like `install_php`: `run_task`-style
@@ -327,6 +362,7 @@ export const commands = {
 export const events = {
 	mysqlInitLogEvent: makeEvent<MysqlInitLogEvent>("mysql-init-log-event"),
 	mysqlInstallLogEvent: makeEvent<MysqlInstallLogEvent>("mysql-install-log-event"),
+	mysqlInstallProgressEvent: makeEvent<MysqlInstallProgressEvent>("mysql-install-progress-event"),
 	phpInstallLogEvent: makeEvent<PhpInstallLogEvent>("php-install-log-event"),
 	quitRequestedEvent: makeEvent<QuitRequestedEvent>("quit-requested-event"),
 	serviceLogEvent: makeEvent<ServiceLogEvent>("service-log-event"),
@@ -707,8 +743,14 @@ export type MysqlInitOutcomeDto = { kind: "initialized" } | { kind: "alreadyInit
 export type MysqlInitStepDto = "render" | "validate" | "initialize" | "startTempServer" | "setPassword" | "shutdown" | "finalize";
 
 /**
- *  One line of `brew install mysql@<major>`'s output, forwarded live while an
- *  install runs. Same shape and reasoning as [`PhpInstallLogEvent`].
+ *  One line of a MySQL package operation's output, forwarded live while it
+ *  runs. Same shape and reasoning as [`PhpInstallLogEvent`].
+ * 
+ *  Since the MySQL-from-tarball slice this carries **`brew uninstall`'s output
+ *  only**: installing no longer runs a child process at all, and its progress
+ *  arrives as typed [`crate::mysql_pkg::MysqlInstallProgressEvent`] states
+ *  instead of prose. The channel name is unchanged because the uninstall path
+ *  still uses it (package-uninstall design D1 — one lock, one output surface).
  */
 export type MysqlInstallLogEvent = {
 	major: string,
@@ -717,12 +759,111 @@ export type MysqlInstallLogEvent = {
 	line: string,
 };
 
-/**  Mirrors `InstallOutcomeDto` for MySQL (spec D7's `install_mysql`). */
+/**
+ *  `install_mysql`'s return: the major it was for, and how it ended.
+ * 
+ *  `major` sits OUTSIDE the result union because every consumer needs it to
+ *  attribute the outcome to a row, on every branch — the same "tag it with what
+ *  it is for" fix `MysqlInitFailure` applies on the frontend to a DTO that does
+ *  not carry its own subject.
+ */
 export type MysqlInstallOutcomeDto = {
 	major: string,
-	exitCode: number | null,
-	detected: boolean,
+	result: MysqlInstallResultDto,
 };
+
+/**
+ *  One step of the install pipeline, as the user watches it — the wire copy of
+ *  `openvhost_pkg::Progress`, which carries no serde/specta derives of its own.
+ * 
+ *  Variants map 1:1 and the [`From`] impl below is exhaustive, so a sixth
+ *  pipeline stage cannot silently arrive as one of these five.
+ * 
+ *  `Verified` and `Extracted` are SEPARATE variants and must render as separate
+ *  sentences. That is the entire point: a download whose SHA-256 was checked
+ *  against the compiled-in pin and one that merely arrived are different events,
+ *  and collapsing them would make the guarantee golden rule 6 exists to provide
+ *  unobservable.
+ */
+export type MysqlInstallProgressDto = 
+/**
+ *  The transfer started; `total` is the server's declared length, absent
+ *  when it declared none.
+ */
+{ kind: "started"; total: number | null } | 
+/**  Cumulative bytes received so far. */
+{ kind: "downloaded"; bytes: number } | 
+/**
+ *  The received bytes hash to the pinned SHA-256. Nothing has parsed the
+ *  archive at this point — verification happens first, by design.
+ */
+{ kind: "verified" } | 
+/**  The archive was unpacked into a private staging directory. */
+{ kind: "extracted" } | 
+/**
+ *  The tree was renamed into place and this major's `current` link now
+ *  points at it.
+ */
+{ kind: "linked" };
+
+/**
+ *  One pipeline step, forwarded live while an install runs.
+ * 
+ *  A typed payload rather than a log line (which is what the brew era streamed
+ *  through `MysqlInstallLogEvent`): the UI has to tell `Verified` from
+ *  `Extracted` structurally, and a substring match on prose is exactly the kind
+ *  of check that passes while the two render identically.
+ */
+export type MysqlInstallProgressEvent = {
+	major: string,
+	tsMs: number,
+	progress: MysqlInstallProgressDto,
+};
+
+/**
+ *  How one `install_mysql` call ended.
+ * 
+ *  Outcome-shaped, never an `IpcError`, for the same reason
+ *  `MysqlConnectionProofDto` is: every one of these is something the row must
+ *  RENDER, with its own copy and its own next step, and a thrown error collapses
+ *  all of them into one red banner. In particular a **verification failure is
+ *  its own variant** — it is not a network error, and telling a user "network
+ *  error" when the bytes arrived intact but hashed wrong would hide the one
+ *  event the SHA-256 pin exists to catch.
+ */
+export type MysqlInstallResultDto = 
+/**
+ *  Downloaded, verified, extracted, linked. `detected` is whether the
+ *  packaged walk then found the runtime — no probe, no spawn, just a
+ *  `read_link` and three `is_file` calls, so a `false` here means the
+ *  archive genuinely did not contain the binaries this app drives.
+ */
+{ kind: "installed"; version: string; detected: boolean; ledger: MysqlLedgerWriteDto } | 
+/**
+ *  That exact version directory already exists. Refused before any network
+ *  or staging work — a fact, not a failure.
+ */
+{ kind: "alreadyInstalled"; version: string } | 
+/**
+ *  The user cancelled. Staging is an RAII temporary removed as the future
+ *  unwinds, so nothing was installed and nothing was left behind.
+ */
+{ kind: "cancelled" } | 
+/**
+ *  The bytes arrived but did not hash to the pinned value. The install
+ *  stopped **before** anything parsed the archive.
+ */
+{ kind: "verificationFailed"; expected: string; actual: string } | 
+/**
+ *  The transfer stopped making progress for longer than the idle window.
+ *  `detail` is `PkgError::DownloadStalled`'s own message, which already
+ *  names how far it got, how fast it was going and how long it was silent.
+ */
+{ kind: "stalled"; detail: string } | 
+/**  This build publishes no verified package for this major on `target`. */
+{ kind: "unavailable"; target: string } | 
+/**  Anything else, verbatim. */
+{ kind: "failed"; reason: string };
 
 /**
  *  One row on the Databases page: a catalogue major (installed or not), or
@@ -748,7 +889,58 @@ export type MysqlInstanceDto = {
 	socketPath: string | null,
 	serviceId: string | null,
 	datadirState: MysqlDatadirStateDto,
+	/**
+	 *  WHERE the installed binaries came from — OpenVHost's own package tree or
+	 *  a Homebrew keg (MySQL-from-tarball design D3). `None` when nothing is
+	 *  installed for this major.
+	 * 
+	 *  Two install sources coexist by design during the migration, and the
+	 *  owner will be running a brew 8.4 and a packaged 8.4 at the same time, so
+	 *  "which mysqld am I actually running" is a question this page has to be
+	 *  able to answer without the user guessing from a path.
+	 */
+	source: MysqlRuntimeSourceDto | null,
+	/**
+	 *  Whether THIS BUILD publishes a verified package for this major on THIS
+	 *  host, and which version it would install.
+	 * 
+	 *  Distinct from `cataloged`: that says "this build manages the major",
+	 *  this says "and there are bytes for your architecture". An Intel Mac gets
+	 *  `Unavailable` for a fully cataloged 8.4 — Oracle's x86_64 build exists
+	 *  but never went through the signature check the pin rests on — and the
+	 *  row renders that as an honest absence with Homebrew as the remaining
+	 *  route, never as a broken Install button.
+	 */
+	offer: MysqlPackageOfferDto,
 };
+
+/**
+ *  Whether the install was also recorded in `state.db`'s package ledger.
+ * 
+ *  The wire copy of `openvhost_core::mysql::LedgerWrite`, and a state rather
+ *  than a boolean for the reason its Rust counterpart is one: the failure
+ *  carries a reason worth showing. The package is installed either way — the
+ *  tree is the inventory — so a failed row costs provenance, never correctness,
+ *  and the UI says exactly that rather than calling a demonstrably installed
+ *  MySQL a failure.
+ */
+export type MysqlLedgerWriteDto = { kind: "recorded" } | { kind: "failed"; reason: string };
+
+/**
+ *  Whether this build can install a given major on THIS host, and what it
+ *  would install.
+ * 
+ *  Modelled as a state rather than a `bool` because the two answers carry
+ *  different payloads and different copy: `Available` names the exact version
+ *  the user is about to get, `Unavailable` names the target we publish nothing
+ *  for. An Intel Mac lands on the second one — Oracle does publish an x86_64
+ *  build, but its bytes never went through the signature check the catalogue's
+ *  pin rests on, so this build offers nothing for it and says so. That is an
+ *  honest **absence**, not a failure: Homebrew remains that machine's only
+ *  source today, and the row renders no Install button at all rather than one
+ *  that throws.
+ */
+export type MysqlPackageOfferDto = { kind: "available"; version: string } | { kind: "unavailable"; target: string };
 
 /**
  *  `reset_mysql_root_password`'s outcome (spec D7 + Deferred: "distinct
@@ -757,6 +949,24 @@ export type MysqlInstanceDto = {
  *  never thrown as an `IpcError`; a spawn/other failure still is.
  */
 export type MysqlResetOutcomeDto = { kind: "reset" } | { kind: "authFailed"; detail: string };
+
+/**
+ *  Where a listed runtime's binaries came from — the wire copy of
+ *  `openvhost_core::mysql::MysqlRuntimeSource`.
+ * 
+ *  **The tag is not a second spelling.** `MysqlRuntimeSource::as_str()` is the
+ *  one definition of the machine-facing word for each source (Task 2 made it so
+ *  deliberately), and [`the_wire_tag_is_mysql_runtime_source_as_str`] pins this
+ *  type's serialized `kind` to it for every variant, so the two cannot drift
+ *  into different words for the same fact.
+ * 
+ *  `Homebrew` carries **no version, on purpose.** Brew's exact version would
+ *  have to be probed — the measurement that put design D4 in the spec — and
+ *  reporting the *major* as though it were the full version would be a lie no
+ *  caller could detect. The UI renders `8.4.11` for a packaged runtime and a
+ *  bare `8.4` for a brew one, and invents nothing in between.
+ */
+export type MysqlRuntimeSourceDto = { kind: "packaged"; version: string } | { kind: "homebrew" };
 
 /**
  *  Which family of package an uninstall targets.
@@ -772,21 +982,24 @@ export type PackageKind = "php" | "mysql";
  *  Wire-safe copy of [`PackageOperation`] — same relationship
  *  [`InstallKindDto`] has to [`InstallKind`].
  */
-export type PackageOperationDto = "install" | "uninstall";
+export type PackageOperationDto = "install" | "uninstall" | "initialize";
 
 /**
  *  What [`pending_install`] reports: which kind of run occupies
- *  `InstallLock`'s shared slot, which direction it is going, and its label —
- *  e.g. `"8.4"` for a PHP install or uninstall, `"MySQL 8.4"` for a MySQL one,
- *  `"MySQL 8.4 initialization"` for an init run (see the `set_running` calls in
+ *  `InstallLock`'s shared slot, what it is doing, and its label — e.g. `"8.4"`
+ *  for a PHP install or uninstall, `"MySQL 8.4"` for a MySQL install,
+ *  uninstall or initialization (see the `set_running` calls in
  *  `install_php`/`install_mysql`/`initialize_mysql`/`uninstall_package` for the
  *  exact shapes).
  * 
  *  `operation` exists because the quit dialog's copy — "… is still installing.
  *  Quitting stops it immediately and discards the download/build in progress"
  *  — is simply false for a removal, where what is at risk is a
- *  half-uninstalled formula rather than a discarded download. The Rust side
- *  reports the distinction; rendering it is the dialog's own (owed) change.
+ *  half-uninstalled formula rather than a discarded download, and false again
+ *  for an initialization, where nothing has been downloaded and nothing is
+ *  half-removed. The label no longer carries that fact in prose (it used to
+ *  read `"MySQL 8.4 initialization"`): `operation` carries it, which is the
+ *  only place [`InstallLock::abort_running_if`] can see it — audit F1.
  */
 export type PendingInstallDto = {
 	kind: InstallKindDto,

@@ -20,6 +20,9 @@ use openvhost_core::site::apply::LISTEN_PORT;
 // `macos_stack` constructs them today), and `php_fpm_spec` below is called
 // from `commands.rs`, which is ungated too.
 use openvhost_core::mysql::{DatadirState, MysqlRuntime, classify_datadir, mysql_paths};
+// Re-exported by `openvhost-core` so this crate needs no direct `openvhost-pkg`
+// dependency. Minted only from a resolved home — never from IPC input.
+use openvhost_core::PackagesRoot;
 use openvhost_core::{InstalledRuntimes, PhpRuntime};
 use openvhost_proc::{DEFAULT_GRACE, ReadinessProbe, ServiceSpec, SpawnSpec};
 
@@ -318,17 +321,26 @@ fn discover_installed_php(
 
 /// The MySQL discovery walk `macos_stack` performs at startup, factored out
 /// exactly like [`discover_installed_php`] and for the identical reason: a
-/// test hands it a fake prefix and a fake probe instead of the machine's real
-/// Homebrew installs and a spawned `mysqld --version`. Thin pass-through to
+/// test hands it a fake home and a fake probe instead of the machine's real
+/// installs and a spawned `mysqld --version`. Thin pass-through to
 /// `openvhost_core::mysql::discover_mysql`, which has its own thorough test
-/// suite (`openvhost-core/src/mysql/discover.rs`) — not re-tested here.
+/// suite (`openvhost-core/src/mysql/discover.rs`) — its merge rules are not
+/// re-tested here.
+///
+/// `home` is what makes OpenVHost's OWN package tree
+/// (`<home>/packages/mysql/…`) visible to startup, alongside Homebrew (design
+/// D3). The [`PackagesRoot`] is minted from the resolved home and from nothing
+/// else. The tests below pin that this walk really reads that tree — a startup
+/// that saw only half the machine is exactly the C2 defect
+/// [`discover_installed_php`]'s comment records.
 #[cfg(target_os = "macos")]
 fn discover_installed_mysql(
+    home: &Path,
     prefixes: &[&Path],
     probe: &dyn Fn(&Path) -> Option<String>,
 ) -> Vec<MysqlRuntime> {
     // `.runtimes` — see `discover_installed_php`.
-    openvhost_core::mysql::discover_mysql(prefixes, probe).runtimes
+    openvhost_core::mysql::discover_mysql(&PackagesRoot::from_home(home), prefixes, probe).runtimes
 }
 
 /// Sweep abandoned MySQL staging directories (spec D2: "swept on rescan")
@@ -435,7 +447,7 @@ pub fn macos_stack() -> MacosStack {
     // function runs from `lib.rs`'s synchronous `setup()` closure, never from
     // inside a tokio worker — see the PHP walk's own comment for why that
     // distinction matters).
-    let mysql: Vec<MysqlRuntime> = discover_installed_mysql(&prefixes, &|bin| {
+    let mysql: Vec<MysqlRuntime> = discover_installed_mysql(&home, &prefixes, &|bin| {
         tauri::async_runtime::block_on(openvhost_conf::probe_mysqld_version(bin))
     });
 
@@ -517,6 +529,7 @@ mod tests {
             mysqld: PathBuf::from("/opt/homebrew/opt/mysql@8.4/bin/mysqld"),
             mysql: PathBuf::from("/opt/homebrew/opt/mysql@8.4/bin/mysql"),
             mysqladmin: PathBuf::from("/opt/homebrew/opt/mysql@8.4/bin/mysqladmin"),
+            source: openvhost_core::mysql::MysqlRuntimeSource::Homebrew,
         };
         let custom_confd = mysql_paths(home, &major).custom_confd;
         assert!(
@@ -656,6 +669,7 @@ mod tests {
                 mysqld: PathBuf::from("/opt/homebrew/opt/mysql@8.4/bin/mysqld"),
                 mysql: PathBuf::from("/opt/homebrew/opt/mysql@8.4/bin/mysql"),
                 mysqladmin: PathBuf::from("/opt/homebrew/opt/mysql@8.4/bin/mysqladmin"),
+                source: openvhost_core::mysql::MysqlRuntimeSource::Homebrew,
             },
         );
         assert_eq!(mysql.id, "mysql-8.4");
@@ -756,6 +770,131 @@ mod tests {
         assert!(
             !staging.exists(),
             "an abandoned staging directory must be swept at startup, not only on a later rescan"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // MySQL-from-tarball design D3/D5 — the seam between discovery and the
+    // spec the supervisor actually spawns.
+    //
+    // `openvhost-core` owns the merge rules and tests them thoroughly. What
+    // is provable ONLY here is that startup reads the packaged tree at all,
+    // and that the concrete path core resolved survives into
+    // `ServiceSpec::spawn.program` — the value a child is really spawned
+    // from.
+    // ------------------------------------------------------------------
+
+    /// Lay down `<home>/packages/mysql/<major>/<version>/bin/{mysqld,mysql,
+    /// mysqladmin}` with `mysqld`'s body set to `body`, exactly as an install
+    /// leaves it — so a test can tell one version's binary from another's by
+    /// CONTENT rather than by the path it was reached through.
+    #[cfg(unix)]
+    fn install_fake_mysql_package(home: &Path, major: &str, version: &str, body: &str) {
+        let bin = PackagesRoot::from_home(home)
+            .package_dir("mysql", major, version)
+            .join("bin");
+        std::fs::create_dir_all(&bin).expect("mkdir package bin");
+        for name in ["mysqld", "mysql", "mysqladmin"] {
+            let content = if name == "mysqld" {
+                body
+            } else {
+                "#!/bin/sh\n"
+            };
+            std::fs::write(bin.join(name), content.as_bytes()).expect("write fake binary");
+        }
+    }
+
+    /// Point (or re-point) `packages/mysql/<major>/current` at `target`, the
+    /// way `openvhost-pkg` does: a RELATIVE symlink naming the bare version.
+    #[cfg(unix)]
+    fn point_current(home: &Path, major: &str, target: &str) {
+        let link = PackagesRoot::from_home(home).current_link("mysql", major);
+        std::fs::create_dir_all(link.parent().expect("major dir")).expect("mkdir major");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(PathBuf::from(target), &link).expect("symlink current");
+    }
+
+    /// D3, at the startup seam: `macos_stack`'s MySQL walk must see OpenVHost's
+    /// OWN package tree, not just Homebrew. Deliberately run with NO brew
+    /// prefixes and a probe that panics if consulted — so the only way this can
+    /// pass is by reading `<home>/packages/`, and it cannot pass by falling
+    /// through to a keg on the machine running the test.
+    #[cfg(unix)]
+    #[test]
+    fn startup_discovery_finds_a_packaged_mysql_with_no_homebrew_at_all() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        install_fake_mysql_package(home, "8.4", "8.4.11", "8.4.11 server\n");
+        point_current(home, "8.4", "8.4.11");
+
+        let found = discover_installed_mysql(home, &[], &|_| {
+            panic!("startup must not probe a packaged runtime for its version")
+        });
+        assert_eq!(found.len(), 1, "got {found:?}");
+        assert_eq!(found[0].major.as_str(), "8.4");
+        assert_eq!(
+            found[0].source,
+            openvhost_core::mysql::MysqlRuntimeSource::Packaged {
+                version: "8.4.11".to_string()
+            },
+            "the row must be able to say where it came from"
+        );
+    }
+
+    /// D5, at the seam that matters: the path a supervised child is spawned
+    /// from is the concrete version directory, and a later `current` swap does
+    /// not reach back and change which engine a restart brings up.
+    ///
+    /// Asserting only that the path *looks* concrete would pass against a
+    /// `current` link that happens to resolve, so the swap is the load-bearing
+    /// half. The registered `ServiceSpec` is the record: `openvhost-proc`
+    /// spawns `spawn.program` verbatim, and a re-`Start` re-uses the stored
+    /// spec.
+    ///
+    /// VACUITY, proven by mutation: rewriting `packaged_mysql_runtime` in
+    /// `openvhost-core` to build its paths from `root.current_link(...)`
+    /// instead of `root.package_dir(...)` fails this test. Re-running with the
+    /// two shape assertions neutered leaves the swap assertion still failing,
+    /// `left: "8.4.10 server\n"` — so the swap, not the shape, is what pins
+    /// D5 here.
+    #[cfg(unix)]
+    #[test]
+    fn a_packaged_mysql_spec_spawns_a_concrete_version_and_survives_a_current_swap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        install_fake_mysql_package(home, "8.4", "8.4.10", "8.4.10 server\n");
+        install_fake_mysql_package(home, "8.4", "8.4.11", "8.4.11 server\n");
+        point_current(home, "8.4", "8.4.11");
+
+        let found = discover_installed_mysql(home, &[], &|_| None);
+        assert_eq!(found.len(), 1, "got {found:?}");
+        let spec = mysql_spec(home, &found[0]);
+
+        assert!(
+            spec.spawn
+                .program
+                .starts_with(PackagesRoot::from_home(home).package_dir("mysql", "8.4", "8.4.11")),
+            "the supervisor would spawn {:?}, which is not the concrete version directory",
+            spec.spawn.program
+        );
+        assert!(
+            !spec
+                .spawn
+                .program
+                .components()
+                .any(|c| c.as_os_str() == "current"),
+            "the supervisor would spawn through the current link: {:?}",
+            spec.spawn.program
+        );
+
+        // A `current` swap is a legitimate operation (a future upgrade flow
+        // does exactly this). It must not silently change which binary the
+        // already-registered spec starts.
+        point_current(home, "8.4", "8.4.10");
+        assert_eq!(
+            std::fs::read(&spec.spawn.program).expect("read the spawned binary"),
+            b"8.4.11 server\n",
+            "a current swap changed the engine an already-registered spec spawns"
         );
     }
 }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, expect, it } from 'vitest';
 import {
+	SHARED_DATADIR_DISCLOSURE,
 	anyMysqlInstalled,
 	catalogedMajors,
 	mysqlInitStepLabel,
@@ -21,16 +22,18 @@ function instance(overrides: Partial<MysqlInstanceDto> = {}): MysqlInstanceDto {
 		socketPath: null,
 		serviceId: null,
 		datadirState: { kind: 'notInitialized' },
+		source: null,
+		offer: { kind: 'available', version: '8.4.11' },
 		...overrides
 	};
 }
 
 function inputs(overrides: Partial<MysqlRowInputs> = {}): MysqlRowInputs {
 	return {
-		brewFound: true,
 		instance: instance(),
 		installingMajor: '',
-		installLog: [],
+		installProgress: null,
+		installTotal: null,
 		initializingMajor: '',
 		initLog: [],
 		initFailure: null,
@@ -39,19 +42,40 @@ function inputs(overrides: Partial<MysqlRowInputs> = {}): MysqlRowInputs {
 }
 
 describe('mysqlRowState', () => {
-	it('is noBrew when not installed and Homebrew is missing', () => {
-		expect(mysqlRowState(inputs({ brewFound: false }))).toEqual({ kind: 'noBrew' });
+	// Homebrew's presence is NOT an input any more. Installing MySQL is
+	// download -> verify -> extract, so a machine that has never had brew
+	// installs fine; what gates the row is whether this build publishes a
+	// checksum-verified download for this host.
+	it('is notInstalled, naming the exact version it would install, when a download exists', () => {
+		expect(mysqlRowState(inputs())).toEqual({ kind: 'notInstalled', version: '8.4.11' });
 	});
 
-	it('is notInstalled when not installed but Homebrew is present', () => {
-		expect(mysqlRowState(inputs({ brewFound: true }))).toEqual({ kind: 'notInstalled' });
+	it('is unavailable — an absence naming the target — when this host has no verified download', () => {
+		const intel = instance({ offer: { kind: 'unavailable', target: 'macos-x86_64' } });
+		expect(mysqlRowState(inputs({ instance: intel }))).toEqual({
+			kind: 'unavailable',
+			target: 'macos-x86_64'
+		});
 	});
 
-	it('is installing while this exact major is mid-brew-install, with the scoped log', () => {
-		const log = [{ id: '8.4', tsMs: 1, level: 'info' as const, line: 'Fetching...' }];
+	it('is installing while this exact major is mid-install, carrying the pipeline state', () => {
 		expect(
-			mysqlRowState(inputs({ installingMajor: '8.4', installLog: log, brewFound: false }))
-		).toEqual({ kind: 'installing', log });
+			mysqlRowState(
+				inputs({
+					installingMajor: '8.4',
+					installProgress: { kind: 'verified' },
+					installTotal: 1024
+				})
+			)
+		).toEqual({ kind: 'installing', progress: { kind: 'verified' }, total: 1024 });
+	});
+
+	it('is installing with a null progress before the first pipeline event arrives', () => {
+		expect(mysqlRowState(inputs({ installingMajor: '8.4' }))).toEqual({
+			kind: 'installing',
+			progress: null,
+			total: null
+		});
 	});
 
 	it('never shows installing for a different major', () => {
@@ -82,12 +106,26 @@ describe('mysqlRowState', () => {
 		);
 	});
 
-	it('is datadirForeign for an installed major with unexpected datadir content, regardless of brewFound', () => {
+	// The state an already-installed row must reach even where nothing could be
+	// installed: an Intel Mac with a brew-installed MySQL is a supported machine,
+	// and an absent DOWNLOAD must never hide a present RUNTIME.
+	it('never reports unavailable for a major that is already installed', () => {
+		const brewOnIntel = instance({
+			installed: true,
+			source: { kind: 'homebrew' },
+			offer: { kind: 'unavailable', target: 'macos-x86_64' },
+			datadirState: { kind: 'initialized' }
+		});
+		expect(mysqlRowState(inputs({ instance: brewOnIntel }))).toEqual({ kind: 'ready' });
+	});
+
+	it('is datadirForeign for an installed major with unexpected datadir content, whatever the offer says', () => {
 		const foreign = instance({
 			installed: true,
+			offer: { kind: 'unavailable', target: 'macos-x86_64' },
 			datadirState: { kind: 'foreign', detail: 'found unexpected.txt' }
 		});
-		expect(mysqlRowState(inputs({ instance: foreign, brewFound: false }))).toEqual({
+		expect(mysqlRowState(inputs({ instance: foreign }))).toEqual({
 			kind: 'datadirForeign',
 			detail: 'found unexpected.txt'
 		});
@@ -217,6 +255,21 @@ describe('anyMysqlInstalled', () => {
 	it('is false when nothing is installed, including an empty list', () => {
 		expect(anyMysqlInstalled([instance({ installed: false })])).toBe(false);
 		expect(anyMysqlInstalled([])).toBe(false);
+	});
+});
+
+describe('SHARED_DATADIR_DISCLOSURE', () => {
+	// The old copy described Homebrew's OWN formula creating a second datadir
+	// as a side effect of pressing Install here. That stopped being true when
+	// installing stopped going through brew, and stale copy that describes a
+	// side effect the app no longer has is worse than none.
+	it('describes the datadir being shared per version, not brew creating one', () => {
+		expect(SHARED_DATADIR_DISCLOSURE).toMatch(/shared per version/i);
+		expect(SHARED_DATADIR_DISCLOSURE).toMatch(/keeps those databases/i);
+	});
+
+	it('no longer claims a Homebrew formula creates anything', () => {
+		expect(SHARED_DATADIR_DISCLOSURE).not.toMatch(/formula/i);
 	});
 });
 

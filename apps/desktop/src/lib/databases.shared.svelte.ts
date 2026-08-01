@@ -13,6 +13,7 @@
 // class (its unit tests hand it a fake `DatabasesApi`), and this is the one
 // place that binds it to the real Tauri commands.
 import {
+	cancelMysqlInstall,
 	initializeMysql,
 	installMysql,
 	mysqlEnvironment,
@@ -27,6 +28,7 @@ export const databasesStore = new DatabasesStore({
 	mysqlEnvironment,
 	rescanMysql,
 	installMysql,
+	cancelMysqlInstall,
 	initializeMysql,
 	mysqlRootPassword,
 	resetMysqlRootPassword,

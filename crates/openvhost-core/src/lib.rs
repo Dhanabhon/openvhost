@@ -36,12 +36,21 @@ pub use logs::{
     classify_level, ensure_log_dir, read_window,
 };
 pub use mysql::{
-    DatadirState, MYSQL_CATALOGUE, MysqlInitOutcome, MysqlInitStep, MysqlInstance,
-    MysqlInstanceRepo, MysqlMajor, MysqlPaths, MysqlRuntime, RootPassword, alter_user_sql,
-    classify_datadir, discover_mysql, finalize_staging, generate_root_password, mysql_brew_formula,
-    mysql_brew_install_spec, mysql_brew_uninstall_spec, mysql_paths, mysql_runtime_for_major,
+    DatadirState, InstallLedger, LedgerEntry, LedgerWrite, MYSQL_CATALOGUE, MYSQL_PACKAGE_NAME,
+    MYSQL_PACKAGES, MYSQL_WARMUP_BINARY, MysqlInitOutcome, MysqlInitStep, MysqlInstance,
+    MysqlInstanceRepo, MysqlMajor, MysqlPackage, MysqlPackageInstall, MysqlPaths, MysqlRuntime,
+    MysqlRuntimeSource, PackageTarget, RootPassword, alter_user_sql, brew_mysql_runtime_for_major,
+    classify_datadir, discover_mysql, finalize_staging, generate_root_password,
+    install_mysql_package, mysql_brew_formula, mysql_brew_install_spec, mysql_brew_uninstall_spec,
+    mysql_package_for_host, mysql_package_for_target, mysql_paths, packaged_mysql_runtime,
     remove_staging_dir, staging_dir_path, sweep_stale_staging,
 };
+/// The package-pipeline types that appear in this crate's own public
+/// signatures, re-exported so the desktop app and the CLI need no direct
+/// dependency on `openvhost-pkg`. Nothing here lets a caller choose a URL or a
+/// hash: [`PackagesRoot`] is minted from a resolved home, and
+/// [`install_mysql_package`] takes a [`MysqlMajor`].
+pub use openvhost_pkg::{ArchiveFormat, InstalledPackage, PackagesRoot, PkgError, Progress};
 pub use php::{
     BREW_PREFIXES, CATALOGUE, PhpMajor, brew_formula, brew_install_spec, brew_uninstall_spec,
     discover_php_in, find_brew, php_runtime_for_major,

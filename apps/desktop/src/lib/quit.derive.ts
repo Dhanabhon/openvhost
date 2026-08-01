@@ -27,9 +27,17 @@
  *  `InstallKindDto`; the assignment in `+layout.svelte` pins the two together. */
 export type PendingOperationKind = 'php' | 'mysql';
 
-/** Which direction the run is going. Mirrors the generated
- *  `PackageOperationDto`. */
-export type PackageOperation = 'install' | 'uninstall';
+/** What the run is doing to the package. Mirrors the generated
+ *  `PackageOperationDto`.
+ *
+ *  `'initialize'` arrived with the security audit's F1 fix, and it is the same
+ *  bug this file already existed to kill, one layer down: a MySQL datadir
+ *  initialization used to be tagged `install` in Rust and carry the word
+ *  "initialization" in its LABEL, so the dialog narrated it "MySQL 8.4
+ *  initialization is still installing" — and, far worse, `abort_running_if`
+ *  could not tell it from a real install, because labels are prose and
+ *  discriminators are not. */
+export type PackageOperation = 'install' | 'uninstall' | 'initialize';
 
 /**
  * What `pending_install` reports, in the shape this dialog consumes.
@@ -38,8 +46,12 @@ export type PackageOperation = 'install' | 'uninstall';
  * side tracks (`InstallLock`'s `set_running` call sites): a PHP run's label is
  * the BARE major (`"8.4"`), because {@link pendingOperationCopy} supplies the
  * leading "PHP" word itself; a MySQL run's label ALREADY reads as a complete
- * phrase (`"MySQL 8.4"`, `"MySQL 8.4 initialization"`), so rendering it verbatim
- * is correct and prepending another "MySQL" would double it.
+ * phrase (`"MySQL 8.4"`), so rendering it verbatim is correct and prepending
+ * another "MySQL" would double it.
+ *
+ * What a label no longer carries is the OPERATION. An init run used to be
+ * labelled `"MySQL 8.4 initialization"`; that fact now lives in
+ * {@link PackageOperation}, where the Rust cancel check can see it too.
  */
 export interface PendingOperation {
 	kind: PendingOperationKind;
@@ -82,10 +94,13 @@ function operationLead(kind: PendingOperationKind): string {
 }
 
 /**
- * What quitting costs, per direction. Exhaustive over {@link PackageOperation},
- * no `default` fallback — a third operation must fail to compile rather than
- * inherit a sentence written about a different one, which is precisely how the
- * uninstall case shipped narrated as an install.
+ * What quitting costs, per operation. Exhaustive over
+ * {@link PackageOperation}, no `default` fallback — a further operation must
+ * fail to compile rather than inherit a sentence written about a different one,
+ * which is precisely how the uninstall case shipped narrated as an install.
+ * That exhaustiveness is what forced this arm to exist when Rust gained
+ * `PackageOperation::Initialize`, and it is the point of the pattern rather
+ * than a chore it imposes.
  *
  * The install wording is unchanged, deliberately: it was correct, and the
  * failure being fixed was that it was the ONLY wording.
@@ -111,6 +126,19 @@ function operationRest(operation: PackageOperation): string {
 				' is still being removed. Quitting stops Homebrew part-way, which can leave the package ' +
 				'half-removed — still listed by brew while some of its files are already gone. Check it ' +
 				'with brew after reopening OpenVHost, and uninstall it again if it is still listed.'
+			);
+		// Nothing is downloaded and nothing is removed, so both sentences above
+		// would be false here. What IS true: the new data directory is built
+		// under a staging name and only moved into place on success, so quitting
+		// mid-way leaves no usable database and no half-written one either — the
+		// leftover staging folder is swept at the next launch
+		// (`sweep_stale_staging`). There are no databases yet, so there is
+		// nothing of the user's to lose; the cost is the wait.
+		case 'initialize':
+			return (
+				' is still being set up. Quitting stops it before the database is usable — there is ' +
+				'nothing in it yet, so nothing of yours is lost, and the partly written folder it ' +
+				'leaves behind is cleared the next time OpenVHost starts. Set it up again then.'
 			);
 		default: {
 			const unreachable: never = operation;

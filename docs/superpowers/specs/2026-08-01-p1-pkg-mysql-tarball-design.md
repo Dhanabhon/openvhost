@@ -1,7 +1,7 @@
 # Slice 1 — MySQL from the upstream tarball, off Homebrew
 
 - **Date:** 2026-08-01
-- **Status:** Written ahead of Slice 0's payload proof. **Every fact Slice 0 is measuring is marked `[S0]` and is a blank, not an assumption.** The design shape does not depend on those answers; the catalogue entry and two limits do.
+- **Status:** Every `[S0]` blank is now filled with a measured value — Slice 0 proved the payload, Slice 1 (PR #43) made the extractor accept it, and the provenance chain was closed on 2026-08-01. **Ready to build.**
 - **Owner decision, 2026-08-01:** move OpenVHost off Homebrew entirely and adopt ServBay's model — our own package tree, binaries fetched at runtime and verified. Raised cost: we become the trusted publisher, with build, signing and hosting obligations. Owner chose it with that in front of them.
 - **Programme:** slice 1 of 7. Slice 0 = prove the payload · **1 = MySQL from tarball** · 2 = uninstall + `current` + installed list · 3 = MariaDB · 4 = nginx (first own build) · 5 = PHP · 6 = remote manifests + signing.
 
@@ -25,7 +25,25 @@ This slice is the first consumer. It adds no new install machinery; if it needs 
 
 Pinned `(version, url, sha256, format)`, mirroring how `MYSQL_CATALOGUE: [&str; 1] = ["8.4"]` already works. The public `openvhost/manifests` repo is slice 6, deliberately last: its schema should describe four packages that work rather than predict them.
 
-`[S0]` The exact version, URL and SHA-256 come from Slice 0. Also from Slice 0: whether upstream publishes a `.asc` for the **macOS** artifact specifically — we compute our own SHA-256 either way, but the upstream signature is the trust anchor for that computation and its absence is worth recording.
+**The catalogue entry, and its provenance — verified 2026-08-01, not assumed:**
+
+```
+version  8.4.11
+url      https://cdn.mysql.com/Downloads/MySQL-8.4/mysql-8.4.11-macos15-arm64.tar.gz
+sha256   b96e00493bc3499b9ffd7f08d65c5d64933af0383a8287d9873b64f94c2d6009
+size     167,977,240 bytes  (installs to 639 MB)
+```
+
+Oracle publishes **MD5 and a detached PGP signature, no SHA-256 sidecar**, so our pin is computed by us — which is exactly why the signature had to be checked before it could mean anything. It was:
+
+- key `BCA43417C3B485DD128EC6D4B7B3B788A8D3785C` (MySQL Release Engineering), created 2023-10-23, **valid to 2027-10-23**;
+- its fingerprint **cross-checked against `dev.mysql.com/doc`** — a different host from the `repo.mysql.com` the key was fetched from;
+- `gpg --verify` → **Good signature** on the artifact;
+- the signed bytes hash to exactly the SHA-256 above.
+
+So the pin certifies *"the bytes Oracle published"*, not *"the bytes someone downloaded"*. **Re-run that check whenever the catalogue entry changes** — a pin nobody traced back to a signature is the failure golden rule 6 exists to prevent.
+
+Trap for a future entry: the OS tag is **version-coupled** (`macos15` for 8.4.10 and 8.4.11; `macos14` 404s). A manifest cannot template it from the MySQL version — pin it per release.
 
 ### D3 — Discovery reads our tree *and* Homebrew, in that order
 
@@ -43,7 +61,7 @@ The research established that this cost **follows us into the new model** — th
 
 We installed it, so we know what it is: `state.db` records the exact version at install time. Probing survives **only** for discovering Homebrew runtimes we did not install.
 
-`[S0]` Whether a package installed through our own pipeline pays the same first-exec cost, and whether it lands before or after the atomic rename. If it recurs *after* the rename, every install pays it twice and we should do one deliberate warm-up exec at the end of install, where the user already expects to wait.
+**Measured, and already solved by Slice 1.** The cost is real but far smaller than the Homebrew figure that started this: **809 ms cold, 16 ms warm** — not 11.53 s. And the signature validation **survives `rename(2)`**, so `install_package`'s staged warm-up (`with_warmup_binary`) pre-pays it: the `Extracted → Linked` window absorbs ~810 ms and the user's first Start is warm. Pass `bin/mysqld` as the warm-up binary — **never `bin/mysqld_safe`**, which carries a hardcoded `/usr/local/mysql/data` and genuinely tries to start a server.
 
 ### D5 — Spawn a resolved concrete path, never `current`
 
@@ -57,7 +75,15 @@ The datadir stays at `<home>/data/mysql/<major>/`, keyed by **major**, not by wh
 
 That is deliberate: a user who has an initialized 8.4 datadir from the brew era and then gets the tarball-installed 8.4 **keeps their databases**. Same major, same MySQL, same on-disk format.
 
-`[S0]` One thing to confirm rather than assume: the upstream tarball's exact minor versus the brew-installed `8.4.11`. MySQL will not open a datadir initialized by a *newer* server. If the pinned tarball is older than 8.4.11, pin forward instead — and the catalogue must never move a user's server backwards.
+**Confirmed safe: the upstream tarball is 8.4.11, the same minor Homebrew installs today.** A datadir initialized under the brew build opens under this one. The rule still stands for every future entry — MySQL will not open a datadir initialized by a *newer* server, so **the catalogue must never move a user's server backwards**.
+
+### D3b — One row per major, and what that costs (decided 2026-08-01)
+
+Discovery **merges per major**: with both a packaged and a Homebrew 8.4 present, the list holds **one** 8.4 runtime — ours — and the Homebrew one is not in it. That is D3's "ours wins" made concrete, and it is the shape the UI's one-row-per-major model needs.
+
+The live proof surfaced a consequence I had not thought through when writing D3, and it is accepted deliberately rather than by accident: **once a packaged 8.4 lands, the user can no longer uninstall their Homebrew 8.4 from inside the app.** The row is badged packaged, and a packaged runtime offers no Uninstall — `openvhost-pkg` has no uninstall counterpart at all yet. `MysqlRow` renders an explicit note so it reads as a known limit rather than a missing button, and `brew uninstall mysql@8.4` still works.
+
+The alternative — two rows for one major — buys that one affordance at the cost of the row model, on every page, permanently. Not worth it. The real fix is the slice that gives `openvhost-pkg` an uninstall.
 
 ### D7 — Never touch a Homebrew keg
 
@@ -73,20 +99,21 @@ Two install sources coexisting is the *intended* state during a migration, not a
 - **Retiring the Homebrew paths** — slice 7, after every service has a new route.
 - **`.tar.zst` / `.tar.xz`** — only needed once we build our own artifacts.
 
-## Facts Slice 0 is measuring, and what each one changes
+## What Slice 0 and Slice 1 settled
 
-These are blanks in this spec, not assumptions:
+Every one of these was an open question when this spec was written. All are now measured; none blocks.
 
-| `[S0]` | If it goes the wrong way |
+| Question | Answer |
 |---|---|
-| Does the extractor accept a real MySQL tarball at all? | The reserved-name rule (`aux`/`con`/`nul`/`com0-9`/`lpt0-9`) rejects the **entire archive** if any path component's stem matches — plausible inside `mysql-test/`. A relaxation was part of the P0-6 APPROVE, so it is a security-auditor conversation, not a code change. **This can block the whole programme.** |
-| `MAX_ENTRIES` 100 000 · `MAX_REL_BYTES` 240 · `MAX_DEPTH` 32 | A DB tarball with a large test suite may exceed these. Raising a limit is a design change with an audit trail, not a tweak. |
-| `strip_single_root` | **The only silent failure in the set.** It strips only when the root is an explicit directory entry; otherwise the install "succeeds" one level too deep and discovery finds no `bin/mysqld` — indistinguishable from D4's symptom, and it would send a diagnosis straight down the wrong path. |
-| Symlinks with `..` targets | Rejected today; DB tarballs contain symlinks. |
-| 900 s total download timeout vs ~200 MB | Caps a 200 MB download at roughly 2 Mbit/s. |
-| `otool -L bin/mysqld` | Tells us whether upstream's tarball is genuinely relocatable or expects a fixed prefix. |
-| `codesign -dv` | An unsigned arm64 binary is **killed at exec**. Adhoc is fine; unsigned is not. |
-| First-exec timing | D4. |
+| Does the extractor accept a real MySQL tarball? | **It did not** — three blockers. All fixed in PR #43, and the archive now installs in 5.19 s. |
+| The reserved-name rule (`aux`/`con`/`nul`/…) | **Never fired.** The premise was wrong: this tarball ships no `mysql-test/`. The rule is untouched. |
+| `MAX_ENTRIES` · `MAX_REL_BYTES` · `MAX_DEPTH` | **375 / 80 / 6** against 100 000 / 240 / 32. Untouched. |
+| `strip_single_root` — the silent one | Was real: no explicit root header, so the install returned `Ok` one level too deep. Fixed, and its test asserts on the **tree**, never on `Result`. |
+| Symlinks with `..` targets | 22 of 34, and **load-bearing** — dropping them gives a `mysqld` that SIGABRTs in dyld. The rule now bounds `..` by the link's own depth instead of banning it. |
+| The 900 s download timeout | Was a **~1.5 Mbit/s floor** wearing a network error's clothes. Replaced with a 30 s idle window. |
+| `otool -L bin/mysqld` | Only system paths and `@loader_path`. **Genuinely relocatable.** |
+| `codesign -dv` | **Developer ID (Oracle America), hardened runtime** — and still valid after our extraction. |
+| First-exec timing | 809 ms cold → 16 ms warm; pre-payable in staging. See D4. |
 
 ## Testing
 

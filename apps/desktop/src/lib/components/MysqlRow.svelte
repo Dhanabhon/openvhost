@@ -3,12 +3,13 @@
 	import type {
 		MysqlConnectionProofDto,
 		MysqlInstallOutcomeDto,
+		MysqlInstallProgressDto,
 		MysqlInstanceDto,
 		MysqlResetOutcomeDto,
 		ServiceStatus
 	} from '$lib/ipc';
 	import {
-		HOMEBREW_DATADIR_DISCLOSURE,
+		SHARED_DATADIR_DISCLOSURE,
 		mysqlInitStepLabel,
 		mysqlPortConflictHint,
 		mysqlRowState,
@@ -16,6 +17,17 @@
 		type MysqlInitFailure,
 		type UiLog
 	} from '$lib/databases.derive';
+	import {
+		PACKAGED_UNINSTALL_UNAVAILABLE,
+		mysqlCancelLabel,
+		mysqlInstallProgressLabel,
+		mysqlInstallProgressPercent,
+		mysqlInstallResultNotice,
+		mysqlLedgerNotice,
+		mysqlPackageOfferNotice,
+		mysqlSourceBadge,
+		mysqlUninstallOffered
+	} from '$lib/mysql-install.derive';
 	import { uninstallActionDisabled, uninstallConfirmLabel } from '$lib/uninstall.derive';
 	import Button from './Button.svelte';
 	import LogPane from './LogPane.svelte';
@@ -24,9 +36,10 @@
 
 	let {
 		instance,
-		brewFound,
 		installingMajor,
-		installLog,
+		installProgress,
+		installTotal,
+		cancellingInstall = false,
 		installOutcome,
 		installError = '',
 		initializingMajor,
@@ -47,6 +60,7 @@
 		verifyResult,
 		verifyError,
 		onInstall,
+		onCancelInstall,
 		onInitialize,
 		onUninstall,
 		onStart,
@@ -58,11 +72,18 @@
 		onVerify
 	}: {
 		instance: MysqlInstanceDto;
-		brewFound: boolean;
 		/** The major installing anywhere on the page, '' when idle — shared
 		 *  page-wide (one `InstallLock`), same as `LanguagesStore.installing`. */
 		installingMajor: string;
-		installLog: UiLog[];
+		/** The last install-pipeline state, page-wide. Replaces the brew era's
+		 *  streamed stdout: an install is five typed states now, and `verified`
+		 *  vs `extracted` is the distinction the whole checksum guarantee rests
+		 *  on being visible. */
+		installProgress: MysqlInstallProgressDto | null;
+		/** The declared download length, from the `started` event. */
+		installTotal: number | null;
+		/** Whether a cancel has been asked for and not yet settled. */
+		cancellingInstall?: boolean;
 		/** The last `install_mysql` outcome, whichever major it was for —
 		 *  `MysqlInstallOutcomeDto` carries its own `major`, so this row only
 		 *  renders it once it matches `instance.major` (mirrors
@@ -118,6 +139,10 @@
 		verifyResult?: MysqlConnectionProofDto;
 		verifyError: string;
 		onInstall: (major: string) => void;
+		/** Aborts the install in flight. MANDATORY affordance: the download has
+		 *  no wall-clock bound and the package pipeline's install permit is
+		 *  process-wide, so an install nobody can stop starves every later one. */
+		onCancelInstall: () => void;
 		onInitialize: (major: string) => void;
 		/** Opens the uninstall confirmation (package-uninstall design D6).
 		 *  Uninstalls nothing on its own: the plan behind the dialog is a pure
@@ -160,16 +185,6 @@
 	const rowInstallOutcome = $derived(
 		installOutcome !== null && installOutcome.major === instance.major ? installOutcome : null
 	);
-	/** Brew exited 0 but the version was not found afterwards — same case
-	 *  `LanguageRow.svelte`'s `notFound` covers, for the identical reason. */
-	const installNotFound = $derived(
-		rowInstallOutcome !== null && rowInstallOutcome.exitCode === 0 && !rowInstallOutcome.detected
-	);
-	/** A non-zero exit (or `null`, killed by a signal) is an OUTCOME to render,
-	 *  never a thrown `error` — same C1 audit finding `LanguageRow.svelte`
-	 *  fixed for PHP. */
-	const rowInstallFailed = $derived(rowInstallOutcome !== null && rowInstallOutcome.exitCode !== 0);
-
 	const portConflictHint = $derived(
 		serviceState?.kind === 'failed' ? mysqlPortConflictHint(serviceState.stderrTail) : null
 	);
@@ -181,14 +196,33 @@
 	// which is real. Renaming the variable is the whole fix.
 	const rowState = $derived(
 		mysqlRowState({
-			brewFound,
 			instance,
 			installingMajor,
-			installLog,
+			installProgress,
+			installTotal,
 			initializingMajor,
 			initLog,
 			initFailure
 		})
+	);
+
+	/** Which install put these binaries here — `null` when nothing is installed
+	 *  (design D3: two sources coexist during the migration, and "which mysqld
+	 *  am I actually running" must not be a guess). */
+	const sourceBadge = $derived(mysqlSourceBadge(instance.source));
+	/** MANDATORY absence: `openvhost-pkg` has no uninstall counterpart at all
+	 *  yet, so the brew-driven dialog could only fail on a packaged runtime. */
+	const canUninstall = $derived(mysqlUninstallOffered(instance.source));
+	const offerNotice = $derived(mysqlPackageOfferNotice(instance.offer));
+	const outcomeNotice = $derived(
+		rowInstallOutcome === null ? null : mysqlInstallResultNotice(rowInstallOutcome.result)
+	);
+	/** A ledger row that could not be written — provenance lost, never the
+	 *  install. `null` on every other outcome and on the happy path. */
+	const ledgerNotice = $derived(
+		rowInstallOutcome !== null && rowInstallOutcome.result.kind === 'installed'
+			? mysqlLedgerNotice(rowInstallOutcome.result.ledger)
+			: null
 	);
 </script>
 
@@ -205,6 +239,16 @@
 		<div class="primary">
 			<span class="version">MySQL {instance.major}</span>
 			<span class="badge unmanaged">Not managed</span>
+			<!-- Informational, like the pill beside it: WHERE this unmanaged
+			     runtime came from is exactly the question a migration raises, and
+			     answering it offers no action. -->
+			{#if sourceBadge}
+				<span
+					class="badge source source-{instance.source?.kind}"
+					title={sourceBadge.title}
+					data-testid="mysql-source-{instance.major}">{sourceBadge.label}</span
+				>
+			{/if}
 		</div>
 		<div class="pill-cell">
 			{#if serviceState}
@@ -222,6 +266,18 @@
 	<div class="row mysql-row" data-testid="mysql-row-{instance.major}">
 		<div class="primary">
 			<span class="version">MySQL {instance.major}</span>
+			<!-- WHICH INSTALL these binaries came from (design D3). Absent when
+			     nothing is installed. The Homebrew badge deliberately carries no
+			     version: brew's exact patch release is only knowable by executing
+			     a 55 MB mysqld, and printing the major where a full version
+			     belongs would be a lie nobody could detect. -->
+			{#if sourceBadge}
+				<span
+					class="badge source source-{instance.source?.kind}"
+					title={sourceBadge.title}
+					data-testid="mysql-source-{instance.major}">{sourceBadge.label}</span
+				>
+			{/if}
 		</div>
 		<div class="pill-cell">
 			{#if serviceState}
@@ -229,15 +285,17 @@
 			{/if}
 		</div>
 		<div class="row-actions">
-			{#if rowState.kind === 'noBrew' || rowState.kind === 'datadirForeign'}
-				<!-- Nothing to offer: no brew to install through, or a foreign
-				     datadir this app will not touch. -->
+			{#if rowState.kind === 'unavailable' || rowState.kind === 'datadirForeign'}
+				<!-- Nothing to offer: no checksum-verified download for this host,
+				     or a foreign datadir this app will not touch. The absence is
+				     explained below the row, never rendered as a button that
+				     throws. -->
 			{:else if rowState.kind === 'notInstalled'}
 				<Button
 					variant="primary"
 					size="sm"
 					testId="install-{instance.major}"
-					ariaLabel="Install MySQL {instance.major}"
+					ariaLabel="Install MySQL {rowState.version}"
 					disabled={anyInstallOrInitRunning}
 					onclick={() => onInstall(instance.major)}
 				>
@@ -245,6 +303,21 @@
 				</Button>
 			{:else if rowState.kind === 'installing'}
 				<Button variant="primary" size="sm" disabled onclick={() => {}}>Installing…</Button>
+				<!-- MANDATORY. Nothing bounds the download by wall clock — only a
+				     30 s idle window — and the package pipeline's install permit is
+				     process-wide and taken BEFORE staging, so a server dribbling one
+				     byte every 29 s would hold it forever and starve every later
+				     install. This button is the only way to get it back. -->
+				<Button
+					variant="quiet"
+					size="sm"
+					testId="cancel-install-{instance.major}"
+					ariaLabel="Cancel installing MySQL {instance.major}"
+					disabled={cancellingInstall}
+					onclick={() => onCancelInstall()}
+				>
+					{mysqlCancelLabel(cancellingInstall)}
+				</Button>
 			{:else if rowState.kind === 'installedNotInitialized' || rowState.kind === 'initFailed'}
 				<Button
 					variant="primary"
@@ -291,14 +364,19 @@
 			{:else}
 				{unreachableMysqlRowState(rowState)}
 			{/if}
-			{#if instance.installed}
+			{#if instance.installed && canUninstall}
 				<!-- Last in the row, after whatever the lifecycle offers: the rare,
-				     destructive control. Present for EVERY installed managed major,
+				     destructive control. Present for every installed HOMEBREW major,
 				     including one whose datadir is foreign (design D6/D2 — removing
 				     the engine never touches a datadir, so a datadir this app
 				     refuses to adopt is no reason to trap its binaries either) and
 				     one that was never initialized. Opens a confirmation; it
-				     uninstalls nothing by itself. -->
+				     uninstalls nothing by itself.
+
+				     ABSENT for a PACKAGED runtime, deliberately: the uninstall
+				     slice drives `brew uninstall`, and `openvhost-pkg` has no
+				     uninstall counterpart at all yet. An affordance that is present
+				     and fails is worse than one that is absent. -->
 				<Button
 					variant="quiet"
 					size="sm"
@@ -313,36 +391,82 @@
 		</div>
 	</div>
 
-	{#if rowState.kind === 'noBrew'}
-		<p class="note" data-testid="mysql-no-brew-note-{instance.major}">
-			Install Homebrew above to continue.
+	{#if rowState.kind === 'unavailable'}
+		<!-- An honest ABSENCE, not an error (design D2): Oracle publishes an
+		     x86_64 build, but its bytes never went through the signature check
+		     the catalogue's pin rests on, so this build offers nothing for it and
+		     says exactly that — with the route that does still work. -->
+		<p class="note warn" data-testid="mysql-unavailable-{instance.major}">
+			<strong>{offerNotice.title}.</strong>
+			{offerNotice.body}
 		</p>
 	{:else if rowState.kind === 'notInstalled'}
-		<p class="note" data-testid="disclosure-{instance.major}">{HOMEBREW_DATADIR_DISCLOSURE}</p>
+		<p class="note" data-testid="offer-{instance.major}">
+			<strong>{offerNotice.title}.</strong>
+			{offerNotice.body}
+		</p>
+		<p class="note" data-testid="disclosure-{instance.major}">{SHARED_DATADIR_DISCLOSURE}</p>
 		{#if installError !== ''}
 			<p class="error" role="alert" style="white-space: pre-wrap">{installError}</p>
 		{/if}
-		{#if rowInstallFailed}
-			<p class="error" role="alert">
-				{#if rowInstallOutcome?.exitCode !== null && rowInstallOutcome?.exitCode !== undefined}
-					brew exited with code {rowInstallOutcome.exitCode} while installing MySQL {instance.major}.
-				{:else}
-					brew was killed before installing MySQL {instance.major} finished.
-				{/if}
-				Check the log above for what brew actually did.
-			</p>
-		{:else if installNotFound}
-			<p class="note warn" role="alert">
-				Homebrew reported success installing MySQL {instance.major}, but the version was not found
-				afterwards. Check the log above for what brew actually did.
+		{#if outcomeNotice}
+			<p
+				class={outcomeNotice.tone === 'error' ? 'error' : `note ${outcomeNotice.tone}`}
+				role={outcomeNotice.tone === 'ok' ? undefined : 'alert'}
+				data-testid="install-outcome-{instance.major}"
+			>
+				<strong>{outcomeNotice.title}.</strong>
+				{outcomeNotice.body}
 			</p>
 		{/if}
 	{:else if rowState.kind === 'installing'}
-		<p class="note" data-testid="disclosure-{instance.major}">{HOMEBREW_DATADIR_DISCLOSURE}</p>
-		{#if rowState.log.length > 0}
-			<LogPane logs={rowState.log} />
+		<!-- The pipeline the user watches. `verified` and `extracted` are
+		     SEPARATE sentences on purpose: a download that was checked against
+		     the built-in SHA-256 and one that merely arrived must never look
+		     identical, which is the whole of what golden rule 6 buys. -->
+		<p class="note progress" data-testid="install-progress-{instance.major}">
+			{rowState.progress === null
+				? 'Preparing the download…'
+				: mysqlInstallProgressLabel(rowState.progress, rowState.total)}
+		</p>
+		{#if rowState.progress !== null && mysqlInstallProgressPercent(rowState.progress, rowState.total) !== null}
+			<div
+				class="bar"
+				role="progressbar"
+				aria-label="Downloading MySQL {instance.major}"
+				aria-valuemin={0}
+				aria-valuemax={100}
+				aria-valuenow={mysqlInstallProgressPercent(rowState.progress, rowState.total)}
+				data-testid="install-bar-{instance.major}"
+			>
+				<span
+					class="fill"
+					style="width: {mysqlInstallProgressPercent(rowState.progress, rowState.total)}%"
+				></span>
+			</div>
 		{/if}
 	{:else if rowState.kind === 'installedNotInitialized'}
+		<!-- The state a successful install lands in, so this is where its own
+		     outcome is read back: the row stopped being `notInstalled` the moment
+		     the rescan saw the new tree. -->
+		{#if outcomeNotice}
+			<p
+				class={outcomeNotice.tone === 'error' ? 'error' : `note ${outcomeNotice.tone}`}
+				role={outcomeNotice.tone === 'ok' ? undefined : 'alert'}
+				data-testid="install-outcome-{instance.major}"
+			>
+				<strong>{outcomeNotice.title}.</strong>
+				{outcomeNotice.body}
+			</p>
+		{/if}
+		{#if ledgerNotice}
+			<!-- Provenance lost, never the install: the packages tree IS the
+			     inventory, so a missing row costs the recorded install date and
+			     nothing else. Calling a demonstrably installed MySQL a failure
+			     would be the bigger lie. -->
+			<p class="note warn" data-testid="ledger-warning-{instance.major}">{ledgerNotice}</p>
+		{/if}
+		<p class="note" data-testid="disclosure-{instance.major}">{SHARED_DATADIR_DISCLOSURE}</p>
 		{#if initError !== ''}
 			<p class="error" role="alert" style="white-space: pre-wrap">{initError}</p>
 		{/if}
@@ -416,6 +540,14 @@
 	{:else}
 		{unreachableMysqlRowState(rowState)}
 	{/if}
+
+	{#if instance.installed && !canUninstall}
+		<!-- Rendered once, after whatever the lifecycle had to say, so the
+		     MISSING Uninstall control reads as a known limit rather than an
+		     oversight. `openvhost-pkg` has no uninstall counterpart at all yet —
+		     that is its own slice. -->
+		<p class="note" data-testid="no-uninstall-{instance.major}">{PACKAGED_UNINSTALL_UNAVAILABLE}</p>
+	{/if}
 {/if}
 
 <style>
@@ -443,17 +575,25 @@
 	.pill-cell {
 		min-width: 0;
 	}
+	/* Wraps since the source badge landed: at a 380px panel this cell can hold
+	   "MySQL 9.7" + "Not managed" + "OpenVHost 8.4.11", which on one nowrap line
+	   would push the row's action column off-screen — the exact failure the
+	   status-bar slice had to fix once already. */
 	.primary {
 		font-weight: 600;
 		display: flex;
+		flex-wrap: wrap;
 		align-items: center;
-		gap: 8px;
+		gap: 6px 8px;
 		min-width: 0;
 	}
 	.primary .version {
 		white-space: nowrap;
 	}
-	.badge.unmanaged {
+	/* Shared chip base. `.unmanaged` used to carry all of this alone; the
+	   source badge needs the identical box, so it is a base plus two modifiers
+	   rather than a second copy that can drift. */
+	.badge {
 		display: inline-flex;
 		align-items: center;
 		flex-shrink: 0;
@@ -484,6 +624,47 @@
 	}
 	.mono {
 		font-family: var(--vh-font-mono);
+	}
+	/* Provenance, not status: a quiet outline chip rather than a filled pill,
+	   so it reads as metadata beside the version and never competes with the
+	   StatusPill in the next column. The packaged variant borrows the link
+	   accent to say "this one is ours"; Homebrew keeps the neutral `.badge`
+	   treatment `.unmanaged` already uses. */
+	/* Provenance, not status: a quieter weight than `.unmanaged` so it reads as
+	   metadata beside the version rather than competing with the StatusPill in
+	   the next column. */
+	.badge.source {
+		font-weight: 500;
+		letter-spacing: 0.01em;
+	}
+	/* The packaged chip borrows the link accent to say "this one is ours".
+	   `--vh-link` is brand-700, the same token `.link-button` already uses on
+	   this surface; Homebrew keeps the neutral base. */
+	.badge.source-packaged {
+		color: var(--vh-link);
+		border-color: color-mix(in oklab, var(--vh-link) 35%, transparent);
+		background: color-mix(in oklab, var(--vh-link) 8%, transparent);
+	}
+	/* The live pipeline line. Tabular numerals so a byte counter ticking up
+	   does not shuffle the words after it left and right on every event. */
+	.note.progress {
+		font-variant-numeric: tabular-nums;
+	}
+	.bar {
+		margin: 0 var(--vh-space-4) var(--vh-space-3);
+		height: 4px;
+		border-radius: 2px;
+		background: var(--vh-surface-2);
+		overflow: hidden;
+	}
+	.bar .fill {
+		display: block;
+		height: 100%;
+		background: var(--vh-link);
+		/* Width only — a transform-based fill would need a wrapper to avoid
+		   scaling the rounded ends, and 4px of bar is not worth that. The
+		   transition is short enough to read as "it moved", not as animation. */
+		transition: width var(--vh-dur-fast) linear;
 	}
 	/* Amber "needs attention, not fixed" tone — the vouched pairing
 	   `ScaffoldNoticeBanner.svelte` uses (`--vh-start` directly on plain
