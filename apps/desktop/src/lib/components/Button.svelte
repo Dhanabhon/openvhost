@@ -15,7 +15,7 @@
 		onclick,
 		children
 	}: {
-		variant?: 'primary' | 'quiet';
+		variant?: 'primary' | 'quiet' | 'ghost';
 		size?: 'sm';
 		disabled?: boolean;
 		/** Overrides the accessible name when the visible label alone is ambiguous out of
@@ -51,6 +51,7 @@
 		'btn',
 		variant === 'primary' && 'btn-primary',
 		variant === 'quiet' && 'btn-quiet',
+		variant === 'ghost' && 'btn-ghost',
 		size === 'sm' && 'btn-sm'
 	)}
 	aria-label={ariaLabel}
@@ -97,6 +98,24 @@
 	.btn-quiet:hover {
 		background: color-mix(in oklab, var(--vh-text) 6%, transparent);
 	}
+	/* The row-action level. `.btn-quiet` is the app's secondary button and draws a full
+	   border at rest, which is right for a dialog's Cancel — one control, one decision — and
+	   wrong for a control repeated once per row: five bordered boxes per row down a list
+	   reads as a grid of frames rather than a place to act. This is the same button with the
+	   resting border withheld until the pointer or focus arrives.
+
+	   Identical geometry to `.btn-quiet` — only `border-color` differs, and the border stays
+	   1px throughout — so a control can move between the two variants without reflowing, and
+	   a ghost button sitting beside a quiet one lines up exactly. */
+	.btn-ghost {
+		background: transparent;
+		color: var(--vh-text);
+		border-color: transparent;
+	}
+	.btn-ghost:hover {
+		background: color-mix(in oklab, var(--vh-text) 6%, transparent);
+		border-color: var(--vh-border-strong);
+	}
 	/* The global `:focus-visible` in tokens.css puts a 2px ring 2px outside the
 	   control. On a button with no border of its own that reads as one focus
 	   indicator, which is what it is. On `.btn-quiet` — the only variant with a
@@ -115,8 +134,16 @@
 
 	   NOT applied to `.btn-primary`: its border is already transparent, so it
 	   has no doubling to fix, and a green ring flush against a green fill would
-	   lose the contrast the 2px gap currently gives it against the page. */
-	.btn-quiet:focus-visible {
+	   lose the contrast the 2px gap currently gives it against the page.
+
+	   `.btn-ghost` joins for a different reason. It has nothing to double — its
+	   resting border is transparent, like primary's — but it lives in the row
+	   action strip next to `.icon-link`, which already copies this exact
+	   treatment so the group reads as one family of controls. Letting ghost
+	   take the global ring instead would split that group in two the moment
+	   anyone tabbed through it. The band it produces is the same 3px. */
+	.btn-quiet:focus-visible,
+	.btn-ghost:focus-visible {
 		border-color: var(--vh-focus-ring);
 		outline-offset: 0;
 	}
@@ -125,6 +152,13 @@
 		border-color: var(--vh-border);
 		background: transparent;
 		cursor: not-allowed;
+	}
+	/* Must follow `.btn:disabled` — same specificity, so order decides. Without it a ghost
+	   button POPS a border in at the instant it goes busy, which is a frame appearing out of
+	   nowhere at exactly the moment the row should look calm. The dimmed label already
+	   carries the state, and it is the same signal the other variants rely on. */
+	.btn-ghost:disabled {
+		border-color: transparent;
 	}
 	.btn-sm {
 		padding: 4px 10px;

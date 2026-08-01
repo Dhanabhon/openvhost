@@ -183,6 +183,30 @@ describe('SiteListRow View logs deep link', () => {
 	});
 });
 
+// Delete is the only framed control in the strip. Everything else is `ghost` — no resting
+// border — so the row reads as a place to act rather than a grid of boxes, and the one
+// irreversible action is the one thing with an edge around it. That distinction is invisible
+// to a reader of the markup (all four are just `<Button>`s), so a later tidy-up that makes
+// them uniform would silently strip the frame off the destructive one. Asserted both ways so
+// "all ghost" and "all quiet" each fail.
+describe('only the destructive action is framed', () => {
+	const tagFor = (html: string, label: string) => {
+		const m = html.match(new RegExp(`<button[^>]*aria-label="${label}"[^>]*>`));
+		expect(m, `no button labelled "${label}"`).not.toBeNull();
+		return m?.[0] ?? '';
+	};
+
+	it('frames Delete and ghosts the routine actions', () => {
+		const html = rowHtml(site(true));
+		expect(tagFor(html, 'Delete shop')).toContain('btn-quiet');
+		expect(tagFor(html, 'Delete shop')).not.toContain('btn-ghost');
+		for (const label of ['Disable shop', 'Edit shop', 'Open shop in a browser']) {
+			expect(tagFor(html, label)).toContain('btn-ghost');
+			expect(tagFor(html, label)).not.toContain('btn-quiet');
+		}
+	});
+});
+
 // The wrapped narrow layout is a CSS container query, and there is no layout engine here —
 // nothing below asserts that anything WRAPS. That was measured in a browser against the real
 // stylesheet and the numbers are in the PR; a jsdom assertion about a class would only be a

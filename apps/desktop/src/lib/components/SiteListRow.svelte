@@ -176,7 +176,7 @@
 			     the button would open a page that cannot load. `busy` covers the in-flight
 			     case, same as the other row actions. -->
 			<Button
-				variant="quiet"
+				variant="ghost"
 				size="sm"
 				ariaLabel="Open {site.name} in a browser"
 				disabled={busy || !site.enabled}
@@ -203,14 +203,14 @@
 				</span>
 			</Button>
 			<Button
-				variant="quiet"
+				variant="ghost"
 				size="sm"
 				ariaLabel={site.enabled ? `Disable ${site.name}` : `Enable ${site.name}`}
 				disabled={busy}
 				onclick={() => onToggleEnabled(site, !site.enabled)}
 				>{site.enabled ? 'Disable' : 'Enable'}</Button
 			>
-			<Button variant="quiet" size="sm" ariaLabel="Edit {site.name}" onclick={() => onEdit(site)}
+			<Button variant="ghost" size="sm" ariaLabel="Edit {site.name}" onclick={() => onEdit(site)}
 				>Edit</Button
 			>
 			<Button
@@ -375,10 +375,15 @@
 		align-items: center;
 		opacity: 0.85;
 	}
-	/* Reproduces Button.svelte's `.btn`/`.btn-quiet`/`.btn-sm` recipe locally for an `<a>` —
+	/* Reproduces Button.svelte's `.btn`/`.btn-ghost`/`.btn-sm` recipe locally for an `<a>` —
 	   Button always renders a `<button>`, which is wrong for NAVIGATION (this is a real link
 	   to `/logs?source=…`, not an onclick action). Same "hand-roll a `.btn` subset outside
-	   Button.svelte" precedent this file already uses for `.btn-danger` below. */
+	   Button.svelte" precedent this file already uses for `.btn-danger` below.
+
+	   It says `.btn-ghost` because this rule has always had a transparent resting border, so
+	   for its whole life it looked like a variant that did not exist yet: next to `Open`,
+	   which was `.btn-quiet`, one icon sat bare and its neighbour sat in a box. `.btn-ghost`
+	   is the level this was already written at, and Open now uses it too. */
 	.icon-link {
 		display: inline-flex;
 		align-items: center;
@@ -392,13 +397,17 @@
 			background var(--vh-dur-fast) var(--vh-ease-out),
 			border-color var(--vh-dur-fast) var(--vh-ease-out);
 	}
+	/* Border on hover as well as background, to stay in step with `.btn-ghost:hover`. Without
+	   it the two icon links would be the only controls in the strip that never draw an edge,
+	   so pointing at one would look like a different kind of control from pointing at Edit. */
 	.icon-link:hover {
 		background: color-mix(in oklab, var(--vh-text) 6%, transparent);
+		border-color: var(--vh-border-strong);
 	}
-	/* Same doubled-frame fix as `.btn-quiet:focus-visible` (Button.svelte) — this control has
-	   no border of its own in the ordinary state (transparent), but a focus RING alone would
-	   still look inconsistent with every other icon-only control in this row group once
-	   `Button`'s OWN `.btn-quiet:focus-visible` rule is accounted for; matching it exactly
+	/* Same doubled-frame fix as `.btn-quiet`/`.btn-ghost:focus-visible` (Button.svelte) — this
+	   control has no border of its own in the ordinary state (transparent), but a focus RING
+	   alone would still look inconsistent with every other icon-only control in this row group
+	   once `Button`'s OWN shared `:focus-visible` rule is accounted for; matching it exactly
 	   keeps the whole row-actions group looking like one family of controls. */
 	.icon-link:focus-visible {
 		border-color: var(--vh-focus-ring);
