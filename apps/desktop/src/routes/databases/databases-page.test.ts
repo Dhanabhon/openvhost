@@ -26,8 +26,26 @@ function instance(overrides: Partial<MysqlInstanceDto> = {}): MysqlInstanceDto {
 		socketPath: null,
 		serviceId: null,
 		datadirState: { kind: 'notInitialized' },
+		source: null,
+		offer: { kind: 'available', version: '8.4.11' },
 		...overrides
 	};
+}
+
+/** An installed row from a Homebrew keg — still supported during the migration
+ *  (design D3/D7), and the only source the brew-driven uninstall path applies
+ *  to. */
+function brewed(overrides: Partial<MysqlInstanceDto> = {}): MysqlInstanceDto {
+	return instance({ installed: true, source: { kind: 'homebrew' }, ...overrides });
+}
+
+/** An installed row from OpenVHost's own package tree. */
+function packaged(overrides: Partial<MysqlInstanceDto> = {}): MysqlInstanceDto {
+	return instance({
+		installed: true,
+		source: { kind: 'packaged', version: '8.4.11' },
+		...overrides
+	});
 }
 
 function env(brewFound: boolean, instances: MysqlInstanceDto[]): MysqlEnvironmentDto {
@@ -45,6 +63,9 @@ beforeEach(() => {
 	databasesStore.error = '';
 	databasesStore.installing = '';
 	databasesStore.installLog = [];
+	databasesStore.installProgress = null;
+	databasesStore.installTotal = null;
+	databasesStore.cancellingInstall = false;
 	databasesStore.installOutcome = null;
 	databasesStore.initializing = '';
 	databasesStore.initLog = [];
@@ -108,17 +129,38 @@ describe('the /databases route', () => {
 		expect(body).not.toContain('data-testid="databases-page-error"');
 	});
 
-	it('offers Check again once brew is found, with nothing installed yet', () => {
+	it('offers Check again with nothing installed yet', () => {
 		databasesStore.env = env(true, [instance()]);
 		const { body } = render(DatabasesPage);
 		expect(body).toContain('data-testid="databases-check-again-header"');
 	});
 
-	it('does not duplicate Check again on the no-brew page, which renders its own', () => {
+	// The gate this slice removes. Installing MySQL is download -> verify ->
+	// extract, so a machine that has never had Homebrew must still see — and be
+	// able to press — every control on this page. It used to see none of them.
+	it('renders the rowlist and its Install control on a machine with no Homebrew', () => {
+		databasesStore.env = env(false, [instance()]);
+		const { body } = render(DatabasesPage);
+		expect(body).toContain('data-testid="mysql-row-8.4"');
+		expect(body).toContain('data-testid="install-8.4"');
+		expect(body).toContain('data-testid="databases-check-again-header"');
+	});
+
+	it('renders exactly one Check again control, never a second from the empty state', () => {
 		databasesStore.env = env(false, []);
 		const { body } = render(DatabasesPage);
-		expect(body).toContain('data-testid="databases-check-again"');
-		expect(body).not.toContain('data-testid="databases-check-again-header"');
+		// The trailing quote disambiguates: `…-check-again-header` contains
+		// `…-check-again` as a substring, so a bare `toContain` would pass
+		// against the header and prove nothing.
+		expect(body).not.toContain('data-testid="databases-check-again"');
+		expect(body.match(/data-testid="databases-check-again-header"/g)?.length).toBe(1);
+	});
+
+	it('no longer tells a user without Homebrew to go install it', () => {
+		databasesStore.env = env(false, [instance()]);
+		const { body } = render(DatabasesPage);
+		expect(body).not.toContain('data-testid="databases-no-brew"');
+		expect(body).not.toMatch(/homebrew is required/i);
 	});
 
 	it('disables the header Check again while an install is running', () => {
@@ -140,8 +182,7 @@ describe('the /databases route', () => {
 
 	it('renders a Ready row with its supervisor state from the shared services snapshot', () => {
 		databasesStore.env = env(true, [
-			instance({
-				installed: true,
+			brewed({
 				datadirState: { kind: 'initialized' },
 				socketPath: '/Users/x/.openvhost/run/mysql-8.4.sock',
 				serviceId: 'mysql-8.4'
@@ -156,8 +197,7 @@ describe('the /databases route', () => {
 
 	it('renders no pill or control for a row whose serviceId matches nothing in the snapshot', () => {
 		databasesStore.env = env(true, [
-			instance({
-				installed: true,
+			packaged({
 				datadirState: { kind: 'initialized' },
 				socketPath: '/x/mysql-8.4.sock',
 				serviceId: 'mysql-8.4'
@@ -189,6 +229,101 @@ describe('the /databases route', () => {
 	});
 });
 
+// The three things this slice exists to make visible, checked where the page's
+// own glue can break them — which per-component tests structurally cannot see.
+describe('the /databases route — the tarball install, end to end on the page', () => {
+	it('shows the pipeline state the store received, not a generic spinner', () => {
+		databasesStore.env = env(true, [instance()]);
+		databasesStore.installing = '8.4';
+		databasesStore.installProgress = { kind: 'verified' };
+		const { body } = render(DatabasesPage);
+		expect(body).toContain('data-testid="install-progress-8.4"');
+		expect(body).toMatch(/checksum verified/i);
+	});
+
+	// The one that carries golden rule 6: a checked download and an unchecked
+	// one must not look the same on this page.
+	it('renders verified and extracted as different sentences', () => {
+		databasesStore.env = env(true, [instance()]);
+		databasesStore.installing = '8.4';
+		databasesStore.installProgress = { kind: 'verified' };
+		const verified = render(DatabasesPage).body;
+		databasesStore.installProgress = { kind: 'extracted' };
+		const extracted = render(DatabasesPage).body;
+		const line = (body: string) =>
+			body.match(/data-testid="install-progress-8\.4"[^>]*>([^<]*)</)?.[1] ?? '';
+		expect(line(verified)).not.toBe('');
+		expect(line(verified)).not.toBe(line(extracted));
+	});
+
+	it('carries the declared total through to the byte reading', () => {
+		databasesStore.env = env(true, [instance()]);
+		databasesStore.installing = '8.4';
+		databasesStore.installTotal = 4096;
+		databasesStore.installProgress = { kind: 'downloaded', bytes: 1024 };
+		const { body } = render(DatabasesPage);
+		expect(body).toMatch(/1\.00 KiB of 4\.00 KiB/);
+	});
+
+	// MANDATORY: the install permit is process-wide and the download has no
+	// wall-clock bound, so an install nobody can stop starves every later one.
+	it('offers Cancel while an install runs, and not otherwise', () => {
+		databasesStore.env = env(true, [instance()]);
+		expect(render(DatabasesPage).body).not.toContain('data-testid="cancel-install-8.4"');
+		databasesStore.installing = '8.4';
+		expect(render(DatabasesPage).body).toContain('data-testid="cancel-install-8.4"');
+	});
+
+	it('reflects a cancel already in flight rather than an idle button', () => {
+		databasesStore.env = env(true, [instance()]);
+		databasesStore.installing = '8.4';
+		databasesStore.cancellingInstall = true;
+		const { body } = render(DatabasesPage);
+		expect(body).toMatch(/Cancelling…/);
+	});
+
+	it('renders a settled checksum failure as a checksum failure', () => {
+		databasesStore.env = env(true, [instance()]);
+		databasesStore.installOutcome = {
+			major: '8.4',
+			result: { kind: 'verificationFailed', expected: 'a'.repeat(64), actual: 'b'.repeat(64) }
+		};
+		const { body } = render(DatabasesPage);
+		expect(body).toMatch(/checksum did not match/i);
+		expect(body).not.toMatch(/network error/i);
+	});
+
+	it('renders an unavailable target as an honest absence with no Install button', () => {
+		databasesStore.env = env(true, [
+			instance({ offer: { kind: 'unavailable', target: 'macos-x86_64' } })
+		]);
+		const { body } = render(DatabasesPage);
+		expect(body).toContain('data-testid="mysql-unavailable-8.4"');
+		expect(body).toContain('macos-x86_64');
+		expect(body).not.toContain('data-testid="install-8.4"');
+	});
+
+	// D3's whole reason for existing: the owner will be running both at once.
+	it('says which install each runtime came from when both sources are present', () => {
+		databasesStore.env = env(true, [
+			packaged({ major: '8.4', datadirState: { kind: 'initialized' } }),
+			brewed({ major: '9.7', cataloged: false })
+		]);
+		const { body } = render(DatabasesPage);
+		expect(body).toContain('OpenVHost 8.4.11');
+		expect(body).toContain('data-testid="mysql-source-9.7"');
+		const brewBadge = body.match(/data-testid="mysql-source-9\.7"[^>]*>([^<]*)</)?.[1] ?? '';
+		expect(brewBadge).toBe('Homebrew');
+	});
+
+	it('offers no Uninstall for a packaged runtime, and says why', () => {
+		databasesStore.env = env(true, [packaged({ datadirState: { kind: 'initialized' } })]);
+		const { body } = render(DatabasesPage);
+		expect(body).not.toContain('data-testid="uninstall-8.4"');
+		expect(body).toContain('data-testid="no-uninstall-8.4"');
+	});
+});
+
 /** Just the Uninstall button's own opening tag for `major`. */
 function uninstallTag(body: string, major: string): string {
 	const match = body.match(new RegExp(`<button[^>]*data-testid="uninstall-${major}"[^>]*>`));
@@ -199,8 +334,10 @@ function uninstallTag(body: string, major: string): string {
 // Package-uninstall design D6, at the route layer — the page's own glue, which
 // is what per-component tests structurally cannot see.
 describe('the /databases route — uninstall', () => {
-	const installed = instance({
-		installed: true,
+	// A HOMEBREW keg: the brew-driven uninstall path only applies to runtimes
+	// brew installed. A packaged runtime's own (absent) affordance is pinned
+	// below.
+	const installed = brewed({
 		datadirState: { kind: 'initialized' },
 		serviceId: 'mysql-8.4',
 		socketPath: '/Users/x/.openvhost/run/mysql-8.4.sock'
@@ -296,8 +433,7 @@ describe('the /databases route — uninstall', () => {
 
 // Task 1's wiring, observed from this page rather than re-implemented.
 describe('the /databases route — a service that disappears', () => {
-	const installed = instance({
-		installed: true,
+	const installed = packaged({
 		datadirState: { kind: 'initialized' },
 		serviceId: 'mysql-8.4',
 		socketPath: '/Users/x/.openvhost/run/mysql-8.4.sock'

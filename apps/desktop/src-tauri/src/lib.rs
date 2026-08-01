@@ -23,6 +23,10 @@ mod control;
 // see this module's own doc comment for why they live here rather than in
 // openvhost-conf (review fix wave finding 4).
 mod mysql_admin;
+/// MySQL from OpenVHost's own package tree over IPC — the DTOs, the progress
+/// event and the two install commands. A sibling of `commands` rather than more
+/// of it (that file is ~8 200 lines).
+mod mysql_pkg;
 mod quit;
 
 // Ungated: `stack::StackPaths` is a portable type named by `commands.rs` on
@@ -89,7 +93,8 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::pending_install,
             commands::mysql_environment,
             commands::rescan_mysql,
-            commands::install_mysql,
+            mysql_pkg::install_mysql,
+            mysql_pkg::cancel_mysql_install,
             commands::initialize_mysql,
             commands::mysql_root_password,
             commands::reset_mysql_root_password,
@@ -107,6 +112,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::ServiceUnregisteredEvent,
             commands::PhpInstallLogEvent,
             commands::MysqlInstallLogEvent,
+            mysql_pkg::MysqlInstallProgressEvent,
             commands::MysqlInitLogEvent,
             quit::QuitRequestedEvent
         ])

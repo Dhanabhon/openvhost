@@ -5,7 +5,12 @@
 // is computed here, once, as a plain discriminated union — never inferred ad
 // hoc in a template.
 
-import type { MysqlDatadirStateDto, MysqlInitStepDto, MysqlInstanceDto } from './ipc';
+import type {
+	MysqlDatadirStateDto,
+	MysqlInitStepDto,
+	MysqlInstallProgressDto,
+	MysqlInstanceDto
+} from './ipc';
 
 /** Same shape `LogPane.svelte` renders (`services.svelte.ts`'s `UiLog`),
  *  redeclared here rather than imported — same reasoning as
@@ -29,9 +34,21 @@ export interface UiLog {
  * `scaffoldNotice` (`sites.derive.ts`) gives its own banner.
  */
 export type MysqlRowState =
-	| { kind: 'noBrew' }
-	| { kind: 'notInstalled' }
-	| { kind: 'installing'; log: UiLog[] }
+	/** Not installed, and this build publishes no checksum-verified download
+	 *  for this host — an Intel Mac, today. An ABSENCE, not an error: the row
+	 *  renders the explanation and no Install control at all. Replaces the old
+	 *  `noBrew` state, which the move off Homebrew made false: installing MySQL
+	 *  no longer involves brew, so a machine without it is no longer stuck. */
+	| { kind: 'unavailable'; target: string }
+	| { kind: 'notInstalled'; version: string }
+	| {
+			kind: 'installing';
+			/** The last pipeline state seen, or `null` before the first event. */
+			progress: MysqlInstallProgressDto | null;
+			/** The length declared by the `started` event — the later
+			 *  `downloaded` events do not repeat it. */
+			total: number | null;
+	  }
 	| { kind: 'installedNotInitialized' }
 	| { kind: 'initializing'; log: UiLog[] }
 	| { kind: 'initFailed'; step: MysqlInitStepDto; reason: string }
@@ -54,18 +71,17 @@ export interface MysqlInitFailure {
 }
 
 export interface MysqlRowInputs {
-	/** `MysqlEnvironmentDto.brewFound` — a single, environment-wide fact, not
-	 *  per-row, but still a real input to a not-yet-installed row's own state
-	 *  (spec D1: an installed row is never told to go find brew, no matter
-	 *  what `brewFound` says — only a row that still NEEDS brew to move
-	 *  forward reads it at all). */
-	brewFound: boolean;
 	instance: MysqlInstanceDto;
 	/** The major currently running `install_mysql`, or `''` when idle —
 	 *  shared page-wide, the same single-flight rule `LanguagesStore.installing`
 	 *  already follows (one `InstallLock`, spec D7). */
 	installingMajor: string;
-	installLog: readonly UiLog[];
+	/** The last install-pipeline state, page-wide (only one install can run).
+	 *  Replaces the brew era's `installLog`: an install is no longer a child
+	 *  process whose stdout can be tailed, it is five typed states. */
+	installProgress: MysqlInstallProgressDto | null;
+	/** The declared download length, carried forward from `started`. */
+	installTotal: number | null;
 	/** The major currently running `initialize_mysql`, or `''` when idle. */
 	initializingMajor: string;
 	initLog: readonly UiLog[];
@@ -83,9 +99,12 @@ export interface MysqlRowInputs {
  *    can ever be true for at most one row at a time; `installing` is checked
  *    first only to keep this function deterministic on the (unreachable in
  *    practice) case where both would somehow name the same major.
- * 2. Not installed at all: `noBrew` when Homebrew itself cannot be found —
- *    there is nothing this row's own Install button could do about that —
- *    else `notInstalled`.
+ * 2. Not installed at all: `notInstalled` when this build has a
+ *    checksum-verified download for this host, else `unavailable` — there is
+ *    nothing this row's own Install button could do about a target we publish
+ *    nothing for, so it renders no button rather than one that throws.
+ *    (This used to read Homebrew's presence. It no longer can: installing MySQL
+ *    is download → verify → extract, and a machine with no brew installs fine.)
  * 3. Installed: the on-DISK datadir state is authoritative and always wins
  *    over a remembered outcome, because it is read fresh on every
  *    environment load/rescan and a stale memory of a past failure must never
@@ -100,15 +119,35 @@ export function mysqlRowState(inputs: MysqlRowInputs): MysqlRowState {
 	const { instance } = inputs;
 
 	if (inputs.installingMajor === instance.major) {
-		return { kind: 'installing', log: [...inputs.installLog] };
+		return {
+			kind: 'installing',
+			progress: inputs.installProgress,
+			total: inputs.installTotal
+		};
 	}
 	if (inputs.initializingMajor === instance.major) {
 		return { kind: 'initializing', log: [...inputs.initLog] };
 	}
 	if (!instance.installed) {
-		return inputs.brewFound ? { kind: 'notInstalled' } : { kind: 'noBrew' };
+		return notInstalledRowState(instance.offer);
 	}
 	return datadirRowState(instance.datadirState, instance.major, inputs.initFailure);
+}
+
+/** A not-yet-installed row's state, from what this build can actually offer on
+ *  this host. Exhaustive over `MysqlPackageOfferDto` — a third offer state must
+ *  decide here rather than inherit "Install is fine". */
+function notInstalledRowState(offer: MysqlInstanceDto['offer']): MysqlRowState {
+	switch (offer.kind) {
+		case 'available':
+			return { kind: 'notInstalled', version: offer.version };
+		case 'unavailable':
+			return { kind: 'unavailable', target: offer.target };
+		default: {
+			const unreachable: never = offer;
+			return unreachable;
+		}
+	}
 }
 
 function datadirRowState(
@@ -181,13 +220,19 @@ export function mysqlInitStepLabel(step: MysqlInitStepDto): string {
 }
 
 /**
- * Copy for the Databases page's install-flow disclosure (spec Owner caveat
- * 1): Homebrew's OWN `mysql@8.4` post-install creates a separate datadir that
- * OpenVHost neither adopts nor deletes. Centralized so the page and its tests
- * share one string.
+ * Copy for a MySQL major whose datadir is shared across install sources
+ * (MySQL-from-tarball design D6). The datadir is keyed by MAJOR, not by where
+ * the binaries came from, so a user who initialized 8.4 under the Homebrew era
+ * keeps their databases after installing the packaged 8.4 — same major, same
+ * MySQL, same on-disk format.
+ *
+ * Replaces the old `HOMEBREW_DATADIR_DISCLOSURE`, which described a fact that
+ * stopped being true when installing stopped going through brew: OpenVHost no
+ * longer runs `brew install mysql@8.4`, so brew's own formula no longer creates
+ * anything as a side effect of pressing Install here.
  */
-export const HOMEBREW_DATADIR_DISCLOSURE =
-	"Homebrew's own mysql@8.4 formula also creates a separate data directory the first time it's installed, with no root password. OpenVHost never touches or removes it.";
+export const SHARED_DATADIR_DISCLOSURE =
+	'Data directories are shared per version, not per install source — if you already initialized MySQL 8.4 through Homebrew, this keeps those databases rather than starting over.';
 
 /**
  * The manual-recovery copy for a stale stored credential (spec Deferred:

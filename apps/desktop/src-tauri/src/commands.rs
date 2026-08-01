@@ -20,6 +20,10 @@ use openvhost_core::{
 // home is the `site` submodule (Tasks 2-3), and it stays that way rather than
 // growing `lib.rs`'s re-export list for a type only this one command needs.
 use openvhost_core::site::scaffold::{ScaffoldOutcome, ScaffoldStep, scaffold, scaffold_path};
+// The MySQL package surface lives in its own sibling module (this file is
+// already ~8 200 lines); only the two DTOs a `MysqlInstanceDto` embeds are
+// named here.
+use crate::mysql_pkg::{MysqlPackageOfferDto, MysqlRuntimeSourceDto};
 
 use crate::stack::StackPaths;
 
@@ -2299,6 +2303,36 @@ impl InstallLock {
             .as_ref()
             .map(|r| r.abort.clone())
     }
+
+    /// Abort the in-flight run **only if** it is the given kind and direction,
+    /// reporting whether anything was actually aborted.
+    ///
+    /// The user-facing cancel (`cancel_mysql_install`) needs this rather than a
+    /// bare `running_abort_handle()`: the slot is shared across PHP, MySQL,
+    /// install and uninstall, and a Cancel button on the Databases page must
+    /// never abort somebody else's run just because it happens to hold the
+    /// lock. Check and abort happen under ONE acquisition of `running`, so the
+    /// occupant cannot change between the two — reading the kind and then
+    /// fetching the handle would be a real race, however narrow.
+    ///
+    /// Both discriminators must match — deliberately full equality on the two
+    /// enums rather than "is it MySQL", so a third `InstallKind` or a third
+    /// `PackageOperation` cannot start matching a cancel that was never meant
+    /// for it.
+    pub(crate) fn abort_running_if(&self, kind: InstallKind, operation: PackageOperation) -> bool {
+        let slot = self
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(running) = slot.as_ref() else {
+            return false;
+        };
+        let is_target = running.kind == kind && running.operation == operation;
+        if is_target {
+            running.abort.abort();
+        }
+        is_target
+    }
 }
 
 /// Clears `InstallLock`'s running slot when dropped, no matter which of
@@ -3377,6 +3411,25 @@ pub struct MysqlInstanceDto {
     pub socket_path: Option<String>,
     pub service_id: Option<String>,
     pub datadir_state: MysqlDatadirStateDto,
+    /// WHERE the installed binaries came from — OpenVHost's own package tree or
+    /// a Homebrew keg (MySQL-from-tarball design D3). `None` when nothing is
+    /// installed for this major.
+    ///
+    /// Two install sources coexist by design during the migration, and the
+    /// owner will be running a brew 8.4 and a packaged 8.4 at the same time, so
+    /// "which mysqld am I actually running" is a question this page has to be
+    /// able to answer without the user guessing from a path.
+    pub source: Option<MysqlRuntimeSourceDto>,
+    /// Whether THIS BUILD publishes a verified package for this major on THIS
+    /// host, and which version it would install.
+    ///
+    /// Distinct from `cataloged`: that says "this build manages the major",
+    /// this says "and there are bytes for your architecture". An Intel Mac gets
+    /// `Unavailable` for a fully cataloged 8.4 — Oracle's x86_64 build exists
+    /// but never went through the signature check the pin rests on — and the
+    /// row renders that as an honest absence with Homebrew as the remaining
+    /// route, never as a broken Install button.
+    pub offer: MysqlPackageOfferDto,
 }
 
 /// What the Databases page needs to decide which state to show (spec D6).
@@ -3389,17 +3442,14 @@ pub struct MysqlEnvironmentDto {
     pub instances: Vec<MysqlInstanceDto>,
 }
 
-/// Mirrors `InstallOutcomeDto` for MySQL (spec D7's `install_mysql`).
-#[derive(Debug, Clone, serde::Serialize, specta::Type)]
-#[serde(rename_all = "camelCase")]
-pub struct MysqlInstallOutcomeDto {
-    pub major: String,
-    pub exit_code: Option<i32>,
-    pub detected: bool,
-}
-
-/// One line of `brew install mysql@<major>`'s output, forwarded live while an
-/// install runs. Same shape and reasoning as [`PhpInstallLogEvent`].
+/// One line of a MySQL package operation's output, forwarded live while it
+/// runs. Same shape and reasoning as [`PhpInstallLogEvent`].
+///
+/// Since the MySQL-from-tarball slice this carries **`brew uninstall`'s output
+/// only**: installing no longer runs a child process at all, and its progress
+/// arrives as typed [`crate::mysql_pkg::MysqlInstallProgressEvent`] states
+/// instead of prose. The channel name is unchanged because the uninstall path
+/// still uses it (package-uninstall design D1 — one lock, one output surface).
 #[derive(Debug, Clone, serde::Serialize, specta::Type, tauri_specta::Event)]
 #[serde(rename_all = "camelCase")]
 pub struct MysqlInstallLogEvent {
@@ -3523,6 +3573,8 @@ fn mysql_rows(
             major: major.as_str().to_string(),
             cataloged: major.is_cataloged(),
             installed: found.is_some(),
+            source: found.map(|rt| MysqlRuntimeSourceDto::from(&rt.source)),
+            offer: crate::mysql_pkg::package_offer(major),
             path: found.map(|rt| rt.mysqld.display().to_string()),
             socket_path: registered.then(|| mp.socket.display().to_string()),
             // Same `mysql-<major>` shape `crate::stack::mysql_spec` builds —
@@ -4460,124 +4512,6 @@ pub async fn rescan_mysql(
         brew_found: openvhost_core::find_brew().is_some(),
         brew_searched: brew_searched_paths(),
         instances: mysql_rows(&p.home, &installed.runtimes),
-    })
-}
-
-/// Install a MySQL major via Homebrew, streaming its output live, then
-/// rescan so a freshly installed version (if it appears) is picked up —
-/// mirrors `install_php` exactly, sharing `InstallLock` (decision 5) — see
-/// `InstallKind`'s doc comment for why the quit dialog's PHP-specific copy
-/// is unaffected by this.
-#[tauri::command]
-#[specta::specta]
-pub async fn install_mysql(
-    app: tauri::AppHandle,
-    major: String,
-    runtimes: tauri::State<'_, RwLock<Option<Vec<openvhost_core::mysql::MysqlRuntime>>>>,
-    paths: tauri::State<'_, Option<StackPaths>>,
-    sup: tauri::State<'_, Arc<Supervisor>>,
-    lock: tauri::State<'_, InstallLock>,
-) -> Result<MysqlInstallOutcomeDto, IpcError> {
-    // The catalogue gate, before anything else happens (decision 2).
-    let major = openvhost_core::mysql::MysqlMajor::parse(&major)?;
-
-    let Ok(_guard) = lock.inner().guard.try_lock() else {
-        return Err(IpcError::Core {
-            message: "an install is already running".into(),
-        });
-    };
-
-    let p = stack_paths(&paths)?;
-
-    let before: Vec<String> = runtimes
-        .read()
-        .map_err(|_| IpcError::Core {
-            message: "mysql runtime list is poisoned".into(),
-        })?
-        .clone()
-        .unwrap_or_default()
-        .iter()
-        .map(|rt| rt.major.as_str().to_string())
-        .collect();
-
-    if before.iter().any(|m| m == major.as_str()) {
-        return Err(IpcError::Core {
-            message: format!("MySQL {} is already installed", major.as_str()),
-        });
-    }
-
-    let brew = openvhost_core::find_brew().ok_or_else(|| IpcError::Core {
-        message: format!(
-            "Homebrew was not found. Looked for bin/brew under: {}",
-            openvhost_core::BREW_PREFIXES.join(", ")
-        ),
-    })?;
-
-    let spec = openvhost_core::mysql::mysql_brew_install_spec(&brew, &major)?;
-    let (tx, mut rx) = tokio::sync::mpsc::channel(256);
-
-    let emitter = app.clone();
-    let for_event = major.as_str().to_string();
-    let pump = tokio::spawn(async move {
-        while let Some(ev) = rx.recv().await {
-            if let openvhost_proc::TaskEvent::Line { stream, text } = ev {
-                let _ = MysqlInstallLogEvent {
-                    major: for_event.clone(),
-                    ts_ms: now_ms(),
-                    stream: match stream {
-                        openvhost_proc::TaskStream::Stdout => "stdout".into(),
-                        openvhost_proc::TaskStream::Stderr => "stderr".into(),
-                    },
-                    line: text,
-                }
-                .emit(&emitter);
-            }
-        }
-    });
-
-    let install_task = tokio::spawn(openvhost_proc::run_task(
-        openvhost_proc::default_driver(),
-        spec,
-        tx,
-    ));
-    let abort_handle = install_task.abort_handle();
-    lock.inner().set_running(
-        InstallKind::Mysql,
-        PackageOperation::Install,
-        format!("MySQL {}", major.as_str()),
-        abort_handle.clone(),
-    );
-    let _running_guard = RunningInstallGuard {
-        lock: lock.inner(),
-        abort: abort_handle,
-    };
-
-    let exit_code = match install_task.await {
-        Ok(result) => result?,
-        Err(join_err) if join_err.is_cancelled() => {
-            return Err(IpcError::Proc {
-                message: "the install was aborted because the app is quitting".into(),
-            });
-        }
-        Err(join_err) => {
-            return Err(IpcError::Proc {
-                message: format!("the install task ended unexpectedly: {join_err}"),
-            });
-        }
-    };
-    let _ = pump.await;
-
-    // See `install_php`'s matching block: `detected` is a stat of the formula
-    // directory we asked brew to create, never a version probe. THIS is the
-    // path the failure was reproduced on.
-    let seed = openvhost_core::mysql::brew_mysql_runtime_for_major(&brew_prefixes(), &major);
-    let detected = seed.is_some();
-    rescan_mysql_into_state(runtimes.inner(), sup.inner(), &p.home, seed).await?;
-
-    Ok(MysqlInstallOutcomeDto {
-        major: major.as_str().to_string(),
-        exit_code,
-        detected,
     })
 }
 

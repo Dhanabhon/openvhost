@@ -22,11 +22,13 @@
 // `revealed`'s own doc comment for the screen-share scenario this fixes).
 import { errorMessage } from './errors';
 import { anyMysqlInstalled, type MysqlInitFailure, type UiLog } from './databases.derive';
+import { mysqlInstallDeclaredTotal } from './mysql-install.derive';
 import type {
 	MysqlConnectionProofDto,
 	MysqlEnvironmentDto,
 	MysqlInitOutcomeDto,
 	MysqlInstallOutcomeDto,
+	MysqlInstallProgressDto,
 	MysqlResetOutcomeDto
 } from './ipc';
 
@@ -34,6 +36,9 @@ export interface DatabasesApi {
 	mysqlEnvironment(): Promise<MysqlEnvironmentDto>;
 	rescanMysql(): Promise<MysqlEnvironmentDto>;
 	installMysql(major: string): Promise<MysqlInstallOutcomeDto>;
+	/** Aborts an in-flight `installMysql`, resolving to whether anything was
+	 *  actually stopped. See {@link DatabasesStore.cancelInstall}. */
+	cancelMysqlInstall(): Promise<boolean>;
 	initializeMysql(major: string): Promise<MysqlInitOutcomeDto>;
 	mysqlRootPassword(major: string): Promise<string>;
 	resetMysqlRootPassword(major: string): Promise<MysqlResetOutcomeDto>;
@@ -62,6 +67,25 @@ export class DatabasesStore {
 	/** '' when idle, otherwise the major currently running `install_mysql`. */
 	installing = $state('');
 	installLog = $state<UiLog[]>([]);
+	/**
+	 * The last pipeline state of the install in flight, or `null` before the
+	 * first event arrives (and after a fresh install starts).
+	 *
+	 * Page-wide rather than per-major, matching {@link installing}: one
+	 * `InstallLock` means one install, so a per-major dictionary would model a
+	 * concurrency that cannot happen and would then need reconciling.
+	 */
+	installProgress = $state<MysqlInstallProgressDto | null>(null);
+	/** The download length the server declared, captured from the `started`
+	 *  event because no later event repeats it. `null` when it declared none —
+	 *  which is a real case, and one the UI must render as "so far" rather than
+	 *  as a percentage of a number it made up. */
+	installTotal = $state<number | null>(null);
+	/** True between {@link cancelInstall} being pressed and the install
+	 *  settling. A state, not a disabled attribute: the Cancel button must read
+	 *  "Cancelling…" while the staging directory unwinds, or it invites a
+	 *  second press at the worst moment. */
+	cancellingInstall = $state(false);
 	/** The last `install_mysql` outcome, whichever major it was for —
 	 *  `MysqlInstallOutcomeDto` carries its own `major`, same as PHP's
 	 *  `InstallOutcomeDto`. */
@@ -170,15 +194,41 @@ export class DatabasesStore {
 	}
 
 	/**
-	 * Install `major` via Homebrew. Mirrors `LanguagesStore.install` exactly:
-	 * the re-entrancy guard lives here (not only on a button's `disabled`),
-	 * `installLog` is scoped to this attempt's own major before anything else
-	 * happens, and a settled call always re-reads the environment via
-	 * {@link refresh} rather than assuming the row is now installed.
+	 * Record one install-pipeline state as it arrives.
+	 *
+	 * `started` is also where the declared total is captured — no later event
+	 * repeats it, so losing it here means every subsequent `downloaded` reading
+	 * has no denominator.
+	 */
+	applyInstallProgress(progress: MysqlInstallProgressDto): void {
+		this.installProgress = progress;
+		const declared = mysqlInstallDeclaredTotal(progress);
+		if (declared !== null) this.installTotal = declared;
+	}
+
+	/**
+	 * Install `major` from the pinned upstream tarball — download, verify,
+	 * extract. **No Homebrew.** Mirrors `LanguagesStore.install`'s discipline:
+	 * the re-entrancy guard lives here (not only on a button's `disabled`), and
+	 * a settled call always re-reads the environment via {@link refresh} rather
+	 * than assuming the row is now installed.
+	 *
+	 * Progress state is cleared as the run STARTS, not when it ends — the same
+	 * "drop the previous verdict as the run starts" rule
+	 * `webservers.svelte.ts`'s `validate()` follows. A stale "Checksum
+	 * verified" from the previous attempt sitting above this attempt's first
+	 * byte is exactly the confusion that rule exists to prevent.
+	 *
+	 * Only a rejected major or a busy install lock THROWS; every pipeline
+	 * failure — a checksum mismatch, a stall, an unavailable target, a cancel —
+	 * comes back as a settled outcome to render.
 	 */
 	async install(major: string): Promise<boolean> {
 		if (this.installing !== '') return false;
 		this.installing = major;
+		this.installProgress = null;
+		this.installTotal = null;
+		this.cancellingInstall = false;
 		this.installLog = this.installLog.filter((entry) => entry.id === major);
 		try {
 			this.installOutcome = await this.api.installMysql(major);
@@ -187,9 +237,41 @@ export class DatabasesStore {
 			return false;
 		} finally {
 			this.installing = '';
+			this.cancellingInstall = false;
 		}
 		await this.refresh();
 		return true;
+	}
+
+	/**
+	 * Ask the backend to abort the install in flight.
+	 *
+	 * MANDATORY, not a convenience: nothing bounds the download by wall clock —
+	 * only a 30-second idle window — and `openvhost-pkg`'s install permit is
+	 * process-wide and taken BEFORE staging, so a server dribbling one byte
+	 * every 29 seconds would hold it effectively forever and starve every later
+	 * install. This is the only way a user can get that permit back.
+	 *
+	 * Does not clear {@link installing} itself: the in-flight `install()` call
+	 * settles with a `cancelled` outcome and clears it there, so there is
+	 * exactly one place the row leaves its installing state.
+	 *
+	 * A `false` reply means nothing was stopped — the run had already finished,
+	 * or the shared lock was held by a different one — so the button is put back
+	 * rather than left reading "Cancelling…" over a run that is still going. The
+	 * window is small but real: this store sets `installing` synchronously,
+	 * before the backend has recorded the run's abort handle.
+	 */
+	async cancelInstall(): Promise<void> {
+		if (this.installing === '' || this.cancellingInstall) return;
+		this.cancellingInstall = true;
+		try {
+			const stopped = await this.api.cancelMysqlInstall();
+			if (!stopped) this.cancellingInstall = false;
+		} catch (e) {
+			this.error = errorMessage(e);
+			this.cancellingInstall = false;
+		}
 	}
 
 	/**

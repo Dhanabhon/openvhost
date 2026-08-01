@@ -35,8 +35,14 @@ import type {
 	MysqlInitStepDto,
 	MysqlInstallLogEvent,
 	MysqlInstallOutcomeDto,
+	MysqlInstallProgressDto,
+	MysqlInstallProgressEvent,
+	MysqlInstallResultDto,
 	MysqlInstanceDto,
+	MysqlLedgerWriteDto,
+	MysqlPackageOfferDto,
 	MysqlResetOutcomeDto,
+	MysqlRuntimeSourceDto,
 	PendingInstallDto,
 	PhpEnvironmentDto,
 	PhpInstallLogEvent,
@@ -83,8 +89,14 @@ export type {
 	MysqlInitStepDto,
 	MysqlInstallLogEvent,
 	MysqlInstallOutcomeDto,
+	MysqlInstallProgressDto,
+	MysqlInstallProgressEvent,
+	MysqlInstallResultDto,
 	MysqlInstanceDto,
+	MysqlLedgerWriteDto,
+	MysqlPackageOfferDto,
 	MysqlResetOutcomeDto,
+	MysqlRuntimeSourceDto,
 	PendingInstallDto,
 	PhpEnvironmentDto,
 	PhpInstallLogEvent,
@@ -460,22 +472,60 @@ export async function rescanMysql(): Promise<MysqlEnvironmentDto> {
 }
 
 /**
- * Install a MySQL major via Homebrew. Streams its output live through
- * {@link onMysqlInstallLog} while it runs, then resolves with the outcome —
- * including `detected`, which can be `false` even when `exitCode` is `0`.
- * Shares the same install lock as {@link installPhp}: only one of
- * `installPhp`/`installMysql`/`initializeMysql` can run at a time.
+ * Install a MySQL major from the pinned upstream tarball — download, SHA-256
+ * verify, extract. **No Homebrew is involved**, so this works on a machine that
+ * has never had brew installed.
+ *
+ * Streams typed pipeline states through {@link onMysqlInstallProgress} while it
+ * runs, then resolves with an OUTCOME rather than throwing: a verification
+ * failure, a stalled transfer, a cancel and an unavailable target are all
+ * distinct, renderable results (see `MysqlInstallResultDto`). Only a rejected
+ * major or a busy install lock throws.
+ *
+ * Shares the same install lock as {@link installPhp}: one of
+ * `installPhp`/`installMysql`/`initializeMysql`/`uninstallPackage` at a time.
  */
 export async function installMysql(major: string): Promise<MysqlInstallOutcomeDto> {
 	return unwrap(commands.installMysql(major));
 }
 
-/** Subscribe to `mysql-install-log`. Same `IpcError` contract as {@link onServiceState}. */
+/**
+ * Cancel an in-flight MySQL install, resolving to whether anything was actually
+ * stopped (`false` when it had already finished, or when the shared lock is
+ * held by a different run).
+ *
+ * Not a nicety. Nothing bounds the download by wall clock — only a 30-second
+ * idle window — and the package pipeline's install permit is process-wide and
+ * taken before staging, so an install nobody can stop starves every later one.
+ * Cancelling drops the install future, which removes the staging directory and
+ * releases that permit.
+ */
+export async function cancelMysqlInstall(): Promise<boolean> {
+	return unwrap(commands.cancelMysqlInstall());
+}
+
+/** Subscribe to `mysql-install-log` — since the tarball slice this carries a
+ *  MySQL **uninstall**'s brew output only; an install reports through
+ *  {@link onMysqlInstallProgress}. Same `IpcError` contract as
+ *  {@link onServiceState}. */
 export async function onMysqlInstallLog(
 	cb: (ev: MysqlInstallLogEvent) => void
 ): Promise<() => void> {
 	try {
 		return await events.mysqlInstallLogEvent.listen((e) => cb(e.payload));
+	} catch (e) {
+		throw normalizeError(e);
+	}
+}
+
+/** Subscribe to `mysql-install-progress` — one typed state per pipeline step
+ *  (`started`/`downloaded`/`verified`/`extracted`/`linked`). Same `IpcError`
+ *  contract as {@link onServiceState}. */
+export async function onMysqlInstallProgress(
+	cb: (ev: MysqlInstallProgressEvent) => void
+): Promise<() => void> {
+	try {
+		return await events.mysqlInstallProgressEvent.listen((e) => cb(e.payload));
 	} catch (e) {
 		throw normalizeError(e);
 	}
