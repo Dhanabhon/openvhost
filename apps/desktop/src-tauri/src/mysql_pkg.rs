@@ -98,24 +98,38 @@ pub enum MysqlPackageOfferDto {
     Unavailable { target: String },
 }
 
-/// What this build would install for `major` on this host.
+/// What this build would install for `major` on `target`.
 ///
-/// Any refusal is an absence — this deliberately does not parse an error
-/// payload to decide, so a future refusal reason cannot accidentally become an
-/// offer. The target name is derived from `PackageTarget::host()` directly,
-/// matched exhaustively.
-pub(crate) fn package_offer(major: &openvhost_core::mysql::MysqlMajor) -> MysqlPackageOfferDto {
-    let host = openvhost_core::mysql::PackageTarget::host();
-    let target = match host {
+/// `target` is an explicit `Option` rather than read from the host inside, for
+/// exactly the reason `mysql_package_for_target` takes one: **both branches
+/// have to be reachable from a test on any one machine.** They were not before
+/// — a mutation that returned `Available` for every refusal survived the whole
+/// suite green on Apple Silicon, because the refusal arm never executed there,
+/// and the refusal arm is the entire Intel story this slice promises.
+///
+/// Any refusal is an absence. This deliberately does not parse an error payload
+/// to decide, so a future refusal reason cannot accidentally become an offer.
+pub(crate) fn package_offer_for(
+    major: &openvhost_core::mysql::MysqlMajor,
+    target: Option<openvhost_core::mysql::PackageTarget>,
+) -> MysqlPackageOfferDto {
+    // `PackageTarget` is matched exhaustively via its own `as_str`; `None` is
+    // the host this programme publishes nothing for at all.
+    let named = match target {
         Some(t) => t.as_str().to_string(),
         None => "this host".to_string(),
     };
-    match openvhost_core::mysql::mysql_package_for_target(major, host) {
+    match openvhost_core::mysql::mysql_package_for_target(major, target) {
         Ok(entry) => MysqlPackageOfferDto::Available {
             version: entry.version.to_string(),
         },
-        Err(_) => MysqlPackageOfferDto::Unavailable { target },
+        Err(_) => MysqlPackageOfferDto::Unavailable { target: named },
     }
+}
+
+/// What this build would install for `major` on the host it was compiled for.
+pub(crate) fn package_offer(major: &openvhost_core::mysql::MysqlMajor) -> MysqlPackageOfferDto {
+    package_offer_for(major, openvhost_core::mysql::PackageTarget::host())
 }
 
 /// One step of the install pipeline, as the user watches it — the wire copy of
@@ -753,15 +767,77 @@ mod tests {
         }
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn apple_silicon_is_offered_the_pinned_build() {
         let major = openvhost_core::mysql::MysqlMajor::parse("8.4").unwrap();
         assert_eq!(
-            package_offer(&major),
+            package_offer_for(
+                &major,
+                Some(openvhost_core::mysql::PackageTarget::MacosArm64)
+            ),
             MysqlPackageOfferDto::Available {
                 version: "8.4.11".into()
             }
+        );
+    }
+
+    /// The Intel story, reachable on the Apple Silicon machine this is
+    /// developed on — which is the whole reason `package_offer_for` takes an
+    /// explicit target. Before it did, a mutation returning `Available` for
+    /// every refusal survived the entire suite green here, because this arm
+    /// never ran.
+    #[test]
+    fn an_intel_host_is_offered_nothing_and_the_absence_names_the_target() {
+        let major = openvhost_core::mysql::MysqlMajor::parse("8.4").unwrap();
+        assert_eq!(
+            package_offer_for(
+                &major,
+                Some(openvhost_core::mysql::PackageTarget::MacosX86_64)
+            ),
+            MysqlPackageOfferDto::Unavailable {
+                target: "macos-x86_64".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_host_this_programme_publishes_nothing_for_says_so_without_naming_an_arch() {
+        let major = openvhost_core::mysql::MysqlMajor::parse("8.4").unwrap();
+        assert_eq!(
+            package_offer_for(&major, None),
+            MysqlPackageOfferDto::Unavailable {
+                target: "this host".into()
+            }
+        );
+    }
+
+    /// The two answers must not be confusable: an offer always carries a
+    /// version, an absence always carries a target, and neither is the other.
+    #[test]
+    fn an_offer_and_an_absence_serialize_distinctly() {
+        let major = openvhost_core::mysql::MysqlMajor::parse("8.4").unwrap();
+        let arm = package_offer_for(
+            &major,
+            Some(openvhost_core::mysql::PackageTarget::MacosArm64),
+        );
+        let intel = package_offer_for(
+            &major,
+            Some(openvhost_core::mysql::PackageTarget::MacosX86_64),
+        );
+        assert_ne!(arm, intel);
+        assert_ne!(tag_of(&arm), tag_of(&intel));
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn the_host_offer_agrees_with_the_explicit_arm64_offer_on_this_machine() {
+        let major = openvhost_core::mysql::MysqlMajor::parse("8.4").unwrap();
+        assert_eq!(
+            package_offer(&major),
+            package_offer_for(
+                &major,
+                Some(openvhost_core::mysql::PackageTarget::MacosArm64)
+            )
         );
     }
 

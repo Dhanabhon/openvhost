@@ -2,6 +2,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { onMysqlInitLog, onMysqlInstallLog, onMysqlInstallProgress } from '$lib/ipc';
+	import { subscribeDatabaseEvents } from '$lib/databases.listeners';
 	import { databasesStore as store } from '$lib/databases.shared.svelte';
 	import { servicesStore } from '$lib/services.shared.svelte';
 	import { uninstallStore } from '$lib/uninstall.shared.svelte';
@@ -94,42 +95,24 @@
 	}
 
 	onMount(() => {
-		let unlistenInstall: (() => void) | null = null;
-		let unlistenProgress: (() => void) | null = null;
-		let unlistenInit: (() => void) | null = null;
+		// Every subscription lives in `databases.listeners.ts`, NOT inline here:
+		// `onMount` does not run under `svelte/server`, so anything written in
+		// this closure is untestable by construction — a neuter experiment
+		// severed the progress callback and the whole suite stayed green. What
+		// remains here is only the part a DOM would be needed to test anyway:
+		// calling it, and calling its disposer.
+		let release: (() => void) | null = null;
 		let disposed = false;
 
 		void (async () => {
 			try {
-				// One channel, two operations: `uninstall_package` streams a MySQL
-				// uninstall on the SAME `mysql-install-log` event `install_mysql`
-				// uses (design D1 — one lock, one output surface), so the line is
-				// routed by whichever operation currently holds that lock.
-				// `UninstallStore.appendLog` re-checks the same condition itself,
-				// so this routing is a convenience, not the guard.
-				const stopInstall = await onMysqlInstallLog((ev) => {
-					if (uninstallStore.uninstalling !== '') uninstallStore.appendLog(ev.major, ev.line);
-					else store.appendInstallLog(ev.major, ev.line);
-				});
-				// The install's OWN surface since the move off Homebrew: five typed
-				// pipeline states, not stdout. `verified` and `extracted` arrive as
-				// different values so the UI can render them as different sentences
-				// — a checked download and an unchecked one must not look alike.
-				const stopProgress = await onMysqlInstallProgress((ev) =>
-					store.applyInstallProgress(ev.progress)
+				const stop = await subscribeDatabaseEvents(
+					{ onMysqlInstallLog, onMysqlInstallProgress, onMysqlInitLog },
+					store,
+					uninstallStore,
+					() => disposed
 				);
-				const stopInit = await onMysqlInitLog((ev) => store.appendInitLog(ev.major, ev.line));
-				// Mirrors languages/+page.svelte's onMount wiring: this page can
-				// unmount while the listener registrations are still in flight.
-				if (disposed) {
-					stopInstall();
-					stopProgress();
-					stopInit();
-					return;
-				}
-				unlistenInstall = stopInstall;
-				unlistenProgress = stopProgress;
-				unlistenInit = stopInit;
+				release = stop;
 				await store.refresh();
 			} catch (e) {
 				store.fail(e);
@@ -138,12 +121,8 @@
 
 		return () => {
 			disposed = true;
-			unlistenInstall?.();
-			unlistenProgress?.();
-			unlistenInit?.();
-			unlistenInstall = null;
-			unlistenProgress = null;
-			unlistenInit = null;
+			release?.();
+			release = null;
 		};
 	});
 </script>
