@@ -361,7 +361,10 @@
 		   268px = the original 232px (measured, not derived — the confirm state plus a
 		   little air) PLUS one icon-only button's width (View logs, spec D6 — a second icon
 		   button alongside Open, ~30px including its `gap: 4px` neighbour). Verified against
-		   a 964px content width (1180px window minus the rail). */
+		   a 964px content width (1180px window minus the rail) — which left the row 2px of
+		   slack, so every narrower window clipped this group off the right edge. The wrapped
+		   layout at the bottom of this block is what handles those widths; this floor still
+		   applies there and is simply never the binding constraint. */
 		min-width: 268px;
 		display: flex;
 		gap: 4px;
@@ -460,5 +463,58 @@
 		padding: 0 var(--vh-space-4) var(--vh-space-3);
 		color: var(--vh-fail);
 		font-size: var(--vh-text-table);
+	}
+
+	/* The one-line row costs 962px, added up rather than guessed: the name floor 220 + the
+	   three fixed tracks 168 + 90 + 120 + the action floor 268 = 866, plus four 16px gaps and
+	   the row's own 2x16px padding. Below that the grid cannot fit and does not try — px
+	   tracks refuse to shrink, so it overflowed into `.panel`'s `overflow: hidden` and ate the
+	   Delete button from the right edge. Reachable in an ordinary window rather than a
+	   contrived one: `minWidth` is 960 and the rail takes 216, so the app's own smallest legal
+	   window leaves a row about 700px and loses Delete entirely.
+
+	   The threshold is 980, not 962, and the 18px is deliberate. 268 above is a MEASURED
+	   value — it tracks the width of the words on the buttons — so a sum built on it is only
+	   as stable as today's labels. Wrapping 18px earlier than strictly necessary is invisible;
+	   wrapping 1px too late clips a destructive control. If you change a track above, change
+	   this with it, and keep the slack.
+
+	   Flex rather than a second set of tracks, because what has to give is WHERE the row
+	   breaks, not how wide its cells are: every cell keeps its exact width as a flex basis, so
+	   PHP, the web server and the pill still line up down the list, and only the actions drop
+	   to a line of their own. The name keeps its `flex-shrink`, so a long domain still
+	   ellipsizes rather than forcing a third line. */
+	@container rowlist (width < 980px) {
+		.row {
+			display: flex;
+			flex-wrap: wrap;
+			/* Tighter between a row's two lines than between the cells on one, so the pair
+			   still reads as a single row against the 1px border that separates rows. */
+			row-gap: var(--vh-space-2);
+		}
+		.site-row > :first-child {
+			flex: 1 1 220px;
+		}
+		.php-cell {
+			flex: 0 0 168px;
+		}
+		/* Direct child only — `.meta` is also the domain line INSIDE the name cell, which must
+		   keep shrinking with its parent rather than pinning itself to the web server's width. */
+		.site-row > .meta {
+			flex: 0 0 90px;
+		}
+		.pill {
+			flex: 0 0 120px;
+		}
+		/* `flex-grow` hands the whole second line to the actions, which `justify-content:
+		   flex-end` already keeps right-aligned, so they sit under the row's right edge exactly
+		   as they do on one line. `flex-shrink: 0` is the load-bearing half: button labels are
+		   text and cannot be squeezed, so the group must be allowed to claim its natural width
+		   and wrap instead. The 268px floor above is left alone — harmless here, since the
+		   narrowest row this layout ever sees is ~694px and the actions have the line to
+		   themselves. */
+		.row-actions {
+			flex: 1 0 auto;
+		}
 	}
 </style>
