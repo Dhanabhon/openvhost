@@ -575,17 +575,25 @@
 	.pill-cell {
 		min-width: 0;
 	}
+	/* Wraps since the source badge landed: at a 380px panel this cell can hold
+	   "MySQL 9.7" + "Not managed" + "OpenVHost 8.4.11", which on one nowrap line
+	   would push the row's action column off-screen — the exact failure the
+	   status-bar slice had to fix once already. */
 	.primary {
 		font-weight: 600;
 		display: flex;
+		flex-wrap: wrap;
 		align-items: center;
-		gap: 8px;
+		gap: 6px 8px;
 		min-width: 0;
 	}
 	.primary .version {
 		white-space: nowrap;
 	}
-	.badge.unmanaged {
+	/* Shared chip base. `.unmanaged` used to carry all of this alone; the
+	   source badge needs the identical box, so it is a base plus two modifiers
+	   rather than a second copy that can drift. */
+	.badge {
 		display: inline-flex;
 		align-items: center;
 		flex-shrink: 0;
@@ -622,10 +630,16 @@
 	   StatusPill in the next column. The packaged variant borrows the link
 	   accent to say "this one is ours"; Homebrew keeps the neutral `.badge`
 	   treatment `.unmanaged` already uses. */
+	/* Provenance, not status: a quieter weight than `.unmanaged` so it reads as
+	   metadata beside the version rather than competing with the StatusPill in
+	   the next column. */
 	.badge.source {
 		font-weight: 500;
 		letter-spacing: 0.01em;
 	}
+	/* The packaged chip borrows the link accent to say "this one is ours".
+	   `--vh-link` is brand-700, the same token `.link-button` already uses on
+	   this surface; Homebrew keeps the neutral base. */
 	.badge.source-packaged {
 		color: var(--vh-link);
 		border-color: color-mix(in oklab, var(--vh-link) 35%, transparent);
