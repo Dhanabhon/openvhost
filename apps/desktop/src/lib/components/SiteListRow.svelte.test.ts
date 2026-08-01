@@ -11,6 +11,7 @@
 // items in the PR. The store-side guarantees (re-entrancy, error routing) are covered in
 // sites.svelte.test.ts, where they are real functions rather than markup.
 
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { render } from 'svelte/server';
 import SiteListRow from './SiteListRow.svelte';
@@ -179,5 +180,33 @@ describe('SiteListRow View logs deep link', () => {
 	it('is a real navigation link, not a button pretending to be one', () => {
 		const html = rowHtml(site(true));
 		expect(html).toMatch(/<a[^>]*aria-label="View logs for shop"/);
+	});
+});
+
+// The wrapped narrow layout is a CSS container query, and there is no layout engine here —
+// nothing below asserts that anything WRAPS. That was measured in a browser against the real
+// stylesheet and the numbers are in the PR; a jsdom assertion about a class would only be a
+// test that cannot fail, which this project has shipped enough of.
+//
+// What IS worth guarding is the seam, because it fails SILENTLY: the query lives in this
+// component and names a container that only SitesPanel declares. Delete `container-name`
+// there and every rule below `@container` simply stops matching — no error, no failing
+// render, no visual difference until someone narrows the window and loses Delete again.
+describe('the narrow-width layout stays wired to its container', () => {
+	const read = (f: string) =>
+		readFileSync(new URL(f, import.meta.url), 'utf8').match(/<style>([\s\S]*?)<\/style>/)?.[1] ??
+		'';
+
+	it('queries a container that SitesPanel actually declares', () => {
+		const queried = read('./SiteListRow.svelte').match(/@container\s+([\w-]+)\s*\(/)?.[1];
+		expect(queried, 'SiteListRow should query a NAMED container').toBeDefined();
+
+		const panel = read('./SitesPanel.svelte');
+		// Accept the longhand the source uses today or the `container:` shorthand a minifier
+		// or a later refactor may produce — the point is the name, not how it is spelled.
+		expect(panel).toMatch(
+			new RegExp(`container-name:\\s*${queried}\\b|container:\\s*${queried}\\b`)
+		);
+		expect(panel).toMatch(/container-type:\s*inline-size|container:\s*[\w-]+\s*\/\s*inline-size/);
 	});
 });

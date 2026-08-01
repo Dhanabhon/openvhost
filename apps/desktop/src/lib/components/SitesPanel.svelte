@@ -114,6 +114,16 @@
 	.rowlist {
 		display: flex;
 		flex-direction: column;
+		/* A row asks for 962px and cannot get it here: the window's own `minWidth` is 960 and
+		   the rail takes 216 of that, so a legally-sized window leaves a row ~700px and the
+		   grid overflowed into `.panel`'s `overflow: hidden`, clipping Delete. `SiteListRow`
+		   answers with a wrapped layout below that width, and queries THIS element rather
+		   than the viewport: the row's width is set by the panel, not by the screen, and a
+		   viewport media query would silently encode the rail's 216px into a component that
+		   knows nothing about the rail. Safe to contain — nothing inside a row is
+		   absolutely positioned. */
+		container-type: inline-size;
+		container-name: rowlist;
 	}
 	.empty {
 		padding: var(--vh-space-8) var(--vh-space-6);
