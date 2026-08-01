@@ -1132,9 +1132,15 @@ mod tests {
             install_fake_package(&root, "8.0", "8.0.40", "8.0.40 server\n", &ALL_THREE);
             // What a bare `..` would reach: `packages/mysql/bin/`. Ignored by
             // the walk itself (`bin` is not `major.minor`-shaped), so planting
-            // it creates no runtime of its own — it exists only so the `..`
-            // case has something real to resolve to, the way the decoy above
-            // does for the absolute case.
+            // it creates no runtime of its own.
+            //
+            // It is not an arbitrary prop: `bin/ lib/ share/` directly under
+            // the package root is exactly what an accidental one-level-too-high
+            // extraction of the real MySQL tarball leaves behind, because that
+            // is the tarball's own root. So the `..` case models a plausible
+            // no-attacker state, the way the decoy above does for the absolute
+            // case — not a shape only someone who could already plant anything
+            // would produce.
             let sibling_bin = root.as_path().join(MYSQL_PACKAGE_NAME).join("bin");
             std::fs::create_dir_all(&sibling_bin).unwrap();
             for name in ALL_THREE {

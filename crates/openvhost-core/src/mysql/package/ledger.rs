@@ -39,8 +39,12 @@ const MAX_COMPONENT_BYTES: usize = 64;
 /// independent crate for the same reason [`MAX_COMPONENT_BYTES`] is one — that
 /// crate's copy is `pub(crate)` and unimportable, and coupling the two would
 /// mean relaxing one silently relaxes the other. What must NOT diverge is the
-/// SET, and `the_write_guard_refuses_everything_the_installer_refuses` is what
-/// keeps the two lists honest with each other.
+/// SET. `the_write_guard_refuses_everything_the_installer_refuses` pins that
+/// every name in THIS list is refused — it does not keep the two lists in
+/// step, because it spells the names out a third time. A 25th entry added to
+/// `openvhost_pkg`'s `RESERVED` would leave both this list and that test stale
+/// and green. Closing that properly means asserting set equality against
+/// pkg's list, which needs it made public.
 const RESERVED_STEMS: [&str; 24] = [
     "con", "prn", "aux", "nul", "com0", "com1", "com2", "com3", "com4", "com5", "com6", "com7",
     "com8", "com9", "lpt0", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",

@@ -77,6 +77,14 @@ That is deliberate: a user who has an initialized 8.4 datadir from the brew era 
 
 **Confirmed safe: the upstream tarball is 8.4.11, the same minor Homebrew installs today.** A datadir initialized under the brew build opens under this one. The rule still stands for every future entry — MySQL will not open a datadir initialized by a *newer* server, so **the catalogue must never move a user's server backwards**.
 
+### D3b — One row per major, and what that costs (decided 2026-08-01)
+
+Discovery **merges per major**: with both a packaged and a Homebrew 8.4 present, the list holds **one** 8.4 runtime — ours — and the Homebrew one is not in it. That is D3's "ours wins" made concrete, and it is the shape the UI's one-row-per-major model needs.
+
+The live proof surfaced a consequence I had not thought through when writing D3, and it is accepted deliberately rather than by accident: **once a packaged 8.4 lands, the user can no longer uninstall their Homebrew 8.4 from inside the app.** The row is badged packaged, and a packaged runtime offers no Uninstall — `openvhost-pkg` has no uninstall counterpart at all yet. `MysqlRow` renders an explicit note so it reads as a known limit rather than a missing button, and `brew uninstall mysql@8.4` still works.
+
+The alternative — two rows for one major — buys that one affordance at the cost of the row model, on every page, permanently. Not worth it. The real fix is the slice that gives `openvhost-pkg` an uninstall.
+
 ### D7 — Never touch a Homebrew keg
 
 This slice installs into our tree only. It does not `brew uninstall` anything, does not relink, does not migrate. A user who wants their brew MySQL gone does that themselves, or through the uninstall slice's brew path, which stays.

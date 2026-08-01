@@ -4735,8 +4735,18 @@ enum InitializeMysqlGate {
 /// That is precisely how the init run came to carry the same
 /// `(Mysql, Install)` pair `cancel_mysql_install` fires on, differing only in
 /// a `label` that `InstallLock::abort_running_if` neither reads nor should.
-/// Retagging an initialization as an install now means editing this function,
-/// and `a_running_mysql_init_survives_the_databases_page_cancel` fails.
+/// Retagging an initialization as an install *here* means editing this
+/// function, and `a_running_mysql_init_survives_the_databases_page_cancel`
+/// fails.
+///
+/// BYPASSING this helper — tagging inline in `initialize_mysql`, the shape the
+/// bug originally had — is invisible to that test, because `initialize_mysql`
+/// takes `AppHandle<Wry>` and no test can reach its body. What catches it is
+/// the COMPILER: `PackageOperation::Initialize`, `MYSQL_INIT_RUN` and this
+/// function would all become dead code, and `-D warnings` turns those three
+/// lints into hard errors. That is stronger than a test — it cannot go
+/// vacuous — but it holds only while none of the three gains a second
+/// non-test user. If one ever does, this seam needs a real test instead.
 fn set_running_mysql_init(
     lock: &InstallLock,
     major: &openvhost_core::mysql::MysqlMajor,
