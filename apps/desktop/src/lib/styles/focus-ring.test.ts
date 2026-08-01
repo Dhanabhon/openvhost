@@ -54,9 +54,12 @@ describe('a focused quiet button', () => {
 	// separated the two frames rather than removing one.
 	const button = readFileSync(new URL('../components/Button.svelte', import.meta.url), 'utf8');
 
-	/** The body of `.btn-quiet:focus-visible`, without its braces. */
+	/** The body of the rule that styles `.btn-quiet:focus-visible`, without its braces.
+	 *  Matched on the selector LIST rather than an exact selector: `.btn-ghost` shares this
+	 *  treatment, and grouping is how CSS says "these two are the same rule". `[^{}]*` cannot
+	 *  cross a brace, so it stays inside the selector list. */
 	function quietFocusBlock(): string {
-		const m = button.match(/\.btn-quiet:focus-visible\s*\{([^}]*)\}/);
+		const m = button.match(/\n\t[^{}]*\.btn-quiet:focus-visible[^{}]*\{([^}]*)\}/);
 		if (!m) throw new Error('no `.btn-quiet:focus-visible` rule found in Button.svelte');
 		return m[1];
 	}
@@ -71,6 +74,18 @@ describe('a focused quiet button', () => {
 		// With the gap closed, a grey border against a green ring would still read
 		// as two bands. Matching the colour is what makes them one.
 		expect(quietFocusBlock()).toMatch(/border-color:\s*var\(--vh-focus-ring\)/);
+	});
+
+	it('hands the same band to the ghost variant', () => {
+		// `.btn-ghost` has no doubling to fix — its resting border is transparent, like
+		// primary's. It shares the rule for a different reason: it sits in the Sites row
+		// action strip beside `.icon-link`, which copies this treatment verbatim. If ghost
+		// fell back to the global ring, tabbing across that strip would show two different
+		// focus shapes in one group of controls.
+		expect(button).toMatch(/\.btn-ghost:focus-visible/);
+		const m = button.match(/\n\t[^{}]*\.btn-ghost:focus-visible[^{}]*\{([^}]*)\}/);
+		expect(m?.[1], '`.btn-ghost:focus-visible` should resolve to a rule body').toBeDefined();
+		expect(m?.[1]).toBe(quietFocusBlock());
 	});
 
 	it('leaves the primary button on the global ring', () => {
