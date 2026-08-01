@@ -394,4 +394,54 @@
 		margin: 0 var(--vh-space-4) var(--vh-space-3);
 		font-size: var(--vh-text-table);
 	}
+
+	/* The one-line row costs 940px: the four track floors 190 + 120 + 180 + 180 = 670, four
+	   16px gaps and the row's own 2x16px padding make 766, and the widest the action column
+	   ever gets is 174. px tracks do not shrink, so below that the grid overflowed into
+	   `.panel`'s `overflow: hidden`. Measured at the app's own smallest legal window (960,
+	   leaving a row 694px): 191px of overflow, with Uninstall's LEFT edge already past the
+	   panel — not clipped, gone. On a row that is not installed yet the same is true of
+	   Install, so a small window could not install PHP at all.
+
+	   174 is the widest action column, not the resting one, and the difference matters: it is
+	   `Installing…` alone, which beats Stop + `Uninstalling…`. A threshold derived from
+	   resting labels would have been 136 and wrong by 38px at exactly the moment a user is
+	   watching an install.
+
+	   The threshold is 970, not 940. Labels are text and this row's swing between resting and
+	   busy is already 60px on one button, so the sum is only as stable as today's wording.
+	   Wrapping 30px early is invisible; wrapping late puts a control off-screen. If you change
+	   a track or a label above, change this with it, and keep the slack.
+
+	   Flex rather than a second set of tracks: every cell keeps its exact width as a flex
+	   basis, so the version, the pill and both paths still line up down the list, and the
+	   wrap follows DOM order — no `order`, so focus order is untouched. */
+	@container langlist (width < 970px) {
+		.lang-row {
+			display: flex;
+			flex-wrap: wrap;
+			/* Tighter between a row's own lines than between cells on one line, so the pair
+			   still reads as one row against the 1px border that separates rows. */
+			row-gap: var(--vh-space-2);
+		}
+		.lang-row > .primary {
+			flex: 1 1 190px;
+		}
+		.lang-row > .pill-cell {
+			flex: 0 0 120px;
+		}
+		/* Both keep `flex-shrink`, so a long path still ellipsizes — `.meta` already sets
+		   `min-width: 0` and the ellipsis — rather than forcing another line. */
+		.lang-row > .path,
+		.lang-row > .socket {
+			flex: 1 1 180px;
+		}
+		/* `flex-shrink: 0` is the load-bearing half: button labels are text and cannot be
+		   squeezed, so the group claims its natural width and wraps instead. `flex-grow` then
+		   hands it the rest of its line, which `justify-content: flex-end` keeps right-aligned
+		   under the row's right edge exactly as on one line. */
+		.lang-row > .row-actions {
+			flex: 1 0 auto;
+		}
+	}
 </style>

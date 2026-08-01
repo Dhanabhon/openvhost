@@ -4,6 +4,7 @@
 // WHAT THIS FILE CANNOT COVER: no DOM, so click handlers are exercised only through
 // the `onclick` prop wiring Button.svelte already covers, not by simulating a click.
 
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { render } from 'svelte/server';
 import LanguageRow from './LanguageRow.svelte';
@@ -465,5 +466,81 @@ describe('LanguageRow — an installed major this build does not manage', () => 
 		const body = renderRow({ row: r('8.4', false), cataloged: true });
 		expect(body).not.toContain('data-testid="php-out-of-catalogue-8.4"');
 		expect(body).toContain('data-testid="install-8.4"');
+	});
+});
+
+// The wrapped narrow layout is a CSS container query and there is no layout engine here, so
+// nothing below asserts that anything WRAPS — that was measured in a browser and the numbers
+// are in the PR. What is worth guarding is the two ways it can rot silently, both of which
+// end with a control off-screen and every test still green.
+describe('the narrow-width layout', () => {
+	const styleOf = (rel: string) =>
+		readFileSync(new URL(rel, import.meta.url), 'utf8').match(/<style>([\s\S]*?)<\/style>/)?.[1] ??
+		'';
+	const row = styleOf('./LanguageRow.svelte');
+
+	it('queries a container the Languages page actually declares', () => {
+		// The query names a container only the page declares. Drop `container-name` there and
+		// every rule below `@container` stops matching — no error, no failing render, no
+		// visual difference until someone narrows the window and loses Uninstall again.
+		const queried = row.match(/@container\s+([\w-]+)\s*\(/)?.[1];
+		expect(queried, 'LanguageRow should query a NAMED container').toBeDefined();
+
+		const page = styleOf('../../routes/languages/+page.svelte');
+		expect(page).toMatch(
+			new RegExp(`container-name:\\s*${queried}\\b|container:\\s*${queried}\\b`)
+		);
+		expect(page).toMatch(/container-type:\s*inline-size|container:\s*[\w-]+\s*\/\s*inline-size/);
+	});
+
+	it('keeps the one-line cost below the width at which the row wraps', () => {
+		// Widen a track and the row costs more than the width at which it wraps, so it goes
+		// back to overflowing `.panel`'s `overflow: hidden`. Re-derived from the stylesheet.
+		const tokens = readFileSync(new URL('../styles/tokens.css', import.meta.url), 'utf8');
+		const resolve = (decl: string) =>
+			/^\d+px$/.test(decl)
+				? Number(decl.slice(0, -2))
+				: Number(
+						tokens.match(
+							new RegExp(`${decl.match(/var\((--[\w-]+)\)/)?.[1] ?? '\0'}:\\s*(\\d+)px`)
+						)?.[1]
+					);
+
+		// Measured in a browser at the widest the action column ever gets — `Installing…`
+		// alone, which beats Stop + `Uninstalling…`. It cannot be read off the stylesheet:
+		// unlike the Sites row, this `.row-actions` has no `min-width` floor, so the number
+		// lives here with its provenance rather than pretending to be derived.
+		const WIDEST_ACTION_COLUMN_PX = 174;
+
+		const tracks = (row.match(/grid-template-columns:\s*([^;]+);/)?.[1] ?? '')
+			.replace(/minmax\(\s*(\d+px)[^)]*\)/g, '$1')
+			.trim()
+			.split(/\s+/);
+		const floors = tracks.filter((t) => /^\d+px$/.test(t)).map((t) => Number(t.slice(0, -2)));
+		const rowRule = row.match(/\n\t\.row\s*\{[\s\S]*?\}/)?.[0] ?? '';
+		const gap = resolve(rowRule.match(/\bgap:\s*([^;]+);/)?.[1]?.trim() ?? '');
+		const padX = resolve(rowRule.match(/padding:\s*\S+\s+([^;]+);/)?.[1]?.trim() ?? '');
+		const wrapsBelow = Number(row.match(/@container\s+[\w-]+\s*\(width\s*<\s*(\d+)px\)/)?.[1]);
+
+		// Without this a regex that stops matching yields 0 and the assertion below passes for
+		// the wrong reason — a test that cannot fail, dressed as one that can.
+		expect({ floors: floors.length, autos: tracks.filter((t) => t === 'auto').length }).toEqual({
+			floors: tracks.length - 1,
+			autos: 1
+		});
+		for (const [name, n] of Object.entries({ gap, padX, wrapsBelow })) {
+			expect(n, `${name} should have been read out of the stylesheet`).toBeGreaterThan(0);
+		}
+
+		const oneLineCost =
+			floors.reduce((a, b) => a + b, 0) +
+			WIDEST_ACTION_COLUMN_PX +
+			(tracks.length - 1) * gap +
+			2 * padX;
+		expect(
+			wrapsBelow,
+			`the row costs ${oneLineCost}px on one line but only wraps below ${wrapsBelow}px — ` +
+				`raise the @container threshold above ${oneLineCost}`
+		).toBeGreaterThanOrEqual(oneLineCost);
 	});
 });

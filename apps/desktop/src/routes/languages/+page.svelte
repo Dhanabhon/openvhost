@@ -266,6 +266,15 @@
 	.rowlist {
 		display: flex;
 		flex-direction: column;
+		/* A row costs 940px and cannot get it here: `minWidth` is 960, the rail takes 216 and
+		   this panel another 50 of margin and border, so the app's own smallest legal window
+		   leaves a row ~694px. The grid overflowed into `.panel`'s `overflow: hidden` and put
+		   Uninstall — and on a row that is not installed yet, Install — entirely off the right
+		   edge. `LanguageRow` answers with a wrapped layout below that width and queries THIS
+		   element rather than the viewport: the row's width comes from the panel, not the
+		   screen. Same treatment as SitesPanel's `.rowlist`. */
+		container-type: inline-size;
+		container-name: langlist;
 	}
 	.empty {
 		padding: var(--vh-space-8) var(--vh-space-6);
