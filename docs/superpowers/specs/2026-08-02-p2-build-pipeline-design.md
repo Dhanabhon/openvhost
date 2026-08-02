@@ -153,8 +153,14 @@ A tarball is acceptable only if **all** of these hold. The audit is a script; a 
 a failed build, not a warning.
 
 1. Extracts to a single root containing at least `bin/` and `share/`.
-2. **Linkage:** every `otool -L` entry of every Mach-O is `/usr/lib/*`, `/System/*`, or
-   `@loader_path/...`. Nothing else.
+2. **Linkage:** every `otool -L` entry of every Mach-O is `/usr/lib/*`, `/System/*`,
+   `@loader_path/...` or `@rpath/...`, **and** every `LC_RPATH` is `@loader_path`-relative.
+   Nothing else. *Amended 2026-08-02 during implementation:* real MariaDB ships
+   `LC_ID_DYLIB = @rpath/libmariadb.3.dylib` alongside `LC_RPATH = @loader_path/../lib`,
+   which is the idiomatic macOS pattern for a self-contained tree rather than a defect.
+   Admitting `@rpath` on its own would have been a hole rather than a widening — it is only
+   as relocatable as the `LC_RPATH` entries that resolve it, and `otool -L` never shows one —
+   so the rpath condition arrives with it.
 3. **Signature:** every Mach-O is signed and `codesign -v` passes.
 4. **No builder identity anywhere in the tree.** Today's tree fails this — 13 files carry
    the staging path. See D8 for how the prefix is chosen so that what remains is harmless,

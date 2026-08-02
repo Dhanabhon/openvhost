@@ -226,7 +226,18 @@ RECIPE_VERSION="$BUILD_VERSION"
 # actually needs. Everything else is required and is checked below.
 RECIPE_BUILD_TOOLS=()
 RECIPE_DEPENDS=()
-RECIPE_IGNORE_PREFIXES=(/opt/homebrew /usr/local /Applications/ServBay)
+# CMAKE_IGNORE_PREFIX_PATH matches a prefix EXACTLY; it does not ignore
+# descendants. Listing /Applications/ServBay therefore does nothing about
+# /Applications/ServBay/package/common — which is the directory that actually
+# holds their headers and libraries, and one of the two routes by which the host
+# leaked into the reference build (spec §2). A default that names the parent and
+# misses the child reads like a defence and is not one, so both are listed.
+RECIPE_IGNORE_PREFIXES=(
+	/opt/homebrew
+	/usr/local
+	/Applications/ServBay
+	/Applications/ServBay/package/common
+)
 RECIPE_SIGNING_KEY_FPR=""
 RECIPE_SIGNING_KEY_EXPIRY=""
 RECIPE_SIGNING_KEY_VERIFIED_ON=""
