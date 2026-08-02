@@ -21,3 +21,20 @@ apps/desktop/src-tauri/gen/
 **/.claude/skills/
 # The isolated worktrees this repo's agent workflow creates live under here too.
 **/.claude/worktrees/
+
+# The package build pipeline (build/). The driver, the audit and the recipes are
+# the repo's; nothing they produce is. A MariaDB build tree is 3.4 GB and the
+# installed tree 465 MB, so one careless `git add` is a repository nobody can
+# clone. The default output directory is excluded outright, and the artifact
+# shapes are excluded wherever under build/ they land, because an artifact that
+# is merely in an unusual place is still an artifact.
+#
+# `/build/` and not `build/`: a leading slash anchors this to the repo root, so
+# it cannot swallow a `build/` directory inside a crate or an app. Verified with
+# `git check-ignore -v`, not assumed.
+/build/out/
+/build/**/*.tar.gz
+/build/**/*.tar.xz
+/build/**/*.tgz
+/build/**/*.sha256
+/build/**/*.manifest.json
