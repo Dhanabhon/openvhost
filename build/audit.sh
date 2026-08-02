@@ -8,7 +8,8 @@
 #
 #   1. layout      a single root containing bin/ and share/
 #   2. linkage     every otool -L entry of every Mach-O is /usr/lib/*,
-#                  /System/*, or @loader_path/...  — nothing else
+#                  /System/*, @loader_path/... or @rpath/..., AND every
+#                  LC_RPATH is @loader_path-relative — nothing else
 #   3. signature   every Mach-O is signed and codesign --verify passes
 #   4. identity    the tree carries no trace of the machine that built it
 #   5. relocation  copy to path A, run; move to path B, run again
@@ -355,17 +356,32 @@ while IFS= read -r macho; do
 		entry="${entry%% (*}"
 		[ -n "$entry" ] || continue
 		case "$entry" in
-		/usr/lib/?* | /System/?* | @loader_path/?*) ;;
+		/usr/lib/?* | /System/?* | @loader_path/?* | @rpath/?*) ;;
 		*) printf '%s -> %s\n' "${macho#"$TREE"/}" "$entry" >>"$link_problems" ;;
 		esac
 	done <"$otool_out"
+
+	# `@rpath` is only as relocatable as the LC_RPATH entries that resolve it, so
+	# admitting it above without this would be a hole rather than a widening: an
+	# absolute LC_RPATH defeats relocation exactly the way an absolute dependency
+	# does, and `otool -L` never shows it. Real MariaDB needs this — it ships
+	# `LC_ID_DYLIB = @rpath/libmariadb.3.dylib` with `LC_RPATH = @loader_path/../lib`,
+	# which is the idiomatic macOS pattern for a self-contained tree, not a defect.
+	while IFS= read -r rpath; do
+		[ -n "$rpath" ] || continue
+		case "$rpath" in
+		@loader_path/?* | @loader_path) ;;
+		*) printf '%s -> LC_RPATH %s\n' "${macho#"$TREE"/}" "$rpath" >>"$link_problems" ;;
+		esac
+	done < <(otool -l "$macho" 2>/dev/null |
+		awk '/^ *cmd LC_RPATH$/{want=1} want && /^ *path /{print $2; want=0}')
 done <"$MACHO_LIST"
 
 if [ -s "$link_problems" ]; then
 	check_fail "$(count_lines "$link_problems") load-command entries outside the contract"
 	report_lines "$link_problems"
 else
-	check_pass "$MACHO_COUNT Mach-O files; every entry /usr/lib, /System or @loader_path"
+	check_pass "$MACHO_COUNT Mach-O files; deps /usr/lib, /System, @loader_path or @rpath; every LC_RPATH @loader_path-relative"
 fi
 
 # ------------------------------------------------------------- 3. signature --
@@ -435,6 +451,13 @@ add_forbidden_path() {
 	printf '%s\n' "$twin" >>"$FORBID_FILE"
 }
 
+# Check 4's strength depends on where the build actually ran, and D8 is what
+# makes that safe rather than lucky: build.sh forces every build under the
+# neutral root, so the paths a package embeds are inert by construction. Auditing
+# a tree built somewhere else — a session scratchpad, say — can therefore pass
+# here and still carry that path, which is correct behaviour for a contract about
+# the builder's IDENTITY, and is why --forbid exists for the cases it is not.
+#
 # (a) the builder's own directories, as the environment reports them
 add_forbidden_path "${HOME:-}"
 add_forbidden_path "$PWD"
