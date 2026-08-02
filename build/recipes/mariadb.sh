@@ -63,6 +63,77 @@ RECIPE_SIGNING_KEY_URLS=(
 RECIPE_UPSTREAM_RELEASE_DATE="2025-11-05"
 RECIPE_LAST_CHECKED="2026-08-02"
 
+# ------------------------------------------- what `bundled` actually downloads --
+#
+# -DWITH_PCRE=bundled and -DWITH_LIBFMT=bundled vendor nothing. Each is an
+# ExternalProject_Add that fetches an archive over the network DURING the build
+# and checks it with URL_MD5 and nothing else (cmake/pcre.cmake, cmake/libfmt.cmake).
+# Both are compiled into bin/mariadbd, so the artifact contract cannot see either
+# one: check 2 reads link commands, and a static library that was compiled in
+# leaves no entry there. MD5 stopped being collision-resistant in 2004, and
+# neither archive is signed by the host that serves it.
+#
+# The answer is not to trust that check harder. Both archives are fetched here
+# and verified here — PCRE2 against its GPG signature, fmt against its digest,
+# because fmt publishes no signature — and then placed where ExternalProject
+# looks before it decides anything, since its download step returns early when
+# the file is already present and its hash matches (_mariadb_seed_archive).
+# recipe_build then runs with the network taken away (_mariadb_no_network), which
+# is what makes "no unverified fetch" a property of the build rather than a claim
+# about the two downloads we happened to think of.
+#
+# §14 now covers these two as well — but note the shape of that obligation. The
+# versions are MariaDB's choice, not ours, because cmake insists on its own
+# URL_MD5; so the answer to a pcre2 CVE is a MariaDB release that bumps it, and
+# not a number edited here.
+
+RECIPE_VENDORED_LAST_CHECKED="2026-08-03"
+
+RECIPE_PCRE2_VERSION="10.45"
+RECIPE_PCRE2_URL="https://github.com/PCRE2Project/pcre2/releases/download/pcre2-$RECIPE_PCRE2_VERSION/pcre2-$RECIPE_PCRE2_VERSION.zip"
+RECIPE_PCRE2_SHA256="59c8556fd45e68599897cd5d74efad9c4a43f85e981fe7ac3ac5fd7aa70672ac"
+RECIPE_PCRE2_SIGNATURE_URL="$RECIPE_PCRE2_URL.sig"
+RECIPE_PCRE2_UPSTREAM_RELEASE_DATE="2025-02-05"
+
+# PCRE2 signs every release asset. The signature over pcre2-10.45.zip was made on
+# 2025-02-04 by subkey BACF71F10404D5761C09D392021DE40BFB63B406, whose primary is
+# the fingerprint pinned below — Nicholas Wilson, PCRE2's maintainer. Verified on
+# 2026-08-03 from two hosts that share no infrastructure with github.com, both of
+# which served the same primary and the same subkey set:
+#
+#   keys.openpgp.org      -> A95536204A3BB489715231282A98E77EB6F24CA8
+#   keyserver.ubuntu.com  -> A95536204A3BB489715231282A98E77EB6F24CA8
+#
+# The PRIMARY is pinned, not the subkey that made the signature, which is why
+# _mariadb_verify_signature reads the last field of VALIDSIG rather than the
+# first. A maintainer may rotate a signing subkey between releases without the
+# identity changing; pinning the subkey would turn that into a build failure
+# indistinguishable from an attack.
+RECIPE_PCRE2_SIGNING_KEY_FPR="A95536204A3BB489715231282A98E77EB6F24CA8"
+RECIPE_PCRE2_SIGNING_KEY_URLS=(
+	"https://keys.openpgp.org/vks/v1/by-fingerprint/A95536204A3BB489715231282A98E77EB6F24CA8"
+	"https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xA95536204A3BB489715231282A98E77EB6F24CA8&options=mr"
+)
+
+RECIPE_FMT_VERSION="12.0.0"
+RECIPE_FMT_URL="https://github.com/fmtlib/fmt/releases/download/$RECIPE_FMT_VERSION/fmt-$RECIPE_FMT_VERSION.zip"
+RECIPE_FMT_SHA256="1c32293203449792bf8e94c7f6699c643887e826f2d66a80869b4f279fb07d25"
+RECIPE_FMT_UPSTREAM_RELEASE_DATE="2025-09-17"
+
+# fmt publishes NO signature: no detached .sig, no signed digest list. Said out
+# loud rather than left to inference, because "verified" has to mean one thing
+# everywhere in this file. What upstream does publish is fmt-12.0.0.intoto.jsonl,
+# a SLSA provenance attestation whose subject digest is the sha256 pinned above —
+# but checking its Sigstore envelope needs cosign or slsa-verifier, which this
+# pipeline does not have and will not grow for one archive, and reading the
+# digest out of an unverified attestation served by the same host proves nothing.
+#
+# So the pin above is the guarantee, with one genuinely independent corroboration:
+# MariaDB's GPG-signed source declares the MD5 of these same bytes, and
+# _mariadb_seed_archive asserts our copy matches it. Two parties, two algorithms,
+# one artifact.
+RECIPE_FMT_SIGNATURE="none published upstream; sha256 pin only"
+
 # ------------------------------------------------------------------- inputs --
 
 # D3/§13: static OpenSSL, built by build/recipes/openssl.sh with --stage-only
@@ -107,8 +178,140 @@ _mariadb_tarball() { printf '%s/mariadb-%s.tar.gz\n' "$BUILD_DOWNLOADS" "$RECIPE
 _mariadb_signature() { printf '%s.asc\n' "$(_mariadb_tarball)"; }
 _mariadb_openssl_prefix() { bp_dep_prefix openssl "$RECIPE_OPENSSL_VERSION"; }
 
+# The basenames are not free choices: ExternalProject looks for the last path
+# component of its own URL, so these must be what upstream's URL ends with.
+_mariadb_pcre2_archive() { printf '%s/pcre2-%s.zip\n' "$BUILD_DOWNLOADS" "$RECIPE_PCRE2_VERSION"; }
+_mariadb_pcre2_signature() { printf '%s.sig\n' "$(_mariadb_pcre2_archive)"; }
+_mariadb_fmt_archive() { printf '%s/fmt-%s.zip\n' "$BUILD_DOWNLOADS" "$RECIPE_FMT_VERSION"; }
+
 _mariadb_gpg() {
 	"$(bp_tool gpg)" --batch --no-tty --quiet --homedir "$(_mariadb_gnupg_home)" "$@"
+}
+
+# Take the network away from one command. cmake's file(DOWNLOAD) — which is what
+# every ExternalProject download step ends up in — is libcurl, and libcurl honours
+# these variables for the schemes upstream uses, so a step that decides to fetch
+# gets a connection refused instead of an archive. no_proxy is cleared because a
+# single entry in it would route around the whole thing.
+#
+# This is the load-bearing half of the arrangement. Seeding two archives stops
+# the two downloads we know about; this is what makes a third one, added by some
+# future MariaDB release, fail loudly instead of quietly succeeding.
+_mariadb_no_network() {
+	http_proxy="http://127.0.0.1:9" https_proxy="http://127.0.0.1:9" \
+		all_proxy="http://127.0.0.1:9" ftp_proxy="http://127.0.0.1:9" \
+		HTTP_PROXY="http://127.0.0.1:9" HTTPS_PROXY="http://127.0.0.1:9" \
+		ALL_PROXY="http://127.0.0.1:9" FTP_PROXY="http://127.0.0.1:9" \
+		no_proxy="" NO_PROXY="" \
+		"$@"
+}
+
+# Import every candidate key whose PRIMARY fingerprint is $1, from the URLs given
+# after the label. The fingerprint is the trust anchor, so key material may come
+# from any host: a substituted key cannot produce it. What the fetch has to get
+# right is freshness, not authenticity — expiry and revocation only travel with
+# the key — which is why no candidate is ever reused from a previous run.
+_mariadb_import_key() {
+	local fpr="$1" label="$2"
+	shift 2
+	local index=0 url dest imported=0 primary
+	for url in "$@"; do
+		index=$((index + 1))
+		dest="$BUILD_DOWNLOADS/signing-key-$label-$index.asc"
+		rm -f -- "$dest"
+		if ! bp_download "$url" "$dest" >/dev/null 2>&1; then
+			bp_log "signing key not available from $url"
+			continue
+		fi
+		# Import only if a PRIMARY key in the file carries the pinned fingerprint.
+		# Verification below insists on that same fingerprint, so an extra key
+		# riding along could not vouch for anything — but there is no reason to let
+		# one into the keyring either.
+		primary="$(_mariadb_gpg --show-keys --with-colons "$dest" 2>/dev/null |
+			awk -F: '$1 == "pub" { want = 1; next } $1 == "fpr" && want { print $10; want = 0 }' |
+			grep -Fx "$fpr" || true)"
+		if [ -z "$primary" ]; then
+			bp_log "ignoring key from $url: no primary key with fingerprint $fpr"
+			continue
+		fi
+		_mariadb_gpg --import "$dest" >/dev/null 2>&1 || continue
+		imported=$((imported + 1))
+		bp_log "imported signing key $fpr from $url"
+	done
+	[ "$imported" -gt 0 ] ||
+		bp_die "no host served a key with fingerprint $fpr; cannot verify provenance"
+}
+
+# Insist on a good signature over <file> by the primary key <fpr>.
+#
+# gpg --verify exits 0 on an EXPIRED signing key — measured on 2026-08-02 against
+# OpenSSL's, whose keyserver copy had lapsed — so the exit status proves nothing
+# and the machine-readable status is read instead.
+#
+# The fingerprint compared is the LAST field of VALIDSIG, which is the primary
+# key; the first field is whichever subkey actually made the signature. MariaDB
+# signs with its primary and PCRE2 signs with a subkey, so the primary is the only
+# stable thing to pin — see RECIPE_PCRE2_SIGNING_KEY_FPR.
+_mariadb_verify_signature() {
+	local file="$1" sig="$2" fpr="$3" what status errors bad
+	what="$(basename -- "$file")"
+	status="$BUILD_WORK/gpg-status-$what.txt"
+	errors="$BUILD_WORK/gpg-stderr-$what.txt"
+
+	_mariadb_gpg --status-fd 1 --verify "$sig" "$file" >"$status" 2>"$errors" || true
+
+	awk -v fpr="$fpr" \
+		'$1 == "[GNUPG:]" && $2 == "VALIDSIG" && $NF == fpr { found = 1 }
+		 END { exit found ? 0 : 1 }' "$status" ||
+		bp_die "no valid signature by $fpr over $what; gpg said: $(tr '\n' ' ' <"$errors")"
+	for bad in EXPKEYSIG REVKEYSIG BADSIG ERRSIG EXPSIG; do
+		# An `if`, not `grep ... && bp_die`: under set -e the AND-list's failure
+		# becomes the loop's exit status, and a loop that "fails" because nothing
+		# was wrong would abort the build on the happy path.
+		if grep -q "^\[GNUPG:\] $bad " "$status"; then
+			bp_die "signature over $what is $bad; refusing to build from it"
+		fi
+	done
+	bp_log "GPG: good signature by $fpr over $what"
+}
+
+# Put a verified archive where MariaDB's ExternalProject step will look, and prove
+# that step is still asking for exactly these bytes.
+#
+# ExternalProject downloads into <PREFIX>/src and its download step returns early
+# when the file is already there and its hash matches. On a MISMATCH it deletes
+# the file and fetches. So a stale seed does not fail — it silently becomes the
+# network fetch this exists to remove, and that is the failure mode worth
+# engineering against, not a wrong digest. The URL and URL_MD5 are therefore read
+# back out of the source whose signature we just checked, and compared with what
+# we fetched: a MariaDB release that bumps either one stops the build here,
+# before anything is compiled, rather than downloading its own copy.
+_mariadb_seed_archive() {
+	local module="$1" download_dir="$2" archive="$3" want_url="$4"
+	local declared_url declared_md5 actual_md5
+
+	[ -f "$module" ] ||
+		bp_die "$module is missing; MariaDB no longer bundles this the way the recipe seeds it, and the seed cannot be verified"
+
+	# $1 rather than a regex: URL_MD5 also begins with "URL", and a pattern that
+	# confuses the two would silently compare a digest against a URL.
+	declared_url="$(awk '$1 == "URL" { gsub(/"/, "", $2); print $2; exit }' "$module")"
+	declared_md5="$(awk '$1 == "URL_MD5" { print $2; exit }' "$module")"
+	[ -n "$declared_url" ] && [ -n "$declared_md5" ] ||
+		bp_die "could not read URL/URL_MD5 out of $module; it no longer has the ExternalProject shape this recipe seeds, so the seed would be ignored"
+
+	[ "$declared_url" = "$want_url" ] ||
+		bp_die "$(basename -- "$module") now fetches $declared_url, not $want_url; re-pin it in this recipe with a fresh digest and, where upstream signs, a re-verified signature"
+
+	# /sbin/md5, absolute: this is a verification step, and the one thing this
+	# pipeline has already been bitten by is a tool found on PATH (spec §2).
+	actual_md5="$(/sbin/md5 -q -- "$archive")"
+	[ "$actual_md5" = "$declared_md5" ] ||
+		bp_die "$(basename -- "$archive") has md5 $actual_md5 but $(basename -- "$module") expects $declared_md5; cmake would delete our verified copy and fetch its own"
+
+	mkdir -p "$download_dir"
+	cp -- "$archive" "$download_dir/$(basename -- "$archive")"
+	bp_log "seeded $(basename -- "$archive") into $download_dir (md5 agrees with $(basename -- "$module"), so no download step runs)"
 }
 
 # True only if this bison can actually generate a parser. Version is not a test:
@@ -157,65 +360,39 @@ recipe_fetch() {
 
 	bp_download "$RECIPE_SOURCE_URL" "$(_mariadb_tarball)"
 	bp_download "$RECIPE_SIGNATURE_URL" "$(_mariadb_signature)"
+	# The two archives -DWITH_PCRE=bundled and -DWITH_LIBFMT=bundled would
+	# otherwise fetch mid-build behind an MD5. Fetched here so that they pass
+	# through the same verification as everything else.
+	bp_download "$RECIPE_PCRE2_URL" "$(_mariadb_pcre2_archive)"
+	bp_download "$RECIPE_PCRE2_SIGNATURE_URL" "$(_mariadb_pcre2_signature)"
+	bp_download "$RECIPE_FMT_URL" "$(_mariadb_fmt_archive)"
 
-	local index=0 url dest imported=0 primary
 	bp_rm_tree "$(_mariadb_gnupg_home)"
 	mkdir -p "$(_mariadb_gnupg_home)"
 	chmod 700 "$(_mariadb_gnupg_home)"
-	for url in ${RECIPE_SIGNING_KEY_URLS[@]+"${RECIPE_SIGNING_KEY_URLS[@]}"}; do
-		index=$((index + 1))
-		dest="$BUILD_DOWNLOADS/signing-key-$index.asc"
-		# Never reused from a previous run: key material is the one input whose
-		# freshness matters, because expiry and revocation only travel with it.
-		rm -f -- "$dest"
-		if ! bp_download "$url" "$dest" >/dev/null 2>&1; then
-			bp_log "signing key not available from $url"
-			continue
-		fi
-		# Import only if a PRIMARY key in the file carries the pinned fingerprint.
-		# Verification below insists on VALIDSIG for that same fingerprint, so an
-		# extra key riding along could not vouch for anything — but there is no
-		# reason to let one into the keyring either.
-		primary="$(_mariadb_gpg --show-keys --with-colons "$dest" 2>/dev/null |
-			awk -F: '$1 == "pub" { want = 1; next } $1 == "fpr" && want { print $10; want = 0 }' |
-			grep -Fx "$RECIPE_SIGNING_KEY_FPR" || true)"
-		if [ -z "$primary" ]; then
-			bp_log "ignoring key from $url: no primary key with fingerprint $RECIPE_SIGNING_KEY_FPR"
-			continue
-		fi
-		_mariadb_gpg --import "$dest" >/dev/null 2>&1 || continue
-		imported=$((imported + 1))
-		bp_log "imported signing key $RECIPE_SIGNING_KEY_FPR from $url"
-	done
-	[ "$imported" -gt 0 ] ||
-		bp_die "no host served a key with fingerprint $RECIPE_SIGNING_KEY_FPR; cannot verify provenance"
+	# One keyring for both. Each verification names the fingerprint it demands, so
+	# a key in here can only vouch for the release it actually signed.
+	_mariadb_import_key "$RECIPE_SIGNING_KEY_FPR" mariadb \
+		${RECIPE_SIGNING_KEY_URLS[@]+"${RECIPE_SIGNING_KEY_URLS[@]}"}
+	_mariadb_import_key "$RECIPE_PCRE2_SIGNING_KEY_FPR" pcre2 \
+		${RECIPE_PCRE2_SIGNING_KEY_URLS[@]+"${RECIPE_PCRE2_SIGNING_KEY_URLS[@]}"}
 }
 
 recipe_verify_source() {
-	local status="$BUILD_WORK/gpg-status.txt" errors="$BUILD_WORK/gpg-stderr.txt" bad
-
 	# The signature says who produced these bytes; the pinned digest says they
 	# are the same bytes we reviewed. Both, in that order.
-	#
-	# gpg --verify exits 0 on an EXPIRED signing key — measured on 2026-08-02
-	# against OpenSSL's, whose keyserver copy had lapsed — so the exit status
-	# proves nothing and the machine-readable status is read instead.
-	_mariadb_gpg --status-fd 1 --verify "$(_mariadb_signature)" "$(_mariadb_tarball)" \
-		>"$status" 2>"$errors" || true
-
-	grep -q "^\[GNUPG:\] VALIDSIG $RECIPE_SIGNING_KEY_FPR " "$status" ||
-		bp_die "no valid signature by $RECIPE_SIGNING_KEY_FPR over $(basename -- "$(_mariadb_tarball)"); gpg said: $(tr '\n' ' ' <"$errors")"
-	for bad in EXPKEYSIG REVKEYSIG BADSIG ERRSIG EXPSIG; do
-		# An `if`, not `grep ... && bp_die`: under set -e the AND-list's failure
-		# becomes the loop's exit status, and a loop that "fails" because nothing
-		# was wrong would abort the build on the happy path.
-		if grep -q "^\[GNUPG:\] $bad " "$status"; then
-			bp_die "signature over $(basename -- "$(_mariadb_tarball)") is $bad; refusing to build from it"
-		fi
-	done
-	bp_log "GPG: good signature by $RECIPE_SIGNING_KEY_FPR"
-
+	_mariadb_verify_signature "$(_mariadb_tarball)" "$(_mariadb_signature)" \
+		"$RECIPE_SIGNING_KEY_FPR"
 	bp_verify_sha256 "$(_mariadb_tarball)" "$RECIPE_SOURCE_SHA256"
+
+	_mariadb_verify_signature "$(_mariadb_pcre2_archive)" "$(_mariadb_pcre2_signature)" \
+		"$RECIPE_PCRE2_SIGNING_KEY_FPR"
+	bp_verify_sha256 "$(_mariadb_pcre2_archive)" "$RECIPE_PCRE2_SHA256"
+
+	# Logged, not buried in a comment: a reader of the build output should not have
+	# to infer which inputs were signature-checked and which were not.
+	bp_log "fmt $RECIPE_FMT_VERSION signature: $RECIPE_FMT_SIGNATURE"
+	bp_verify_sha256 "$(_mariadb_fmt_archive)" "$RECIPE_FMT_SHA256"
 }
 
 recipe_extract() {
@@ -237,6 +414,15 @@ recipe_configure() {
 	done
 	[ -z "$(find "$ssl_prefix" -name '*.dylib' -print | sed -n 1p)" ] ||
 		bp_die "the staged OpenSSL at $ssl_prefix contains a dylib; D3 requires static, and a dylib here would become a shipped dependency"
+
+	# Before cmake runs, so that a pin that has drifted stops the build while
+	# nothing has been compiled yet. The archives only have to be in place before
+	# the BUILD step reaches ExternalProject, but the assertions inside are worth
+	# more the earlier they fire.
+	_mariadb_seed_archive "$BUILD_SRC/cmake/pcre.cmake" "$BUILD_OBJ/extra/pcre2/src" \
+		"$(_mariadb_pcre2_archive)" "$RECIPE_PCRE2_URL"
+	_mariadb_seed_archive "$BUILD_SRC/cmake/libfmt.cmake" "$BUILD_OBJ/extra/libfmt/src" \
+		"$(_mariadb_fmt_archive)" "$RECIPE_FMT_URL"
 
 	bison="$(_mariadb_bison)"
 	RECIPE_BISON_PATH="$bison"
@@ -260,6 +446,10 @@ recipe_configure() {
 		"-DCMAKE_IGNORE_PREFIX_PATH=$(bp_ignore_prefix_path)"
 		# One concrete prefix. Never `bundled`, never `system`, never `auto`.
 		"-DWITH_SSL=$ssl_prefix"
+		# `bundled` here means "download it during the build and check the MD5",
+		# not "vendored in the tarball". Both archives were fetched, signature- or
+		# digest-verified, and seeded above; the value stays `bundled` because the
+		# alternatives are worse — see the provenance block.
 		"-DWITH_PCRE=bundled"
 		"-DWITH_LIBFMT=bundled"
 		"-DWITH_ZLIB=bundled"
@@ -279,11 +469,15 @@ recipe_configure() {
 		"-DPLUGIN_S3=NO"
 	)
 	bp_record_flags "${args[@]}"
-	(cd "$BUILD_OBJ" && "$(bp_tool cmake)" "$BUILD_SRC" "${args[@]}")
+	(cd "$BUILD_OBJ" && _mariadb_no_network "$(bp_tool cmake)" "$BUILD_SRC" "${args[@]}")
 }
 
 recipe_build() {
-	"$(bp_tool cmake)" --build "$BUILD_OBJ" --parallel "$BUILD_JOBS"
+	# This is where ExternalProject's download steps run, and where the network
+	# block earns its place: with pcre2 and fmt already seeded, nothing here has
+	# any business reaching a remote host, so anything that tries is a supply-chain
+	# input nobody reviewed and the build should stop rather than acquire it.
+	_mariadb_no_network "$(bp_tool cmake)" --build "$BUILD_OBJ" --parallel "$BUILD_JOBS"
 }
 
 recipe_install() {
@@ -291,7 +485,7 @@ recipe_install() {
 	# embed the install prefix; a DESTDIR staging directory that is moved
 	# afterwards puts the staging path into every one of them, which is exactly
 	# the defect contract check 4 exists to reject.
-	"$(bp_tool cmake)" --install "$BUILD_OBJ"
+	_mariadb_no_network "$(bp_tool cmake)" --install "$BUILD_OBJ"
 }
 
 # ----------------------------------------------------------------- optional --
@@ -448,25 +642,39 @@ recipe_serve_probe() {
 # ---------------------------------------------------------------- manifest ----
 
 recipe_manifest_extra() {
-	# Which OpenSSL, how it is linked, and which bison built the parser. All
-	# three are audit facts: the first two are what D3 decided, and the third is
-	# the tool whose failure looked like success.
-	printf '{"openssl": {"version": "%s", "linkage": "static"}, "bison": {"path": "%s", "version": "%s"}, "bundled_downloads": %s}' \
+	# Which OpenSSL, how it is linked, which bison built the parser, and what went
+	# into the two libraries that are compiled in and therefore invisible to every
+	# contract check. All of it is audit fact, not detail.
+	printf '{"openssl": {"version": "%s", "linkage": "static"}, "bison": {"path": "%s", "version": "%s"}, "vendored_last_checked": "%s", "vendored": %s, "vendored_on_disk": %s}' \
 		"$RECIPE_OPENSSL_VERSION" \
 		"$(printf '%s' "$RECIPE_BISON_PATH" | tr -cd 'A-Za-z0-9@_/.+-')" \
 		"$RECIPE_BISON_VERSION" \
-		"$(_mariadb_bundled_downloads)"
+		"$RECIPE_VENDORED_LAST_CHECKED" \
+		"$(_mariadb_vendored)" \
+		"$(_mariadb_vendored_on_disk)"
 }
 
-# WITH_PCRE=bundled and WITH_LIBFMT=bundled do not mean "vendored in the
-# tarball" — MariaDB's cmake fetches pcre2 and libfmt over the network at build
-# time and checks them with URL_MD5 (cmake/pcre.cmake, cmake/libfmt.cmake).
-# Both are compiled into bin/mariadbd, neither is signed, and MD5 is not a
-# collision-resistant check. That is upstream's decision, not ours, and no
-# linker flag or contract check can see it — but §7 exists so the inputs are at
-# least auditable, and an input nobody recorded is an input nobody can audit.
-# So the digest of what actually arrived goes in the manifest.
-_mariadb_bundled_downloads() {
+# What we pinned, and how far the verification of each actually goes. "verified"
+# is spelled out per entry precisely because it differs: PCRE2 publishes a
+# detached signature and fmt publishes none, and a manifest that flattened both
+# to "verified" would be worse than one that said nothing.
+_mariadb_vendored() {
+	printf '['
+	printf '{"name": "pcre2", "version": "%s", "url": "%s", "sha256": "%s", "release_date": "%s", "verified": "gpg+sha256", "signing_key_fingerprint": "%s"}, ' \
+		"$RECIPE_PCRE2_VERSION" "$RECIPE_PCRE2_URL" "$RECIPE_PCRE2_SHA256" \
+		"$RECIPE_PCRE2_UPSTREAM_RELEASE_DATE" "$RECIPE_PCRE2_SIGNING_KEY_FPR"
+	printf '{"name": "fmt", "version": "%s", "url": "%s", "sha256": "%s", "release_date": "%s", "verified": "sha256", "signature": "%s"}' \
+		"$RECIPE_FMT_VERSION" "$RECIPE_FMT_URL" "$RECIPE_FMT_SHA256" \
+		"$RECIPE_FMT_UPSTREAM_RELEASE_DATE" "$RECIPE_FMT_SIGNATURE"
+	printf ']'
+}
+
+# And what was actually on disk when the build read it. The block above records
+# intent; this records the bytes, which is the only one of the two that a later
+# auditor can check against the artifact. They should agree — the seeding is what
+# makes them agree — and the point of printing both is that a disagreement is
+# visible rather than assumed away.
+_mariadb_vendored_on_disk() {
 	local first=1 archive name digest
 	printf '['
 	while IFS= read -r archive; do

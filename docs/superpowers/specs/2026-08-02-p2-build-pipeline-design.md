@@ -141,11 +141,23 @@ us to compute one. The recipe verifies that signature, and the key fingerprint i
 cross-checked against a second host, exactly as the MySQL slice did. Record the key id,
 its expiry, and the verification date alongside the pin.
 
+**A `bundled` flag is not vendoring**, and "the source archive" is not the whole of the
+input. MariaDB's `WITH_PCRE=bundled` and `WITH_LIBFMT=bundled` download pcre2 and fmt over
+the network *during* the build and check them with `URL_MD5` and nothing else; both are
+compiled into `mariadbd`, where §8's linkage check cannot see them, because a static
+library that was compiled in leaves no entry in any link command. So the recipe fetches
+both itself, verifies both itself — pcre2 by GPG signature, fmt by digest, since fmtlib
+publishes no signature — seeds them where cmake's `ExternalProject` looks before it decides
+to fetch, and runs the compile with the network taken away so that a download added by a
+later upstream fails loudly instead of succeeding quietly. Verified means verified by us,
+including for the inputs upstream's build system fetches on our behalf.
+
 **The build manifest** published with every artifact records: upstream URL and its verified
 sha256, the signing key fingerprint, every configure flag, the toolchain versions
-(`cmake`, `bison`, `clang`, macOS SDK), the neutral build prefix, and the output sha256.
-Not bit-reproducible — but auditable, which is the achievable goal for a single-builder
-pipeline.
+(`cmake`, `bison`, `clang`, macOS SDK), the neutral build prefix, the output sha256, and —
+for each input the build system would otherwise have fetched for itself — its URL, its
+verified digest, and how far that verification actually goes. Not bit-reproducible — but
+auditable, which is the achievable goal for a single-builder pipeline.
 
 ## 8. D6 — The artifact contract
 
@@ -241,7 +253,11 @@ trigger is an intention.
 
 - **Watch list, recorded in the repo** next to the catalogue: MariaDB 11.4 releases and
   the OpenSSL 3.x advisory feed, being the two things we compile and ship. Add one entry
-  per package as the pipeline grows to nginx and PHP.
+  per package as the pipeline grows to nginx and PHP. **pcre2 and fmt belong on it too** —
+  both are compiled into `mariadbd` (see D5) — with one qualification worth stating,
+  because it changes what the entry means: their versions are MariaDB's choice, not ours,
+  since cmake insists on its own `URL_MD5`. The answer to a pcre2 CVE is therefore a
+  MariaDB release that bumps it, not a number we edit.
 - **The pin is the tripwire.** The catalogue already carries `{version, url, sha256}`; add
   the upstream release date and the date we last checked. A stale check is then visible in
   the source rather than remembered.
