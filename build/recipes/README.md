@@ -119,10 +119,13 @@ packed tarball — and a failure is a failed build. The checks are in
 `docs/superpowers/specs/2026-08-02-p2-build-pipeline-design.md` §8. Two are
 worth stating here because they shape how a recipe must be written:
 
-- **Linkage.** Every `otool -L` entry must be `/usr/lib/*`, `/System/*`, or
-  `@loader_path/...`. `@rpath/...` is **not** accepted — including a dylib's own
-  `LC_ID_DYLIB`. A recipe that produces `@rpath` install names must rewrite them
-  in `recipe_normalize`.
+- **Linkage.** Every `otool -L` entry must be `/usr/lib/*`, `/System/*`,
+  `@loader_path/...` or `@rpath/...`, **and** every `LC_RPATH` must be
+  `@loader_path`-relative. `@rpath` is only as relocatable as the rpaths that
+  resolve it, and `otool -L` never shows one — so the second half is not a
+  detail. A recipe whose binaries carry an absolute `LC_RPATH` must fix that in
+  `recipe_normalize`; one that ships `@rpath/libfoo.dylib` alongside
+  `LC_RPATH = @loader_path/../lib` is already correct and needs no rewriting.
 - **Builder identity.** Nothing in the tree may contain the builder's home
   directory, username, session directories, or the tree's own ancestors.
 
