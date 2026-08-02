@@ -2,7 +2,8 @@
 
 # OpenVHost's own package build pipeline — design
 
-**Status:** design, awaiting owner approval on the open questions in §9.
+**Status:** approved. The four questions it raised were decided by the owner on
+2026-08-02 and are recorded in §13.
 **Date:** 2026-08-02.
 **Why now:** the off-Homebrew programme (slices 3–5) cannot continue without it. MySQL
 was the last service that could be *downloaded*; MariaDB, nginx and PHP publish no macOS
@@ -15,7 +16,8 @@ Produce OpenVHost's own macOS packages for services upstream does not ship, as
 and run correctly from any path — the same contract Oracle's MySQL tarball already
 satisfies, which is why slice 2 worked.
 
-MariaDB proves the pipeline. nginx and PHP must then slot in without changing the driver.
+MariaDB proves the pipeline — **11.4 LTS only** (§13). nginx and PHP must then slot in
+without changing the driver.
 
 ## 2. What is already proven, and what it cost to learn
 
@@ -94,7 +96,7 @@ of how it arrived. Configuration expresses intent; the audit is what we actually
 Building it ourselves is not optional: the proof tree currently contains **Homebrew's**
 `libssl`/`libcrypto`, which we cannot redistribute.
 
-**Prefer static linking.** It removes the only remaining dylib, and with it the entire
+**Decided (owner, 2026-08-02): static.** It removes the only remaining dylib, and with it the entire
 install-name rewriting step, the dylib re-signing step, and one whole class of runtime
 failure. `otool -L` on the result should show nothing but `/usr/lib` and `/System`.
 
@@ -210,13 +212,36 @@ obligation arrives with the first package we build, not with 1.0.
   does not change that.
 - Bit-for-bit reproducible builds.
 
-## 13. Open questions for the owner
+## 13. Decisions taken (owner, 2026-08-02)
 
-1. **Single-builder trust (D1).** Artifacts will be built on your Mac with no independent
-   reproduction. Acceptable for now, or should this block until CI is back?
-2. **The security-update obligation (§11).** This is the decision with the longest tail.
-   Confirm explicitly rather than by implication.
-3. **Which MariaDB versions to ship.** ServBay offers 10.4 → 11.7. Every additional major
-   is another tree to build, verify and patch. Recommendation: **11.4 LTS only** to start.
-4. **Static or bundled OpenSSL (D3)** — recommendation is static; confirm the fallback is
-   acceptable if it proves impractical.
+All four were put to the owner as open questions and answered the same day.
+
+1. **Single-builder trust — accepted.** Builds run on the owner's Mac with no independent
+   reproduction. The build manifest (§7) is what makes it auditable; it is now mandatory,
+   not a nicety.
+2. **The security-update obligation — accepted explicitly**, not by implication. See §14:
+   accepting it without a mechanism is how it gets forgotten, so it acquires one here.
+3. **MariaDB 11.4 LTS only.** No 10.x, no 11.7. Every extra major is another tree to
+   build, verify and patch, and the obligation in §14 scales with that count. Adding a
+   major later is a decision with a cost, not a configuration change.
+4. **Static OpenSSL.** The `@loader_path` bundling proven on 2026-08-02 stays documented in
+   D3 as the fallback if static turns out impractical — falling back is a reported finding,
+   not a quiet substitution.
+
+## 14. The security-update mechanism
+
+§11's obligation is now owned, so it needs a way to fire. An accepted obligation with no
+trigger is an intention.
+
+- **Watch list, recorded in the repo** next to the catalogue: MariaDB 11.4 releases and
+  the OpenSSL 3.x advisory feed, being the two things we compile and ship. Add one entry
+  per package as the pipeline grows to nginx and PHP.
+- **The pin is the tripwire.** The catalogue already carries `{version, url, sha256}`; add
+  the upstream release date and the date we last checked. A stale check is then visible in
+  the source rather than remembered.
+- **Rebuild is a slice, not a patch.** A CVE means: re-verify upstream's signature, rebuild
+  through the same recipe, re-run the artifact contract (§8), publish, bump the catalogue.
+  The contract is what makes that safe to do quickly.
+- **We cannot silently inherit a fix any more.** Until now a user's `brew upgrade` patched
+  their PHP and MySQL without us. From the first package we build, that stops being true
+  for anything we ship — and the user has no other route to the fix.
