@@ -471,6 +471,19 @@ pub(crate) fn validate_symlink(link_rel: &str, target: &str) -> Result<(), PkgEr
     if target.starts_with('/') || target.contains('\\') || target.contains(':') {
         return Err(reject("absolute or non-relative symlink target"));
     }
+    // Clause 5 bounds the RESOLVED path, which says nothing about the string
+    // that is split to compute it: `"./".repeat(100_000) + "x"` resolves to one
+    // component, so it passed — after allocating a 100_001-element vector, per
+    // entry, from an archive nobody has authenticated yet. The pre-split bound
+    // is the longest target that could survive clause 5 anyway: at most
+    // MAX_REL_BYTES of resolved path, plus a leading `../` run that clause 3
+    // caps at the link's own depth, which `validate_entry_name` caps at
+    // MAX_DEPTH. Nothing a legitimate archive can ship is excluded — the whole
+    // mariadb tarball's longest target is a fifth of it.
+    const MAX_TARGET_BYTES: usize = MAX_REL_BYTES + MAX_DEPTH * 3;
+    if target.len() > MAX_TARGET_BYTES {
+        return Err(reject("symlink target too long"));
+    }
     let raw: Vec<&str> = target.split('/').collect();
     for c in &raw {
         if c.is_empty() {
@@ -510,10 +523,17 @@ pub(crate) fn validate_symlink(link_rel: &str, target: &str) -> Result<(), PkgEr
         return Err(reject("symlink target ascends past the package root"));
     }
 
-    // Clauses 4 and 5 — what the target actually names, once resolved
-    // against the link's directory. `k <= d` was just checked and
-    // `k <= comps.len()` holds by construction, so neither slice can panic.
-    let mut resolved: Vec<&str> = link_dir[..d - k].to_vec();
+    // Clauses 4 and 5 — what the target actually names, once resolved against
+    // the link's directory. `d - k` cannot underflow: `k <= d` was just
+    // checked. The upper end is asked for rather than asserted — `d` equals
+    // `link_dir.len()` only because nothing between here and the assignment
+    // touches `link_dir`, which is an invariant held by adjacency in a function
+    // that will be edited again. A panic here is a denial of service reachable
+    // from an unauthenticated archive, so it fails closed instead.
+    let Some(link_prefix) = link_dir.get(..d - k) else {
+        return Err(reject("symlink target could not be resolved"));
+    };
+    let mut resolved: Vec<&str> = link_prefix.to_vec();
     resolved.extend_from_slice(&comps[k..]);
     if resolved.is_empty() {
         return Err(reject("symlink target resolves to the package root itself"));
@@ -1121,6 +1141,31 @@ mod tests {
         assert_eq!(
             reason("a/l", "./../.."),
             "symlink target ascends past the package root"
+        );
+    }
+
+    #[test]
+    fn rejects_a_target_inflated_past_what_any_resolution_could_need() {
+        // Clause 5 measures the RESOLVED path, so `.` inflation was free: this
+        // 200_001-byte target resolves to the single component "x" and was
+        // accepted, after splitting into 100_001 slices. Deleting the pre-split
+        // bound turns both of these back into `Ok`, which is what makes this
+        // test capable of failing.
+        let inflated = format!("{}x", "./".repeat(100_000));
+        assert_eq!(reason("a/l", &inflated), "symlink target too long");
+        let ascended = format!("{}b", "../".repeat(100_000));
+        assert!(validate_symlink("a/l", &ascended).is_err());
+
+        // The bound is a ceiling on nonsense, not on real archives, and it is
+        // placed exactly at the largest target the later clauses can accept: a
+        // maximal `../` run for a link at MAX_DEPTH, plus a MAX_REL_BYTES tail.
+        // That one is still ACCEPTED, so the bound gives up nothing.
+        let link = format!("{}/l", vec!["d"; MAX_DEPTH].join("/"));
+        let maximal = format!("{}{}", "../".repeat(MAX_DEPTH), "t".repeat(MAX_REL_BYTES));
+        assert_eq!(maximal.len(), MAX_REL_BYTES + MAX_DEPTH * 3);
+        assert!(
+            validate_symlink(&link, &maximal).is_ok(),
+            "the longest target the other clauses admit must not be cut off by length"
         );
     }
 
