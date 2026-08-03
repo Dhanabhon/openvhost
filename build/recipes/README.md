@@ -62,6 +62,8 @@ to a tool that cannot see the driver reading them.
 | `RECIPE_IGNORE_PREFIXES` | `/opt/homebrew /usr/local /Applications/ServBay` | prefixes a configure step must ignore. Join them with `bp_ignore_prefix_path`. |
 | `RECIPE_SERVER_BIN` | `""` | the server binary, relative to the tree root, that contract checks 5 and 6 exercise — `bin/mariadbd`, `sbin/nginx`. Empty means the package has no server, and both checks report `SKIPPED (no server binary)`. |
 | `RECIPE_SERVER_VERSION_ARGS` | `(--version)` | how to ask that binary to identify itself and exit 0. |
+| `RECIPE_INERT_PATHS` | `()` | subtrees of the package that contract check 7 does not scan — documentation, test fixtures. Named in every audit run. Checks 1-3 still cover every Mach-O inside them. |
+| `RECIPE_ALLOWED_WRITABLE_PATHS` | `()` | individual embedded paths contract check 7 may allow despite a world-writable ancestor. Trace each to the file that carries it, and say next to it why nothing resolves it. Printed on every audit run. |
 | `RECIPE_SIGNING_KEY_FPR`, `RECIPE_SIGNING_KEY_EXPIRY`, `RECIPE_SIGNING_KEY_VERIFIED_ON` | `""` | upstream's signing key, its expiry, and when we last cross-checked the fingerprint against a second host. Recorded in the manifest. |
 | `RECIPE_UPSTREAM_RELEASE_DATE`, `RECIPE_LAST_CHECKED` | `""` | §14's tripwire. A stale check must be visible in the source, not remembered. |
 
@@ -98,17 +100,20 @@ socket has. It must leave no process running when it returns, on either path.
 
 | Variable | Is |
 |---|---|
-| `$BUILD_PREFIX` | `/tmp/openvhost-build/<name>-<version>` — the install prefix **and** the staged tree, in one place |
-| `$BUILD_DOWNLOADS`, `$BUILD_SRC`, `$BUILD_OBJ` | scratch, under `/tmp/openvhost-build/_work/<name>-<version>/` |
+| `$BUILD_PREFIX` | `/opt/openvhost-build/<name>-<version>` — the install prefix **and** the staged tree, in one place |
+| `$BUILD_DOWNLOADS`, `$BUILD_SRC`, `$BUILD_OBJ` | scratch, under `/opt/openvhost-build/_work/<name>-<version>/` |
 
 Those, plus the output directory the driver owns, are the only places anything
 may be written. **Nothing may touch `~/.openvhost`, a datadir, or Homebrew.**
 
-`$BUILD_PREFIX` is deliberately meaningless (D8). Roughly fifty files in a
-finished MariaDB tree embed the install prefix, and post-processing them all is
-fragile; so the build installs to a stable, anonymous path and contract check 4
-enforces that the builder's real directories never appear. **Install directly to
-`$BUILD_PREFIX`.** A `DESTDIR` staging directory that is moved afterwards puts
+`$BUILD_PREFIX` is deliberately anonymous (D8), and — since 2026-08-03 — also
+deliberately un-plantable. Roughly fifty files in a finished MariaDB tree embed
+the install prefix and post-processing them all is fragile, so the build installs
+to a stable path; check 4 enforces that the builder's real directories never
+appear in it, and check 7 enforces that no ancestor of it is world-writable. Both
+are needed: the first artifact embedded `/tmp/openvhost-build/...`, which named
+nobody and which anything on a user's machine could have created and filled with
+a plugin dylib. **Install directly to `$BUILD_PREFIX`.** A `DESTDIR` staging directory that is moved afterwards puts
 the staging path into those fifty files, which is precisely the defect the
 reference tree has.
 
@@ -128,6 +133,12 @@ worth stating here because they shape how a recipe must be written:
   `LC_RPATH = @loader_path/../lib` is already correct and needs no rewriting.
 - **Builder identity.** Nothing in the tree may contain the builder's home
   directory, username, session directories, or the tree's own ancestors.
+- **Plantable paths.** No absolute path embedded anywhere in the tree may have a
+  world-writable ancestor. A recipe fixes what it can at configure time — MariaDB's
+  `/tmp/mysql.sock` default is one `-DMYSQL_UNIX_ADDR=` away — and declares the rest,
+  with a reason, in `RECIPE_ALLOWED_WRITABLE_PATHS` or `RECIPE_INERT_PATHS`. Reach
+  for the flag before the allowance: an allowance is a promise that nothing resolves
+  the path, and you have to be able to keep it.
 
 If you are ever tempted to relax a contract check to make a build pass, that is
 the moment the pipeline stops being worth having. Report it instead.

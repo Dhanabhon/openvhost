@@ -20,10 +20,18 @@
 #   2. CMAKE_IGNORE_PREFIX_PATH, because the host leaked in from two package
 #      managers at once — GNUTLS/HOGWEED from /opt/homebrew, GSSAPI and
 #      KRB5_CONFIG from /Applications/ServBay.
-#   3. WITH_SSL is an overloaded name: the server accepts bundled|system|<path>,
-#      the bundled Connector/C accepts ON|OPENSSL|GNUTLS and silently falls into
-#      its GnuTLS branch on anything else (libmariadb/CMakeLists.txt:346). One
-#      concrete prefix — ours — is the only value that satisfies both readers.
+#   3. WITH_SSL is an overloaded name. The server accepts bundled|system|<path>,
+#      and `bundled` — wolfSSL for the server — is what hands the bundled
+#      Connector/C to GnuTLS: cmake/mariadb_connector_c.cmake derives
+#      CONC_WITH_SSL from the top-level choice and, having seen wolfSSL, sets it
+#      to GNUTLS on every non-Windows platform. The connector then does
+#      FIND_PACKAGE(GnuTLS REQUIRED) and finds Homebrew's, which is how GNUTLS
+#      and HOGWEED got into the reference build. One concrete prefix — ours — is
+#      the only value that gives both readers OpenSSL.
+#      (An earlier version of this comment claimed the connector "falls into its
+#      GnuTLS branch on anything else"; it does not. Its GnuTLS branch is an
+#      exact STREQUAL match and its catch-all is FATAL_ERROR "Invalid TLS/SSL
+#      option". The flag was right; the reason written next to it was not.)
 #   4. `auto` is the enemy. It is how WITH_PCRE found Homebrew's pcre2.
 
 # ---------------------------------------------------------------- provenance --
@@ -165,6 +173,77 @@ RECIPE_SERVER_BIN="bin/mariadbd"
 # and a my.cnf on the builder's machine must not be able to decide whether the
 # package passes.
 RECIPE_SERVER_VERSION_ARGS=(--no-defaults --version)
+
+# Contract check 7: no absolute path embedded in the tree may have a
+# world-writable ancestor. MariaDB's own corpus does not satisfy that literally,
+# so the exceptions are declared here — visible in every audit run, next to a
+# reason — rather than built into the checker where nobody would read them.
+#
+# Two subtrees are documentation and fixtures, not things the product resolves:
+RECIPE_INERT_PATHS=(
+	# 234 MB of MariaDB's own regression suite. Its .test/.sql files name ~500
+	# scratch files under /tmp because that is what a test harness does with a
+	# scratch file; nothing in the server reads them. Checks 1-3 still cover
+	# every Mach-O in here, and check 6 proves the server works without it.
+	mariadb-test
+	# The sql-bench harness, same shape: Perl scripts with /tmp workspaces.
+	sql-bench
+	# Manual pages. `man mariadbd` documents MariaDB's historical defaults,
+	# including /tmp/mysql.sock; documenting a default is not adopting one.
+	man
+	# One file rather than a subtree, which is the whole reason a single file is
+	# allowed here: bin/mariadb-client-test is upstream's client regression
+	# binary, and its proxy-header fixture has the literal string
+	# "/tmp/mysql.sock" compiled in as test DATA — it is not that binary's
+	# socket default, which -DMYSQL_UNIX_ADDR moved with everything else's.
+	# Declining to scan one test binary is narrow; allowing the string
+	# /tmp/mysql.sock tree-wide would also have waved it through in mariadbd,
+	# which is the file the whole check exists for.
+	bin/mariadb-client-test
+)
+# And these paths survive in files the product does ship. Each was traced to the
+# file that carries it before it was written down; none is a path the server
+# resolves while serving. The one that WAS — /tmp/mysql.sock, upstream's
+# MYSQL_UNIX_ADDR, in 27 files including mariadbd and libmariadb.3.dylib — is
+# absent from this list on purpose: it is fixed in recipe_configure instead,
+# because a socket a client will actually open is not something to wave through.
+RECIPE_ALLOWED_WRITABLE_PATHS=(
+	# DBUG's default trace target, in the client tools only. Written to only
+	# when --debug is passed with no explicit target, which no OpenVHost code
+	# path does. bin/mariadb, bin/mariadb-dump, bin/mariadb-slap,
+	# bin/my_print_defaults, bin/mariadb-client-test.
+	/tmp/mariadb.trace
+	/tmp/mariadb-dump.trace
+	/tmp/mariadb-slap.trace
+	/tmp/my_print_defaults.trace
+	/tmp/mysql_client_test.trace
+	# The example my.cnf printed inside bin/mariadbd-multi's own --example
+	# output. Documentation that happens to live in a script.
+	/tmp/mysql.sock2
+	/tmp/mysql.sock3
+	/tmp/mysql.sock4
+	/tmp/mysql.sock6
+	# bin/mariadb-access (a Perl script) writes a debug log here when run with
+	# its own --debug. Not on any path OpenVHost invokes.
+	/tmp/mysqlaccess.log
+	# mktemp template in bin/mariadbd-safe, reached only by the Galera recovery
+	# branch — and -DWITH_WSREP=OFF means there is no Galera here to recover.
+	/tmp/wsrep_recovery.XXXXXX
+	# Worked examples in the built-in HELP corpus (share/fill_help_tables.sql):
+	# the manual's LOAD DATA and LOAD_FILE entries use /tmp paths as prose.
+	/tmp/loaddata7.dat
+	/tmp/picture
+	/tmp/world
+	/tmp/skr3
+	# Worked examples in share/mariadb_sys_schema.sql (and its copy embedded in
+	# bin/mariadb-upgrade): the format_path()/ps_trace_thread() docs show
+	# /tmp/stack_*.dot output filenames.
+	/tmp/stack-
+	/tmp/stack-2014-02-16-21
+	/tmp/stack_
+	/tmp/stack_25.pdf
+	/tmp/stack_25.png
+)
 
 # Filled in by recipe_configure, reported by recipe_manifest_extra. Which bison
 # built the parser is an audit fact, not a detail.
@@ -439,6 +518,15 @@ recipe_configure() {
 		# (CMAKE_BUILD_WITH_INSTALL_RPATH), so no binary ever carries the build
 		# tree's absolute rpath, not even briefly.
 		"-DINSTALL_LAYOUT=STANDALONE"
+		# Upstream's default MYSQL_UNIX_ADDR is /tmp/mysql.sock, and it is
+		# compiled into mariadbd, every client, libmariadb.3.dylib, mysql_config
+		# and mariadb.pc — 27 shipped files. /tmp is mode 1777, so anything on
+		# the machine can bind that name first and collect the credentials of
+		# every client that connects to "localhost" without an explicit
+		# --socket. Contract check 7 rejects it; this is the fix, not an
+		# allowance. The value lands inside the prefix, which check 7 then
+		# proves is un-plantable.
+		"-DMYSQL_UNIX_ADDR=$BUILD_PREFIX/run/mariadb.sock"
 		"-DCMAKE_INSTALL_RPATH=@loader_path/../lib"
 		"-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON"
 		"-DCMAKE_MACOSX_RPATH=ON"
@@ -490,11 +578,29 @@ recipe_install() {
 
 # ----------------------------------------------------------------- optional --
 
-# No recipe_normalize. Static OpenSSL is why: with no bundled dylib there is
-# nothing to rewrite, and D4's rule that signing must follow the last Mach-O
-# edit becomes trivially satisfied. MariaDB's own libmariadb.3.dylib carries
-# LC_ID_DYLIB = @rpath/libmariadb.3.dylib with LC_RPATH = @loader_path/../lib,
-# which is the idiomatic self-contained layout and is what the contract admits.
+# recipe_normalize rewrites NO Mach-O. Static OpenSSL is why: with no bundled
+# dylib there is nothing to rewrite, and D4's rule that signing must follow the
+# last Mach-O edit stays trivially satisfied — this function touches one text
+# file. MariaDB's own libmariadb.3.dylib carries LC_ID_DYLIB =
+# @rpath/libmariadb.3.dylib with LC_RPATH = @loader_path/../lib, which is the
+# idiomatic self-contained layout and is what the contract admits.
+recipe_normalize() {
+	# The bundled Connector/C generates mariadb.pc from its own socket default
+	# rather than from MYSQL_UNIX_ADDR, so this one file still advertised
+	# /tmp/mysql.sock after the flag had moved every binary — including
+	# libmariadb.3.dylib itself — off it. It is metadata, but metadata that
+	# anyone compiling a client against this tree would compile in, and contract
+	# check 7 found it. Rewritten to agree with the library it describes.
+	local pc="$BUILD_PREFIX/lib/pkgconfig/mariadb.pc" want="$BUILD_PREFIX/run/mariadb.sock"
+	[ -f "$pc" ] || bp_die "lib/pkgconfig/mariadb.pc is missing; the install layout changed"
+	LC_ALL=C sed -e "s|^socket=.*|socket=$want|" "$pc" >"$pc.new"
+	# Verified, not assumed: a template that stops emitting `socket=` must fail
+	# the build rather than quietly leave check 7 to catch it on some later day.
+	grep -qxF "socket=$want" "$pc.new" ||
+		bp_die "could not rewrite the socket default in mariadb.pc"
+	mv -- "$pc.new" "$pc"
+	bp_log "mariadb.pc socket default set to $want"
+}
 
 # --------------------------------------------------- contract check 6 (serve) --
 

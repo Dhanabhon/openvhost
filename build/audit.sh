@@ -3,7 +3,7 @@
 #
 # audit.sh — the artifact contract for an OpenVHost package.
 #
-# Implements the six points of the build-pipeline design (D6, spec §8). A
+# Implements the seven points of the build-pipeline design (D6, spec §8). A
 # package is acceptable only if ALL of them hold:
 #
 #   1. layout      a single root containing bin/ and share/
@@ -14,10 +14,24 @@
 #   4. identity    the tree carries no trace of the machine that built it
 #   5. relocation  copy to path A, run; move to path B, run again
 #   6. service     start the server, create a table, insert, restart, read back
+#   7. plantable   no absolute path embedded anywhere in the tree has a
+#                  world-writable ancestor
 #
-# Points 5 and 6 need a server binary and a package-specific probe. A package
-# with neither reports them as SKIPPED, with the reason — never silently. See
-# build/recipes/README.md for how a recipe supplies them.
+# Check 7 exists because check 4 asks the wrong question about the install
+# prefix. Check 4 asks "does this path identify the builder"; /tmp/openvhost-build
+# identifies nobody, and the tree was signed off on that basis. But the prefix is
+# not decoration — mariadbd resolves basedir, plugin-dir and character-sets-dir
+# from it — and /tmp is mode 1777, so on a user's machine any unprivileged
+# process could create the tree the package names and plant a plugin dylib in it
+# (CWE-426 / CWE-427). Neutral is not inert. Check 7 asks the question that
+# actually decides it: can anything unprivileged create the paths this tree
+# names?
+#
+# Points 5 and 6 need a server binary and a package-specific probe, AND they
+# execute the artifact, so they additionally need --execute-artifact. A package
+# with neither, or a run without the flag, reports them as SKIPPED with the
+# reason — never silently. See build/recipes/README.md for how a recipe supplies
+# them.
 #
 # This script is the gate, not a warning: any failed check exits non-zero. Every
 # check runs even after an earlier one fails, so one invocation tells you
@@ -40,7 +54,7 @@ AUDIT_DIR="$(cd -- "$(dirname -- "$AUDIT_SELF")" && pwd -P)"
 TAB=$'\t'
 SOH=$'\001'
 
-BUILD_ROOT="${OPENVHOST_BUILD_ROOT:-/tmp/openvhost-build}"
+BUILD_ROOT="${OPENVHOST_BUILD_ROOT:-/opt/openvhost-build}"
 
 usage() {
 	cat <<'EOF'
@@ -49,14 +63,33 @@ Usage: build/audit.sh [options] <tree-or-tarball>
 Verifies one built package tree, or one packed tarball, against the artifact
 contract in docs/superpowers/specs/2026-08-02-p2-build-pipeline-design.md §8.
 
+THIS SCRIPT EXECUTES CODE, and says so here rather than in a comment nobody
+reads:
+
+  * --recipe SOURCES the named file into this shell. Whatever it does at source
+    time, this script does. It is a repo file by default; a value containing a
+    slash sources that path instead.
+  * --execute-artifact RUNS THE ARTIFACT: check 5 runs the server binary from
+    two directories, and check 6 hands the tree to the recipe's serve probe,
+    which starts a real server against it. Without the flag, both are skipped.
+  * the caller's PATH is APPENDED to the system directories (a recipe's probe
+    needs its own tools), so a recipe may reach binaries this script did not
+    choose. Nothing is prepended: a stale entry cannot shadow /usr/bin.
+
+Audit a tarball you were handed WITHOUT --execute-artifact. build.sh passes it
+because it built the thing it is auditing.
+
 Options
-  --recipe <name>      source build/recipes/<name>.sh for RECIPE_SERVER_BIN and
-                       recipe_serve_probe, which drive checks 5 and 6. A value
-                       containing a slash is taken as a path to a recipe.
+  --recipe <name>      source build/recipes/<name>.sh for RECIPE_SERVER_BIN,
+                       recipe_serve_probe (checks 5 and 6) and
+                       RECIPE_ALLOWED_WRITABLE_PATHS / RECIPE_INERT_PATHS
+                       (check 7). A value containing a slash is a path.
   --version <version>  value of RECIPE_VERSION while the recipe is sourced
+  --execute-artifact   permit checks 5 and 6, which run code from the tree
   --server-bin <path>  server binary, relative to the tree root, for checks 5
                        and 6; overrides the recipe. Empty disables both.
   --forbid <string>    add one forbidden string to check 4 (repeatable)
+  --allow-writable <p> allow one embedded path prefix in check 7 (repeatable)
   --max-report <n>     cap the offending lines printed per check (default 20)
   --keep-scratch       do not delete this run's scratch directory
   -h, --help           this text
@@ -66,10 +99,13 @@ Environment
                              4 — session directories, scratchpads, staging
                              roots. Check 4 takes the builder's identity from
                              the environment; it hardcodes no machine's paths.
-  OPENVHOST_BUILD_ROOT       the neutral build root (default
-                             /tmp/openvhost-build). Meaningless by design (D8),
-                             so it is exempt from check 4, and it is where this
-                             script keeps its scratch.
+  OPENVHOST_BUILD_ROOT       the build root (default /opt/openvhost-build). The
+                             staged tree IS the install prefix (D8), so a build
+                             audited in place sits inside the one directory it
+                             is expected to name, and check 4's ancestor walk
+                             stops there. It is check 7, not check 4, that makes
+                             that safe. Only the _work subtree — compiler debug
+                             info — is exempt from check 4 outright.
 
 Exit status
   0  every check passed, or was explicitly skipped
@@ -88,7 +124,7 @@ die() {
 }
 
 CHECK_INDEX=0
-CHECK_TOTAL=6
+CHECK_TOTAL=7
 FAILED_CHECKS=""
 
 check_start() {
@@ -126,6 +162,8 @@ SERVER_BIN_SET=0
 MAX_REPORT=20
 KEEP_SCRATCH=0
 EXTRA_FORBIDDEN=()
+EXTRA_ALLOWED=()
+EXECUTE_ARTIFACT=0
 TARGET=""
 
 while [ $# -gt 0 ]; do
@@ -150,6 +188,15 @@ while [ $# -gt 0 ]; do
 		[ $# -ge 2 ] || die "--forbid needs a value"
 		EXTRA_FORBIDDEN[${#EXTRA_FORBIDDEN[@]}]="$2"
 		shift 2
+		;;
+	--allow-writable)
+		[ $# -ge 2 ] || die "--allow-writable needs a value"
+		EXTRA_ALLOWED[${#EXTRA_ALLOWED[@]}]="$2"
+		shift 2
+		;;
+	--execute-artifact)
+		EXECUTE_ARTIFACT=1
+		shift
 		;;
 	--max-report)
 		[ $# -ge 2 ] || die "--max-report needs a value"
@@ -195,10 +242,13 @@ done
 
 # ------------------------------------------------------------------- scratch --
 
-# Every byte this script writes lands under here, and here is under the neutral
-# build root by construction.
-SCRATCH="$BUILD_ROOT/_audit/$$"
-mkdir -p "$SCRATCH"
+# Every byte this script writes lands under here. mktemp, not $BUILD_ROOT/_audit/$$:
+# a pid is guessable and the old path could be pre-created — with a symlink where
+# a directory was expected — by anything that could write the parent. mktemp
+# picks a name nothing can predict and creates it 0700, so neither trick works
+# even when TMPDIR is unset and this falls back to a world-writable /tmp.
+SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/openvhost-audit.XXXXXXXX")" ||
+	die "could not create a scratch directory"
 
 # shellcheck disable=SC2329  # invoked by the EXIT trap installed below
 cleanup() {
@@ -206,11 +256,11 @@ cleanup() {
 	if [ "$KEEP_SCRATCH" -eq 1 ]; then
 		say "scratch kept at $SCRATCH"
 	else
-		# Never rm -rf an unvalidated variable. This path is BUILD_ROOT plus
-		# two fixed components, and the shape is re-checked here rather than
-		# trusted.
+		# Never rm -rf an unvalidated variable. This path came from mktemp
+		# with a fixed template, and the shape is re-checked here rather
+		# than trusted.
 		case "$SCRATCH" in
-		/?*/_audit/[0-9]*) rm -rf -- "$SCRATCH" ;;
+		/?*/openvhost-audit.????????) rm -rf -- "$SCRATCH" ;;
 		*) printf 'audit: refusing to remove suspicious scratch path: %s\n' "$SCRATCH" >&2 ;;
 		esac
 	fi
@@ -257,6 +307,13 @@ fi
 
 RECIPE_SERVER_BIN="${RECIPE_SERVER_BIN:-}"
 RECIPE_SERVER_VERSION_ARGS=(--version)
+# Check 7 allowances. Both are empty by default, both are printed on every run,
+# and both belong to the recipe rather than to this script: an upstream that
+# writes /tmp into its own documentation is a fact about that upstream, and the
+# place to record it — with a reason — is next to everything else known about
+# that package. An allowance nobody can see is how check 4 went blind.
+RECIPE_ALLOWED_WRITABLE_PATHS=()
+RECIPE_INERT_PATHS=()
 
 if [ -n "$RECIPE_NAME_ARG" ]; then
 	# A bare name resolves inside build/recipes/; anything containing a slash is
@@ -424,13 +481,35 @@ is_floor() {
 	return 1
 }
 
-# The neutral build prefix (D8) is meaningless by design and is *expected* to be
-# embedded in the tree, so it and everything under it are exempt.
+# Exempt from check 4: the WORK tree, and nothing else under the build root.
+# Compiler debug info records the source and object paths the compiler saw; they
+# are not runtime paths — nothing resolves them — and the tree they name is
+# deleted when the build finishes.
+#
+# This used to exempt the entire build root, which is how the contract came to be
+# structurally blind to the install prefix: /tmp/openvhost-build was exempt, so
+# no check ever looked at it, and mariadbd shipped resolving plugin-dir out of a
+# mode-1777 tree. What makes the prefix acceptable is check 7 proving nothing can
+# create it, not an exemption asserting it does not matter.
 is_exempt() {
 	local p="$1" root
 	for root in "$BUILD_ROOT" "/private${BUILD_ROOT}" "${BUILD_ROOT#/private}"; do
 		[ -n "$root" ] || continue
-		case "$p" in "$root" | "$root"/*) return 0 ;; esac
+		case "$p" in "$root"/_work | "$root"/_work/*) return 0 ;; esac
+	done
+	return 1
+}
+
+# The staged tree IS the install prefix (D8), so a build audited in place sits
+# inside the single directory it is expected to name, and (c) below stops the
+# ancestor walk here. That is a named allowance for one directory, not a blanket
+# over a path family: check 7 is what makes it safe, by proving no absolute path
+# in the tree — the prefix included — can be created by unprivileged code.
+is_build_root() {
+	local p="$1" root
+	for root in "$BUILD_ROOT" "/private${BUILD_ROOT}" "${BUILD_ROOT#/private}"; do
+		[ -n "$root" ] || continue
+		if [ "$p" = "${root%/}" ]; then return 0; fi
 	done
 	return 1
 }
@@ -451,12 +530,10 @@ add_forbidden_path() {
 	printf '%s\n' "$twin" >>"$FORBID_FILE"
 }
 
-# Check 4's strength depends on where the build actually ran, and D8 is what
-# makes that safe rather than lucky: build.sh forces every build under the
-# neutral root, so the paths a package embeds are inert by construction. Auditing
-# a tree built somewhere else — a session scratchpad, say — can therefore pass
-# here and still carry that path, which is correct behaviour for a contract about
-# the builder's IDENTITY, and is why --forbid exists for the cases it is not.
+# Check 4's strength depends on where the build actually ran. Auditing a tree
+# built somewhere else — a session scratchpad, say — can pass here and still
+# carry that path, which is correct behaviour for a contract about the builder's
+# IDENTITY, and is why --forbid exists for the cases it is not.
 #
 # (a) the builder's own directories, as the environment reports them
 add_forbidden_path "${HOME:-}"
@@ -487,6 +564,7 @@ while :; do
 	ancestor="$(dirname -- "$ancestor")"
 	[ "$ancestor" != "/" ] || break
 	if is_floor "$ancestor"; then break; fi
+	if is_build_root "$ancestor"; then break; fi
 	add_forbidden_path "$ancestor"
 done
 
@@ -570,7 +648,9 @@ run_server() {
 
 relocation_state="skip"
 relocation_note="no server binary"
-if [ -n "$RECIPE_SERVER_BIN" ]; then
+if [ "$EXECUTE_ARTIFACT" -eq 0 ]; then
+	relocation_note="running the artifact was not requested (--execute-artifact)"
+elif [ -n "$RECIPE_SERVER_BIN" ]; then
 	if [ ! -x "$TREE/$RECIPE_SERVER_BIN" ]; then
 		relocation_state="fail"
 		relocation_note="the declared server binary is missing or not executable: $RECIPE_SERVER_BIN"
@@ -610,7 +690,9 @@ service_state="skip"
 service_note="no server binary"
 probe_log="$SCRATCH/serve.txt"
 : >"$probe_log"
-if [ -n "$RECIPE_SERVER_BIN" ]; then
+if [ "$EXECUTE_ARTIFACT" -eq 0 ]; then
+	service_note="running the artifact was not requested (--execute-artifact)"
+elif [ -n "$RECIPE_SERVER_BIN" ]; then
 	if [ "$probe_kind" != "function" ]; then
 		service_note="the recipe defines no recipe_serve_probe"
 	else
@@ -640,6 +722,150 @@ skip) check_skip "$service_note" ;;
 	report_lines "$probe_log"
 	;;
 esac
+
+# --------------------------------------------- 7. plantable embedded paths ----
+
+# The question is not "is this path pretty" (check 4) but "can anything create
+# it". A path is offending when some PROPER ancestor of it is a world-writable
+# directory on this machine: that ancestor is where an unprivileged process gets
+# to invent the rest of the chain and put a file at the end of it. The path's own
+# mode is not the test — a bare /tmp in a man page names a directory that already
+# exists and is nobody's load path; /tmp/openvhost-build/mariadb-11.4.9/lib/plugin
+# is a directory the loader will happily be handed by whoever creates it first.
+#
+# Evaluated against the auditing machine's filesystem, which is a proxy for the
+# user's; it is a good one, because the ancestors that matter (/tmp, /var/tmp,
+# /Users/Shared, /Library/Caches) are macOS's own and are the same everywhere.
+
+check_start "7 embedded paths"
+embedded_paths="$SCRATCH/embedded-paths.txt"
+embedded_dirs="$SCRATCH/embedded-dirs.txt"
+writable_dirs="$SCRATCH/writable-ancestors.txt"
+plant_problems="$SCRATCH/plantable.txt"
+allow_file="$SCRATCH/allowed-writable.txt"
+: >"$plant_problems"
+: >"$allow_file"
+
+for entry in ${RECIPE_ALLOWED_WRITABLE_PATHS[@]+"${RECIPE_ALLOWED_WRITABLE_PATHS[@]}"} \
+	${EXTRA_ALLOWED[@]+"${EXTRA_ALLOWED[@]}"}; do
+	[ -n "$entry" ] || continue
+	printf '%s\n' "${entry%/}" >>"$allow_file"
+done
+sort -u -o "$allow_file" "$allow_file"
+
+# Paths the recipe declares inert are skipped, by name, and named in the output.
+# An entry may be a subtree or a single file; a file is how you decline to scan
+# one binary without declining to scan the STRING it carries everywhere else,
+# which is the safer of the two allowances and should be preferred. Checks 1-3
+# still cover every Mach-O either way.
+scan_prune=()
+inert_note=""
+for sub in ${RECIPE_INERT_PATHS[@]+"${RECIPE_INERT_PATHS[@]}"}; do
+	sub="${sub#/}"
+	sub="${sub%/}"
+	[ -n "$sub" ] || continue
+	case "$sub" in
+	*..*) die "RECIPE_INERT_PATHS entry must be a path inside the tree: $sub" ;;
+	esac
+	[ -e "$TREE/$sub" ] || continue
+	scan_prune[${#scan_prune[@]}]="-path"
+	scan_prune[${#scan_prune[@]}]="$TREE/$sub"
+	scan_prune[${#scan_prune[@]}]="-o"
+	scan_prune[${#scan_prune[@]}]="-path"
+	scan_prune[${#scan_prune[@]}]="$TREE/$sub/*"
+	scan_prune[${#scan_prune[@]}]="-o"
+	if [ -d "$TREE/$sub" ]; then sub="$sub/"; fi
+	inert_note="$inert_note${inert_note:+, }$sub"
+done
+
+if [ "${#scan_prune[@]}" -gt 0 ]; then
+	unset 'scan_prune[$((${#scan_prune[@]} - 1))]'
+	find "$TREE" \( "${scan_prune[@]}" \) -prune -o -type f -print0
+else
+	find "$TREE" -type f -print0
+fi |
+	xargs -0 env LC_ALL=C grep -oahE '/[A-Za-z0-9_.+-]+(/[A-Za-z0-9_.+-]+)*' 2>/dev/null |
+	# `.` and `..` are collapsed first. Half of what a build tree embeds looks
+	# like obj/client/../mysys/libmysys.a, and comparing prefixes against a
+	# spelling the kernel would never resolve to lets an offending path hide
+	# behind a `..` — /x/../tmp/evil is /tmp/evil to everything that opens it.
+	LC_ALL=C awk '{
+		n = split($0, part, "/"); top = 0
+		for (i = 2; i <= n; i++) {
+			c = part[i]
+			if (c == "." || c == "") continue
+			if (c == "..") { if (top > 0) top--; continue }
+			stack[++top] = c
+		}
+		out = ""
+		for (i = 1; i <= top; i++) out = out "/" stack[i]
+		print (out == "" ? "/" : out)
+	}' |
+	LC_ALL=C sort -u >"$embedded_paths" || true
+
+# Every proper ancestor of every embedded path, deduplicated, so each candidate
+# directory is stat'd once instead of once per path that names it.
+LC_ALL=C awk -F/ '{ p = ""; for (i = 2; i < NF; i++) { p = p "/" $i; print p } }' \
+	"$embedded_paths" | LC_ALL=C sort -u >"$embedded_dirs"
+
+: >"$writable_dirs"
+while IFS= read -r dir; do
+	[ -d "$dir" ] || continue
+	case "$(stat -L -f '%OLp' -- "$dir" 2>/dev/null || true)" in
+	'') ;;
+	*[2367]) printf '%s\n' "$dir" >>"$writable_dirs" ;;
+	esac
+done <"$embedded_dirs"
+
+if [ -s "$writable_dirs" ]; then
+	LC_ALL=C awk -F/ '
+		NR == FNR { writable[$0] = 1; next }
+		{
+			p = ""
+			for (i = 2; i < NF; i++) {
+				p = p "/" $i
+				if (p in writable) { print $0 "\t" p; next }
+			}
+		}
+	' "$writable_dirs" "$embedded_paths" >"$plant_problems.all"
+	# An allowance matches the embedded path itself or a parent of it, never a
+	# suffix: /tmp must never be allowable as a way of allowing /tmp/anything.
+	if [ -s "$allow_file" ]; then
+		LC_ALL=C awk -F'\t' '
+			NR == FNR { allowed[$0] = 1; next }
+			{
+				n = split($1, part, "/")
+				p = ""
+				for (i = 2; i <= n; i++) {
+					p = p "/" part[i]
+					if (p in allowed) next
+				}
+				print
+			}
+		' "$allow_file" "$plant_problems.all" >"$plant_problems"
+	else
+		cp "$plant_problems.all" "$plant_problems"
+	fi
+fi
+
+plant_summary="$(count_lines "$embedded_paths") absolute paths"
+if [ -n "$inert_note" ]; then plant_summary="$plant_summary; inert: $inert_note"; fi
+if [ -s "$allow_file" ]; then
+	plant_summary="$plant_summary; $(count_lines "$allow_file") declared allowances"
+fi
+
+if [ -s "$plant_problems" ]; then
+	check_fail "$(count_lines "$plant_problems") embedded paths have a world-writable ancestor"
+	report_lines "$plant_problems"
+	detail "world-writable ancestors seen: $(tr '\n' ' ' <"$writable_dirs")"
+else
+	check_pass "$plant_summary, none rooted in a world-writable directory"
+	if [ -n "$inert_note" ]; then detail "declared inert (not scanned): $inert_note"; fi
+	while IFS= read -r entry; do
+		[ -n "$entry" ] || continue
+		detail "declared allowance: $entry"
+	done <"$allow_file"
+fi
 
 # --------------------------------------------------------------- verdict -----
 

@@ -47,6 +47,15 @@ RECIPE_DEPENDS=()
 RECIPE_SERVER_BIN=""
 RECIPE_SERVER_VERSION_ARGS=(--version)
 
+# Contract check 7: no absolute path embedded in the tree may have a
+# world-writable ancestor. Prefer fixing one at configure time — a build flag
+# that moves a default out of /tmp is worth more than any note here. Only what
+# genuinely cannot be fixed goes below, and each entry needs the file that
+# carries it and a reason nothing resolves it; the audit reads both out loud on
+# every run, which is the point.
+RECIPE_INERT_PATHS=()
+RECIPE_ALLOWED_WRITABLE_PATHS=()
+
 # ------------------------------------------------------------------- stages --
 
 recipe_fetch() {

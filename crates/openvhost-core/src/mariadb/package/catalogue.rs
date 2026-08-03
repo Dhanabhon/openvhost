@@ -183,10 +183,36 @@ pub struct MariadbPackage {
 /// user: `crate::mariadb::install_mariadb_package` refuses before any network
 /// work, naming the tag to publish.
 ///
-/// **To publish:** create release `mariadb-11.4.9` carrying
-/// `mariadb-11.4.9-macos-arm64.tar.gz`, its `.sha256` and the build manifest,
-/// confirm the served bytes still hash to the pin below, then flip
-/// `availability` to [`Availability::Published`].
+/// # The pin below is STALE and the bytes it names must not be published
+///
+/// A security audit BLOCKed the artifact this hash was taken from, on
+/// 2026-08-03. Its `mariadbd` resolves `basedir`, `plugin_dir` and
+/// `character-sets-dir` out of `/private/tmp/openvhost-build/...`, and
+/// `/private/tmp` is mode 1777 — so on a user's machine anything could create
+/// that tree and plant a plugin dylib or a charset index for the server to load
+/// (CWE-426 / CWE-427). Nothing was ever published, and
+/// [`Availability::AwaitingRelease`] is why. `build/build.sh` now refuses to
+/// build under a root with a world-writable ancestor, and contract check 7
+/// rejects the artifact even if one somehow appeared.
+///
+/// **To publish** — step 1 is not optional, and the rest cannot be reached
+/// without it, because the hash will not match until it is done:
+///
+/// 1. Prepare the build root once, then rebuild:
+///    ```text
+///    sudo mkdir -p /opt/openvhost-build
+///    sudo chown "$(id -u):$(id -g)" /opt/openvhost-build
+///    build/build.sh mariadb 11.4.9
+///    ```
+///    All seven contract checks must pass, twice — once on the staged tree and
+///    once on the packed tarball. The driver runs both.
+/// 2. Replace `sha256` below with the hash the `pack` stage printed, and run
+///    `the_real_artifact_installs_and_runs_from_the_package_tree` (it is
+///    `#[ignore]`d; set `OPENVHOST_MARIADB_TARBALL`) — it fails unless the
+///    tarball on disk is the one this pin names.
+/// 3. Create release `mariadb-11.4.9` carrying the tarball, its `.sha256` and
+///    the build manifest, confirm the served bytes still hash to the new pin,
+///    then flip `availability` to [`Availability::Published`].
 ///
 /// **`macos-x86_64` is deliberately absent** and this slice does not add it:
 /// there is no signature-checked x86_64 artifact, and shipping an unverified

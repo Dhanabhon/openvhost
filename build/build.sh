@@ -55,9 +55,18 @@ Options
   -h, --help        this text
 
 Environment
-  OPENVHOST_BUILD_ROOT   the neutral build root (default /tmp/openvhost-build).
-                         D8: the install prefix is deliberately meaningless, so
-                         that the paths every build embeds are inert.
+  OPENVHOST_BUILD_ROOT   the build root (default /opt/openvhost-build). D8: the
+                         install prefix is deliberately meaningless, AND no
+                         ancestor of it may be world-writable — a package
+                         embeds its prefix, and a prefix an unprivileged
+                         process can create is a prefix it can plant a plugin
+                         in. The driver refuses to run otherwise.
+
+Preparing a build machine
+  The build root must live where unprivileged code cannot create it, which is
+  the same thing as saying you need one privileged mkdir, once:
+
+    sudo mkdir -p /opt/openvhost-build && sudo chown "$(id -u):$(id -g)" /opt/openvhost-build
 
 Exit status
   0  the artifact was produced and passes the contract
@@ -155,11 +164,93 @@ esac
 
 # -------------------------------------------------------------- environment --
 
-BUILD_ROOT="${OPENVHOST_BUILD_ROOT:-/tmp/openvhost-build}"
+BUILD_ROOT="${OPENVHOST_BUILD_ROOT:-/opt/openvhost-build}"
 case "$BUILD_ROOT" in
 /?*) ;;
 *) bp_usage_die "OPENVHOST_BUILD_ROOT must be an absolute path: $BUILD_ROOT" ;;
 esac
+BUILD_ROOT="${BUILD_ROOT%/}"
+
+# The deepest ancestor of $1 that exists, resolved physically. Everything below
+# it does not exist yet, so who is allowed to create those components is decided
+# by this directory's mode — which is the question every caller here is asking.
+# Resolving matters because /tmp is a symlink to /private/tmp and `stat` reads
+# the link's own mode, which is not the directory's.
+bp_deepest_existing() {
+	local p="$1"
+	while [ ! -d "$p" ]; do p="$(dirname -- "$p")"; done
+	(cd -- "$p" && pwd -P)
+}
+
+bp_mode() { stat -L -f '%OLp' -- "$1" 2>/dev/null || true; }
+
+bp_is_world_writable() {
+	case "$(bp_mode "$1")" in
+	'') return 1 ;;
+	*[2367]) return 0 ;;
+	esac
+	return 1
+}
+
+# Takes the root to SUGGEST, which is not always the root that was asked for: a
+# root with a world-writable ancestor cannot be fixed by creating it, so telling
+# the operator to mkdir the very path just rejected would be advice that does not
+# work.
+bp_build_root_help() {
+	printf 'build: prepare a root whose every ancestor is root-owned, once:\n' >&2
+	printf 'build:   sudo mkdir -p %s && sudo chown %s:%s %s\n' \
+		"$1" "$(id -u)" "$(id -g)" "$1" >&2
+}
+
+# D8, corrected. A neutral prefix is NOT an inert one. Fifty-odd files in a
+# finished tree embed the install prefix, and mariadbd resolves basedir,
+# plugin-dir and character-sets-dir from it — so on a user's machine, where that
+# tree does not exist, the prefix is a name something will follow. If any
+# ancestor of it is world-writable (/tmp is mode 1777) then any unprivileged
+# local process can create the tree we named and plant a plugin dylib, a charset
+# Index.xml or an option file for the server to load: CWE-426 / CWE-427.
+#
+# So the prefix must be un-plantable, not merely meaningless, and that is
+# enforced here rather than assumed. The corollary is not a wart to work around:
+# a directory unprivileged code cannot create is a directory unprivileged code
+# cannot create, so preparing a build machine costs one privileged mkdir, once.
+bp_assert_unplantable() {
+	local root="$1" node
+	node="$(bp_deepest_existing "$root")"
+	while :; do
+		if bp_is_world_writable "$node"; then
+			printf 'build: refusing to build under %s\n' "$root" >&2
+			printf 'build: its ancestor %s is world-writable (mode %s), so on a machine\n' \
+				"$node" "$(bp_mode "$node")" >&2
+			printf 'build: where this tree does not exist anything could create the path the\n' >&2
+			printf 'build: package embeds and plant a plugin, a charset index or an option file.\n' >&2
+			bp_build_root_help /opt/openvhost-build
+			exit 1
+		fi
+		[ "$node" != "/" ] || break
+		node="$(dirname -- "$node")"
+	done
+}
+
+bp_assert_unplantable "$BUILD_ROOT"
+
+# Owner and mode are verified, not hoped for: a root somebody else owns, or one
+# left group- or world-readable by an earlier run, is not a root this build may
+# treat as its own.
+if [ ! -d "$BUILD_ROOT" ]; then
+	if ! mkdir -p -- "$BUILD_ROOT" 2>/dev/null; then
+		printf 'build: cannot create the build root: %s\n' "$BUILD_ROOT" >&2
+		bp_build_root_help "$BUILD_ROOT"
+		exit 2
+	fi
+fi
+chmod 0700 -- "$BUILD_ROOT" 2>/dev/null || true
+bp_root_owner="$(stat -L -f '%u' -- "$BUILD_ROOT" 2>/dev/null || true)"
+[ "$bp_root_owner" = "$(id -u)" ] ||
+	bp_die "the build root is owned by uid ${bp_root_owner:-?}, not $(id -u): $BUILD_ROOT"
+bp_root_mode="$(bp_mode "$BUILD_ROOT")"
+[ "$bp_root_mode" = "700" ] ||
+	bp_die "the build root is mode ${bp_root_mode:-?}, not 700: $BUILD_ROOT"
 
 BUILD_PREFIX="$BUILD_ROOT/$BUILD_NAME-$BUILD_VERSION"
 BUILD_WORK="$BUILD_ROOT/_work/$BUILD_NAME-$BUILD_VERSION"
@@ -185,12 +276,32 @@ esac
 # below ever writes anywhere else: the neutral build root, the output directory,
 # and (read-only) the repo. Nothing here touches ~/.openvhost, a datadir, or
 # Homebrew.
+#
+# Lexical containment is not containment. /tmp/openvhost-build/../../../etc
+# begins with the root and names none of it, so `..` is refused outright rather
+# than reasoned about; and because a component of the root may be a symlink
+# (/tmp is one), both ends are then resolved physically and compared again. The
+# comment above is a guarantee, so both halves have to hold, not just the cheap
+# one.
 bp_assert_under() {
-	local path="$1" root="$2" what="$3"
+	local path="$1" root="$2" what="$3" real_path real_root
 	case "$path" in
-	"$root" | "$root"/*) return 0 ;;
+	/*) ;;
+	*) bp_die "refusing to $what a relative path: $path" ;;
 	esac
-	bp_die "refusing to $what outside $root: $path"
+	case "/$path/" in
+	*/../*) bp_die "refusing to $what a path containing '..': $path" ;;
+	esac
+	case "$path" in
+	"$root" | "$root"/*) ;;
+	*) bp_die "refusing to $what outside $root: $path" ;;
+	esac
+	real_root="$(bp_deepest_existing "$root")"
+	real_path="$(bp_deepest_existing "$path")"
+	case "$real_path" in
+	"$real_root" | "$real_root"/*) return 0 ;;
+	esac
+	bp_die "refusing to $what outside $root: $path resolves to $real_path"
 }
 
 # rm -rf is never handed an unvalidated variable: a path must be absolute, deep
@@ -302,7 +413,12 @@ bp_download() {
 	fi
 	mkdir -p "$(dirname -- "$dest")"
 	bp_log "fetching $url"
+	# --location without --proto/--proto-redir is a downgrade waiting to happen:
+	# one 302 to http:// and a signature-verified source arrives over a channel
+	# anyone on the path can rewrite. Both are needed — --proto pins the request
+	# we make, --proto-redir pins the ones curl is told to make next.
 	curl --fail --location --silent --show-error \
+		--proto '=https' --proto-redir '=https' \
 		--connect-timeout 30 --speed-time 60 --speed-limit 1024 \
 		--output "$dest.part" -- "$url"
 	mv -- "$dest.part" "$dest"
@@ -456,9 +572,13 @@ stage_sign() {
 	bp_log "ad-hoc signed $count Mach-O files"
 }
 
+# --execute-artifact is passed deliberately and only here: checks 5 and 6 run the
+# server binary this driver has just produced, which the driver is entitled to do
+# because it built it. Someone auditing a tarball they were handed is not in that
+# position, so audit.sh does not assume it.
 stage_audit() {
 	"$BUILD_DIR/audit.sh" --recipe "$RECIPE_FILE" --version "$BUILD_VERSION" \
-		"$BUILD_PREFIX"
+		--execute-artifact "$BUILD_PREFIX"
 }
 
 stage_pack() {
@@ -476,12 +596,26 @@ stage_pack() {
 
 stage_verify_artifact() {
 	"$BUILD_DIR/audit.sh" --recipe "$RECIPE_FILE" --version "$BUILD_VERSION" \
-		"$TARBALL"
+		--execute-artifact "$TARBALL"
 }
 
+# A manifest that is not valid JSON is a manifest nothing reads, so every
+# character JSON forbids raw in a string is escaped here rather than left to a
+# caller to remember. `tr` drops the control characters that have no short
+# escape; the rest — backslash, quote, tab, CR and LF — are escaped. LF matters
+# most: a tool version line is one `head -n 1` away from being multi-line, and
+# the old code passed both LF and CR through untouched.
+# sed escapes each line; awk joins them. NOT `sed -e :a -e N -e '$!ba'` to slurp
+# first: on macOS's sed, `N` with no next line quits WITHOUT printing, so every
+# single-line value — which is nearly all of them — came out EMPTY. That wrote a
+# manifest of empty strings, and it was still valid JSON, so nothing downstream
+# would have complained.
 json_string() {
-	printf '%s' "$1" | LC_ALL=C sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g' |
-		LC_ALL=C tr -d '\000-\010\013\014\016-\037'
+	printf '%s' "$1" |
+		LC_ALL=C tr -d '\000-\010\013\014\016-\037' |
+		LC_ALL=C sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' \
+			-e "s/$(printf '\t')/\\\\t/g" -e "s/$(printf '\r')/\\\\r/g" |
+		LC_ALL=C awk 'NR > 1 { printf "%s", "\\n" } { printf "%s", $0 }'
 }
 
 json_array() {
