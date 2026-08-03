@@ -224,7 +224,7 @@ pub const MARIADB_PACKAGES: [MariadbPackage; 1] = [MariadbPackage {
     version: "11.4.9",
     target: PackageTarget::MacosArm64,
     url: "https://github.com/Dhanabhon/openvhost/releases/download/mariadb-11.4.9/mariadb-11.4.9-macos-arm64.tar.gz",
-    sha256: "04f99318eca08e471ea40ac0a7527bcb0ebbc1de429ad0f5667eaaabd9a64ca9",
+    sha256: "76ea96a4089e56953693d1af14e3ddd8da03cab291eada1fd1cf4e2c1df18304",
     format: ArchiveFormat::TarGz,
     availability: Availability::AwaitingRelease {
         tag: "mariadb-11.4.9",
@@ -321,7 +321,7 @@ mod tests {
         );
         assert_eq!(
             e.sha256,
-            "04f99318eca08e471ea40ac0a7527bcb0ebbc1de429ad0f5667eaaabd9a64ca9"
+            "76ea96a4089e56953693d1af14e3ddd8da03cab291eada1fd1cf4e2c1df18304"
         );
         assert_eq!(e.format, ArchiveFormat::TarGz);
     }
