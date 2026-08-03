@@ -68,7 +68,7 @@ Per D2, D3, D5, D8, §13.
 
 **OpenSSL is built first and statically** (owner decision). Success means `otool -L bin/mariadbd` shows **nothing** but `/usr/lib` and `/System` — no `lib/` bundling and no `install_name_tool` step at all. If static proves impractical, the `@loader_path` fallback in D3 is already proven — but **falling back is a reported finding**, not a quiet substitution.
 
-Build under the **neutral prefix** `/tmp/openvhost-build/<name>-<version>` (D8), because 13 files embed it and post-processing them all is fragile. Contract check 4 is what enforces that the owner's real paths never appear.
+Build under the **neutral, un-plantable prefix** `/opt/openvhost-build/<name>-<version>` (D8), because 13 files embed it and post-processing them all is fragile. Contract check 4 enforces that the owner's real paths never appear in it; contract check 7 enforces that no ancestor of it is world-writable. *Amended 2026-08-03:* the prefix was `/tmp/openvhost-build/...` and check 7 did not exist, so the first artifact shipped `mariadbd` resolving `plugin_dir` out of a mode-1777 tree.
 
 Output: `mariadb-11.4.9-macos-arm64.tar.gz`, its `.sha256`, and the build manifest (§7: upstream URL + verified sha256, MariaDB's signing-key fingerprint and expiry, every configure flag, toolchain versions, neutral prefix, output sha256).
 

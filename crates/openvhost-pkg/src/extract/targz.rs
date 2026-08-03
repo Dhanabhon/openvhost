@@ -614,10 +614,16 @@ mod tests {
         // S14: `d -> .` then `l -> d/../x` escapes at runtime, because the
         // kernel resolves `d` before applying `..`. Since the rule now
         // ADMITS `..` (as a leading run), the two links are refused by two
-        // different clauses: `d`'s target is a bare `.` component, and `l`'s
-        // puts `..` after a named component — the exact primitive the
-        // laundering pair is built from. `d` comes first, so its reason is
+        // different clauses: `d`'s target normalizes to no components at all,
+        // and `l`'s puts `..` after a named component — the exact primitive
+        // the laundering pair is built from. `d` comes first, so its reason is
         // the one that surfaces.
+        //
+        // The first reason changed when clause 1 began normalizing `.` rather
+        // than rejecting it; the link is still refused, by the
+        // nothing-but-dots rule. `rejects_symlink_chain_escape_second_link`
+        // below pins the OTHER half independently, so this pair cannot come to
+        // rest on one clause doing all the work.
         let bytes = targz_bytes(&[
             TarSpec::Symlink {
                 path: "d",
@@ -630,7 +636,24 @@ mod tests {
         ]);
         match extract(&bytes) {
             Err(PkgError::UnsafeArchive(msg)) => {
-                assert_eq!(msg, "'.' component in symlink target")
+                assert_eq!(msg, "symlink target resolves to its own directory")
+            }
+            other => panic!("expected the containment rejection, got {other:?}"),
+        }
+    }
+
+    /// The second half of the laundering pair, on its own — so the escape is
+    /// still refused even if the first link were ever admitted. Without this,
+    /// the pair above rests entirely on `d`'s rejection surfacing first.
+    #[test]
+    fn rejects_symlink_chain_escape_second_link() {
+        let bytes = targz_bytes(&[TarSpec::Symlink {
+            path: "l",
+            target: "d/../x",
+        }]);
+        match extract(&bytes) {
+            Err(PkgError::UnsafeArchive(msg)) => {
+                assert_eq!(msg, "'..' after a named component")
             }
             other => panic!("expected the containment rejection, got {other:?}"),
         }

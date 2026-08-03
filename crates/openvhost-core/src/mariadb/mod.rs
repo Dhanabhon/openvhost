@@ -1,0 +1,28 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//! MariaDB: the compiled-in package pin and the wiring that installs it into
+//! `<home>/packages/mariadb/11.4/<version>/`. See
+//! docs/superpowers/specs/2026-08-02-p2-build-pipeline-design.md (D5, §13,
+//! §14).
+//!
+//! **Installing a runtime is not running one.** Datadir initialization,
+//! start/stop, credentials, supervision and the Databases-page row are the next
+//! slice; nothing here touches a datadir, a credential or `<home>/logs/` on any
+//! path, including error paths. The module is deliberately shaped so that slice
+//! can add `datadir`/`init`/`repo` beside `package` exactly as
+//! [`crate::mysql`] does, rather than reshuffling this one.
+//!
+//! [`crate::PackageTarget`] is reused rather than redefined. It answers "which
+//! OS/architecture pair can a prebuilt package be published for", which is a
+//! question about packages and not about MySQL — and a second copy of the enum
+//! would mean a new variant broke compilation at only half the sites that have
+//! to decide about it. Its declaration living under `mysql/` is the wrong home
+//! for the same reason [`crate::mysql::InstallLedger`]'s is; both are worth
+//! moving together, and neither is this slice's business.
+
+mod package;
+
+pub use package::{
+    Availability, MARIADB_PACKAGE_NAME, MARIADB_PACKAGES, MARIADB_SERIES, MARIADB_WARMUP_BINARY,
+    MariadbPackage, MariadbPackageInstall, install_mariadb_package, mariadb_package_for_host,
+    mariadb_package_for_target,
+};

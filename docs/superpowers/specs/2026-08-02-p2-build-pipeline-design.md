@@ -47,9 +47,17 @@ Four build failures, each of which became a requirement below:
 1. ServBay's broken `bison` on `PATH` (→ D2, pin every tool).
 2. The host leaked in from **two package managers at once** — `GNUTLS`/`HOGWEED` from
    `/opt/homebrew`, `GSSAPI_INCS` and `KRB5_CONFIG` from `/Applications/ServBay` (→ D2).
-3. `WITH_SSL` is an **overloaded name**: the server accepts `bundled|system|<path>`, the
-   bundled Connector/C accepts `ON|OPENSSL|GNUTLS` and falls into its GnuTLS branch on
-   anything else (`libmariadb/CMakeLists.txt:346`) (→ D3).
+3. `WITH_SSL` is an **overloaded name**: the server accepts `bundled|system|<path>`, and it
+   is `WITH_SSL=bundled` — wolfSSL for the server — that hands the bundled Connector/C to
+   GnuTLS. `cmake/mariadb_connector_c.cmake` derives `CONC_WITH_SSL` from the top-level
+   choice, and when the server picked wolfSSL it sets the connector to `GNUTLS` on every
+   non-Windows platform; the connector then does `FIND_PACKAGE(GnuTLS REQUIRED)` and finds
+   Homebrew's, dragging GnuTLS and Hogweed into the tree. One concrete prefix — ours — is
+   the only value that gives both readers OpenSSL. (*Corrected 2026-08-03:* an earlier
+   draft said the connector "falls into its GnuTLS branch on anything else"; it does not.
+   Its GnuTLS branch is an exact `STREQUAL "GNUTLS"` match and its catch-all is
+   `FATAL_ERROR "Invalid TLS/SSL option"`. The configuration was right, the reason given
+   for it was not.) (→ D3).
 4. Scrubbing `PATH` before resolving `cmake` removed `cmake` (→ D2).
 
 And one thing the proof nearly missed: **13 files in the finished tree still embed the
@@ -141,11 +149,23 @@ us to compute one. The recipe verifies that signature, and the key fingerprint i
 cross-checked against a second host, exactly as the MySQL slice did. Record the key id,
 its expiry, and the verification date alongside the pin.
 
+**A `bundled` flag is not vendoring**, and "the source archive" is not the whole of the
+input. MariaDB's `WITH_PCRE=bundled` and `WITH_LIBFMT=bundled` download pcre2 and fmt over
+the network *during* the build and check them with `URL_MD5` and nothing else; both are
+compiled into `mariadbd`, where §8's linkage check cannot see them, because a static
+library that was compiled in leaves no entry in any link command. So the recipe fetches
+both itself, verifies both itself — pcre2 by GPG signature, fmt by digest, since fmtlib
+publishes no signature — seeds them where cmake's `ExternalProject` looks before it decides
+to fetch, and runs the compile with the network taken away so that a download added by a
+later upstream fails loudly instead of succeeding quietly. Verified means verified by us,
+including for the inputs upstream's build system fetches on our behalf.
+
 **The build manifest** published with every artifact records: upstream URL and its verified
 sha256, the signing key fingerprint, every configure flag, the toolchain versions
-(`cmake`, `bison`, `clang`, macOS SDK), the neutral build prefix, and the output sha256.
-Not bit-reproducible — but auditable, which is the achievable goal for a single-builder
-pipeline.
+(`cmake`, `bison`, `clang`, macOS SDK), the neutral build prefix, the output sha256, and —
+for each input the build system would otherwise have fetched for itself — its URL, its
+verified digest, and how far that verification actually goes. Not bit-reproducible — but
+auditable, which is the achievable goal for a single-builder pipeline.
 
 ## 8. D6 — The artifact contract
 
@@ -153,16 +173,45 @@ A tarball is acceptable only if **all** of these hold. The audit is a script; a 
 a failed build, not a warning.
 
 1. Extracts to a single root containing at least `bin/` and `share/`.
-2. **Linkage:** every `otool -L` entry of every Mach-O is `/usr/lib/*`, `/System/*`, or
-   `@loader_path/...`. Nothing else.
+2. **Linkage:** every `otool -L` entry of every Mach-O is `/usr/lib/*`, `/System/*`,
+   `@loader_path/...` or `@rpath/...`, **and** every `LC_RPATH` is `@loader_path`-relative.
+   Nothing else. *Amended 2026-08-02 during implementation:* real MariaDB ships
+   `LC_ID_DYLIB = @rpath/libmariadb.3.dylib` alongside `LC_RPATH = @loader_path/../lib`,
+   which is the idiomatic macOS pattern for a self-contained tree rather than a defect.
+   Admitting `@rpath` on its own would have been a hole rather than a widening — it is only
+   as relocatable as the `LC_RPATH` entries that resolve it, and `otool -L` never shows one —
+   so the rpath condition arrives with it.
 3. **Signature:** every Mach-O is signed and `codesign -v` passes.
 4. **No builder identity anywhere in the tree.** Today's tree fails this — 13 files carry
-   the staging path. See D8 for how the prefix is chosen so that what remains is harmless,
-   and this check enforces that the builder's real directories never appear.
+   the staging path. See D8 for how the prefix is chosen so that what remains carries no
+   identity, and this check enforces that the builder's real directories never appear.
+   *Amended 2026-08-03:* the exemption for the build root is now one named directory — the
+   install prefix the staged tree unavoidably is — and the `_work` subtree, whose paths
+   appear only in compiler debug info. It used to be the whole root and everything under
+   it, which is precisely how the contract came to be blind to check 7's finding.
 5. **Runs from two different paths.** Automated: install to A, run, move to B, run again.
    A single-location test cannot detect the defect this whole pipeline exists to avoid.
 6. **Serves and survives.** Start the server, create a table, insert, restart, read back —
    the proof performed today, run as a gate rather than once by hand.
+7. **No absolute path embedded anywhere in the tree has a world-writable ancestor.**
+   *Added 2026-08-03, after a security audit BLOCKed the first artifact.* Checks 4 and 7
+   ask different questions about the same string, and only 7 asks the one that decides
+   whether the package is safe: not "does this path name the builder" but "can anything
+   unprivileged create it". `/tmp/openvhost-build/mariadb-11.4.9` names nobody and passed
+   check 4 — and `mariadbd` resolves `basedir`, `plugin_dir` and `character-sets-dir` out
+   of it, on machines where the tree does not exist and `/tmp` is mode 1777 (CWE-426,
+   CWE-427). Checks 5 and 6 could not see it either: both pass `--basedir` explicitly.
+
+   Where upstream's own corpus cannot satisfy this literally, the exceptions are declared
+   **in the recipe**, and every one of them is printed on every audit run —
+   `RECIPE_INERT_PATHS` for subtrees that are documentation or test fixtures, and
+   `RECIPE_ALLOWED_WRITABLE_PATHS` for individual paths, each traced to the file that
+   carries it. An exception that has to be written down next to a reason, and that the
+   audit reads out loud, is a different thing from one built into the checker.
+
+   Checks 5 and 6 execute the artifact, so they additionally require `--execute-artifact`.
+   `build.sh` passes it because it built the tree it is auditing; someone auditing a
+   tarball they were handed is not in that position and must opt in deliberately.
 
 ## 9. D7 — One driver, one recipe per package
 
@@ -177,13 +226,51 @@ fetch → verify signature → extract → configure → build → install
 MariaDB proves it. nginx and PHP must slot in **without changing the driver** — if either
 needs the driver changed, that is a finding to report, not a change to make quietly.
 
-## 10. D8 — Build under a neutral prefix
+## 10. D8 — Build under a neutral prefix that nothing unprivileged can create
 
 Because 13 files embed the staging path and post-processing all of them is fragile, the
-build uses a **stable, meaningless prefix** — `/tmp/openvhost-build/<name>-<version>` —
-rather than a session temp directory. Anything that leaks is then inert, and contract
-check 4 enforces that the owner's real paths (home directory, project directories, session
-scratchpads) never appear.
+build uses a **stable prefix** — `<root>/<name>-<version>` — rather than a session temp
+directory, and contract check 4 enforces that the owner's real paths (home directory,
+project directories, session scratchpads) never appear in it.
+
+**Corrected 2026-08-03, after a security audit BLOCKed the first artifact.** This section
+originally read `/tmp/openvhost-build/<name>-<version>`, and justified it with "anything
+that leaks is then inert". *That sentence was wrong*, and it was wrong in the way that
+matters: it confused **carrying no information** with **having no effect**.
+
+An embedded prefix is not a label. `mariadbd` resolves `basedir`, `plugin_dir` and
+`character-sets-dir` from it, and it does so on a machine where that tree does not exist.
+`/private/tmp` is mode 1777. So any unprivileged local process could have created
+`/tmp/openvhost-build/mariadb-11.4.9/lib/plugin` and put a dylib in it, or a
+`share/charsets/Index.xml`, and the server would have loaded it: CWE-426 / CWE-427. A
+meaningless name that anyone can claim is not inert; it is an unclaimed name.
+
+So the prefix must satisfy **two** properties, and both are enforced rather than assumed:
+
+- **neutral** — it identifies nobody. Contract check 4.
+- **un-plantable** — no ancestor of it is world-writable, so unprivileged code cannot
+  create the tree the package names. `build.sh` refuses to run otherwise, and contract
+  check 7 re-derives it from the finished artifact rather than trusting the driver.
+
+The default root is therefore **`/opt/openvhost-build`**: `/opt` and `/` are root-owned and
+mode 755, so on any Mac the path is un-plantable, and it names no user.
+
+The consequence is not a wart to be engineered around — it is the same fact stated twice. A
+directory unprivileged code cannot create is a directory unprivileged code cannot create,
+including for us, so preparing a build machine costs one privileged `mkdir`, once:
+
+```
+sudo mkdir -p /opt/openvhost-build && sudo chown "$(id -u):$(id -g)" /opt/openvhost-build
+```
+
+`build.sh` prints exactly that command when the root is missing or unsafe. The root itself
+is then verified to be owned by the builder and mode 0700 before any build writes to it.
+
+One embedded path was fixed rather than tolerated: upstream compiles `MYSQL_UNIX_ADDR` as
+`/tmp/mysql.sock` into `mariadbd`, every client, `libmariadb.3.dylib`, `mysql_config` and
+`mariadb.pc` — 27 shipped files. Anything on the machine can bind that name first and
+collect the credentials of every client that connects to "localhost" without an explicit
+`--socket`, so the recipe pins it inside the prefix instead.
 
 OpenVHost spawns server binaries directly and **never** through `mysqld_safe`-style
 wrappers — an existing rule from the MySQL slice, where `mysqld_safe` carried a hardcoded
@@ -235,7 +322,11 @@ trigger is an intention.
 
 - **Watch list, recorded in the repo** next to the catalogue: MariaDB 11.4 releases and
   the OpenSSL 3.x advisory feed, being the two things we compile and ship. Add one entry
-  per package as the pipeline grows to nginx and PHP.
+  per package as the pipeline grows to nginx and PHP. **pcre2 and fmt belong on it too** —
+  both are compiled into `mariadbd` (see D5) — with one qualification worth stating,
+  because it changes what the entry means: their versions are MariaDB's choice, not ours,
+  since cmake insists on its own `URL_MD5`. The answer to a pcre2 CVE is therefore a
+  MariaDB release that bumps it, not a number we edit.
 - **The pin is the tripwire.** The catalogue already carries `{version, url, sha256}`; add
   the upstream release date and the date we last checked. A stale check is then visible in
   the source rather than remembered.
