@@ -379,7 +379,9 @@ pub(crate) fn stripped_rel(validated_raw: &str, strip: &StripInfo) -> Option<Str
 /// components, and `d` the number of components in the link's own directory.
 ///
 /// 1. The target is non-empty and relative: no leading `/`, no `\`, no `:`,
-///    no empty component, no `.` component.
+///    no empty component. `.` components are **normalized away** before `k`,
+///    `d` and everything below are computed; a target left with no
+///    components at all (`.`, `./.`) is refused.
 /// 2. `..` appears ONLY in that leading run. Any `..` after a named
 ///    component is rejected. **Load-bearing — see below.**
 /// 3. `k <= d`.
@@ -391,7 +393,29 @@ pub(crate) fn stripped_rel(validated_raw: &str, strip: &StripInfo) -> Option<Str
 /// Measured against upstream `mysql-8.4.11-macos15-arm64.tar.gz`: all 34
 /// symlinks pass, no exceptions, and each of the 22 whose target contains
 /// `..` saturates `k == d` exactly — none of them even wants to reach the
-/// package root, let alone leave it.
+/// package root, let alone leave it. Measured again against OpenVHost's own
+/// `mariadb-11.4.9-macos-arm64.tar.gz` (17,246 entries): every entry passes,
+/// and the four `mariadb-test/mtr -> ./mariadb-test-run.pl` links are the
+/// reason clause 1 normalizes `.` instead of rejecting it.
+///
+/// # Why `.` is normalized rather than rejected — and why NOT simply allowed
+///
+/// `.` carries no traversal power: the kernel resolves `a/./b` and `a/b`
+/// identically, at every hop, symlinked ancestors included. So the rule
+/// accepts a target `T` exactly when it accepts `normalize(T)`, and
+/// `normalize(T)` is `.`-free and was already in the accepted language. **The
+/// set of reachable destinations is therefore unchanged by this clause** —
+/// nothing becomes reachable that a `.`-free spelling could not already
+/// reach.
+///
+/// That argument holds only because the `.` components are REMOVED before
+/// clauses 2–5 run. Merely deleting the old rejection would punch a hole in
+/// clause 4, which tests emptiness on the component vector rather than on a
+/// normalized path: `a/l -> ../.` would leave `resolved == ["."]`, read as
+/// non-empty, and slip past the very check that refuses the `up -> ../..`
+/// laundering primitive. `refuses_a_dot_that_would_launder_a_root_resolution`
+/// pins that case; it fails against the delete-the-check variant and passes
+/// against this one.
 ///
 /// # Why lexical normalization is NOT enough
 ///
@@ -447,14 +471,24 @@ pub(crate) fn validate_symlink(link_rel: &str, target: &str) -> Result<(), PkgEr
     if target.starts_with('/') || target.contains('\\') || target.contains(':') {
         return Err(reject("absolute or non-relative symlink target"));
     }
-    let comps: Vec<&str> = target.split('/').collect();
-    for c in &comps {
+    let raw: Vec<&str> = target.split('/').collect();
+    for c in &raw {
         if c.is_empty() {
             return Err(reject("empty component in symlink target"));
         }
-        if *c == "." {
-            return Err(reject("'.' component in symlink target"));
-        }
+    }
+    // `.` is normalized away, NOT tolerated in place: see "Why `.` is
+    // normalized rather than rejected" above. Everything below — `k`, the
+    // clause-2 scan, `d`, `resolved` and the two size limits — must see the
+    // `.`-free vector, or clause 4 stops meaning what it says.
+    let comps: Vec<&str> = raw.into_iter().filter(|c| *c != ".").collect();
+    if comps.is_empty() {
+        // `.`, `./.`, … — a link to its own directory. Not an escape (it lands
+        // inside the root at every depth), but a self-reference nothing
+        // legitimate ships, and admitting it would mean admitting a traversal
+        // cycle for no benefit. Refused so this clause only ever ADMITS
+        // destinations a `.`-free target could already name.
+        return Err(reject("symlink target resolves to its own directory"));
     }
 
     // Clause 2 — `..` ONLY as a leading contiguous run. This is the clause
@@ -986,20 +1020,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_absolute_dot_and_empty_target_components() {
-        // Clause 1 — retained verbatim from the pre-`..` rule.
+    fn rejects_absolute_and_empty_target_components() {
+        // Clause 1 — retained verbatim from the pre-`..` rule, except for `.`,
+        // which is now normalized (see the three tests below).
         assert_eq!(reason("a/l", ""), "empty symlink target");
         for bad in ["/abs/path", "c:\\x", "b\\c", "x:stream"] {
             assert_eq!(
                 reason("a/l", bad),
                 "absolute or non-relative symlink target",
-                "{bad}"
-            );
-        }
-        for bad in ["./x", "x/./y", "."] {
-            assert_eq!(
-                reason("a/l", bad),
-                "'.' component in symlink target",
                 "{bad}"
             );
         }
@@ -1010,6 +1038,90 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// The shape OpenVHost's own MariaDB tarball actually ships, four times
+    /// over (`mariadb-test/mtr -> ./mariadb-test-run.pl`). `.` is inert, so
+    /// each of these must be accepted exactly as its `.`-free spelling is.
+    #[test]
+    fn accepts_a_dot_component_because_it_names_the_same_destination() {
+        for (link, dotted, plain) in [
+            (
+                "mariadb-test/mtr",
+                "./mariadb-test-run.pl",
+                "mariadb-test-run.pl",
+            ),
+            ("a/l", "./x", "x"),
+            ("a/l", "x/./y", "x/y"),
+            ("a/b/l", "./../x", "../x"),
+            ("a/b/c/l", "././../../x", "../../x"),
+        ] {
+            assert!(
+                validate_symlink(link, dotted).is_ok(),
+                "must accept {link} -> {dotted}"
+            );
+            assert_eq!(
+                validate_symlink(link, dotted).is_ok(),
+                validate_symlink(link, plain).is_ok(),
+                "{link}: {dotted} and {plain} name the same path and must agree"
+            );
+        }
+    }
+
+    /// A target that is nothing BUT `.` names the link's own directory. Not an
+    /// escape, but a self-reference nothing ships — and refusing it is what
+    /// keeps this clause purely a normalization rather than a widening.
+    #[test]
+    fn rejects_a_target_made_only_of_dot_components() {
+        for bad in [".", "./.", "././."] {
+            assert_eq!(
+                reason("a/l", bad),
+                "symlink target resolves to its own directory",
+                "{bad}"
+            );
+            assert_eq!(
+                reason("a/b/c/l", bad),
+                "symlink target resolves to its own directory",
+                "{bad}"
+            );
+        }
+    }
+
+    /// **The reason clause 1 normalizes instead of simply dropping the old
+    /// rejection.** Clause 4 tests emptiness on the component vector, so a
+    /// surviving `.` reads as "non-empty" and lets `../.` — which really does
+    /// resolve to the extraction root — past the check that exists to refuse
+    /// the `up -> ../..` laundering primitive.
+    ///
+    /// Mutation-proven: with the normalizing filter removed so that `.` is
+    /// merely tolerated in place, `validate_symlink("a/l", "../.")` is
+    /// ACCEPTED and this test fails on exactly that case. Three sibling tests
+    /// fail alongside it (`rejects_a_target_made_only_of_dot_components`,
+    /// `accepts_a_dot_component_because_it_names_the_same_destination` and
+    /// targz's `rejects_symlink_chain_escape`); the other 71 stay green.
+    #[test]
+    fn refuses_a_dot_that_would_launder_a_root_resolution() {
+        for bad in ["../.", ".././", "./..", "./../."] {
+            // `.././` also carries an empty trailing component, refused earlier;
+            // assert only that NOTHING in this family is accepted.
+            assert!(
+                validate_symlink("a/l", bad).is_err(),
+                "a/l -> {bad} resolves to the package root and must be refused"
+            );
+        }
+        assert_eq!(
+            reason("a/l", "../."),
+            "symlink target resolves to the package root itself"
+        );
+        assert_eq!(
+            reason("a/l", "./.."),
+            "symlink target resolves to the package root itself"
+        );
+        // And the same laundering one level up must still be caught by clause 3.
+        assert_eq!(
+            reason("a/l", "./../.."),
+            "symlink target ascends past the package root"
+        );
     }
 
     #[test]

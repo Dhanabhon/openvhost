@@ -84,6 +84,31 @@ pub enum CoreError {
         /// for.
         target: &'static str,
     },
+    /// The catalogue pins a package whose release has not been published yet,
+    /// so the URL it names does not exist (build-pipeline design D5:
+    /// "publishing is owner-gated").
+    ///
+    /// Deliberately NOT a download failure. The bytes exist and were built and
+    /// audited; what is missing is the outward-facing act of publishing them,
+    /// which only the owner may perform. Letting the pin reach the downloader
+    /// instead would turn a known, stated gap into a 404 that looks like a
+    /// network fault — and a user would have no way to tell the two apart.
+    /// Refused before any network or filesystem work, and the message names
+    /// the release a human has to create.
+    #[error(
+        "{name} {version} is pinned at a release that does not exist yet ({url}); \
+         publish release {tag} before this build can install it"
+    )]
+    PackageNotPublished {
+        /// The package tree name, e.g. `"mariadb"`.
+        name: &'static str,
+        /// The exact version the catalogue pins.
+        version: &'static str,
+        /// The release tag that must exist, e.g. `"mariadb-11.4.9"`.
+        tag: &'static str,
+        /// The URL the release will serve once it is published.
+        url: &'static str,
+    },
     /// A package download, verification, extraction or install failed.
     ///
     /// Wraps `openvhost-pkg`'s typed error rather than flattening it to a

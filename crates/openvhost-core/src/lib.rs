@@ -20,6 +20,10 @@ mod info;
 // `brew uninstall php@8.5` from removing an aliased, unversioned `php`.
 pub mod keg;
 pub mod logs;
+// MariaDB from OpenVHost's OWN build (upstream publishes no macOS binaries):
+// the compiled-in pin and the wiring that installs it. Catalogue and install
+// only — the service itself is the next slice.
+pub mod mariadb;
 pub mod mysql;
 pub mod php;
 pub mod settings_repo;
@@ -34,6 +38,16 @@ pub use keg::{KegProvenance, ResolvedKeg, keg_provenance, resolve_keg};
 pub use logs::{
     LogCursor, LogLevel, LogLimits, LogPaths, LogQuery, LogReset, LogRow, LogWindow,
     classify_level, ensure_log_dir, read_window,
+};
+/// MariaDB's package surface. Nothing here is wired to a Tauri command, a CLI
+/// subcommand or a UI control, and nothing may be until the owner publishes the
+/// release the catalogue pins — see `mariadb::Availability`. Exported so the
+/// pin is inspectable (and testable) without exposing an install a user could
+/// trigger into a 404.
+pub use mariadb::{
+    Availability, MARIADB_PACKAGE_NAME, MARIADB_PACKAGES, MARIADB_SERIES, MARIADB_WARMUP_BINARY,
+    MariadbPackage, MariadbPackageInstall, install_mariadb_package, mariadb_package_for_host,
+    mariadb_package_for_target,
 };
 pub use mysql::{
     DatadirState, InstallLedger, LedgerEntry, LedgerWrite, MYSQL_CATALOGUE, MYSQL_PACKAGE_NAME,
