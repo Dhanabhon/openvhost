@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT root_password, initialized_at FROM mariadb_instances WHERE major = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "root_password",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "mariadb_instances",
+            "name": "root_password"
+          }
+        }
+      },
+      {
+        "name": "initialized_at",
+        "ordinal": 1,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "mariadb_instances",
+            "name": "initialized_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "e01e06565afae93014a94d74bfbc1675a9813efefe6ea68c75dc43230e124e21"
+}

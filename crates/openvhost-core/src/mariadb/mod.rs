@@ -28,6 +28,7 @@ mod datadir;
 mod discover;
 mod package;
 mod paths;
+mod repo;
 
 pub use datadir::{MariadbDatadirState, classify_mariadb_datadir};
 pub use discover::{MariadbRuntime, discover_mariadb, packaged_mariadb_runtime};
@@ -37,3 +38,4 @@ pub use package::{
     mariadb_package_for_target,
 };
 pub use paths::{MariadbPaths, mariadb_data_root, mariadb_paths};
+pub use repo::{MariadbInstance, MariadbInstanceRepo};
