@@ -31,7 +31,7 @@ Per D1, D5.
 
 **This task carries the data-loss risk and comes first for that reason.**
 
-`classify_datadir` for MariaDB requires **both** `mysql/` (dir) and `mariadb_upgrade_info` (file). MySQL's rule — `mysql/` + `auto.cnf` — would call a populated MariaDB datadir *uninitialized*, and the next step on that verdict is `--initialize` over the user's databases. **Do not reuse `SENTINEL_FILE`.**
+`classify_datadir` for MariaDB requires **both** `mysql/` (dir) and `mariadb_upgrade_info` (file). MySQL's rule is `mysql/` + `auto.cnf`, and MariaDB never writes the second. **Do not reuse `SENTINEL_FILE`.** *Corrected 2026-08-04:* an earlier draft said reusing it would call a populated datadir *uninitialized* and `--initialize` over the user's databases. It would not — `mysql/datadir.rs` has a catch-all that yields `Foreign`, so the real cost is every good MariaDB datadir permanently unusable behind an honest refusal. Bad, and not data loss; see the spec §2 for the full correction and for the half-state that IS reachable through a direct-bootstrap init.
 
 `mariadb_upgrade_info` holds the version (`11.4.9-MariaDB`). A datadir whose recorded series disagrees with the one being started is **`Foreign`, not `Initialized`** — that is a migration, and this slice does not migrate.
 
