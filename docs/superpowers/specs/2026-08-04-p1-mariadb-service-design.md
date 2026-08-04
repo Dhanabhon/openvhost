@@ -27,15 +27,29 @@ that is a finding to report, not scope to absorb.
 |---|---|
 | **MariaDB writes no `auto.cnf`** | initialized a real datadir from the 11.4.9 artifact; root holds `mysql/`, `mariadb_upgrade_info`, `ib*`, `aria_log*`, `sys`, `test`, `undo00[1-3]` |
 | `mariadb_upgrade_info` exists after a successful init and **contains `11.4.9-MariaDB`** | `cat` |
-| A killed init leaves **an empty directory** — both sentinels absent together | `timeout 2` on `mariadb-install-db`, then `ls` |
+| A killed `mariadb-install-db` leaves **an empty directory** | 8 kills across the run, 2 s to 95 % of a 7 s init, process-group `SIGKILL`; the script stages elsewhere and moves in at the end |
 | The local tarball matches the catalogue pin | `76ea96a4…` on disk and in `catalogue.rs` |
 
 **The first row is the reason this spec exists rather than a rename of the MySQL one.**
-`classify_datadir` requires **both** `mysql/` and `auto.cnf` (`mysql/datadir.rs:135-136`).
-A MariaDB datadir has the first and never the second, so the MySQL rule would classify a
-perfectly good, populated datadir as *uninitialized* — and the next step on that verdict is
-`--initialize`, on top of the user's databases. Reusing that constant would have destroyed
-data, and it would have looked like a one-word change.
+`classify_datadir` requires **both** `mysql/` and `auto.cnf` (`mysql/datadir.rs:135-136`),
+and a MariaDB datadir has the first and never the second.
+
+*Corrected 2026-08-04, before implementation, by the task that read the code:* an earlier
+draft of this paragraph said the MySQL rule would call such a datadir *uninitialized* and
+that `--initialize` would then run over the user's databases. **It would not.**
+`mysql/datadir.rs` has a catch-all — non-empty and not both sentinels yields `Foreign`, not
+`NotInitialized` — so reusing the constant would have made every good MariaDB datadir
+**permanently unusable behind an honest refusal**, which is bad and is not data loss. The
+conclusion is unchanged and the reason is now the one the code supports. Recording the
+correction rather than quietly editing it, because a spec that overstates a risk teaches the
+next reader to discount it.
+
+The half-state the rule guards against is nonetheless real. `mariadb-install-db` stages
+elsewhere and moves in, so killing *it* leaves nothing — measured eight times. But
+initialization through the server binary directly, the way the MySQL path does it, writes in
+place: task 1 observed a killed run leaving `mysql/` complete with 88 system tables and no
+`mariadb_upgrade_info`. **Requiring both sentinels covers either init path**, which is why
+the rule does not depend on knowing which one a future change picks.
 
 ## 3. D1 — Sentinels: `mysql/` **and** `mariadb_upgrade_info`
 
