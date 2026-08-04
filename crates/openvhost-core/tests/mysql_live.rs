@@ -878,12 +878,29 @@ async fn mysql_lifecycle_end_to_end_against_real_mysqld() {
     // production calls, with the SAME arguments, is what makes this test a
     // genuine twin of the real path rather than a workaround that only
     // proves the test's own patched-over version works.
+    // Spec D3 (2026-08-04): the four pinned runtime directories, derived from
+    // the runtime this test actually discovered — the same call the production
+    // path makes, so this stays a twin rather than a hand-tuned copy.
+    let dirs = openvhost_core::mysql::mysql_runtime_dirs(&runtime.mysqld)
+        .expect("a real mysql@8.4 install must expose its plugin/charset/message dirs");
+    for d in [
+        &dirs.basedir,
+        &dirs.plugin_dir,
+        &dirs.character_sets_dir,
+        &dirs.lc_messages_dir,
+    ] {
+        assert!(d.is_dir(), "{} must exist on a real install", d.display());
+    }
     let ctx = MysqlCtx {
         my_cnf: paths.my_cnf.clone(),
         datadir: paths.datadir.clone(),
         socket: paths.socket.clone(),
         pid_file: paths.pid_file.clone(),
         custom_confd: paths.custom_confd.clone(),
+        basedir: dirs.basedir.clone(),
+        plugin_dir: dirs.plugin_dir.clone(),
+        character_sets_dir: dirs.character_sets_dir.clone(),
+        lc_messages_dir: dirs.lc_messages_dir.clone(),
     };
     let generated = openvhost_conf::generate_my_cnf(&ctx).expect("my.cnf must render");
     write_generated_config(&generated, &paths.custom_confd).expect("my.cnf must write atomically");

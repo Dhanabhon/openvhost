@@ -37,8 +37,9 @@ pub use discover::{
 };
 pub(crate) use discover::{current_version, looks_like_a_broken_install};
 pub use init::{
-    MysqlInitOutcome, MysqlInitStep, RootPassword, alter_user_sql, finalize_staging,
-    generate_root_password, remove_staging_dir, staging_dir_path, write_generated_config,
+    MysqlInitOutcome, MysqlInitStep, MysqlRuntimeDirs, RootPassword, alter_user_sql,
+    finalize_staging, generate_root_password, mysql_runtime_dirs, remove_staging_dir,
+    staging_dir_path, write_generated_config,
 };
 pub use package::{
     InstallLedger, LedgerEntry, LedgerWrite, MYSQL_PACKAGE_NAME, MYSQL_PACKAGES,

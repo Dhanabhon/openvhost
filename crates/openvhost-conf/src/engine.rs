@@ -15,6 +15,7 @@ const PHP_LOCATION: &str = include_str!("../templates/nginx/php-location.conf.te
 const DEFAULT_SITE_NGINX: &str = include_str!("../templates/nginx/default-site.conf.tera");
 const POOL_FPM: &str = include_str!("../templates/php-fpm/pool.conf.tera");
 const MY_CNF: &str = include_str!("../templates/mysql/my.cnf.tera");
+const MARIADB_MY_CNF: &str = include_str!("../templates/mariadb/my.cnf.tera");
 
 pub(crate) fn engine() -> &'static Tera {
     static ENGINE: OnceLock<Tera> = OnceLock::new();
@@ -32,6 +33,7 @@ pub(crate) fn engine() -> &'static Tera {
             ("nginx/default-site.conf", DEFAULT_SITE_NGINX),
             ("php-fpm/pool.conf", POOL_FPM),
             ("mysql/my.cnf", MY_CNF),
+            ("mariadb/my.cnf", MARIADB_MY_CNF),
         ]) {
             panic!("embedded templates must parse: {e}");
         }
