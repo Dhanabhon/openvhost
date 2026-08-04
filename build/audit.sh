@@ -749,7 +749,20 @@ allow_file="$SCRATCH/allowed-writable.txt"
 for entry in ${RECIPE_ALLOWED_WRITABLE_PATHS[@]+"${RECIPE_ALLOWED_WRITABLE_PATHS[@]}"} \
 	${EXTRA_ALLOWED[@]+"${EXTRA_ALLOWED[@]}"}; do
 	[ -n "$entry" ] || continue
-	printf '%s\n' "${entry%/}" >>"$allow_file"
+	entry="${entry%/}"
+	# An allowance suppresses the path it names AND everything beneath it, so a
+	# broad one switches this check off for a whole subtree. `/tmp` would wave
+	# through `/tmp/anything` — including the next MYSQL_UNIX_ADDR-class default,
+	# which is the one thing check 7 exists to catch. A recipe author silencing a
+	# noisy set of test paths is exactly who would reach for it.
+	#
+	# So a floor is refused at parse time rather than trusted to be avoided. The
+	# audit dies instead of failing the check: a malformed declaration is a
+	# question about the recipe, not a verdict on the artifact.
+	if is_floor "$entry"; then
+		die "allowance '$entry' is a floor: it would suppress check 7 for everything beneath it. Name the leaf paths instead."
+	fi
+	printf '%s\n' "$entry" >>"$allow_file"
 done
 sort -u -o "$allow_file" "$allow_file"
 
@@ -828,8 +841,11 @@ if [ -s "$writable_dirs" ]; then
 			}
 		}
 	' "$writable_dirs" "$embedded_paths" >"$plant_problems.all"
-	# An allowance matches the embedded path itself or a parent of it, never a
-	# suffix: /tmp must never be allowable as a way of allowing /tmp/anything.
+	# An allowance suppresses the path it names and everything BENEATH it — it is
+	# a subtree switch, not an exact match. That breadth is why a floor is refused
+	# where the list is read; do not restate a narrowness here that the loop below
+	# does not implement. (An earlier version of this comment claimed `/tmp` could
+	# never allow `/tmp/anything`. It could, and the recipe leaned on the promise.)
 	if [ -s "$allow_file" ]; then
 		LC_ALL=C awk -F'\t' '
 			NR == FNR { allowed[$0] = 1; next }
