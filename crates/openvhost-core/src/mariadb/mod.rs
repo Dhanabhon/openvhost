@@ -26,12 +26,18 @@
 
 mod datadir;
 mod discover;
+mod init;
 mod package;
 mod paths;
 mod repo;
 
 pub use datadir::{MariadbDatadirState, classify_mariadb_datadir};
 pub use discover::{MariadbRuntime, discover_mariadb, packaged_mariadb_runtime};
+pub use init::{
+    MariadbInitCtx, MariadbInitOutcome, MariadbInitStep, MariadbRuntimeDirs,
+    finalize_mariadb_staging, initialize_mariadb, mariadb_install_db_path, mariadb_runtime_dirs,
+    mariadb_staging_dir_path, root_password_sql,
+};
 pub use package::{
     Availability, MARIADB_PACKAGE_NAME, MARIADB_PACKAGES, MARIADB_SERIES, MARIADB_WARMUP_BINARY,
     MariadbPackage, MariadbPackageInstall, install_mariadb_package, mariadb_package_for_host,

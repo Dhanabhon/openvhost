@@ -36,6 +36,7 @@ pub use discover::{
     packaged_mysql_runtime,
 };
 pub(crate) use discover::{current_version, looks_like_a_broken_install};
+pub(crate) use init::clear_ignorable_clutter;
 pub use init::{
     MysqlInitOutcome, MysqlInitStep, MysqlRuntimeDirs, RootPassword, alter_user_sql,
     finalize_staging, generate_root_password, mysql_runtime_dirs, remove_staging_dir,

@@ -343,7 +343,12 @@ pub fn remove_staging_dir(staging: &Path) -> io::Result<()> {
 /// symlink or a non-directory at `final_dir`, or anything else found
 /// inside it, refuses to delete ANYTHING (not even the `.DS_Store` files
 /// alongside it) and reports what blocked it.
-fn clear_ignorable_clutter(final_dir: &Path) -> Result<(), String> {
+///
+/// `pub(crate)` rather than private: MariaDB's `finalize_mariadb_staging` runs
+/// the identical step, and `.DS_Store` clutter is a property of macOS Finder,
+/// not of MySQL — spec D5's "reuse in place rather than fork" applies to it as
+/// squarely as to `sweep_stale_staging` next door.
+pub(crate) fn clear_ignorable_clutter(final_dir: &Path) -> Result<(), String> {
     let meta = match std::fs::symlink_metadata(final_dir) {
         Ok(meta) => meta,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
