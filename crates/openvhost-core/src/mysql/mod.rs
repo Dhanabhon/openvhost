@@ -22,6 +22,12 @@ pub use brew::{
     MYSQL_CATALOGUE, MysqlMajor, mysql_brew_formula, mysql_brew_install_spec,
     mysql_brew_uninstall_spec,
 };
+/// Generic in substance, misfiled under `mysql/` — re-exported crate-internal
+/// so [`crate::mariadb`] can CALL them where they already live rather than
+/// grow second copies (spec `2026-08-04-p1-mariadb-service-design.md`, D5).
+/// Moving them somewhere neutral is a mechanical follow-up, deliberately not
+/// taken in a slice whose diff goes in front of a security gate.
+pub(crate) use datadir::guard_socket_path;
 pub use datadir::{
     DatadirState, MysqlPaths, classify_datadir, mysql_data_root, mysql_paths, sweep_stale_staging,
 };
@@ -29,6 +35,7 @@ pub use discover::{
     MysqlRuntime, MysqlRuntimeSource, brew_mysql_runtime_for_major, discover_mysql,
     packaged_mysql_runtime,
 };
+pub(crate) use discover::{current_version, looks_like_a_broken_install};
 pub use init::{
     MysqlInitOutcome, MysqlInitStep, RootPassword, alter_user_sql, finalize_staging,
     generate_root_password, remove_staging_dir, staging_dir_path, write_generated_config,
