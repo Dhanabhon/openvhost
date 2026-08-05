@@ -21,6 +21,7 @@ import { describe, expect, it } from 'vitest';
 import { render } from 'svelte/server';
 import MysqlRow from './MysqlRow.svelte';
 import type { EngineInstanceDto } from '$lib/databases.derive';
+import type { MariadbInstallResultDto, MysqlInstallOutcomeDto } from '$lib/ipc';
 
 function instance(overrides: Partial<EngineInstanceDto> = {}): EngineInstanceDto {
 	return {
@@ -42,6 +43,8 @@ function renderRow(
 		engine: 'mysql' | 'mariadb';
 		instance: EngineInstanceDto;
 		installingMajor: string;
+		installOutcome: MysqlInstallOutcomeDto | null;
+		mariadbInstallOutcome: { major: string; result: MariadbInstallResultDto } | null;
 		uninstallingMajor: string;
 		catalogedMajorsList: string[];
 		serviceState: null;
@@ -54,7 +57,8 @@ function renderRow(
 			installingMajor: props.installingMajor ?? '',
 			installProgress: null,
 			installTotal: null,
-			installOutcome: null,
+			installOutcome: props.installOutcome ?? null,
+			mariadbInstallOutcome: props.mariadbInstallOutcome,
 			initializingMajor: '',
 			initLog: [],
 			initFailure: null,
@@ -156,5 +160,118 @@ describe('MysqlRow — awaitingRelease (the ninth row state, design D2)', () => 
 	it('mentions no Homebrew fallback, unlike an unavailable mysql row', () => {
 		const body = renderRow({ engine: 'mariadb', instance: awaitingRelease });
 		expect(body).not.toMatch(/Homebrew|brew/i);
+	});
+});
+
+// Task 3 finding: the notInstalled/unavailable offer banner and the settled
+// install-result banner were still hardcoded to `mysqlPackageOfferNotice`/
+// `mysqlInstallResultNotice` even under `engine="mariadb"` — every other
+// piece of copy in this row went through `descriptor`, but these three did
+// not, so a MariaDB install rendered "Installs MySQL …" / "MySQL 11.4.9
+// installed" / "Downloads it from Oracle…". This section is the render-level
+// proof that the fix holds.
+//
+// Vacuity: each assertion below was proved able to fail by temporarily
+// reverting `MysqlRow.svelte`'s `offerNotice`/`outcomeNotice`/`ledgerNotice`
+// to call `mysqlPackageOfferNotice`/`mysqlInstallResultNotice`/
+// `mysqlLedgerNotice` unconditionally (i.e. dropping the `engine ===
+// 'mariadb'` branch) and confirming every test in this section went red
+// (rendering "MySQL"/"Oracle" under `engine="mariadb"`). The mutation was
+// reverted immediately after.
+describe('MysqlRow — the offer/outcome/ledger banners are engine-aware, not hardcoded to MySQL', () => {
+	it('the notInstalled offer banner names MariaDB and its own GitHub release, never MySQL or Oracle', () => {
+		const body = renderRow({ engine: 'mariadb' });
+		expect(body).toContain('data-testid="offer-11.4"');
+		expect(body).toMatch(/Installs MariaDB 11\.4\.9/);
+		expect(body).not.toMatch(/MySQL|Oracle/);
+	});
+
+	it('the unavailable offer banner names MariaDB, never MySQL or a Homebrew fallback', () => {
+		const unavailable = instance({ offer: { kind: 'unavailable', target: 'macos-x86_64' } });
+		const body = renderRow({ engine: 'mariadb', instance: unavailable });
+		expect(body).toContain('data-testid="mariadb-unavailable-11.4"');
+		expect(body).toMatch(/MariaDB cannot be installed on macos-x86_64/);
+		expect(body).not.toMatch(/MySQL/);
+	});
+
+	it('a settled MariaDB install outcome renders MariaDB’s own banner, not MySQL’s', () => {
+		const body = renderRow({
+			engine: 'mariadb',
+			mariadbInstallOutcome: {
+				major: '11.4',
+				result: {
+					kind: 'installed',
+					version: '11.4.9',
+					detected: true,
+					ledger: { kind: 'recorded' }
+				}
+			}
+		});
+		expect(body).toContain('data-testid="install-outcome-11.4"');
+		expect(body).toMatch(/MariaDB 11\.4\.9 installed/);
+		expect(body).not.toMatch(/MySQL|Oracle/);
+	});
+
+	it('renders the eighth MariaDB-only result state (awaitingRelease) rather than failing to compile it away', () => {
+		const body = renderRow({
+			engine: 'mariadb',
+			mariadbInstallOutcome: {
+				major: '11.4',
+				result: { kind: 'awaitingRelease', tag: 'mariadb-11.4.9' }
+			}
+		});
+		expect(body).toContain('data-testid="install-outcome-11.4"');
+		expect(body).toContain('mariadb-11.4.9');
+	});
+
+	it('a settled MariaDB ledger failure renders MariaDB’s own wording, not MySQL’s', () => {
+		// `ledger-warning-…` only renders in the `installedNotInitialized`
+		// state (the one a successful-but-unrecorded install actually lands
+		// in) — an `installed: true` row with a `notInitialized` datadir.
+		const body = renderRow({
+			engine: 'mariadb',
+			instance: instance({ installed: true }),
+			mariadbInstallOutcome: {
+				major: '11.4',
+				result: {
+					kind: 'installed',
+					version: '11.4.9',
+					detected: true,
+					ledger: { kind: 'failed', reason: 'database is locked' }
+				}
+			}
+		});
+		expect(body).toContain('data-testid="ledger-warning-11.4"');
+		expect(body).toContain('database is locked');
+		expect(body).not.toMatch(/MySQL/);
+	});
+
+	// The identity check both props share (`major === instance.major`) must
+	// still hold per engine — a MariaDB outcome for a DIFFERENT identity must
+	// not render here either.
+	it('shows no MariaDB outcome banner when the tagged major does not match this row', () => {
+		const body = renderRow({
+			engine: 'mariadb',
+			mariadbInstallOutcome: { major: 'not-this-row', result: { kind: 'cancelled' } }
+		});
+		expect(body).not.toContain('data-testid="install-outcome-11.4"');
+	});
+
+	// Cross-engine isolation: a MySQL-shaped `installOutcome` must never leak
+	// into a MariaDB row's banner, and a MariaDB-shaped `mariadbInstallOutcome`
+	// must never leak into a MySQL row's — each engine reads only its own prop.
+	it('never renders a MySQL installOutcome on a MariaDB row', () => {
+		const body = renderRow({
+			engine: 'mariadb',
+			installOutcome: { major: '11.4', result: { kind: 'cancelled' } }
+		});
+		expect(body).not.toContain('data-testid="install-outcome-11.4"');
+	});
+
+	it('never renders a MariaDB mariadbInstallOutcome on a MySQL row', () => {
+		const body = renderRow({
+			mariadbInstallOutcome: { major: '11.4', result: { kind: 'cancelled' } }
+		});
+		expect(body).not.toContain('data-testid="install-outcome-11.4"');
 	});
 });

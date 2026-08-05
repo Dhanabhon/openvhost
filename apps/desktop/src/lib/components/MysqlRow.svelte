@@ -1,9 +1,11 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <script lang="ts">
 	import type {
+		MariadbInstallResultDto,
 		MysqlConnectionProofDto,
 		MysqlInstallOutcomeDto,
 		MysqlInstallProgressDto,
+		MysqlPackageOfferDto,
 		MysqlResetOutcomeDto,
 		ServiceStatus
 	} from '$lib/ipc';
@@ -27,6 +29,11 @@
 		mysqlLedgerNotice,
 		mysqlPackageOfferNotice
 	} from '$lib/mysql-install.derive';
+	import {
+		mariadbInstallResultNotice,
+		mariadbLedgerNotice,
+		mariadbPackageOfferNotice
+	} from '$lib/mariadb-install.derive';
 	import { uninstallActionDisabled, uninstallConfirmLabel } from '$lib/uninstall.derive';
 	import Button from './Button.svelte';
 	import LogPane from './LogPane.svelte';
@@ -41,6 +48,7 @@
 		installTotal,
 		cancellingInstall = false,
 		installOutcome,
+		mariadbInstallOutcome = null,
 		installError = '',
 		initializingMajor,
 		initLog,
@@ -94,6 +102,20 @@
 		 *  renders it once it matches `instance.major` (mirrors
 		 *  `LanguageRow.svelte`'s `rowOutcome`). */
 		installOutcome: MysqlInstallOutcomeDto | null;
+		/** MariaDB's own settled `install_mariadb` outcome (P1 MariaDB UI
+		 *  design), read ONLY when `engine === 'mariadb'` — a SEPARATE prop
+		 *  rather than a widened {@link installOutcome}, because
+		 *  `MariadbInstallResultDto` is not a subtype of `MysqlInstallResultDto`
+		 *  (it adds `awaitingRelease`, design D2/D5): reading each engine's own
+		 *  correctly-typed prop is what lets {@link outcomeNotice}/
+		 *  {@link ledgerNotice} call the right notice function with no cast,
+		 *  where a single widened prop could not. `MariadbInstallOutcomeDto`
+		 *  itself carries no major (a field nothing can vary is overhead, the
+		 *  same reasoning `MariadbInstance` gives for leaving `major` off its
+		 *  own struct), so the tag is added at the boundary that builds this
+		 *  prop — mirrors `DatabasesStore.initOutcome`'s identical "tag it with
+		 *  what it's for" fix for a DTO that does not carry its own subject. */
+		mariadbInstallOutcome?: { major: string; result: MariadbInstallResultDto } | null;
 		/** A thrown install error, PRE-SCOPED by the page to this row (mirrors
 		 *  `+page.svelte`'s `lastAttempted` convention on the Languages page —
 		 *  `error` itself carries no major). Empty when this is not the row the
@@ -195,6 +217,16 @@
 	const rowInstallOutcome = $derived(
 		installOutcome !== null && installOutcome.major === instance.major ? installOutcome : null
 	);
+	/** MariaDB's own settled outcome, tagged and matched the same way as
+	 *  {@link rowInstallOutcome} above — `null` whenever this row is not the
+	 *  one {@link mariadbInstallOutcome} names, or nothing has settled yet. */
+	const mariadbRowOutcome = $derived(
+		mariadbInstallOutcome !== null &&
+			mariadbInstallOutcome !== undefined &&
+			mariadbInstallOutcome.major === instance.major
+			? mariadbInstallOutcome
+			: null
+	);
 	const portConflictHint = $derived(
 		serviceState?.kind === 'failed' ? descriptor.portConflictHint(serviceState.stderrTail) : null
 	);
@@ -228,16 +260,92 @@
 	 *  on every installed MariaDB row, whose packaged Uninstall genuinely
 	 *  works. */
 	const canUninstall = $derived(descriptor.uninstallPolicy(instance.source));
-	const outcomeNotice = $derived(
-		rowInstallOutcome === null ? null : mysqlInstallResultNotice(rowInstallOutcome.result)
-	);
+	/** The settled-install banner (design D1 follow-through, task 3 finding):
+	 *  dispatched on `engine` rather than widening
+	 *  {@link mysqlInstallResultNotice}'s own parameter type, because
+	 *  `MariadbInstallResultDto` adds a member (`awaitingRelease`)
+	 *  `MysqlInstallResultDto` does not have. Reading
+	 *  {@link mariadbRowOutcome}/{@link rowInstallOutcome} — each already
+	 *  typed correctly for its own engine — is what lets each branch call its
+	 *  own notice function with no cast. A `switch` with a `const _: never`
+	 *  default, not an `engine === 'mariadb'` ternary (this codebase's
+	 *  standing "no wildcard arm" rule, applied to {@link EngineKind} itself):
+	 *  a third engine must fail to compile HERE, not silently fall into
+	 *  MySQL's branch. Before this dispatch existed, EVERY engine rendered
+	 *  `mysqlInstallResultNotice`'s hardcoded "MySQL …" copy: the one piece of
+	 *  this row's generalization the row-refactor task had not reached,
+	 *  because it never exercised a non-null `installOutcome` under
+	 *  `engine="mariadb"`. */
+	const outcomeNotice = $derived.by(() => {
+		switch (engine) {
+			case 'mariadb':
+				return mariadbRowOutcome === null
+					? null
+					: mariadbInstallResultNotice(mariadbRowOutcome.result);
+			case 'mysql':
+				return rowInstallOutcome === null
+					? null
+					: mysqlInstallResultNotice(rowInstallOutcome.result);
+			default: {
+				const unreachable: never = engine;
+				return unreachable;
+			}
+		}
+	});
 	/** A ledger row that could not be written — provenance lost, never the
-	 *  install. `null` on every other outcome and on the happy path. */
-	const ledgerNotice = $derived(
-		rowInstallOutcome !== null && rowInstallOutcome.result.kind === 'installed'
-			? mysqlLedgerNotice(rowInstallOutcome.result.ledger)
-			: null
-	);
+	 *  install. `null` on every other outcome and on the happy path. Same
+	 *  per-engine `switch` as {@link outcomeNotice}, for the same reason. */
+	const ledgerNotice = $derived.by(() => {
+		switch (engine) {
+			case 'mariadb':
+				return mariadbRowOutcome !== null && mariadbRowOutcome.result.kind === 'installed'
+					? mariadbLedgerNotice(mariadbRowOutcome.result.ledger)
+					: null;
+			case 'mysql':
+				return rowInstallOutcome !== null && rowInstallOutcome.result.kind === 'installed'
+					? mysqlLedgerNotice(rowInstallOutcome.result.ledger)
+					: null;
+			default: {
+				const unreachable: never = engine;
+				return unreachable;
+			}
+		}
+	});
+	/** The row's own explanation for why there is (or is not) an Install
+	 *  button to press — covers exactly the two states
+	 *  {@link mysqlPackageOfferNotice}'s narrower MySQL-only union was always
+	 *  built for (`unavailable`/`notInstalled`); `awaitingRelease` has its OWN
+	 *  notice ({@link engineAwaitingReleaseNotice}) because a build existing
+	 *  but unpublished is a materially different fact (design D2), not a
+	 *  naming variant of this one. Resolved ONCE here — not with an inline
+	 *  `{@const}` (which is what this template used to call directly,
+	 *  hardcoded to `mysqlPackageOfferNotice` regardless of engine) and never
+	 *  with `{#if engine === …}` in the template itself (design D1): the
+	 *  `unavailable`/`notInstalled` copy was the other half of the same gap
+	 *  {@link outcomeNotice} closes above. `null` in every OTHER row state.
+	 *  The engine `switch` is defined once and called from both branches —
+	 *  same exhaustiveness reasoning as {@link outcomeNotice}. */
+	const offerNotice = $derived.by(() => {
+		const paint = (offer: MysqlPackageOfferDto) => {
+			switch (engine) {
+				case 'mariadb':
+					return mariadbPackageOfferNotice(offer);
+				case 'mysql':
+					return mysqlPackageOfferNotice(offer);
+				default: {
+					const unreachable: never = engine;
+					return unreachable;
+				}
+			}
+		};
+		if (rowState.kind === 'unavailable') {
+			return paint({ kind: 'unavailable', target: rowState.target });
+		}
+		if (rowState.kind === 'notInstalled') {
+			return paint({ kind: 'available', version: rowState.version });
+		}
+		return null;
+	});
 </script>
 
 {#if !instance.cataloged}
@@ -272,7 +380,8 @@
 		<div class="row-actions"></div>
 	</div>
 	<p class="note" data-testid="out-of-catalogue-{instance.major}">
-		{descriptor.label} {instance.major} is installed, but this build only manages {descriptor.label}
+		{descriptor.label}
+		{instance.major} is installed, but this build only manages {descriptor.label}
 		{catalogedMajorsList.join(', ')}. Shown for visibility only — no actions are offered here.
 	</p>
 {:else}
@@ -410,11 +519,11 @@
 		<!-- An honest ABSENCE, not an error (design D2): Oracle publishes an
 		     x86_64 build, but its bytes never went through the signature check
 		     the catalogue's pin rests on, so this build offers nothing for it and
-		     says exactly that — with the route that does still work. -->
-		{@const notice = mysqlPackageOfferNotice({ kind: 'unavailable', target: rowState.target })}
+		     says exactly that — with the route that does still work. `offerNotice`
+		     is resolved once in the script above, per engine. -->
 		<p class="note warn" data-testid="{descriptor.idPrefix}-unavailable-{instance.major}">
-			<strong>{notice.title}.</strong>
-			{notice.body}
+			<strong>{offerNotice?.title}.</strong>
+			{offerNotice?.body}
 		</p>
 	{:else if rowState.kind === 'awaitingRelease'}
 		<!-- The ninth row state (design D2): a build exists and is pinned, but
@@ -427,10 +536,9 @@
 			{notice.body}
 		</p>
 	{:else if rowState.kind === 'notInstalled'}
-		{@const notice = mysqlPackageOfferNotice({ kind: 'available', version: rowState.version })}
 		<p class="note" data-testid="offer-{instance.major}">
-			<strong>{notice.title}.</strong>
-			{notice.body}
+			<strong>{offerNotice?.title}.</strong>
+			{offerNotice?.body}
 		</p>
 		<p class="note" data-testid="disclosure-{instance.major}">{descriptor.datadirDisclosure}</p>
 		{#if installError !== ''}
@@ -521,14 +629,17 @@
 		     stops there. What to do with the foreign content itself is the
 		     user's call, made outside this app. -->
 		<p class="note warn" data-testid="datadir-foreign-{instance.major}">
-			{descriptor.label} {instance.major}'s data directory already has unexpected content and OpenVHost
-			will not touch it: <span class="mono">{rowState.detail}</span>. Once it looks like an empty
-			{descriptor.label} {instance.major} data directory again, use Check again above.
+			{descriptor.label}
+			{instance.major}'s data directory already has unexpected content and OpenVHost will not touch
+			it: <span class="mono">{rowState.detail}</span>. Once it looks like an empty
+			{descriptor.label}
+			{instance.major} data directory again, use Check again above.
 		</p>
 	{:else if rowState.kind === 'ready'}
 		{#if serviceState?.kind === 'failed'}
 			<p class="error" role="alert" data-testid="pool-failed-{instance.serviceId}">
-				{descriptor.label} {instance.major} failed{#if serviceState.exit !== null}&nbsp;(exit {serviceState.exit}){/if}.
+				{descriptor.label}
+				{instance.major} failed{#if serviceState.exit !== null}&nbsp;(exit {serviceState.exit}){/if}.
 			</p>
 			{#if serviceState.stderrTail.length > 0}
 				<pre class="pool-stderr">{serviceState.stderrTail.join('\n')}</pre>

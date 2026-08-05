@@ -1,9 +1,19 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { onMysqlInitLog, onMysqlInstallLog, onMysqlInstallProgress } from '$lib/ipc';
+	import {
+		onMariadbInitLog,
+		onMariadbInstallLog,
+		onMariadbInstallProgress,
+		onMysqlInitLog,
+		onMysqlInstallLog,
+		onMysqlInstallProgress
+	} from '$lib/ipc';
 	import { subscribeDatabaseEvents } from '$lib/databases.listeners';
+	import { subscribeMariadbEvents } from '$lib/mariadb.listeners';
 	import { databasesStore as store } from '$lib/databases.shared.svelte';
+	import { mariadbStore } from '$lib/mariadb.shared.svelte';
+	import { MARIADB_SERIES, mariadbInstance } from '$lib/mariadb.svelte';
 	import { servicesStore } from '$lib/services.shared.svelte';
 	import { uninstallStore } from '$lib/uninstall.shared.svelte';
 	import { runningCount } from '$lib/services.derive';
@@ -17,6 +27,15 @@
 
 	const running = $derived(runningCount(servicesStore.services));
 	const catalogedMajorsList = $derived(store.env ? catalogedMajors(store.env.instances) : []);
+	/** The single MariaDB row, adapted from the single-instance environment —
+	 *  `null` before the first load settles, mirroring `store.env`'s own gate
+	 *  on the MySQL rowlist below. */
+	const mariadbRow = $derived(mariadbStore.env ? mariadbInstance(mariadbStore.env) : null);
+	const mariadbServiceState = $derived(
+		mariadbRow?.serviceId === null || mariadbRow?.serviceId === undefined
+			? null
+			: (servicesStore.services.find((s) => s.id === mariadbRow.serviceId)?.state ?? null)
+	);
 
 	/**
 	 * Which major the on-screen INSTALL/INIT error belongs to. Mirrors
@@ -83,24 +102,83 @@
 		await uninstallStore.request('mysql', major);
 	}
 
-	/** The dialog's confirm. Re-reads the MySQL environment on success; the
-	 *  supervisor row disappearing is handled by the layout's
-	 *  `onServiceUnregistered` subscription, not here. */
+	/**
+	 * The dialog's confirm, shared with MariaDB's own Uninstall (below): the
+	 * kind is captured BEFORE `confirm()` runs, because a successful confirm
+	 * clears `uninstallStore.target` back to `null` — there is no way to ask
+	 * afterwards which package it had just been open for. Re-reads only the
+	 * store the uninstalled package actually belongs to; the supervisor row
+	 * disappearing either way is handled by the layout's
+	 * `onServiceUnregistered` subscription, not here.
+	 */
 	async function onConfirmUninstall(): Promise<void> {
+		const kind = uninstallStore.target?.kind ?? null;
 		const uninstalled = await uninstallStore.confirm();
 		if (uninstalled) {
-			await store.refresh();
+			if (kind === 'mariadb') {
+				await mariadbStore.refresh();
+			} else {
+				await store.refresh();
+			}
 			await servicesStore.reload();
 		}
 	}
 
+	/**
+	 * Which MariaDB action the on-screen error belongs to (install vs
+	 * initialize) — the single-instance mirror of `lastInstallAttempted`/
+	 * `lastInitAttempted` above. Booleans rather than a major string: this
+	 * build ships exactly one series, so there is no "which" left to track,
+	 * only "was the LAST attempt on this store an install, an initialize, or
+	 * neither" — without this gate an unrelated `rescan()` failure would
+	 * render as if the last Install/Initialize press had failed.
+	 */
+	let lastMariadbInstallAttempted = $state(false);
+	let lastMariadbInitAttempted = $state(false);
+
+	async function onInstallMariadb(): Promise<void> {
+		lastMariadbInstallAttempted = true;
+		const installed = await mariadbStore.install();
+		if (installed) {
+			await servicesStore.reload();
+		}
+	}
+
+	/** Mirrors `onRescan` for the MariaDB group's own "Check again". */
+	async function onRescanMariadb(): Promise<void> {
+		await mariadbStore.rescan();
+		await servicesStore.reload();
+	}
+
+	async function onInitializeMariadb(): Promise<void> {
+		lastMariadbInitAttempted = true;
+		const initialized = await mariadbStore.initialize();
+		if (initialized) {
+			await servicesStore.reload();
+		}
+	}
+
+	/** Mirrors `onCopyPassword`'s split — see that function's own doc comment
+	 *  for why Copy calls `copyPassword`, never `reveal`. */
+	async function onCopyMariadbPassword(): Promise<void> {
+		const password = await mariadbStore.copyPassword();
+		if (password !== undefined) await copyToClipboard(password);
+	}
+
+	/** Opens the SAME shared uninstall confirmation MySQL's rows use (design
+	 *  D6/D5): MariaDB's uninstall goes through the identical
+	 *  `PackageKind::Mariadb` path, so there is one dialog, not two. */
+	async function onUninstallMariadb(): Promise<void> {
+		await uninstallStore.request('mariadb', MARIADB_SERIES);
+	}
+
 	onMount(() => {
-		// Every subscription lives in `databases.listeners.ts`, NOT inline here:
-		// `onMount` does not run under `svelte/server`, so anything written in
-		// this closure is untestable by construction — a neuter experiment
+		// Every subscription lives in `databases.listeners.ts`/`mariadb.listeners.ts`,
+		// NOT inline here: `onMount` does not run under `svelte/server`, so anything
+		// written in this closure is untestable by construction — a neuter experiment
 		// severed the progress callback and the whole suite stayed green. What
 		// remains here is only the part a DOM would be needed to test anyway:
-		// calling it, and calling its disposer.
+		// calling each subscriber, and calling its own disposer.
 		let release: (() => void) | null = null;
 		let disposed = false;
 
@@ -119,10 +197,35 @@
 			}
 		})();
 
+		// A PARALLEL subscription, not a wider one (design D6): `MariadbStore`
+		// holds scalars where `DatabasesStore` holds per-major maps, so this
+		// page manages its own, independent disposer for it rather than folding
+		// it into the block above.
+		let releaseMariadb: (() => void) | null = null;
+		let disposedMariadb = false;
+
+		void (async () => {
+			try {
+				const stop = await subscribeMariadbEvents(
+					{ onMariadbInstallLog, onMariadbInstallProgress, onMariadbInitLog },
+					mariadbStore,
+					uninstallStore,
+					() => disposedMariadb
+				);
+				releaseMariadb = stop;
+				await mariadbStore.refresh();
+			} catch (e) {
+				mariadbStore.fail(e);
+			}
+		})();
+
 		return () => {
 			disposed = true;
 			release?.();
 			release = null;
+			disposedMariadb = true;
+			releaseMariadb?.();
+			releaseMariadb = null;
 		};
 	});
 </script>
@@ -134,10 +237,10 @@
 		<h2 class="section-label">MySQL</h2>
 	</div>
 
-	<!-- Grouped under a "MySQL" heading (mirrors Languages' own "PHP" grouping)
-	     even though MySQL is the only database engine today — MariaDB (spec
-	     Deferred: "same seams, next slice") becomes a new group here rather
-	     than a redesign of this page. -->
+	<!-- Grouped under a "MySQL" heading (mirrors Languages' own "PHP" grouping).
+	     MariaDB (P1 MariaDB UI design) is the second group below, exactly as
+	     this comment always said it would be — a new group here, not a
+	     redesign of this page. -->
 	<section class="panel databases-panel" aria-label="MySQL" data-testid="databases">
 		{#if store.error !== '' && store.env === null}
 			<div class="empty">
@@ -215,6 +318,85 @@
 						onVerify={(major) => void store.verifyConnection(major)}
 					/>
 				{/each}
+			</div>
+		{/if}
+	</section>
+
+	<div class="strip-head">
+		<h2 class="section-label">MariaDB</h2>
+	</div>
+
+	<!-- The second group this page's own comment above always anticipated.
+	     A single row, not an `{#each}`: this build ships exactly one series
+	     (`MARIADB_SERIES`), so a list whose length is always 0 or 1 would
+	     invent a key nothing can vary — the same reasoning
+	     `MariadbInstanceRepo` gives for leaving `major` off `MariadbInstance`
+	     (design D6). -->
+	<section class="panel databases-panel" aria-label="MariaDB" data-testid="databases-mariadb">
+		{#if mariadbStore.error !== '' && mariadbStore.env === null}
+			<div class="empty">
+				<div class="title">Could not read the MariaDB environment</div>
+				<p>{mariadbStore.error}</p>
+			</div>
+		{:else if mariadbRow}
+			{#if mariadbStore.error !== ''}
+				<div class="banner-error" role="alert" data-testid="databases-mariadb-page-error">
+					{mariadbStore.error}
+				</div>
+			{/if}
+			<DatabasesEmpty engine="mariadb" anyInstalled={mariadbStore.anyInstalled} />
+			<div class="check-again">
+				<Button
+					size="sm"
+					testId="mariadb-check-again-header"
+					disabled={mariadbStore.installing || mariadbStore.initializing}
+					onclick={() => void onRescanMariadb()}
+				>
+					Check again
+				</Button>
+			</div>
+			<div class="rowlist">
+				<MysqlRow
+					engine="mariadb"
+					instance={mariadbRow}
+					installingMajor={mariadbStore.installingMajor}
+					installProgress={mariadbStore.installProgress}
+					installTotal={mariadbStore.installTotal}
+					cancellingInstall={mariadbStore.cancellingInstall}
+					installOutcome={null}
+					mariadbInstallOutcome={mariadbStore.installOutcome === null
+						? null
+						: { major: MARIADB_SERIES, result: mariadbStore.installOutcome.result }}
+					installError={lastMariadbInstallAttempted ? mariadbStore.error : ''}
+					initializingMajor={mariadbStore.initializingMajor}
+					initLog={mariadbStore.initLog}
+					initFailure={mariadbStore.initFailure}
+					initError={lastMariadbInitAttempted ? mariadbStore.error : ''}
+					uninstallingMajor={uninstallStore.uninstalling}
+					catalogedMajorsList={[MARIADB_SERIES]}
+					serviceState={mariadbServiceState}
+					password={mariadbStore.password}
+					revealed={mariadbStore.revealed}
+					revealing={mariadbStore.revealing}
+					passwordError={mariadbStore.passwordError}
+					resetting={mariadbStore.resetting}
+					resetOutcome={mariadbStore.resetOutcome}
+					resetError={mariadbStore.resetError}
+					verifying={mariadbStore.verifying}
+					verifyResult={mariadbStore.verifyResult}
+					verifyError={mariadbStore.verifyError}
+					onInstall={() => void onInstallMariadb()}
+					onCancelInstall={() => void mariadbStore.cancelInstall()}
+					onInitialize={() => void onInitializeMariadb()}
+					onUninstall={() => void onUninstallMariadb()}
+					onStart={(id) => void servicesStore.start(id)}
+					onStop={(id) => void servicesStore.stop(id)}
+					onReveal={() => void mariadbStore.reveal()}
+					onHide={() => mariadbStore.forgetPassword()}
+					onCopyPassword={() => void onCopyMariadbPassword()}
+					onReset={() => void mariadbStore.resetPassword()}
+					onVerify={() => void mariadbStore.verifyConnection()}
+				/>
 			</div>
 		{/if}
 	</section>

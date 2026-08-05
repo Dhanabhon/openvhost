@@ -1,5 +1,7 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <script lang="ts">
+	import { engineDescriptor, type EngineKind } from '$lib/databases.derive';
+
 	/**
 	 * The one state a brand-new machine lands in that the rowlist cannot say
 	 * for itself: nothing is installed yet, so the rows below are all empty and
@@ -13,22 +15,33 @@
 	 * a *particular host* has a verified download is a per-row fact
 	 * (`MysqlInstanceDto.offer`), rendered by `MysqlRow` where the row's own
 	 * Install control is decided — not here.
+	 *
+	 * `engine` (P1 MariaDB UI design D1) — defaults to `'mysql'` so the
+	 * existing MySQL group's markup, test id and copy stay byte-for-byte
+	 * unchanged. The MariaDB group renders its own instance of this same
+	 * component with `engine="mariadb"` rather than a second, near-duplicate
+	 * one — the row/credentials precedent this task follows. Not gated on
+	 * `awaitingRelease`/`unavailable` deliberately, mirroring the EXISTING
+	 * MySQL behaviour this component already had: whether a *particular host*
+	 * can install right now is a per-row fact this component has never
+	 * concerned itself with (see the paragraph above) — same reasoning applies
+	 * unchanged to a release that is pinned but not yet published.
 	 */
 	let {
+		engine = 'mysql',
 		anyInstalled
 	}: {
+		engine?: EngineKind;
 		anyInstalled: boolean;
 	} = $props();
+
+	const descriptor = $derived(engineDescriptor(engine));
 </script>
 
 {#if !anyInstalled}
-	<div class="empty invite" data-testid="databases-no-mysql">
-		<h3>Install MySQL to get started</h3>
-		<p>
-			OpenVHost downloads MySQL from Oracle, checks it against a checksum built into this app, and
-			unpacks it into its own packages folder — no Homebrew required. It then initializes a data
-			directory with a generated root password and runs it under the supervisor below.
-		</p>
+	<div class="empty invite" data-testid="databases-no-{descriptor.idPrefix}">
+		<h3>Install {descriptor.label} to get started</h3>
+		<p>{descriptor.installInviteBody}</p>
 	</div>
 {/if}
 

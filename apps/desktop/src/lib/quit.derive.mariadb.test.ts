@@ -18,7 +18,11 @@ import { pendingOperationCopy, pendingOperationSentence } from './quit.derive';
 
 describe('an in-flight MariaDB operation', () => {
 	it('supplies nothing in front of the already-complete label, like mysql', () => {
-		const copy = pendingOperationCopy({ kind: 'mariadb', operation: 'install', label: 'MariaDB 11.4' });
+		const copy = pendingOperationCopy({
+			kind: 'mariadb',
+			operation: 'install',
+			label: 'MariaDB 11.4'
+		});
 		expect(copy.lead).toBe('');
 		expect(copy.label).toBe('MariaDB 11.4');
 	});

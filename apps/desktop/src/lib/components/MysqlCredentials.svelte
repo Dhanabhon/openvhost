@@ -178,9 +178,9 @@
 		{#if confirmingReset}
 			<div class="reset-confirm" data-testid="reset-confirm-{major}">
 				<p>
-					This regenerates {descriptor.label} {major}'s root password. The current password stops working
-					immediately, and the new one is stored in OpenVHost's local database (state.db), not in
-					Keychain.
+					This regenerates {descriptor.label}
+					{major}'s root password. The current password stops working immediately, and the new one
+					is stored in OpenVHost's local database (state.db), not in Keychain.
 				</p>
 				<div class="reset-actions">
 					<Button variant="quiet" size="sm" testId="cancel-reset-{major}" onclick={onCancelReset}>
@@ -227,7 +227,8 @@
 		</Button>
 		{#if verifyResult?.kind === 'ok'}
 			<p class="ok" role="status" data-testid="verify-ok-{major}">
-				Connected — {descriptor.label} {verifyResult.version} on port {verifyResult.port}.
+				Connected — {descriptor.label}
+				{verifyResult.version} on port {verifyResult.port}.
 			</p>
 		{:else if verifyResult?.kind === 'authFailed'}
 			<p class="error" role="alert" data-testid="verify-auth-failed-{major}">

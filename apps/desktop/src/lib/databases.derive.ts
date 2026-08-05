@@ -122,6 +122,16 @@ export interface EngineDescriptor {
 	 *  render `PACKAGED_UNINSTALL_UNAVAILABLE` on every installed MariaDB
 	 *  row. */
 	uninstallPolicy: (source: EngineSourceDto | null) => boolean;
+	/** The "get started" invite `DatabasesEmpty.svelte` shows above an empty
+	 *  rowlist — what pressing Install actually does, in this engine's own
+	 *  words (task 3: "give `DatabasesEmpty` what it needs to speak for
+	 *  either engine"). A plain string field, like {@link datadirDisclosure},
+	 *  rather than an inline `{#if engine === …}` in that component's
+	 *  template — the identical D1 discipline this file already applies to
+	 *  every other per-engine fact. Not gated on availability: whether a
+	 *  PARTICULAR host can install right now is a per-row fact this invite has
+	 *  never concerned itself with, for either engine. */
+	installInviteBody: string;
 }
 
 /**
@@ -418,13 +428,21 @@ export function catalogedMajors(instances: readonly MysqlInstanceDto[]): string[
 /** MariaDB's own port-conflict hint (P1 MariaDB UI design). Same
  *  "address already in use" match {@link mysqlPortConflictHint} uses above,
  *  but names no Homebrew service — MariaDB never had one to stop (design D2:
- *  "no Homebrew fallback… anywhere in this app"). */
+ *  "no Homebrew fallback… anywhere in this app").
+ *
+ *  Task 3 review: an earlier draft named "another MariaDB or MySQL server"
+ *  as the likely occupant of port 3307. That was not an honest guess —
+ *  OpenVHost's own MySQL always binds 3306, never 3307 (`MARIADB_ENDPOINT`'s
+ *  own doc comment: the two engines' distinct ports are what let both run at
+ *  once), and nothing else commonly defaults to 3307 the way MySQL's own
+ *  Homebrew formula defaults to 3306. Naming a specific-but-unlikely product
+ *  would read as a diagnosis; this names none, which is the honest version. */
 function mariadbPortConflictHint(stderrTail: readonly string[]): string | null {
 	const isPortConflict = stderrTail.some((line) => /address already in use/i.test(line));
 	if (!isPortConflict) return null;
 	return (
-		'This looks like a port 3307 conflict. Check for another MariaDB or MySQL server already ' +
-		'using it, stop it, then try again.'
+		'This looks like a port 3307 conflict. Nothing else in OpenVHost uses this port — check what ' +
+		'else on this machine is bound to it, stop that, then try again.'
 	);
 }
 
@@ -435,6 +453,25 @@ function mariadbPortConflictHint(stderrTail: readonly string[]): string | null {
 const MARIADB_DATADIR_DISCLOSURE =
 	"MariaDB's data directory is created the first time you initialize it below.";
 
+/** MySQL's "get started" invite body — moved here VERBATIM from
+ *  `DatabasesEmpty.svelte`'s own markup (task 3), so its rendered text is
+ *  byte-for-byte unchanged and that component's existing tests stay green. */
+const MYSQL_INSTALL_INVITE_BODY =
+	'OpenVHost downloads MySQL from Oracle, checks it against a checksum built into this app, and ' +
+	'unpacks it into its own packages folder — no Homebrew required. It then initializes a data ' +
+	'directory with a generated root password and runs it under the supervisor below.';
+
+/** MariaDB's own "get started" invite body (task 3) — names its real source
+ *  (OpenVHost's own GitHub release, never Oracle) and states plainly that
+ *  Homebrew was never involved, rather than "not required" (which would
+ *  wrongly imply an optional Homebrew path exists — design D2: "no Homebrew
+ *  fallback for MariaDB anywhere in this app"). */
+const MARIADB_INSTALL_INVITE_BODY =
+	'OpenVHost downloads MariaDB from its own GitHub release, checks it against a checksum built ' +
+	'into this app, and unpacks it into its own packages folder. MariaDB has never gone through ' +
+	'Homebrew in this app. It then initializes a data directory with a generated root password and ' +
+	'runs it under the supervisor below.';
+
 const MYSQL_DESCRIPTOR: EngineDescriptor = {
 	label: 'MySQL',
 	idPrefix: 'mysql',
@@ -443,7 +480,8 @@ const MYSQL_DESCRIPTOR: EngineDescriptor = {
 	datadirDisclosure: SHARED_DATADIR_DISCLOSURE,
 	unavailableFallback: mysqlUnavailableFallback,
 	sourcePolicy: mysqlSourceBadge,
-	uninstallPolicy: mysqlUninstallOffered
+	uninstallPolicy: mysqlUninstallOffered,
+	installInviteBody: MYSQL_INSTALL_INVITE_BODY
 };
 
 const MARIADB_DESCRIPTOR: EngineDescriptor = {
@@ -454,7 +492,8 @@ const MARIADB_DESCRIPTOR: EngineDescriptor = {
 	datadirDisclosure: MARIADB_DATADIR_DISCLOSURE,
 	unavailableFallback: () => null,
 	sourcePolicy: () => null,
-	uninstallPolicy: () => true
+	uninstallPolicy: () => true,
+	installInviteBody: MARIADB_INSTALL_INVITE_BODY
 };
 
 /**
