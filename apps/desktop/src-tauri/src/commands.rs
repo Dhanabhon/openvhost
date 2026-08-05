@@ -4340,12 +4340,33 @@ async fn run_mysql_init(
 
     // ---- Render ----
     log("stdout", "rendering my.cnf".to_string());
+    // Spec D3 (2026-08-04 MariaDB service): the four runtime directories come
+    // from THE RUNTIME WE ARE ABOUT TO SPAWN, never from a guess and never
+    // from the server's compiled-in prefix. A discovery that cannot supply
+    // them is a Render failure — writing a my.cnf that points at nothing, or
+    // silently omitting the four and letting the prefix win, are the two
+    // outcomes this refusal exists to prevent.
+    let dirs = match openvhost_core::mysql::mysql_runtime_dirs(&ctx.runtime.mysqld) {
+        Some(d) => d,
+        None => fail!(
+            Step::Render,
+            format!(
+                "{} does not look like a usable MySQL install: could not locate its \
+                 plugin, charset and message directories",
+                ctx.runtime.mysqld.display()
+            )
+        ),
+    };
     let mysql_ctx = openvhost_conf::MysqlCtx {
         my_cnf: ctx.paths.my_cnf.clone(),
         datadir: ctx.paths.datadir.clone(),
         socket: ctx.paths.socket.clone(),
         pid_file: ctx.paths.pid_file.clone(),
         custom_confd: ctx.paths.custom_confd.clone(),
+        basedir: dirs.basedir,
+        plugin_dir: dirs.plugin_dir,
+        character_sets_dir: dirs.character_sets_dir,
+        lc_messages_dir: dirs.lc_messages_dir,
     };
     let generated = match openvhost_conf::generate_my_cnf(&mysql_ctx) {
         Ok(f) => f,
@@ -5107,7 +5128,23 @@ mod mysql_ipc_tests {
 
     fn fake_cli(dir: &Path, name: &str, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
-        let p = dir.join(name);
+        // `<dir>/bin/<name>`, alongside the `lib/plugin` and `share/mysql/…`
+        // directories a real install has — NOT a bare `<dir>/<name>`.
+        //
+        // These fakes stand in for a DISCOVERED runtime, and since spec D3
+        // (2026-08-04) the Render step derives the four pinned runtime
+        // directories from exactly that path (`openvhost_core::mysql::
+        // mysql_runtime_dirs`). A fake laid out in a shape no real install
+        // has would make every test here pass against a runtime the
+        // production code correctly refuses — which is the failure mode
+        // "the fixture was incomplete, so the test proved nothing" that this
+        // project has already paid for once.
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(dir.join("lib/plugin")).unwrap();
+        std::fs::create_dir_all(dir.join("share/mysql/charsets")).unwrap();
+        std::fs::create_dir_all(dir.join("share/mysql/english")).unwrap();
+        let p = bin.join(name);
         std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         p

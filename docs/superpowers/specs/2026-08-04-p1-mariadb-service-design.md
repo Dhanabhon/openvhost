@@ -27,15 +27,29 @@ that is a finding to report, not scope to absorb.
 |---|---|
 | **MariaDB writes no `auto.cnf`** | initialized a real datadir from the 11.4.9 artifact; root holds `mysql/`, `mariadb_upgrade_info`, `ib*`, `aria_log*`, `sys`, `test`, `undo00[1-3]` |
 | `mariadb_upgrade_info` exists after a successful init and **contains `11.4.9-MariaDB`** | `cat` |
-| A killed init leaves **an empty directory** — both sentinels absent together | `timeout 2` on `mariadb-install-db`, then `ls` |
+| A killed `mariadb-install-db` leaves **an empty directory** | 8 kills across the run, 2 s to 95 % of a 7 s init, process-group `SIGKILL`; the script stages elsewhere and moves in at the end |
 | The local tarball matches the catalogue pin | `76ea96a4…` on disk and in `catalogue.rs` |
 
 **The first row is the reason this spec exists rather than a rename of the MySQL one.**
-`classify_datadir` requires **both** `mysql/` and `auto.cnf` (`mysql/datadir.rs:135-136`).
-A MariaDB datadir has the first and never the second, so the MySQL rule would classify a
-perfectly good, populated datadir as *uninitialized* — and the next step on that verdict is
-`--initialize`, on top of the user's databases. Reusing that constant would have destroyed
-data, and it would have looked like a one-word change.
+`classify_datadir` requires **both** `mysql/` and `auto.cnf` (`mysql/datadir.rs:135-136`),
+and a MariaDB datadir has the first and never the second.
+
+*Corrected 2026-08-04, before implementation, by the task that read the code:* an earlier
+draft of this paragraph said the MySQL rule would call such a datadir *uninitialized* and
+that `--initialize` would then run over the user's databases. **It would not.**
+`mysql/datadir.rs` has a catch-all — non-empty and not both sentinels yields `Foreign`, not
+`NotInitialized` — so reusing the constant would have made every good MariaDB datadir
+**permanently unusable behind an honest refusal**, which is bad and is not data loss. The
+conclusion is unchanged and the reason is now the one the code supports. Recording the
+correction rather than quietly editing it, because a spec that overstates a risk teaches the
+next reader to discount it.
+
+The half-state the rule guards against is nonetheless real. `mariadb-install-db` stages
+elsewhere and moves in, so killing *it* leaves nothing — measured eight times. But
+initialization through the server binary directly, the way the MySQL path does it, writes in
+place: task 1 observed a killed run leaving `mysql/` complete with 88 system tables and no
+`mariadb_upgrade_info`. **Requiring both sentinels covers either init path**, which is why
+the rule does not depend on knowing which one a future change picks.
 
 ## 3. D1 — Sentinels: `mysql/` **and** `mariadb_upgrade_info`
 
@@ -87,8 +101,20 @@ package resolves those four out of its *compiled-in prefix* when the config does
 otherwise — which is exactly how the first MariaDB artifact came to resolve `plugin_dir`
 out of a mode-1777 tree. The build-time fix (a prefix nothing unprivileged can create)
 removed the reachable attack; **pinning them in the config removes the dependence on the
-prefix altogether.** Doing it for MariaDB alone would leave MySQL relying on a property of
-Homebrew's prefix that nobody has checked.
+prefix for any server this app starts with its own config.** Doing it for MariaDB alone
+would leave MySQL relying on a property of Homebrew's prefix that nobody has checked.
+
+*Corrected 2026-08-04 by the security audit, which measured it:* an earlier draft of that
+sentence said "removes the dependence on the prefix **altogether**", and that is an
+overstatement. `!includedir` is the last line of the generated `my.cnf`, so a
+`custom_confd` drop-in wins over everything above it — including all four directives and
+`bind-address`. The auditor moved `@@plugin_dir` to a directory of its choosing that way on
+a live server. This is not a privilege boundary being crossed: the drop-in directory is
+same-user, under a `0700` home, and it is the documented customization point. But "the
+config pins it" and "nothing can move it" are different claims, and only the first one is
+true. Pinning the four on the spawn argv instead would make them genuinely unoverridable,
+at the cost of taking away a customization affordance we deliberately offer — not a trade
+worth making for a same-user surface.
 
 Cost, stated so it is not a surprise: touching MySQL's template means re-running
 `crates/openvhost-core/tests/mysql_live.rs`.
@@ -148,6 +174,17 @@ Two things genuinely differ and must be verified live rather than assumed:
    server binds a mode-0777 `/tmp/mysqlx.sock` while root is still open. **Establish
    what MariaDB's equivalent exposure is, if any, before the temp server is started for the
    first time.** Answering "there is none" is fine; assuming it is not.
+
+*Both were established live, and one of my numbers was wrong.* `--mysqlx=OFF` is rejected
+by this server and there is nothing to close: `lsof` on the live temp server showed exactly
+one FD, the unix socket named on argv, and zero TCP rows. And this init creates **four**
+root accounts plus a locked `mariadb.sys` — **no anonymous accounts at all**, because
+`--skip-test-db` is on the init argv and suppresses the anonymous pair. An earlier draft of
+this spec said six including two anonymous, and I carried that number into a reviewer's
+brief, which produced a confident finding that the code's own (correct) comment was false.
+The `DELETE FROM mysql.global_priv WHERE User=''` is therefore defence-in-depth against an
+upstream change, exactly as `init.rs:198` says. Recording it because a wrong number in a
+spec does not stay in the spec — it propagates into every brief written from it.
 
 ## 9. What slice A must prove
 

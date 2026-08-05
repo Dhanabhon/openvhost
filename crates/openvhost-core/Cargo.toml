@@ -19,6 +19,12 @@ openvhost-conf = { path = "../openvhost-conf" }
 # never on this crate, and neither depends on tauri.
 openvhost-pkg = { path = "../openvhost-pkg" }
 openvhost-proc = { path = "../openvhost-proc" }
+# `mariadb::init` drives real child processes (mariadb-install-db, the
+# network-less temp server, the password client) — it needs tokio's timer and
+# `process::Command` directly. Not a new transitive edge: openvhost-proc's
+# `SpawnedChild` already wraps `tokio::process::Child`, so this crate has been
+# linking tokio all along; the dependency is now stated rather than borrowed.
+tokio.workspace = true
 similar = "2"
 tracing = "0.1"
 
@@ -28,7 +34,6 @@ specta = ["dep:specta"]
 [dev-dependencies]
 serde_json = "1"
 tempfile = "3"
-tokio = { workspace = true }
 # `mysql::package::install`'s hermetic tests build a real .tar.gz in memory and
 # serve it over loopback, so the install pipeline is exercised end to end
 # without the network. Test-only, and already in Cargo.lock via openvhost-pkg.

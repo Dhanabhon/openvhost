@@ -180,6 +180,22 @@ pub(crate) fn to_config_path(p: &Path) -> Result<String, ConfError> {
     Ok(s)
 }
 
+/// Pull `key=value` out of a rendered option file (`my.cnf`'s unquoted-INI
+/// family). Test-only, and deliberately a parser rather than a
+/// `contains("basedir=…")` check: `contains` cannot tell a directive apart
+/// from a commented-out one, and it happily matches a key that appears as a
+/// substring of some other line's VALUE. Lives here, beside
+/// [`to_config_path`], because both engines' renderers assert against it and a
+/// second copy is how the two would drift.
+#[cfg(test)]
+pub(crate) fn directive<'a>(rendered: &'a str, key: &str) -> Option<&'a str> {
+    rendered
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

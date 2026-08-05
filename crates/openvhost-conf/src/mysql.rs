@@ -52,11 +52,55 @@ pub struct MysqlCtx {
     /// (`<home>/config/custom/mysql/<major>/conf.d`) — the user's own
     /// `!includedir` target, never written by this app.
     pub custom_confd: PathBuf,
+    /// The four fields below are THE RUNTIME DIRECTORIES, and they are not
+    /// paths under the OpenVHost home at all: every one of them names a
+    /// directory INSIDE the installed server's own package tree, supplied by
+    /// the caller from the runtime discovery actually resolved (never guessed
+    /// here, and never probed here — `openvhost-conf` discovers nothing, the
+    /// same rule [`MysqlValidator`] follows for the `mysqld` path).
+    ///
+    /// WHY THEY EXIST (spec D3 of
+    /// docs/superpowers/specs/2026-08-04-p1-mariadb-service-design.md): a
+    /// server that is not TOLD these resolves them out of its **compiled-in
+    /// prefix**. Measured on 2026-08-04 against the real 11.4.9 artifact —
+    /// `SHOW VARIABLES` on a running server started with `--no-defaults`
+    /// reported `basedir`, `character_sets_dir` and `plugin_dir` all under
+    /// `/opt/openvhost-build/mariadb-11.4.9/`, a directory that does not
+    /// exist on any user's machine. That is exactly how the first MariaDB
+    /// artifact came to resolve `plugin_dir` out of a mode-1777 tree
+    /// (CWE-426/427). The build-time fix removed the *reachable* attack;
+    /// pinning here removes the *dependence on the prefix* altogether, which
+    /// is a different guarantee — a future reader will be tempted to drop one
+    /// as redundant, and neither replaces the other.
+    ///
+    /// MySQL carries them for the same reason and not as symmetry: without
+    /// them mysqld relies on a property of Homebrew's prefix that nobody has
+    /// checked.
+    ///
+    /// **The layouts genuinely differ between engines**, which is why these
+    /// are four explicit values rather than one `basedir` this crate expands:
+    /// Homebrew's `mysql@8.4` keeps charsets at `share/mysql/charsets` and
+    /// messages at `share/mysql/`, while the MariaDB package keeps them at
+    /// `share/charsets` and `share/` (both measured, same day). A `basedir` +
+    /// hardcoded suffixes would silently pick the wrong tree for one of them.
+    ///
+    /// `<basedir>` — the server's installation root.
+    pub basedir: PathBuf,
+    /// `<basedir>/lib/plugin` — where the server loads plugins from.
+    pub plugin_dir: PathBuf,
+    /// The directory holding `Index.xml` and the character-set definitions.
+    pub character_sets_dir: PathBuf,
+    /// The PARENT of the per-language `errmsg.sys` directories (the server
+    /// appends `lc_messages`, e.g. `english/`), not that directory itself.
+    pub lc_messages_dir: PathBuf,
 }
 
 /// Render `my.cnf` for one MySQL major.
 ///
-/// Keys EXACTLY per spec D5 — nothing else, no tuning: `[mysqld]` `datadir`,
+/// Keys EXACTLY per spec D5 — nothing else, no tuning — plus the four
+/// runtime directories the 2026-08-04 MariaDB-service spec D3 added to BOTH
+/// engines (see [`MysqlCtx::basedir`] for why): `[mysqld]` `basedir`,
+/// `plugin_dir`, `character-sets-dir`, `lc_messages_dir`, `datadir`,
 /// `socket`, `pid-file`, `port=3306`, `bind-address=127.0.0.1`,
 /// `skip-name-resolve`, `mysqlx=OFF`, `log-error-verbosity=2`,
 /// `!includedir <custom conf.d>`; `[client]` `socket`, `port`. `port` is a
@@ -81,12 +125,20 @@ pub fn generate_my_cnf(ctx: &MysqlCtx) -> Result<GeneratedFile, ConfError> {
     let socket = to_config_path(&ctx.socket)?;
     let pid_file = to_config_path(&ctx.pid_file)?;
     let custom_confd = to_config_path(&ctx.custom_confd)?;
+    let basedir = to_config_path(&ctx.basedir)?;
+    let plugin_dir = to_config_path(&ctx.plugin_dir)?;
+    let character_sets_dir = to_config_path(&ctx.character_sets_dir)?;
+    let lc_messages_dir = to_config_path(&ctx.lc_messages_dir)?;
 
     let mut tc = tera::Context::new();
     tc.insert("datadir", &datadir);
     tc.insert("socket", &socket);
     tc.insert("pid_file", &pid_file);
     tc.insert("custom_confd", &custom_confd);
+    tc.insert("basedir", &basedir);
+    tc.insert("plugin_dir", &plugin_dir);
+    tc.insert("character_sets_dir", &character_sets_dir);
+    tc.insert("lc_messages_dir", &lc_messages_dir);
     let contents = render("mysql/my.cnf", &tc)?;
     Ok(GeneratedFile {
         path: ctx.my_cnf.clone(),
@@ -158,9 +210,15 @@ impl MysqlValidator {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::ctx::directive;
+
+    /// The package tree the fixture's server was "discovered" in — Homebrew's
+    /// real `mysql@8.4` layout, which is NOT the MariaDB one (`share/mysql/…`
+    /// vs `share/…`; both measured 2026-08-04).
+    const FIXTURE_BASEDIR: &str = "/opt/homebrew/opt/mysql@8.4";
 
     fn fixture_ctx() -> MysqlCtx {
         MysqlCtx {
@@ -169,6 +227,10 @@ mod tests {
             socket: PathBuf::from("/tmp/ovh/run/mysql-8.4.sock"),
             pid_file: PathBuf::from("/tmp/ovh/run/mysql-8.4.pid"),
             custom_confd: PathBuf::from("/tmp/ovh/config/custom/mysql/8.4/conf.d"),
+            basedir: PathBuf::from(FIXTURE_BASEDIR),
+            plugin_dir: PathBuf::from("/opt/homebrew/opt/mysql@8.4/lib/plugin"),
+            character_sets_dir: PathBuf::from("/opt/homebrew/opt/mysql@8.4/share/mysql/charsets"),
+            lc_messages_dir: PathBuf::from("/opt/homebrew/opt/mysql@8.4/share/mysql"),
         }
     }
 
@@ -182,6 +244,10 @@ mod tests {
 #   /tmp/ovh/config/custom/mysql/8.4/conf.d
 # ---------------------------------------------------------------------------
 [mysqld]
+basedir=/opt/homebrew/opt/mysql@8.4
+plugin_dir=/opt/homebrew/opt/mysql@8.4/lib/plugin
+character-sets-dir=/opt/homebrew/opt/mysql@8.4/share/mysql/charsets
+lc_messages_dir=/opt/homebrew/opt/mysql@8.4/share/mysql
 datadir=/tmp/ovh/data/mysql/8.4
 socket=/tmp/ovh/run/mysql-8.4.sock
 pid-file=/tmp/ovh/run/mysql-8.4.pid
@@ -208,6 +274,48 @@ port=3306
             f.contents, EXPECTED_MY_CNF,
             "rendered my.cnf did not match the golden file, got:\n{}",
             f.contents
+        );
+    }
+
+    /// Spec D3: the four runtime directories must be present AND must name
+    /// somewhere inside the package tree the server was discovered in — not
+    /// the compiled-in prefix, and not an OpenVHost home path.
+    ///
+    /// VACUITY: proven by editing `FIXTURE_BASEDIR` to `/opt/somewhere-else`
+    /// (a prefix none of the other three share) and re-running — the
+    /// `starts_with` arm fails for all three, naming the offending value.
+    /// Separately, deleting any one of the four lines from the template fails
+    /// the `expect` on that key rather than passing vacuously.
+    #[test]
+    fn my_cnf_pins_all_four_runtime_directories_inside_the_package_tree() {
+        let c = generate_my_cnf(&fixture_ctx()).unwrap();
+        let c = c.contents;
+
+        let basedir = directive(&c, "basedir").expect("basedir must be pinned");
+        assert_eq!(basedir, FIXTURE_BASEDIR);
+
+        for key in ["plugin_dir", "character-sets-dir", "lc_messages_dir"] {
+            let value = directive(&c, key).unwrap_or_else(|| panic!("{key} must be pinned"));
+            assert!(
+                value.starts_with(&format!("{FIXTURE_BASEDIR}/")),
+                "{key}={value} must live inside the package tree {FIXTURE_BASEDIR}"
+            );
+        }
+    }
+
+    /// The four must NOT be derived from a single `basedir` by this crate:
+    /// Homebrew's mysql@8.4 keeps charsets at `share/mysql/charsets` while the
+    /// MariaDB package keeps them at `share/charsets` (both measured
+    /// 2026-08-04), so a hardcoded suffix here would silently point one engine
+    /// at the other's layout. Pins that the caller's value is what is rendered.
+    #[test]
+    fn my_cnf_renders_the_callers_layout_verbatim_not_a_guessed_suffix() {
+        let mut ctx = fixture_ctx();
+        ctx.character_sets_dir = PathBuf::from("/opt/homebrew/opt/mysql@8.4/elsewhere/charsets");
+        let c = generate_my_cnf(&ctx).unwrap().contents;
+        assert_eq!(
+            directive(&c, "character-sets-dir"),
+            Some("/opt/homebrew/opt/mysql@8.4/elsewhere/charsets")
         );
     }
 

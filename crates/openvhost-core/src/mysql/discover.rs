@@ -205,7 +205,13 @@ fn runtime_in(dir: &Path, major: MysqlMajor, source: MysqlRuntimeSource) -> Opti
 /// This bounds what a link TARGET may name. It is not, and could not be, a
 /// defence against someone who can already write inside `<home>/packages` —
 /// nothing in this tree is.
-fn current_version(link: &Path) -> Option<String> {
+///
+/// `pub(crate)`, not private: `crate::mariadb::packaged_mariadb_runtime`
+/// resolves its own `current` link through this exact function. The rule is a
+/// property of how `openvhost-pkg` WRITES the link, not of MySQL, and a
+/// duplicated security predicate is one that will drift — the same reasoning
+/// spec D5 applies to the other generic helpers misfiled under `mysql/`.
+pub(crate) fn current_version(link: &Path) -> Option<String> {
     let target = std::fs::read_link(link).ok()?;
     let mut components = target.components();
     // `Component::Normal` alone rejects `..` (ParentDir), `/` (RootDir) and a
@@ -269,7 +275,11 @@ pub fn packaged_mysql_runtime(root: &PackagesRoot, major: &MysqlMajor) -> Option
 /// A path that exists but cannot be listed (a plain file sitting where a
 /// directory belongs, a permission error) DOES count: we genuinely cannot tell,
 /// which is exactly what [`Discovery::unidentified`] means.
-fn looks_like_a_broken_install(major_dir: &Path) -> bool {
+///
+/// `pub(crate)`: `crate::mariadb::discover_mariadb` applies the identical rule
+/// to its own series directory, and the rule is about a package tree rather
+/// than about an engine.
+pub(crate) fn looks_like_a_broken_install(major_dir: &Path) -> bool {
     match std::fs::read_dir(major_dir) {
         Ok(mut entries) => entries.next().is_some(),
         Err(_) => major_dir.exists(),

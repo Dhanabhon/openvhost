@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO mariadb_instances (major, root_password, initialized_at) VALUES (?, ?, ?) ON CONFLICT(major) DO UPDATE SET root_password = excluded.root_password, initialized_at = excluded.initialized_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "fb58f4b0fed98a0b523ee2e39e2cc3ebd4aa69d42d0c6cb4bf80465dc243a2b8"
+}

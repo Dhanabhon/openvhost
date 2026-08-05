@@ -3,6 +3,14 @@
 //! `shutdown`): bounded, contained, one-shot invocations of the running
 //! server's own command-line tools.
 //!
+//! Plus one MariaDB argv builder, [`mariadb_admin_ping_argv`], which spawns
+//! nothing itself — it is here rather than in `stack.rs` (its only caller)
+//! because what a reader most needs to see is how it DIFFERS from
+//! [`mysqladmin_ping_argv`], and a divergence documented one file away from
+//! the thing it diverges from is a divergence that gets "tidied up".
+//! MariaDB's own init-time CLI work lives in `openvhost-core`'s
+//! `mariadb::init`, which owns its whole staged sequence.
+//!
 //! Review fix wave finding 4: these do NOT belong in `openvhost-conf`.
 //! That crate's `inspect` module documents a "golden-rule-4 reading"
 //! (CONFIRMED by security-auditor, 2026-07-26) that lets a one-shot tool
@@ -98,6 +106,51 @@ pub fn mysqladmin_ping_argv(mysqladmin: &Path, socket: &Path) -> Vec<String> {
         mysqladmin.display().to_string(),
         "--no-defaults".to_string(),
         "--no-login-paths".to_string(),
+        "--protocol=SOCKET".to_string(),
+        format!("--socket={}", socket.display()),
+        "--user=root".to_string(),
+        "--connect-timeout=1".to_string(),
+        "--silent".to_string(),
+        "ping".to_string(),
+    ]
+}
+
+/// The `mariadb-admin ping` argv for the Supervisor's readiness probe on
+/// `stack.rs`'s `mariadb_spec` — MariaDB's counterpart to
+/// [`mysqladmin_ping_argv`] above, deliberately kept beside it so the ONE
+/// place the two engines' pings differ is visible in a single screen.
+///
+/// **It asserts that the server ANSWERS, not that any credential works.**
+/// `ping` exits 0 even when the connection is refused with access denied —
+/// the same property [`mysqladmin_ping`] documents for MySQL, verified for
+/// MariaDB while building the staged init. That is the right assertion for a
+/// readiness probe: `Running` should mean "the socket is up and the server is
+/// answering on it", which is exactly what a client needs to know before
+/// connecting. It is also the ONLY assertion available here, because spec
+/// D4's credential rule (never argv, never env) forbids putting the root
+/// password in a `ReadinessProbe::Command`'s `argv` — a `Vec<String>` held
+/// for the service's whole lifetime and re-spawned on every attempt, visible
+/// in `ps` each time. Nothing downstream may read a passing probe as
+/// "the stored password is good"; proving that needs a real connection, and
+/// belongs to a verify step that can use an ephemeral 0600 defaults file.
+///
+/// **The flag list is NOT MySQL's with the names swapped.** MariaDB 11.4.9's
+/// `mariadb-admin` rejects `--no-login-paths` outright — `unknown option`,
+/// exit 2 — so copying [`mysqladmin_ping_argv`] verbatim would have made
+/// every probe attempt fail for a reason having nothing to do with the
+/// server, leaving a perfectly healthy MariaDB stuck `Starting` until its
+/// deadline and then `Failed`. Nothing is lost by dropping it: that flag
+/// exists because MySQL's `--no-defaults` still reads `.mylogin.cnf`, and
+/// MariaDB has no login-path file at all (`--help` documents `--no-defaults`
+/// as "Don't read default options from any option file", and ships no
+/// `mysql_config_editor`), so `--no-defaults` alone is the complete
+/// containment here that the pair is for MySQL. Same shape as `--mysqlx=OFF`,
+/// which the spec already flagged as not existing on this engine: verify the
+/// option against the real binary rather than assuming a shared ancestry.
+pub fn mariadb_admin_ping_argv(mariadb_admin: &Path, socket: &Path) -> Vec<String> {
+    vec![
+        mariadb_admin.display().to_string(),
+        "--no-defaults".to_string(),
         "--protocol=SOCKET".to_string(),
         format!("--socket={}", socket.display()),
         "--user=root".to_string(),
@@ -224,6 +277,54 @@ mod tests {
                 "--silent".to_string(),
                 "ping".to_string(),
             ]
+        );
+    }
+
+    /// The MariaDB probe, pinned as an exact list for the same reason the
+    /// MySQL one above is — and pinned to be DIFFERENT, which is the part
+    /// worth a test.
+    ///
+    /// `--no-login-paths` is absent because MariaDB 11.4.9's `mariadb-admin`
+    /// exits 2 with `unknown option '--no-login-paths'`. That failure mode is
+    /// invisible from the Rust side: the Supervisor only ever sees "this
+    /// probe did not exit 0", so a healthy server would sit `Starting` for
+    /// the full deadline and then report `Failed`, with the real cause an
+    /// argument the reader would have to think to suspect. Anyone tidying
+    /// these two functions into agreement re-introduces exactly that, so the
+    /// assertion below is deliberately spelled out rather than derived from
+    /// [`mysqladmin_ping_argv`].
+    #[test]
+    fn the_mariadb_ping_argv_omits_the_mysql_only_login_path_flag() {
+        let argv = mariadb_admin_ping_argv(
+            Path::new("/home/packages/mariadb/11.4/11.4.9/bin/mariadb-admin"),
+            Path::new("/tmp/ovh/run/mariadb-11.4.sock"),
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "/home/packages/mariadb/11.4/11.4.9/bin/mariadb-admin".to_string(),
+                "--no-defaults".to_string(),
+                "--protocol=SOCKET".to_string(),
+                "--socket=/tmp/ovh/run/mariadb-11.4.sock".to_string(),
+                "--user=root".to_string(),
+                "--connect-timeout=1".to_string(),
+                "--silent".to_string(),
+                "ping".to_string(),
+            ]
+        );
+        // Stated twice on purpose: the list above pins the whole argv, this
+        // pins the one element whose PRESENCE would be the regression, so a
+        // future reordering of the list cannot quietly reintroduce it.
+        assert!(
+            !argv.iter().any(|a| a == "--no-login-paths"),
+            "mariadb-admin rejects this flag outright: {argv:?}"
+        );
+        // …and it really is a MySQL-only flag, not one this test forgot to
+        // add to both — otherwise the assertion above says nothing.
+        assert!(
+            mysqladmin_ping_argv(Path::new("/x"), Path::new("/y"))
+                .iter()
+                .any(|a| a == "--no-login-paths")
         );
     }
 

@@ -3,7 +3,7 @@
 # will be lost. To customize, add files under:
 #   {{ custom_confd }}
 # ---------------------------------------------------------------------------
-[mysqld]
+[mariadbd]
 basedir={{ basedir }}
 plugin_dir={{ plugin_dir }}
 character-sets-dir={{ character_sets_dir }}
@@ -11,13 +11,12 @@ lc_messages_dir={{ lc_messages_dir }}
 datadir={{ datadir }}
 socket={{ socket }}
 pid-file={{ pid_file }}
-port=3306
+port=3307
 bind-address=127.0.0.1
 skip-name-resolve
-mysqlx=OFF
-log-error-verbosity=2
+log-warnings=2
 !includedir {{ custom_confd }}
 
 [client]
 socket={{ socket }}
-port=3306
+port=3307

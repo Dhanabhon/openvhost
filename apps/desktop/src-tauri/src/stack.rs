@@ -19,7 +19,13 @@ use openvhost_core::site::apply::LISTEN_PORT;
 // own doc comment for why portable types are named ungated even though only
 // `macos_stack` constructs them today), and `php_fpm_spec` below is called
 // from `commands.rs`, which is ungated too.
-use openvhost_core::mysql::{DatadirState, MysqlRuntime, classify_datadir, mysql_paths};
+use openvhost_core::mariadb::{
+    MariadbDatadirState, MariadbPaths, MariadbRuntime, classify_mariadb_datadir, mariadb_paths,
+    mariadb_runtime_dirs,
+};
+use openvhost_core::mysql::{
+    DatadirState, MysqlRuntime, classify_datadir, mysql_paths, write_generated_config,
+};
 // Re-exported by `openvhost-core` so this crate needs no direct `openvhost-pkg`
 // dependency. Minted only from a resolved home — never from IPC input.
 use openvhost_core::PackagesRoot;
@@ -99,9 +105,26 @@ pub fn php_fpm_service_id(major: &str) -> String {
     format!("{PHP_FPM_ID_PREFIX}{major}")
 }
 
+/// The `<prefix><series>` shape of every MariaDB service id — see
+/// [`PHP_FPM_ID_PREFIX`].
+///
+/// It has to be a DIFFERENT prefix from [`MYSQL_ID_PREFIX`], not a different
+/// version under the same one: this build's MariaDB series is `11.4`, and
+/// MySQL majors are discovered from whatever is installed rather than from a
+/// catalogue, so a machine carrying a `mysql@11.4` keg would produce the very
+/// same id string. Two rows sharing one id is not a display bug — the
+/// Supervisor keys its registry by id, so one engine would take over the
+/// other's row.
+pub(crate) const MARIADB_ID_PREFIX: &str = "mariadb-";
+
 /// The supervisor id for one MySQL major — see [`php_fpm_service_id`].
 pub fn mysql_service_id(major: &str) -> String {
     format!("{MYSQL_ID_PREFIX}{major}")
+}
+
+/// The supervisor id for one MariaDB series — see [`php_fpm_service_id`].
+pub fn mariadb_service_id(series: &str) -> String {
+    format!("{MARIADB_ID_PREFIX}{series}")
 }
 
 /// The generated php-fpm pool config for one major: the file `php_fpm_spec`
@@ -263,6 +286,114 @@ pub fn mysql_spec(home: &Path, rt: &MysqlRuntime) -> ServiceSpec {
     }
 }
 
+/// `ServiceSpec::grace` for the `mariadb-<series>` row. Deliberately an ALIAS
+/// of [`MYSQL_GRACE`] rather than a second `Duration::from_secs(15)`: the
+/// reason for the value is InnoDB's flush, which is a property of the storage
+/// engine both servers share, and — more importantly — `quit.rs`'s
+/// quit-budget test asserts `STOP_ALL_TIMEOUT` outlives [`MYSQL_GRACE`]. As
+/// an alias that single assertion keeps covering the longest grace actually
+/// registered; as an independent literal, raising one engine's grace past the
+/// budget would sail past a test still watching the other's.
+pub(crate) const MARIADB_GRACE: Duration = MYSQL_GRACE;
+
+/// How long [`mariadb_spec`]'s readiness probe may retry — an alias of
+/// [`MYSQL_READY_DEADLINE`] for the same reason [`MARIADB_GRACE`] is one:
+/// `control::TRANSITION_TIMEOUT`'s test pins itself against that constant
+/// plus the grace, and an alias keeps that budget honest for both engines
+/// instead of only the one the assertion happens to name.
+pub(crate) const MARIADB_READY_DEADLINE: Duration = MYSQL_READY_DEADLINE;
+
+/// Keeps the two shared budget tests honest without either of them naming
+/// MariaDB.
+///
+/// `quit.rs::stop_all_timeout_outlives_mysqls_longer_grace` and
+/// `control.rs::transition_timeout_outlives_mysqls_readiness_deadline_plus_its_stop_grace`
+/// assert against the `MYSQL_*` constants because those are the LONGEST
+/// registered values — true today only because the two constants above are
+/// aliases. The doc comments say so, but a comment cannot fail a build: the
+/// day someone de-aliases these and raises one past MySQL's, the real budget
+/// would be exceeded while both tests sailed past, still watching the other
+/// engine. This is the tripwire for that day, and it fires at the line
+/// someone would actually edit rather than in a test file they have no reason
+/// to open.
+const _: () = assert!(
+    MARIADB_GRACE.as_secs() <= MYSQL_GRACE.as_secs()
+        && MARIADB_READY_DEADLINE.as_secs() <= MYSQL_READY_DEADLINE.as_secs(),
+    "quit.rs and control.rs assert their budgets against the MYSQL_* constants \
+     as the longest registered values. Widen those two tests to cover both \
+     engines BEFORE making a MariaDB value the longer one."
+);
+
+/// The TCP address the `mariadb-<series>` row advertises (spec D2).
+///
+/// **3307, and the fact that it is not 3306 is load-bearing**, in a way the
+/// port number alone does not suggest. `tray::model::bulk_start_ids` collapses
+/// services that share an endpoint STRING, on the correct assumption that two
+/// services claiming one address are alternatives — which two MySQL majors
+/// are, and two engines are not. A MariaDB row declaring `127.0.0.1:3306`
+/// would therefore be dropped from "Start all" silently: no error, no log
+/// line, just a service that never starts. Giving each engine its own address
+/// is what lets both run at once, so this constant may not be changed to
+/// match MySQL's without first changing that dedupe — and the dedupe is
+/// right.
+pub(crate) const MARIADB_ENDPOINT: &str = "127.0.0.1:3307";
+
+/// The `mariadb-<series>` service row: id, display name, TCP endpoint, and
+/// the exact spawn + readiness spec (spec D2/D5). The MariaDB counterpart of
+/// [`mysql_spec`], sharing its shape and its reasoning:
+///
+/// - `endpoint` is the TCP address a human would point a client at, NOT this
+///   instance's unix socket (which is an internal detail this app uses for
+///   its own admin calls) — see [`MARIADB_ENDPOINT`] for why the value's
+///   distinctness from MySQL's is what makes two engines coexist.
+/// - argv is exactly `["--defaults-file=<my.cnf>"]`, built through `OsString`
+///   rather than `format!` + `.display()` so a non-UTF-8 home is passed
+///   through unchanged instead of lossily. Everything else lives in the file,
+///   which keeps the spawn spec stable across every config change and keeps
+///   the rendered config the single description of how the server is running.
+/// - `program` is `rt.mariadbd`, which `openvhost-core`'s discovery has
+///   already resolved to a CONCRETE version directory. It is not re-resolved
+///   here and the `current` link is never spawned through: a later `current`
+///   swap must not change which binary a restart brings up.
+///
+/// It also performs three side effects before handing the spec over, all three
+/// HERE because this function is the one chokepoint every registration path
+/// goes through — startup today, and a rescan or a fresh init's own
+/// registration once those exist. None can be left to init: init runs once, on
+/// a datadir that did not exist yet, while everything below can go stale or be
+/// removed by hand at any point afterwards.
+///
+/// Two are directories, both found by live runs rather than by unit tests. The
+/// third is the generated config itself, which is re-rendered from the runtime
+/// being registered *right now* — see [`refresh_generated_config`].
+pub fn mariadb_spec(home: &Path, rt: &MariadbRuntime) -> ServiceSpec {
+    let paths = mariadb_paths(home);
+    ensure_custom_confd(&paths.custom_confd);
+    ensure_run_dir(&paths.socket);
+    refresh_generated_config(&paths, rt);
+    let mut defaults_file_arg = OsString::from("--defaults-file=");
+    defaults_file_arg.push(paths.my_cnf.as_os_str());
+    ServiceSpec {
+        id: mariadb_service_id(rt.series),
+        display_name: format!("MariaDB {}", rt.series),
+        endpoint: Some(MARIADB_ENDPOINT.to_string()),
+        spawn: SpawnSpec {
+            program: rt.mariadbd.clone(),
+            args: vec![defaults_file_arg],
+            cwd: None,
+            env: vec![],
+        },
+        // Asserts that the server ANSWERS on its socket — never that a
+        // credential works, which `ping` cannot tell us and which this probe
+        // structurally must not try to: see `mariadb_admin_ping_argv`.
+        readiness: ReadinessProbe::Command {
+            argv: crate::mysql_admin::mariadb_admin_ping_argv(&rt.mariadb_admin, &paths.socket),
+            deadline: MARIADB_READY_DEADLINE,
+        },
+        grace: MARIADB_GRACE,
+    }
+}
+
 /// Best-effort, log-don't-fail (mirrors `provision_home`'s own error
 /// handling at every call site in this file): a failure to create
 /// `custom_confd` must never stop a `ServiceSpec` from being built and
@@ -271,12 +402,120 @@ pub fn mysql_spec(home: &Path, rt: &MysqlRuntime) -> ServiceSpec {
 /// state a real spawn failure already provides. `create_dir_all` is a no-op
 /// when the directory already exists, so this costs nothing on the (normal,
 /// expected) path where nothing was ever deleted.
+///
+/// Shared by both engines, and the message names no engine because the path
+/// already does (`config/custom/<engine>/<series>/conf.d`) — a fixed `mysql:`
+/// prefix would have been a small lie the day MariaDB started calling it.
 fn ensure_custom_confd(custom_confd: &Path) {
     if let Err(e) = std::fs::create_dir_all(custom_confd) {
         eprintln!(
-            "mysql: failed to ensure the custom conf.d directory {}: {e}",
+            "db: failed to ensure the custom conf.d directory {}: {e}",
             custom_confd.display()
         );
+    }
+}
+
+/// Ensure `<home>/run` — the directory the server binds its socket in —
+/// exists, best-effort and log-don't-fail exactly like [`ensure_custom_confd`]
+/// above, and derived from the socket path rather than re-spelling `run` so
+/// the writer and the reader cannot name different directories.
+///
+/// Found by Task 2's live gate, not by any unit test: a real `mariadbd` whose
+/// run directory is missing reports `Bind on unix socket: No such file or
+/// directory` and then the spectacularly misleading `Do you already have
+/// another server running on socket …?`, which sends a reader hunting for a
+/// phantom process. `initialize_mariadb` ensures the same directory for its
+/// own temp server; that covers the init path only, and this is the
+/// supervised-start half of the same requirement.
+///
+/// **Deliberately not added to [`mysql_spec`] in this slice.** Both engines
+/// bind into `<home>/run` and both are covered on a normal launch, where
+/// `provision_home` creates it before any spec is built. What differs is only
+/// that MariaDB's failure text actively misleads, and MySQL's path is
+/// live-proven as it stands — so the belt-and-braces goes where it was earned
+/// rather than re-opening a proven path immediately before a gate. Extending
+/// it to `mysql_spec` is a one-line follow-up, not a fix.
+///
+/// A plain `create_dir_all` matches `provision_home`'s own treatment of
+/// `run` exactly (unlike `logs/`, which that function locks to `0700` through
+/// `ensure_log_dir`), so this cannot leave the directory at a mode the normal
+/// launch path would not have produced.
+fn ensure_run_dir(socket: &Path) {
+    let Some(run_dir) = socket.parent() else {
+        return; // structurally unreachable — see `mariadb_paths`
+    };
+    if let Err(e) = std::fs::create_dir_all(run_dir) {
+        eprintln!(
+            "db: failed to ensure the run directory {} exists: {e}",
+            run_dir.display()
+        );
+    }
+}
+
+/// Re-render `my.cnf` from the runtime being registered RIGHT NOW, so the
+/// generated config can never describe an install other than the one about to
+/// be started (2026-08-04 security audit, M2).
+///
+/// The four directives spec D3 added — `basedir`, `plugin_dir`,
+/// `character-sets-dir`, `lc_messages_dir` — name a CONCRETE version
+/// directory, while `mariadb_paths` keys `my_cnf` on the SERIES. One patch
+/// release later those two disagree: [`mariadb_spec`] hands the Supervisor the
+/// newly discovered `mariadbd` while `--defaults-file` still points every one
+/// of those directives into the previous version's tree. Once that version is
+/// uninstalled, `plugin_dir` names a path that no longer exists — an
+/// availability failure on its own, and a plant target the day anything else
+/// can create that path. Pinning the directories is what made this reachable;
+/// re-rendering is what pays for it.
+///
+/// Rewriting here is safe for a structural reason, not a promise:
+/// `write_generated_config` only creates `custom_confd` and atomically writes
+/// the generated file. It never truncates, clears or even enumerates the
+/// drop-in directory — so everything the user owns, which lives in that
+/// directory and is pulled in by `!includedir`, survives a re-render
+/// untouched. The generated file is the one thing here that is ours.
+/// `openvhost-core`'s own `write_generated_config` doc names this same gap as
+/// its "case (b)" and points back here for the half that runs at registration.
+///
+/// Best-effort and log-don't-fail, exactly like the two `ensure_*` helpers
+/// above and for the same reason: [`mariadb_spec`] returns a `ServiceSpec`
+/// infallibly, and withholding one over a failed re-render would take away the
+/// honest `Failed` state a real spawn failure already provides. Every failure
+/// arm leaves the config already on disk exactly as it was, which is no worse
+/// than the behaviour this replaces.
+///
+/// **Deliberately not added to [`mysql_spec`] in this slice.** MySQL has the
+/// identical gap, recorded as a merge precondition on the packaged-MySQL
+/// slice: touching MySQL's config path here would put a `mysql_live.rs` re-run
+/// immediately in front of a security gate.
+fn refresh_generated_config(paths: &MariadbPaths, rt: &MariadbRuntime) {
+    let Some(dirs) = mariadb_runtime_dirs(&rt.mariadbd) else {
+        eprintln!(
+            "db: not refreshing {}: {} does not look like a usable MariaDB install",
+            paths.my_cnf.display(),
+            rt.mariadbd.display()
+        );
+        return;
+    };
+    let ctx = openvhost_conf::MariadbCtx {
+        my_cnf: paths.my_cnf.clone(),
+        datadir: paths.datadir.clone(),
+        socket: paths.socket.clone(),
+        pid_file: paths.pid_file.clone(),
+        custom_confd: paths.custom_confd.clone(),
+        basedir: dirs.basedir,
+        plugin_dir: dirs.plugin_dir,
+        character_sets_dir: dirs.character_sets_dir,
+        lc_messages_dir: dirs.lc_messages_dir,
+    };
+    let generated = match openvhost_conf::generate_mariadb_my_cnf(&ctx) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("db: failed to re-render {}: {e}", paths.my_cnf.display());
+            return;
+        }
+    };
+    if let Err(e) = write_generated_config(&generated, &paths.custom_confd) {
+        eprintln!("db: failed to write {}: {e}", paths.my_cnf.display());
     }
 }
 
@@ -294,6 +533,27 @@ pub(crate) fn mysql_datadir_is_initialized(home: &Path, rt: &MysqlRuntime) -> bo
         classify_datadir(&paths.datadir),
         Ok(DatadirState::Initialized)
     )
+}
+
+/// Whether MariaDB's datadir is already initialized — the MariaDB half of
+/// [`mysql_datadir_is_initialized`], and the same rule: only an initialized
+/// instance gets a supervisor row, because there is nothing to start
+/// otherwise. Read from disk every time, never a stored boolean.
+///
+/// Matched exhaustively rather than through `matches!` because
+/// [`MariadbDatadirState::Foreign`] is a verdict a reader must see refused
+/// here, not one that disappears into a wildcard: a datadir from another
+/// series is a migration this build does not perform, and starting a server
+/// against it would attempt one in place. A new variant must make this
+/// function fail to compile.
+#[cfg(target_os = "macos")]
+pub(crate) fn mariadb_datadir_is_initialized(home: &Path) -> bool {
+    match classify_mariadb_datadir(&mariadb_paths(home).datadir) {
+        Ok(MariadbDatadirState::Initialized { .. }) => true,
+        Ok(MariadbDatadirState::NotInitialized) | Ok(MariadbDatadirState::Foreign { .. }) => false,
+        // A datadir this process cannot read is not one it may start.
+        Err(_) => false,
+    }
 }
 
 /// The multi-version PHP walk `macos_stack` performs at startup, factored out
@@ -341,6 +601,24 @@ fn discover_installed_mysql(
 ) -> Vec<MysqlRuntime> {
     // `.runtimes` — see `discover_installed_php`.
     openvhost_core::mysql::discover_mysql(&PackagesRoot::from_home(home), prefixes, probe).runtimes
+}
+
+/// The MariaDB discovery walk `macos_stack` performs at startup, factored out
+/// exactly like [`discover_installed_mysql`] so a test can hand it a fake home.
+/// Thin pass-through to `openvhost_core::mariadb::discover_mariadb`, which has
+/// its own thorough test suite — its rules are not re-tested here.
+///
+/// **No Homebrew prefixes and no version probe, and neither is an omission.**
+/// MariaDB arrives only from OpenVHost's own package tree (the off-Homebrew
+/// decision, 2026-08-01), so there is nothing outside `<home>/packages` to
+/// look at; and the version is a directory name chosen at install time rather
+/// than something to ask a binary for, so this walk spawns nothing at all —
+/// unlike the PHP and MySQL walks above, which is why it needs no
+/// `block_on` bridge.
+#[cfg(target_os = "macos")]
+fn discover_installed_mariadb(home: &Path) -> Vec<MariadbRuntime> {
+    // `.runtimes` — see `discover_installed_php`.
+    openvhost_core::mariadb::discover_mariadb(&PackagesRoot::from_home(home)).runtimes
 }
 
 /// Sweep abandoned MySQL staging directories (spec D2: "swept on rescan")
@@ -466,6 +744,22 @@ pub fn macos_stack() -> MacosStack {
             specs.push(mysql_spec(&home, rt));
         }
     }
+    // The second engine, on the identical rule and ALONGSIDE MySQL rather
+    // than instead of it (spec D2): the two carry different ids and
+    // different endpoints precisely so both can be registered and both
+    // started.
+    //
+    // The walk yields at most one runtime — this build ships exactly one
+    // series — and the datadir check takes no runtime, because
+    // `mariadb_paths` deliberately takes no series argument (its own doc
+    // comment argues why). Discovery still runs first, so a machine that has
+    // never installed MariaDB is never asked about a datadir; it spawns
+    // nothing either way, costing a `read_link` and three `is_file` calls.
+    for rt in discover_installed_mariadb(&home) {
+        if mariadb_datadir_is_initialized(&home) {
+            specs.push(mariadb_spec(&home, &rt));
+        }
+    }
     specs.push(ServiceSpec {
         id: "nginx".into(),
         display_name: "nginx".into(),
@@ -507,6 +801,11 @@ pub fn macos_stack() -> MacosStack {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    // Test-only: production code reaches the series through `rt.series` (the
+    // value discovery actually recorded) and the package name through
+    // `discover_mariadb`, never through the constants directly — which is
+    // what keeps a spec describing the tree it was really found in.
+    use openvhost_core::mariadb::{MARIADB_PACKAGE_NAME, MARIADB_SERIES};
 
     /// Post-live-run finding: a REAL mysqld aborts with "Fatal error in
     /// defaults handling. Program aborted!" when `!includedir` names a
@@ -804,11 +1103,15 @@ mod tests {
         }
     }
 
-    /// Point (or re-point) `packages/mysql/<major>/current` at `target`, the
-    /// way `openvhost-pkg` does: a RELATIVE symlink naming the bare version.
+    /// Point (or re-point) `packages/<package>/<major>/current` at `target`,
+    /// the way `openvhost-pkg` does: a RELATIVE symlink naming the bare
+    /// version. Takes the package name because both engines' trees are laid
+    /// out identically — only the segment naming the engine differs — and a
+    /// second copy of this helper is how one engine's tests end up asserting
+    /// against a link shape the other's writer no longer produces.
     #[cfg(unix)]
-    fn point_current(home: &Path, major: &str, target: &str) {
-        let link = PackagesRoot::from_home(home).current_link("mysql", major);
+    fn point_current(home: &Path, package: &str, major: &str, target: &str) {
+        let link = PackagesRoot::from_home(home).current_link(package, major);
         std::fs::create_dir_all(link.parent().expect("major dir")).expect("mkdir major");
         let _ = std::fs::remove_file(&link);
         std::os::unix::fs::symlink(PathBuf::from(target), &link).expect("symlink current");
@@ -825,7 +1128,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tmp.path();
         install_fake_mysql_package(home, "8.4", "8.4.11", "8.4.11 server\n");
-        point_current(home, "8.4", "8.4.11");
+        point_current(home, "mysql", "8.4", "8.4.11");
 
         let found = discover_installed_mysql(home, &[], &|_| {
             panic!("startup must not probe a packaged runtime for its version")
@@ -864,7 +1167,7 @@ mod tests {
         let home = tmp.path();
         install_fake_mysql_package(home, "8.4", "8.4.10", "8.4.10 server\n");
         install_fake_mysql_package(home, "8.4", "8.4.11", "8.4.11 server\n");
-        point_current(home, "8.4", "8.4.11");
+        point_current(home, "mysql", "8.4", "8.4.11");
 
         let found = discover_installed_mysql(home, &[], &|_| None);
         assert_eq!(found.len(), 1, "got {found:?}");
@@ -890,11 +1193,445 @@ mod tests {
         // A `current` swap is a legitimate operation (a future upgrade flow
         // does exactly this). It must not silently change which binary the
         // already-registered spec starts.
-        point_current(home, "8.4", "8.4.10");
+        point_current(home, "mysql", "8.4", "8.4.10");
         assert_eq!(
             std::fs::read(&spec.spawn.program).expect("read the spawned binary"),
             b"8.4.11 server\n",
             "a current swap changed the engine an already-registered spec spawns"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // MariaDB: the SECOND engine's supervisor row (spec D2/D5).
+    //
+    // Discovery itself is `openvhost-core`'s and is tested thoroughly
+    // there. What is provable ONLY here is the shape of the row the
+    // Supervisor is actually handed — the argv it spawns, the binary that
+    // argv names, and the id/endpoint pair that decides whether this row
+    // and MySQL's can coexist at all.
+    // ------------------------------------------------------------------
+
+    /// Lay down `<home>/packages/mariadb/11.4/<version>/bin/{mariadbd,
+    /// mariadb,mariadb-admin}` with `mariadbd`'s body set to `body` — the
+    /// counterpart of [`install_fake_mysql_package`], separate rather than
+    /// generic because the three binary NAMES are precisely what differs
+    /// between the two engines (`openvhost-core`'s own discovery module
+    /// makes the same call, for the same reason).
+    #[cfg(unix)]
+    fn install_fake_mariadb_package(home: &Path, version: &str, body: &str) {
+        let bin = PackagesRoot::from_home(home)
+            .package_dir(MARIADB_PACKAGE_NAME, MARIADB_SERIES, version)
+            .join("bin");
+        std::fs::create_dir_all(&bin).expect("mkdir package bin");
+        for name in ["mariadbd", "mariadb", "mariadb-admin"] {
+            let content = if name == "mariadbd" {
+                body
+            } else {
+                "#!/bin/sh\n"
+            };
+            std::fs::write(bin.join(name), content.as_bytes()).expect("write fake binary");
+        }
+    }
+
+    /// The three subdirectories `mariadb_runtime_dirs` CHECKS for before it
+    /// will hand back the four pinned paths. Separate from
+    /// [`install_fake_mariadb_package`] on purpose: that fixture describes a
+    /// tree discovery can find, and every test using it should keep getting
+    /// exactly that. Only the tests that need a re-render to actually happen
+    /// pay for a complete tree.
+    #[cfg(unix)]
+    fn complete_fake_mariadb_tree(home: &Path, version: &str) {
+        let dir = PackagesRoot::from_home(home).package_dir(
+            MARIADB_PACKAGE_NAME,
+            MARIADB_SERIES,
+            version,
+        );
+        for sub in ["lib/plugin", "share/charsets", "share/english"] {
+            std::fs::create_dir_all(dir.join(sub)).expect("mkdir runtime dir");
+        }
+    }
+
+    /// A runtime naming one CONCRETE installed version — the shape discovery
+    /// produces, without going through discovery, so a test can pin which of
+    /// two installed versions is being registered.
+    #[cfg(unix)]
+    fn mariadb_runtime_at(home: &Path, version: &str) -> MariadbRuntime {
+        let bin = PackagesRoot::from_home(home)
+            .package_dir(MARIADB_PACKAGE_NAME, MARIADB_SERIES, version)
+            .join("bin");
+        MariadbRuntime {
+            series: MARIADB_SERIES,
+            version: version.to_string(),
+            mariadbd: bin.join("mariadbd"),
+            mariadb: bin.join("mariadb"),
+            mariadb_admin: bin.join("mariadb-admin"),
+        }
+    }
+
+    /// A runtime pointing at paths that need not exist: every test below
+    /// except the packaged-discovery one is about the SPEC's shape, and a
+    /// `ServiceSpec` is data — it is built without touching either binary.
+    fn fake_mariadb_runtime() -> MariadbRuntime {
+        MariadbRuntime {
+            series: MARIADB_SERIES,
+            version: "11.4.9".to_string(),
+            mariadbd: PathBuf::from("/nowhere/11.4.9/bin/mariadbd"),
+            mariadb: PathBuf::from("/nowhere/11.4.9/bin/mariadb"),
+            mariadb_admin: PathBuf::from("/nowhere/11.4.9/bin/mariadb-admin"),
+        }
+    }
+
+    /// Limited to CATALOGUE majors: `MysqlMajor::from_probe` (the shape-only
+    /// constructor discovery uses) is `pub(crate)` to `openvhost-core`, so a
+    /// non-catalogue major cannot be built from this crate at all. That is
+    /// why the id-collision test below works on
+    /// [`mysql_service_id`]/[`mariadb_service_id`] directly rather than on
+    /// runtimes — the id functions accept any probed major, which is exactly
+    /// the population "distinct from every MySQL major" has to cover, and
+    /// `11.4` (the interesting one) is not in the catalogue.
+    fn fake_mysql_runtime(major: &str) -> MysqlRuntime {
+        let major = openvhost_core::mysql::MysqlMajor::parse(major).expect("a catalogue major");
+        MysqlRuntime {
+            major,
+            mysqld: PathBuf::from("/nowhere/bin/mysqld"),
+            mysql: PathBuf::from("/nowhere/bin/mysql"),
+            mysqladmin: PathBuf::from("/nowhere/bin/mysqladmin"),
+            source: openvhost_core::mysql::MysqlRuntimeSource::Homebrew,
+        }
+    }
+
+    /// The `ServiceStatus` the tray sees for a freshly registered, not-yet-
+    /// started row — built FROM the real `ServiceSpec` rather than from
+    /// hand-typed strings, so a test cannot pass against an id or endpoint
+    /// the Supervisor was never actually given.
+    fn stopped_row(spec: &ServiceSpec) -> openvhost_proc::ServiceStatus {
+        openvhost_proc::ServiceStatus {
+            id: spec.id.clone(),
+            display_name: spec.display_name.clone(),
+            endpoint: spec.endpoint.clone(),
+            pid: None,
+            state: openvhost_proc::ServiceState::Stopped,
+        }
+    }
+
+    // ---- Group A: argv is EXACTLY one argument ----
+
+    /// Spec D4's rule, carried to the second engine: `--defaults-file` is a
+    /// server requirement and everything else lives inside that file, so the
+    /// spawn spec is stable across every config change. A second argument
+    /// here would mean a setting that the rendered my.cnf does not describe
+    /// — invisible to the diff preview and to `mariadbd --verbose --help`.
+    #[test]
+    fn the_mariadb_spec_argv_is_exactly_one_defaults_file_argument() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+
+        let spec = mariadb_spec(home, &fake_mariadb_runtime());
+
+        let mut expected = OsString::from("--defaults-file=");
+        expected.push(mariadb_paths(home).my_cnf.as_os_str());
+        assert_eq!(
+            spec.spawn.args,
+            vec![expected],
+            "argv must be exactly one --defaults-file argument, got {:?}",
+            spec.spawn.args
+        );
+        assert!(
+            spec.spawn.env.is_empty() && spec.spawn.cwd.is_none(),
+            "nothing may reach the server outside the defaults file: {:?}",
+            spec.spawn
+        );
+    }
+
+    // ---- Group B: a CONCRETE program path, never `current` ----
+
+    /// The lesson that cost a full misdiagnosis in the MySQL slice (spec
+    /// D5), re-proven at the seam that matters: the Supervisor spawns
+    /// `ServiceSpec::spawn.program`, so if that path went through the
+    /// `current` link, swinging the link would silently change which engine
+    /// a restart brings up while the UI still described the old one.
+    ///
+    /// Non-vacuous by CONTENT, not by path shape: the final assertion reads
+    /// the bytes back through the recorded path after the swap. Had the spec
+    /// recorded `…/current/bin/mariadbd`, that identical read would return
+    /// the other version's bytes.
+    #[cfg(unix)]
+    #[test]
+    fn a_packaged_mariadb_spec_spawns_a_concrete_version_and_survives_a_current_swap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        install_fake_mariadb_package(home, "11.4.9", "11.4.9 server\n");
+        install_fake_mariadb_package(home, "11.4.10", "11.4.10 server\n");
+        point_current(home, MARIADB_PACKAGE_NAME, MARIADB_SERIES, "11.4.10");
+
+        let found = discover_installed_mariadb(home);
+        assert_eq!(found.len(), 1, "got {found:?}");
+        let spec = mariadb_spec(home, &found[0]);
+
+        assert!(
+            spec.spawn
+                .program
+                .starts_with(PackagesRoot::from_home(home).package_dir(
+                    MARIADB_PACKAGE_NAME,
+                    MARIADB_SERIES,
+                    "11.4.10"
+                )),
+            "the supervisor would spawn {:?}, which is not the concrete version directory",
+            spec.spawn.program
+        );
+        assert!(
+            !spec
+                .spawn
+                .program
+                .components()
+                .any(|c| c.as_os_str() == "current"),
+            "the supervisor would spawn through the current link: {:?}",
+            spec.spawn.program
+        );
+
+        point_current(home, MARIADB_PACKAGE_NAME, MARIADB_SERIES, "11.4.9");
+        assert_eq!(
+            std::fs::read(&spec.spawn.program).expect("read the spawned binary"),
+            b"11.4.10 server\n",
+            "a current swap changed the engine an already-registered spec spawns"
+        );
+        // And the swap really did take effect — otherwise the assertion above
+        // could be passing because nothing moved at all.
+        let after = mariadb_spec(home, &discover_installed_mariadb(home)[0]);
+        assert_eq!(
+            std::fs::read(&after.spawn.program).expect("read the spawned binary"),
+            b"11.4.9 server\n",
+        );
+    }
+
+    // ---- Group C: id and endpoint distinct from EVERY MySQL major ----
+
+    /// Two MySQL majors are alternatives for one address; two ENGINES are
+    /// not. `11.4` is in the list deliberately: it is the one probed MySQL
+    /// major whose bare version string equals MariaDB's series, so an id
+    /// built without an engine-naming prefix would collide there and
+    /// nowhere else.
+    #[test]
+    fn the_mariadb_id_collides_with_no_mysql_major_including_its_own_series_string() {
+        let mariadb = mariadb_service_id(MARIADB_SERIES);
+        for major in ["5.7", "8.0", "8.4", "9.0", MARIADB_SERIES] {
+            assert_ne!(mariadb, mysql_service_id(major), "major {major}");
+        }
+        assert!(
+            mariadb.starts_with(MARIADB_ID_PREFIX) && !mariadb.starts_with(MYSQL_ID_PREFIX),
+            "{mariadb} is not recognisable as a MariaDB row"
+        );
+    }
+
+    /// Spec D2, at the value that actually reaches the tray: the two rows'
+    /// endpoints, read off real specs rather than off the constants.
+    #[test]
+    fn the_two_engines_declare_different_endpoints() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+
+        let my = mysql_spec(home, &fake_mysql_runtime("8.4"));
+        let mdb = mariadb_spec(home, &fake_mariadb_runtime());
+
+        assert_eq!(my.endpoint.as_deref(), Some("127.0.0.1:3306"));
+        assert_eq!(mdb.endpoint.as_deref(), Some("127.0.0.1:3307"));
+        assert_ne!(my.endpoint, mdb.endpoint);
+        assert_ne!(my.id, mdb.id);
+    }
+
+    // ---- Group D: BOTH engines are started by "Start all" ----
+
+    /// The regression spec D2 exists to prevent, pinned at the only place it
+    /// is observable. `tray::model::bulk_start_ids` collapses services that
+    /// share an endpoint STRING, correctly treating them as alternatives for
+    /// one address — so a MariaDB row declaring `127.0.0.1:3306` would be
+    /// dropped from "Start all" with **no error and no log line**: a service
+    /// that simply never starts.
+    ///
+    /// Non-vacuity is the whole point of the second half of this test. The
+    /// first half alone would keep passing if the dedupe were deleted
+    /// outright; the second half re-runs the identical pair with MariaDB
+    /// declaring MySQL's address and shows the row really does vanish. So
+    /// the first assertion passes BECAUSE of the distinct endpoint, and not
+    /// for want of a mechanism that could drop it.
+    #[test]
+    fn both_engines_survive_the_trays_endpoint_dedupe_and_start_together() {
+        use crate::tray::model::bulk_start_ids;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        let my = mysql_spec(home, &fake_mysql_runtime("8.4"));
+        let mdb = mariadb_spec(home, &fake_mariadb_runtime());
+
+        let ids = bulk_start_ids(&[stopped_row(&my), stopped_row(&mdb)]);
+        assert!(
+            ids.contains(&my.id) && ids.contains(&mdb.id),
+            "Start all must start both engines, got {ids:?}"
+        );
+
+        let collided = openvhost_proc::ServiceStatus {
+            endpoint: my.endpoint.clone(),
+            ..stopped_row(&mdb)
+        };
+        let ids = bulk_start_ids(&[stopped_row(&my), collided]);
+        assert_eq!(
+            ids,
+            vec![my.id.clone()],
+            "the dedupe that the distinct endpoint exists to escape is not actually live, \
+             so the assertion above proves nothing"
+        );
+    }
+
+    // ---- Group E: the directories a real server aborts without ----
+
+    /// Both found by a live run, not by a unit test, and both repaired at
+    /// the one chokepoint every registration path goes through — see
+    /// `mariadb_spec`'s own doc comment for why the spec, and not init, is
+    /// where this belongs.
+    #[test]
+    fn mariadb_spec_ensures_the_directories_a_real_server_aborts_without() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        let paths = mariadb_paths(home);
+        let run_dir = paths.socket.parent().expect("the socket has a parent");
+        assert!(
+            !paths.custom_confd.exists() && !run_dir.exists(),
+            "neither may exist before the call, or this test proves nothing"
+        );
+
+        let _spec = mariadb_spec(home, &fake_mariadb_runtime());
+
+        assert!(
+            paths.custom_confd.is_dir(),
+            "a missing !includedir aborts defaults handling"
+        );
+        assert!(
+            run_dir.is_dir(),
+            "a missing run directory makes mariadbd report a phantom other server"
+        );
+    }
+
+    // ---- Group E2: the config follows the RUNTIME, not the series ----
+
+    /// The 2026-08-04 audit's M2. `mariadb_paths` keys `my_cnf` on the
+    /// SERIES, while spec D3's four pinned directives name a CONCRETE version
+    /// directory. Without a re-render at registration those two disagree the
+    /// first time a patch release lands: the Supervisor is handed the newly
+    /// discovered `mariadbd` while `--defaults-file` still aims `basedir`,
+    /// `plugin_dir`, `character-sets-dir` and `lc_messages_dir` at the
+    /// previous version's tree — and at a `plugin_dir` that does not exist at
+    /// all once that version is uninstalled.
+    ///
+    /// Two installed versions, because one cannot show the disagreement: the
+    /// assertion is that the file names the version being REGISTERED and no
+    /// longer mentions the other one anywhere.
+    #[cfg(unix)]
+    #[test]
+    fn registering_a_runtime_rewrites_a_my_cnf_left_behind_by_another_version() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        for v in ["11.4.9", "11.4.10"] {
+            install_fake_mariadb_package(home, v, "fake server\n");
+            complete_fake_mariadb_tree(home, v);
+        }
+        let paths = mariadb_paths(home);
+
+        // A config left behind by 11.4.9 ...
+        let _ = mariadb_spec(home, &mariadb_runtime_at(home, "11.4.9"));
+        let stale = std::fs::read_to_string(&paths.my_cnf).expect("read my.cnf");
+        assert!(
+            stale.contains("11.4.9") && !stale.contains("11.4.10"),
+            "the fixture must start out naming ONLY the old version, or this \
+             test proves nothing; got:\n{stale}"
+        );
+
+        // ... is corrected when 11.4.10 is the runtime being registered.
+        let _ = mariadb_spec(home, &mariadb_runtime_at(home, "11.4.10"));
+
+        let fresh = std::fs::read_to_string(&paths.my_cnf).expect("read my.cnf");
+        assert!(
+            fresh.contains("11.4.10"),
+            "the config must name the runtime actually being registered; got:\n{fresh}"
+        );
+        assert!(
+            !fresh.contains("11.4.9"),
+            "no directive may still point into the previous version's tree; got:\n{fresh}"
+        );
+    }
+
+    /// The re-render must not be able to take a user's customization with it.
+    /// `write_generated_config` only creates `custom_confd` and atomically
+    /// writes the generated file — it never truncates or enumerates the
+    /// drop-in directory — so a drop-in must survive a version change
+    /// byte for byte. Asserted by INODE as well as content: a
+    /// delete-and-recreate with identical bytes passes a content-only check,
+    /// and this project has shipped that mistake before.
+    #[cfg(unix)]
+    #[test]
+    fn a_re_render_leaves_the_users_drop_ins_untouched() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        for v in ["11.4.9", "11.4.10"] {
+            install_fake_mariadb_package(home, v, "fake server\n");
+            complete_fake_mariadb_tree(home, v);
+        }
+        let paths = mariadb_paths(home);
+
+        let _ = mariadb_spec(home, &mariadb_runtime_at(home, "11.4.9"));
+        let drop_in = paths.custom_confd.join("zz-mine.cnf");
+        std::fs::write(&drop_in, b"[mysqld]\nmax_connections = 42\n").expect("write drop-in");
+        let before = std::fs::metadata(&drop_in).expect("stat drop-in");
+
+        let _ = mariadb_spec(home, &mariadb_runtime_at(home, "11.4.10"));
+
+        let after = std::fs::metadata(&drop_in).expect("the drop-in must still exist");
+        assert_eq!(
+            std::fs::read(&drop_in).expect("read drop-in"),
+            b"[mysqld]\nmax_connections = 42\n",
+            "a re-render must not rewrite what the user owns"
+        );
+        assert_eq!(
+            before.ino(),
+            after.ino(),
+            "same bytes at a NEW inode still means the file was replaced"
+        );
+    }
+
+    // ---- Group F: readiness ----
+
+    /// The probe asserts the server ANSWERS, never that a credential works —
+    /// see `mariadb_spec` and `mariadb_admin_ping_argv`. What is pinned here
+    /// is that the probe is a real command bounded by a deadline (a default
+    /// `AliveAfter` probe would call a server `Running` while it was still
+    /// building its redo logs) and that no credential rides along in it.
+    #[test]
+    fn the_readiness_probe_is_a_bounded_ping_carrying_no_credential() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        let rt = fake_mariadb_runtime();
+
+        let spec = mariadb_spec(home, &rt);
+
+        match &spec.readiness {
+            ReadinessProbe::Command { argv, deadline } => {
+                assert_eq!(*deadline, MARIADB_READY_DEADLINE);
+                assert_eq!(
+                    argv.first().map(String::as_str),
+                    Some("/nowhere/11.4.9/bin/mariadb-admin")
+                );
+                assert!(argv.iter().any(|a| a == "ping"), "{argv:?}");
+                assert!(
+                    argv.iter().all(|a| !a.contains("password")),
+                    "a credential must never reach argv: {argv:?}"
+                );
+            }
+            other => panic!("expected a Command probe, got {other:?}"),
+        }
+        assert!(
+            spec.grace >= MYSQL_GRACE,
+            "InnoDB needs at least what MySQL's flush budget allows"
         );
     }
 }

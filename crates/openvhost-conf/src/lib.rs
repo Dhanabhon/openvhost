@@ -8,6 +8,7 @@ mod ctx;
 mod engine;
 mod error;
 mod inspect;
+mod mariadb;
 mod mysql;
 mod phpruntime;
 pub mod settings;
@@ -20,6 +21,7 @@ pub use inspect::{
     PROBE_TIMEOUT, probe_mysqld_version, probe_nginx_version, probe_php_fpm_version, run_bounded,
     validate_live,
 };
+pub use mariadb::{MariadbCtx, generate_mariadb_my_cnf};
 pub use mysql::{MysqlCtx, MysqlValidator, generate_my_cnf};
 pub use phpruntime::{PhpFpmRuntime, PhpRuntimeAdapter};
 pub use settings::{

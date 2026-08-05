@@ -39,15 +39,20 @@ pub use logs::{
     LogCursor, LogLevel, LogLimits, LogPaths, LogQuery, LogReset, LogRow, LogWindow,
     classify_level, ensure_log_dir, read_window,
 };
-/// MariaDB's package surface. Nothing here is wired to a Tauri command, a CLI
-/// subcommand or a UI control, and nothing may be until the owner publishes the
-/// release the catalogue pins — see `mariadb::Availability`. Exported so the
-/// pin is inspectable (and testable) without exposing an install a user could
-/// trigger into a 404.
+/// MariaDB's package and service surface. Nothing here is wired to a Tauri
+/// command, a CLI subcommand or a UI control, and the install path may not be
+/// until the owner publishes the release the catalogue pins — see
+/// `mariadb::Availability`. Exported so the pin is inspectable (and testable)
+/// without exposing an install a user could trigger into a 404.
+///
+/// `classify_mariadb_datadir` is the one function here whose verdict authorises
+/// a destructive next step, and it is deliberately the only one: nothing else
+/// in this list writes anything at all.
 pub use mariadb::{
     Availability, MARIADB_PACKAGE_NAME, MARIADB_PACKAGES, MARIADB_SERIES, MARIADB_WARMUP_BINARY,
-    MariadbPackage, MariadbPackageInstall, install_mariadb_package, mariadb_package_for_host,
-    mariadb_package_for_target,
+    MariadbDatadirState, MariadbPackage, MariadbPackageInstall, MariadbPaths, MariadbRuntime,
+    classify_mariadb_datadir, discover_mariadb, install_mariadb_package, mariadb_data_root,
+    mariadb_package_for_host, mariadb_package_for_target, mariadb_paths, packaged_mariadb_runtime,
 };
 pub use mysql::{
     DatadirState, InstallLedger, LedgerEntry, LedgerWrite, MYSQL_CATALOGUE, MYSQL_PACKAGE_NAME,

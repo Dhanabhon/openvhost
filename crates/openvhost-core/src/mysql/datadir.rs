@@ -73,7 +73,13 @@ impl MysqlPaths {
     }
 }
 
-fn guard_socket_path(path: &Path) -> Result<(), CoreError> {
+/// `pub(crate)`, not private: `crate::mariadb::MariadbPaths` calls this exact
+/// check for its own two sockets (spec D5 — "reuse what is already generic").
+/// The 104-byte `sun_path` ceiling is a property of the OS, not of an engine,
+/// so a second copy would be a second place for it to drift. Moving this out of
+/// `mysql/` alongside the other misfiled generic helpers is the mechanical
+/// follow-up that slice deliberately does not take.
+pub(crate) fn guard_socket_path(path: &Path) -> Result<(), CoreError> {
     let len = path.as_os_str().as_encoded_bytes().len();
     if len > MAX_SOCKET_PATH_BYTES {
         return Err(CoreError::SocketPathTooLong {

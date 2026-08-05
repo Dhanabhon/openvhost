@@ -65,6 +65,71 @@ pub fn write_generated_config(
     Ok(crate::atomicfile::write_atomic(&file.path, &file.contents)?)
 }
 
+/// The four runtime directories a server must be TOLD about, so it does not
+/// resolve them out of its compiled-in prefix (2026-08-04 MariaDB-service spec
+/// D3). Every field names a directory inside the package tree the runtime was
+/// actually discovered in — the values `openvhost_conf::MysqlCtx`'s four
+/// matching fields are filled from, one for one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MysqlRuntimeDirs {
+    pub basedir: PathBuf,
+    pub plugin_dir: PathBuf,
+    pub character_sets_dir: PathBuf,
+    pub lc_messages_dir: PathBuf,
+}
+
+/// The first candidate under `basedir` that actually exists on disk.
+///
+/// A PROBE, not a guess, and that distinction is the point: the two MySQL
+/// install shapes this app supports genuinely disagree about where the
+/// non-binary data lives. Measured 2026-08-04 on this machine — Homebrew's
+/// `mysql@8.4` has `share/mysql/charsets` and `share/mysql/english`, while
+/// Oracle's own tarball (and the MariaDB package) use `share/charsets` and
+/// `share/english`. Hardcoding either suffix would silently point one install
+/// shape at a directory that is not there, and a wrong `character-sets-dir` is
+/// a server that refuses to start rather than one that quietly misbehaves —
+/// but only at start time, long after the config was written.
+fn first_existing(basedir: &Path, candidates: &[&str]) -> Option<PathBuf> {
+    candidates
+        .iter()
+        .map(|rel| basedir.join(rel))
+        .find(|p| p.is_dir())
+}
+
+/// Derive [`MysqlRuntimeDirs`] from an already-discovered runtime.
+///
+/// `basedir` is `mysqld`'s grandparent (`<basedir>/bin/mysqld`), taken from the
+/// discovered path rather than from any configured or user-supplied value —
+/// discovery is the only thing that knows which install is about to be
+/// spawned, and spec D3 requires these four to name THAT tree.
+///
+/// Returns `None` when the install does not have the directories a server
+/// needs; the caller reports that as a Render failure rather than writing a
+/// `my.cnf` that points at nothing. Deliberately not a fallback to the
+/// compiled-in prefix: falling back is precisely the dependence this exists to
+/// remove.
+pub fn mysql_runtime_dirs(mysqld: &Path) -> Option<MysqlRuntimeDirs> {
+    let bin = mysqld.parent()?;
+    if bin.file_name() != Some(std::ffi::OsStr::new("bin")) {
+        return None;
+    }
+    let basedir = bin.parent()?.to_path_buf();
+    let plugin_dir = first_existing(&basedir, &["lib/plugin"])?;
+    let character_sets_dir = first_existing(&basedir, &["share/mysql/charsets", "share/charsets"])?;
+    // The PARENT of the per-language directories: the server appends
+    // `lc_messages` (e.g. `english/`) itself, so this must be the directory
+    // that CONTAINS `english/errmsg.sys`, never that directory.
+    let lc_messages_dir = first_existing(&basedir, &["share/mysql/english", "share/english"])?
+        .parent()?
+        .to_path_buf();
+    Some(MysqlRuntimeDirs {
+        basedir,
+        plugin_dir,
+        character_sets_dir,
+        lc_messages_dir,
+    })
+}
+
 /// A fresh v4 UUID rendered in "simple" form: 32 lowercase hex characters,
 /// no hyphens. Shared by [`generate_root_password`] (spec D3: "uuid v4
 /// simple hex, 32 chars") and [`staging_dir_path`]'s unique suffix — both
@@ -278,7 +343,12 @@ pub fn remove_staging_dir(staging: &Path) -> io::Result<()> {
 /// symlink or a non-directory at `final_dir`, or anything else found
 /// inside it, refuses to delete ANYTHING (not even the `.DS_Store` files
 /// alongside it) and reports what blocked it.
-fn clear_ignorable_clutter(final_dir: &Path) -> Result<(), String> {
+///
+/// `pub(crate)` rather than private: MariaDB's `finalize_mariadb_staging` runs
+/// the identical step, and `.DS_Store` clutter is a property of macOS Finder,
+/// not of MySQL — spec D5's "reuse in place rather than fork" applies to it as
+/// squarely as to `sweep_stale_staging` next door.
+pub(crate) fn clear_ignorable_clutter(final_dir: &Path) -> Result<(), String> {
     let meta = match std::fs::symlink_metadata(final_dir) {
         Ok(meta) => meta,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -448,6 +518,112 @@ mod tests {
             !sql.contains("'ab'cd'"),
             "a single, undoubled quote would break out of the string literal: {sql:?}"
         );
+    }
+
+    // ---- mysql_runtime_dirs ----
+
+    /// Lay down one of the two real install shapes under `base`.
+    /// `share_prefix` is `"share/mysql"` for Homebrew's `mysql@8.4` and
+    /// `"share"` for Oracle's own tarball — both measured on a real machine
+    /// 2026-08-04.
+    fn fake_install(base: &Path, share_prefix: &str) -> PathBuf {
+        std::fs::create_dir_all(base.join("bin")).unwrap();
+        std::fs::create_dir_all(base.join("lib/plugin")).unwrap();
+        std::fs::create_dir_all(base.join(share_prefix).join("charsets")).unwrap();
+        std::fs::create_dir_all(base.join(share_prefix).join("english")).unwrap();
+        let mysqld = base.join("bin/mysqld");
+        std::fs::write(&mysqld, b"#!/bin/sh\n").unwrap();
+        mysqld
+    }
+
+    #[test]
+    fn runtime_dirs_follow_the_homebrew_layout_when_that_is_what_is_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("mysql@8.4");
+        let mysqld = fake_install(&base, "share/mysql");
+
+        let d = mysql_runtime_dirs(&mysqld).expect("a complete install must resolve");
+
+        assert_eq!(d.basedir, base);
+        assert_eq!(d.plugin_dir, base.join("lib/plugin"));
+        assert_eq!(d.character_sets_dir, base.join("share/mysql/charsets"));
+        // The PARENT of `english/`, never `english/` itself.
+        assert_eq!(d.lc_messages_dir, base.join("share/mysql"));
+    }
+
+    #[test]
+    fn runtime_dirs_follow_the_tarball_layout_when_that_is_what_is_on_disk() {
+        // The same function, the OTHER real layout — this is the pair that
+        // makes a hardcoded suffix wrong for one install shape or the other.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("8.4.11");
+        let mysqld = fake_install(&base, "share");
+
+        let d = mysql_runtime_dirs(&mysqld).expect("a complete install must resolve");
+
+        assert_eq!(d.character_sets_dir, base.join("share/charsets"));
+        assert_eq!(d.lc_messages_dir, base.join("share"));
+    }
+
+    #[test]
+    fn every_resolved_directory_lives_inside_the_discovered_package_tree() {
+        // Spec D3's actual requirement, asserted structurally rather than by
+        // spelling the expected paths out a second time.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("mysql@8.4");
+        let mysqld = fake_install(&base, "share/mysql");
+
+        let d = mysql_runtime_dirs(&mysqld).unwrap();
+
+        for p in [&d.plugin_dir, &d.character_sets_dir, &d.lc_messages_dir] {
+            assert!(
+                p.starts_with(&d.basedir),
+                "{} escaped the package tree {}",
+                p.display(),
+                d.basedir.display()
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_dirs_refuse_an_install_missing_its_plugin_directory() {
+        // VACUITY for the whole group: this is the same fixture as the passing
+        // tests above with ONE directory removed. Restore `lib/plugin` and it
+        // resolves; that is the break-it-and-watch-it-fail step, standing.
+        // Refusing is the point — falling back to the compiled-in prefix is
+        // exactly the dependence spec D3 exists to remove.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("mysql@8.4");
+        let mysqld = fake_install(&base, "share/mysql");
+        std::fs::remove_dir_all(base.join("lib/plugin")).unwrap();
+
+        assert!(mysql_runtime_dirs(&mysqld).is_none());
+    }
+
+    #[test]
+    fn runtime_dirs_refuse_an_install_with_no_charset_directory_in_either_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("mysql@8.4");
+        let mysqld = fake_install(&base, "share/mysql");
+        std::fs::remove_dir_all(base.join("share/mysql/charsets")).unwrap();
+
+        assert!(mysql_runtime_dirs(&mysqld).is_none());
+    }
+
+    #[test]
+    fn runtime_dirs_refuse_a_binary_that_is_not_under_a_bin_directory() {
+        // `<basedir>/bin/mysqld` is the shape the grandparent walk assumes. A
+        // binary somewhere else would make `basedir` a directory that merely
+        // happens to be two levels up — silently wrong, which is worse than a
+        // refusal.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("mysql@8.4");
+        fake_install(&base, "share/mysql");
+        std::fs::create_dir_all(base.join("sbin")).unwrap();
+        let elsewhere = base.join("sbin/mysqld");
+        std::fs::write(&elsewhere, b"#!/bin/sh\n").unwrap();
+
+        assert!(mysql_runtime_dirs(&elsewhere).is_none());
     }
 
     // ---- write_generated_config ----
