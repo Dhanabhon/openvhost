@@ -17,7 +17,7 @@
 	import { servicesStore } from '$lib/services.shared.svelte';
 	import { uninstallStore } from '$lib/uninstall.shared.svelte';
 	import { runningCount } from '$lib/services.derive';
-	import { catalogedMajors } from '$lib/databases.derive';
+	import { catalogedMajors, engineInstallOffered } from '$lib/databases.derive';
 	import { copyToClipboard } from '$lib/utils/clipboard';
 	import AppShell from '$lib/components/AppShell.svelte';
 	import Button from '$lib/components/Button.svelte';
@@ -35,6 +35,17 @@
 		mariadbRow?.serviceId === null || mariadbRow?.serviceId === undefined
 			? null
 			: (servicesStore.services.find((s) => s.id === mariadbRow.serviceId)?.state ?? null)
+	);
+	/** Whether MariaDB currently has anything to press Install on (fix wave
+	 *  item 2) — `false` for `awaitingRelease`/`unavailable`, which is exactly
+	 *  the state this build ships in today. Fed to `DatabasesEmpty`'s own
+	 *  `installable` prop so its "get started" invite stops claiming an
+	 *  action, or naming Homebrew, when no Install control exists anywhere on
+	 *  the page. `false` before the first load settles (`mariadbRow === null`)
+	 *  — moot in practice, since that is also when `mariadbRow` gates the
+	 *  whole panel below from rendering at all. */
+	const mariadbInstallable = $derived(
+		mariadbRow !== null && engineInstallOffered(mariadbRow.offer)
 	);
 
 	/**
@@ -344,7 +355,11 @@
 					{mariadbStore.error}
 				</div>
 			{/if}
-			<DatabasesEmpty engine="mariadb" anyInstalled={mariadbStore.anyInstalled} />
+			<DatabasesEmpty
+				engine="mariadb"
+				anyInstalled={mariadbStore.anyInstalled}
+				installable={mariadbInstallable}
+			/>
 			<div class="check-again">
 				<Button
 					size="sm"

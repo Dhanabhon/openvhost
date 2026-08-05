@@ -174,6 +174,26 @@ describe('the /databases route — the MariaDB group', () => {
 			const { body } = render(DatabasesPage);
 			expect(body).toContain('data-testid="databases-no-mariadb"');
 		});
+
+		// Fix wave item 2 (audit + live proof): the invite used to say "Install
+		// MariaDB to get started" and describe the download mechanism — Homebrew
+		// mention included — directly above a row that offers no Install control
+		// at all in this state. Neither half of this was visible to a test that
+		// renders `DatabasesEmpty` or `MysqlRow` in isolation: it takes the FULL
+		// PAGE, with both siblings rendered together, to see the empty-state copy
+		// contradict the row right below it.
+		it('tells the truth in the empty-state invite instead of pitching an install that is not offered', () => {
+			mariadbStore.env = mariadbEnv();
+			const { body } = render(DatabasesPage);
+			expect(body).toMatch(/MariaDB cannot be installed here right now/i);
+			expect(body).not.toMatch(/install mariadb to get started/i);
+		});
+
+		it('never mentions Homebrew anywhere on the page while awaiting release', () => {
+			mariadbStore.env = mariadbEnv();
+			const { body } = render(DatabasesPage);
+			expect(body).not.toMatch(/homebrew/i);
+		});
 	});
 
 	// Hand-built, since no real environment can produce this state until the

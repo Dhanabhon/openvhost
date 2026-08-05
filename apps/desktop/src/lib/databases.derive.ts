@@ -14,12 +14,7 @@ import type {
 	MysqlPackageOfferDto,
 	MysqlRuntimeSourceDto
 } from './ipc';
-import {
-	mysqlSourceBadge,
-	mysqlUnavailableFallback,
-	mysqlUninstallOffered,
-	type Notice
-} from './mysql-install.derive';
+import { mysqlSourceBadge, mysqlUninstallOffered, type Notice } from './mysql-install.derive';
 
 /** Same shape `LogPane.svelte` renders (`services.svelte.ts`'s `UiLog`),
  *  redeclared here rather than imported — same reasoning as
@@ -101,14 +96,16 @@ export interface EngineDescriptor {
 	 *  (datadirs are shared ACROSS its two install sources); MariaDB has no
 	 *  second source to share one with, so it gets its own, simpler fact. */
 	datadirDisclosure: string;
-	/** The extra sentence for an honest "no verified download" explanation —
-	 *  MySQL names Homebrew as a real fallback; MariaDB has none (design D2:
-	 *  "There is no Homebrew fallback for MariaDB anywhere in this app").
-	 *  MySQL's own row still sources its `unavailable` copy from
-	 *  `mysql-install.derive.ts` directly, unchanged — carried here so a
-	 *  future MariaDB-specific notice cannot silently inherit MySQL's
-	 *  sentence by copy-paste. */
-	unavailableFallback: (target: string) => string | null;
+	/** The manual-recovery sentence for a stale stored credential, rendered by
+	 *  BOTH the reset-`authFailed` and verify-`authFailed` states (fix wave
+	 *  item 1). MySQL's is {@link STALE_CREDENTIAL_RECOVERY}, unchanged;
+	 *  MariaDB's own equivalent names MariaDB's own `--skip-grant-tables`
+	 *  recovery procedure, never MySQL's. Previously a bare module constant
+	 *  `MysqlCredentials.svelte` rendered unconditionally for both engines —
+	 *  a fourth instance of the "shared component says MySQL" bug this file's
+	 *  own D1 discipline exists to prevent, missed by an earlier sweep because
+	 *  it is a STRING, not a function call site. */
+	staleCredentialRecovery: string;
 	/** What provenance badge to show beside the version, or none. MySQL's own
 	 *  `mysqlSourceBadge`, reused verbatim; MariaDB shows none — with exactly
 	 *  one possible source, there is nothing to disambiguate. */
@@ -276,6 +273,31 @@ export function notInstalledRowState(offer: EngineOfferDto): MysqlRowState {
 			return { kind: 'awaitingRelease', tag: offer.tag };
 		case 'unavailable':
 			return { kind: 'unavailable', target: offer.target };
+		default: {
+			const unreachable: never = offer;
+			return unreachable;
+		}
+	}
+}
+
+/**
+ * Whether this engine currently has anything to press Install on — the
+ * question `DatabasesEmpty.svelte`'s own "get started" invite needs answered
+ * before it claims an action exists (fix wave item 2): `awaitingRelease` and
+ * `unavailable` both mean no Install control exists anywhere on the page,
+ * even before anything is installed, so the invite must not describe an
+ * install, or name a mechanism (Homebrew), that this engine is not actually
+ * offering right now. Exhaustive over {@link EngineOfferDto} for the same
+ * reason {@link notInstalledRowState} is: a third offer state must decide
+ * here, not silently inherit "yes, installable".
+ */
+export function engineInstallOffered(offer: EngineOfferDto): boolean {
+	switch (offer.kind) {
+		case 'available':
+			return true;
+		case 'awaitingRelease':
+		case 'unavailable':
+			return false;
 		default: {
 			const unreachable: never = offer;
 			return unreachable;
@@ -453,6 +475,14 @@ function mariadbPortConflictHint(stderrTail: readonly string[]): string | null {
 const MARIADB_DATADIR_DISCLOSURE =
 	"MariaDB's data directory is created the first time you initialize it below.";
 
+/** MariaDB's own manual-recovery copy for a stale stored credential (fix wave
+ *  item 1) — mirrors {@link STALE_CREDENTIAL_RECOVERY} exactly, substituting
+ *  MariaDB's own `--skip-grant-tables` recovery procedure for MySQL's, the
+ *  same substitution {@link mariadbPortConflictHint}/
+ *  {@link MARIADB_DATADIR_DISCLOSURE} already make for their own facts. */
+const MARIADB_STALE_CREDENTIAL_RECOVERY =
+	"The stored password doesn't match this data directory — it may have been restored from a backup or changed outside OpenVHost. There is no in-app recovery yet: reset MariaDB's root password manually (MariaDB's own --skip-grant-tables recovery procedure), then use Reset here once you're back in.";
+
 /** MySQL's "get started" invite body — moved here VERBATIM from
  *  `DatabasesEmpty.svelte`'s own markup (task 3), so its rendered text is
  *  byte-for-byte unchanged and that component's existing tests stay green. */
@@ -478,7 +508,7 @@ const MYSQL_DESCRIPTOR: EngineDescriptor = {
 	defaultPort: 3306,
 	portConflictHint: mysqlPortConflictHint,
 	datadirDisclosure: SHARED_DATADIR_DISCLOSURE,
-	unavailableFallback: mysqlUnavailableFallback,
+	staleCredentialRecovery: STALE_CREDENTIAL_RECOVERY,
 	sourcePolicy: mysqlSourceBadge,
 	uninstallPolicy: mysqlUninstallOffered,
 	installInviteBody: MYSQL_INSTALL_INVITE_BODY
@@ -490,7 +520,7 @@ const MARIADB_DESCRIPTOR: EngineDescriptor = {
 	defaultPort: 3307,
 	portConflictHint: mariadbPortConflictHint,
 	datadirDisclosure: MARIADB_DATADIR_DISCLOSURE,
-	unavailableFallback: () => null,
+	staleCredentialRecovery: MARIADB_STALE_CREDENTIAL_RECOVERY,
 	sourcePolicy: () => null,
 	uninstallPolicy: () => true,
 	installInviteBody: MARIADB_INSTALL_INVITE_BODY

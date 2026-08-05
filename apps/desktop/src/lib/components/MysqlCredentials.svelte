@@ -3,7 +3,6 @@
 	import type { MysqlConnectionProofDto, MysqlResetOutcomeDto } from '$lib/ipc';
 	import {
 		MASKED_PASSWORD_PLACEHOLDER,
-		STALE_CREDENTIAL_RECOVERY,
 		engineDescriptor,
 		type EngineKind
 	} from '$lib/databases.derive';
@@ -207,7 +206,7 @@
 			<p class="ok" role="status" data-testid="reset-ok-{major}">Password regenerated.</p>
 		{:else if resetOutcome?.kind === 'authFailed'}
 			<p class="error" role="alert" data-testid="reset-auth-failed-{major}">
-				Reset failed: {resetOutcome.detail}. {STALE_CREDENTIAL_RECOVERY}
+				Reset failed: {resetOutcome.detail}. {descriptor.staleCredentialRecovery}
 			</p>
 		{/if}
 		{#if resetError !== ''}
@@ -232,7 +231,7 @@
 			</p>
 		{:else if verifyResult?.kind === 'authFailed'}
 			<p class="error" role="alert" data-testid="verify-auth-failed-{major}">
-				{verifyResult.detail}. {STALE_CREDENTIAL_RECOVERY}
+				{verifyResult.detail}. {descriptor.staleCredentialRecovery}
 			</p>
 		{:else if verifyResult?.kind === 'failed'}
 			<p class="error" role="alert" data-testid="verify-failed-{major}">{verifyResult.detail}</p>

@@ -20,19 +20,28 @@
 	 * existing MySQL group's markup, test id and copy stay byte-for-byte
 	 * unchanged. The MariaDB group renders its own instance of this same
 	 * component with `engine="mariadb"` rather than a second, near-duplicate
-	 * one — the row/credentials precedent this task follows. Not gated on
-	 * `awaitingRelease`/`unavailable` deliberately, mirroring the EXISTING
-	 * MySQL behaviour this component already had: whether a *particular host*
-	 * can install right now is a per-row fact this component has never
-	 * concerned itself with (see the paragraph above) — same reasoning applies
-	 * unchanged to a release that is pinned but not yet published.
+	 * one — the row/credentials precedent this task follows.
+	 *
+	 * `installable` (fix wave item 2) IS gated on `awaitingRelease`/
+	 * `unavailable`, unlike the paragraph above: the audit found this
+	 * component pitching "Install {label} to get started" — and describing
+	 * the download mechanism, Homebrew mention included — directly above a
+	 * row that offers no Install control at all in either of those two
+	 * states. Whether a *particular host* can install right now is still a
+	 * per-row fact this component does not diagnose (it names no target, no
+	 * release tag), but it must stop claiming an action, or a mechanism, that
+	 * is not actually on offer. Defaults to `true` so every existing caller
+	 * that never passes it — every MySQL call site, and every pre-existing
+	 * test — renders byte-for-byte what it always did.
 	 */
 	let {
 		engine = 'mysql',
-		anyInstalled
+		anyInstalled,
+		installable = true
 	}: {
 		engine?: EngineKind;
 		anyInstalled: boolean;
+		installable?: boolean;
 	} = $props();
 
 	const descriptor = $derived(engineDescriptor(engine));
@@ -40,8 +49,17 @@
 
 {#if !anyInstalled}
 	<div class="empty invite" data-testid="databases-no-{descriptor.idPrefix}">
-		<h3>Install {descriptor.label} to get started</h3>
-		<p>{descriptor.installInviteBody}</p>
+		{#if installable}
+			<h3>Install {descriptor.label} to get started</h3>
+			<p>{descriptor.installInviteBody}</p>
+		{:else}
+			<!-- No target, no release tag, no download mechanism named here —
+			     the row below already carries that detail (its own
+			     `awaitingRelease`/`unavailable` notice), and this invite must not
+			     repeat, or drift from, whatever that says. -->
+			<h3>{descriptor.label} cannot be installed here right now</h3>
+			<p>See the explanation below.</p>
+		{/if}
 	</div>
 {/if}
 

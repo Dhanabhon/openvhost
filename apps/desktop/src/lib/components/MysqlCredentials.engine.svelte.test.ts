@@ -12,9 +12,16 @@
 import { describe, expect, it } from 'vitest';
 import { render } from 'svelte/server';
 import MysqlCredentials from './MysqlCredentials.svelte';
+import type { MysqlConnectionProofDto, MysqlResetOutcomeDto } from '$lib/ipc';
 
 function renderCredentials(
-	props: Partial<{ engine: 'mysql' | 'mariadb'; major: string; port: number }> = {}
+	props: Partial<{
+		engine: 'mysql' | 'mariadb';
+		major: string;
+		port: number;
+		resetOutcome: MysqlResetOutcomeDto;
+		verifyResult: MysqlConnectionProofDto;
+	}> = {}
 ): string {
 	return render(MysqlCredentials, {
 		props: {
@@ -27,8 +34,10 @@ function renderCredentials(
 			passwordError: '',
 			confirmingReset: false,
 			resetting: false,
+			resetOutcome: props.resetOutcome,
 			resetError: '',
 			verifying: false,
+			verifyResult: props.verifyResult,
 			verifyError: '',
 			onReveal: () => {},
 			onHide: () => {},
@@ -69,5 +78,45 @@ describe('MysqlCredentials — engine="mariadb" paints the descriptor, not hardc
 	it('names MariaDB, not MySQL, in the password field’s accessible label', () => {
 		const body = renderCredentials({ engine: 'mariadb' });
 		expect(body).toContain('aria-label="MariaDB 11.4 root password"');
+	});
+});
+
+// Fix wave item 1 (whole-branch review HIGH): a fourth instance of the
+// "shared component says MySQL" bug — `STALE_CREDENTIAL_RECOVERY` was a bare
+// module constant this component rendered UNCONDITIONALLY for both engines,
+// unlike every other string in this file, which goes through `descriptor`.
+// It survived the earlier engine-generic sweep precisely because that sweep
+// looked for CALL SITES (functions like `mysqlPackageOfferNotice`); this is a
+// STRING CONSTANT, not a function, so nothing flagged it. Neither
+// `MariadbResetOutcomeDto::AuthFailed` nor
+// `MariadbConnectionProofDto::AuthFailed` is hypothetical — both are real,
+// tested backend outcomes a MariaDB user can actually hit.
+//
+// Vacuity: each assertion below was proved able to fail by temporarily making
+// `MARIADB_DESCRIPTOR.staleCredentialRecovery` equal
+// `STALE_CREDENTIAL_RECOVERY` (i.e. MySQL's own text) in
+// `databases.derive.ts`, and confirming both tests below went red — the body
+// then contained "reset MySQL's root password manually" under
+// `engine="mariadb"`. The mutation was reverted immediately after.
+describe('MysqlCredentials — engine="mariadb" never tells a stale-credential user to go fix MySQL', () => {
+	it('names MariaDB’s own recovery procedure after a reset auth failure, never MySQL’s', () => {
+		const body = renderCredentials({
+			engine: 'mariadb',
+			resetOutcome: { kind: 'authFailed', detail: 'Access denied for user root' }
+		});
+		expect(body).toContain('data-testid="reset-auth-failed-11.4"');
+		expect(body).toMatch(/reset MariaDB's root password manually/i);
+		expect(body).toMatch(/MariaDB's own --skip-grant-tables recovery procedure/i);
+		expect(body).not.toMatch(/MySQL/);
+	});
+
+	it('names MariaDB’s own recovery procedure after a verify auth failure, never MySQL’s', () => {
+		const body = renderCredentials({
+			engine: 'mariadb',
+			verifyResult: { kind: 'authFailed', detail: 'Access denied for user root' }
+		});
+		expect(body).toContain('data-testid="verify-auth-failed-11.4"');
+		expect(body).toMatch(/reset MariaDB's root password manually/i);
+		expect(body).not.toMatch(/MySQL/);
 	});
 });

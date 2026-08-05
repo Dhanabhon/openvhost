@@ -5,7 +5,6 @@
 		MysqlConnectionProofDto,
 		MysqlInstallOutcomeDto,
 		MysqlInstallProgressDto,
-		MysqlPackageOfferDto,
 		MysqlResetOutcomeDto,
 		ServiceStatus
 	} from '$lib/ipc';
@@ -24,16 +23,13 @@
 		PACKAGED_UNINSTALL_UNAVAILABLE,
 		mysqlCancelLabel,
 		mysqlInstallProgressLabel,
-		mysqlInstallProgressPercent,
-		mysqlInstallResultNotice,
-		mysqlLedgerNotice,
-		mysqlPackageOfferNotice
+		mysqlInstallProgressPercent
 	} from '$lib/mysql-install.derive';
 	import {
-		mariadbInstallResultNotice,
-		mariadbLedgerNotice,
-		mariadbPackageOfferNotice
-	} from '$lib/mariadb-install.derive';
+		engineLedgerNotice,
+		engineOfferNotice,
+		engineOutcomeNotice
+	} from '$lib/mysql-row.derive';
 	import { uninstallActionDisabled, uninstallConfirmLabel } from '$lib/uninstall.derive';
 	import Button from './Button.svelte';
 	import LogPane from './LogPane.svelte';
@@ -260,92 +256,17 @@
 	 *  on every installed MariaDB row, whose packaged Uninstall genuinely
 	 *  works. */
 	const canUninstall = $derived(descriptor.uninstallPolicy(instance.source));
-	/** The settled-install banner (design D1 follow-through, task 3 finding):
-	 *  dispatched on `engine` rather than widening
-	 *  {@link mysqlInstallResultNotice}'s own parameter type, because
-	 *  `MariadbInstallResultDto` adds a member (`awaitingRelease`)
-	 *  `MysqlInstallResultDto` does not have. Reading
-	 *  {@link mariadbRowOutcome}/{@link rowInstallOutcome} — each already
-	 *  typed correctly for its own engine — is what lets each branch call its
-	 *  own notice function with no cast. A `switch` with a `const _: never`
-	 *  default, not an `engine === 'mariadb'` ternary (this codebase's
-	 *  standing "no wildcard arm" rule, applied to {@link EngineKind} itself):
-	 *  a third engine must fail to compile HERE, not silently fall into
-	 *  MySQL's branch. Before this dispatch existed, EVERY engine rendered
-	 *  `mysqlInstallResultNotice`'s hardcoded "MySQL …" copy: the one piece of
-	 *  this row's generalization the row-refactor task had not reached,
-	 *  because it never exercised a non-null `installOutcome` under
-	 *  `engine="mariadb"`. */
-	const outcomeNotice = $derived.by(() => {
-		switch (engine) {
-			case 'mariadb':
-				return mariadbRowOutcome === null
-					? null
-					: mariadbInstallResultNotice(mariadbRowOutcome.result);
-			case 'mysql':
-				return rowInstallOutcome === null
-					? null
-					: mysqlInstallResultNotice(rowInstallOutcome.result);
-			default: {
-				const unreachable: never = engine;
-				return unreachable;
-			}
-		}
-	});
-	/** A ledger row that could not be written — provenance lost, never the
-	 *  install. `null` on every other outcome and on the happy path. Same
-	 *  per-engine `switch` as {@link outcomeNotice}, for the same reason. */
-	const ledgerNotice = $derived.by(() => {
-		switch (engine) {
-			case 'mariadb':
-				return mariadbRowOutcome !== null && mariadbRowOutcome.result.kind === 'installed'
-					? mariadbLedgerNotice(mariadbRowOutcome.result.ledger)
-					: null;
-			case 'mysql':
-				return rowInstallOutcome !== null && rowInstallOutcome.result.kind === 'installed'
-					? mysqlLedgerNotice(rowInstallOutcome.result.ledger)
-					: null;
-			default: {
-				const unreachable: never = engine;
-				return unreachable;
-			}
-		}
-	});
-	/** The row's own explanation for why there is (or is not) an Install
-	 *  button to press — covers exactly the two states
-	 *  {@link mysqlPackageOfferNotice}'s narrower MySQL-only union was always
-	 *  built for (`unavailable`/`notInstalled`); `awaitingRelease` has its OWN
-	 *  notice ({@link engineAwaitingReleaseNotice}) because a build existing
-	 *  but unpublished is a materially different fact (design D2), not a
-	 *  naming variant of this one. Resolved ONCE here — not with an inline
-	 *  `{@const}` (which is what this template used to call directly,
-	 *  hardcoded to `mysqlPackageOfferNotice` regardless of engine) and never
-	 *  with `{#if engine === …}` in the template itself (design D1): the
-	 *  `unavailable`/`notInstalled` copy was the other half of the same gap
-	 *  {@link outcomeNotice} closes above. `null` in every OTHER row state.
-	 *  The engine `switch` is defined once and called from both branches —
-	 *  same exhaustiveness reasoning as {@link outcomeNotice}. */
-	const offerNotice = $derived.by(() => {
-		const paint = (offer: MysqlPackageOfferDto) => {
-			switch (engine) {
-				case 'mariadb':
-					return mariadbPackageOfferNotice(offer);
-				case 'mysql':
-					return mysqlPackageOfferNotice(offer);
-				default: {
-					const unreachable: never = engine;
-					return unreachable;
-				}
-			}
-		};
-		if (rowState.kind === 'unavailable') {
-			return paint({ kind: 'unavailable', target: rowState.target });
-		}
-		if (rowState.kind === 'notInstalled') {
-			return paint({ kind: 'available', version: rowState.version });
-		}
-		return null;
-	});
+	/** The settled-install banner, the ledger-write warning, and the
+	 *  not-yet-installed explanation — all three dispatch on `engine` the SAME
+	 *  way (design D1 follow-through, task 3 finding: EVERY engine used to
+	 *  render MySQL's own hardcoded copy until this dispatch existed). Pulled
+	 *  into `mysql-row.derive.ts` as a pure module (fix wave item 3): the
+	 *  `switch`-with-`never`-arm dispatch itself is unchanged, only where it
+	 *  lives — see that file for the full reasoning each of the three used to
+	 *  carry here inline. */
+	const outcomeNotice = $derived(engineOutcomeNotice(engine, rowInstallOutcome, mariadbRowOutcome));
+	const ledgerNotice = $derived(engineLedgerNotice(engine, rowInstallOutcome, mariadbRowOutcome));
+	const offerNotice = $derived(engineOfferNotice(engine, rowState));
 </script>
 
 {#if !instance.cataloged}

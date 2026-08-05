@@ -49,12 +49,6 @@ describe('engineDescriptor — mysql', () => {
 		expect(d.uninstallPolicy({ kind: 'packaged', version: '8.4.11' })).toBe(false);
 		expect(d.uninstallPolicy({ kind: 'homebrew' })).toBe(true);
 	});
-
-	it('still names Homebrew as the fallback for an unverified target', () => {
-		const fallback = d.unavailableFallback('macos-x86_64');
-		expect(fallback).not.toBeNull();
-		expect(fallback).toMatch(/Homebrew/);
-	});
 });
 
 describe('engineDescriptor — mariadb', () => {
@@ -82,10 +76,6 @@ describe('engineDescriptor — mariadb', () => {
 		expect(d.sourcePolicy({ kind: 'packaged', version: '11.4.9' })).toBeNull();
 		expect(d.sourcePolicy(null)).toBeNull();
 	});
-
-	it('has no Homebrew fallback for any target — there never was one', () => {
-		expect(d.unavailableFallback('macos-x86_64')).toBeNull();
-	});
 });
 
 describe('engineDescriptor — the two engines never collapse onto one', () => {
@@ -102,9 +92,7 @@ describe('engineDescriptor — the two engines never collapse onto one', () => {
 		expect(mysql.uninstallPolicy({ kind: 'packaged', version: 'x' })).not.toBe(
 			mariadb.uninstallPolicy({ kind: 'packaged', version: 'x' })
 		);
-		expect(mysql.unavailableFallback('macos-x86_64')).not.toBe(
-			mariadb.unavailableFallback('macos-x86_64')
-		);
+		expect(mysql.staleCredentialRecovery).not.toBe(mariadb.staleCredentialRecovery);
 	});
 
 	it('gives the port-conflict hint different wording, naming no Homebrew service for MariaDB', () => {
