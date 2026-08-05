@@ -40,6 +40,7 @@ use crate::commands::{InstallKind, IpcError};
 pub enum PackageKind {
     Php,
     Mysql,
+    Mariadb,
 }
 
 /// One thing that SURVIVES the uninstall, in the user's words.
@@ -198,6 +199,14 @@ pub struct UninstallPlan {
 pub(crate) enum Target {
     Php(PhpMajor),
     Mysql(MysqlMajor),
+    /// MariaDB carries no major/version of its own: this build ships exactly
+    /// one series (`openvhost_core::MARIADB_SERIES`), and there is no
+    /// `MariadbMajor` newtype to parse into — the same reasoning
+    /// `MariadbInstanceRepo`'s own doc comment gives for leaving `major` off
+    /// `MariadbInstance`. A unit variant rather than one carrying the series
+    /// string is what makes "there is nothing to vary" a fact the type states
+    /// rather than a convention every reader has to remember.
+    Mariadb,
 }
 
 impl Target {
@@ -205,6 +214,21 @@ impl Target {
         Ok(match kind {
             PackageKind::Php => Target::Php(PhpMajor::parse(major)?),
             PackageKind::Mysql => Target::Mysql(MysqlMajor::parse(major)?),
+            // No `MariadbMajor::parse` exists to delegate to (there is only
+            // ever one legal value), so the gate is inline here — but it is
+            // still a gate: an out-of-band `major` is refused with the same
+            // field-shaped `IpcError::Validation` every other rejected
+            // version uses, never silently accepted.
+            PackageKind::Mariadb if major == openvhost_core::MARIADB_SERIES => Target::Mariadb,
+            PackageKind::Mariadb => {
+                return Err(IpcError::Validation {
+                    field: "mariadb_version".to_string(),
+                    message: format!(
+                        "OpenVHost ships MariaDB {} only",
+                        openvhost_core::MARIADB_SERIES
+                    ),
+                });
+            }
         })
     }
 
@@ -212,6 +236,7 @@ impl Target {
         match self {
             Target::Php(_) => PackageKind::Php,
             Target::Mysql(_) => PackageKind::Mysql,
+            Target::Mariadb => PackageKind::Mariadb,
         }
     }
 
@@ -219,6 +244,7 @@ impl Target {
         match self {
             Target::Php(m) => m.as_str(),
             Target::Mysql(m) => m.as_str(),
+            Target::Mariadb => openvhost_core::MARIADB_SERIES,
         }
     }
 
@@ -229,24 +255,29 @@ impl Target {
         match self {
             Target::Php(m) => crate::stack::php_fpm_service_id(m.as_str()),
             Target::Mysql(m) => crate::stack::mysql_service_id(m.as_str()),
+            Target::Mariadb => crate::stack::mariadb_service_id(openvhost_core::MARIADB_SERIES),
         }
     }
 
-    /// How this version reads in a sentence — "PHP 8.4", "MySQL 8.4".
+    /// How this version reads in a sentence — "PHP 8.4", "MySQL 8.4",
+    /// "MariaDB 11.4".
     pub(crate) fn display(&self) -> String {
         match self {
             Target::Php(m) => format!("PHP {}", m.as_str()),
             Target::Mysql(m) => format!("MySQL {}", m.as_str()),
+            Target::Mariadb => format!("MariaDB {}", openvhost_core::MARIADB_SERIES),
         }
     }
 
     /// The `InstallLock` slot discriminator, and the label that slot carries.
     /// Matches the shapes the install commands use exactly (PHP's label is
-    /// bare, MySQL's is a complete phrase) — see `PendingInstallDto`.
+    /// bare, MySQL's and MariaDB's are complete phrases) — see
+    /// `PendingInstallDto`.
     pub(crate) fn install_kind(&self) -> InstallKind {
         match self {
             Target::Php(_) => InstallKind::Php,
             Target::Mysql(_) => InstallKind::Mysql,
+            Target::Mariadb => InstallKind::Mariadb,
         }
     }
 
@@ -254,6 +285,7 @@ impl Target {
         match self {
             Target::Php(m) => m.as_str().to_string(),
             Target::Mysql(m) => format!("MySQL {}", m.as_str()),
+            Target::Mariadb => format!("MariaDB {}", openvhost_core::MARIADB_SERIES),
         }
     }
 
@@ -261,33 +293,58 @@ impl Target {
     /// definition, read from `openvhost-core` so the string a dialog shows, the
     /// string a refusal quotes and the string that reaches `brew`'s argv are
     /// one expression rather than three that can drift.
-    pub(crate) fn formula(&self) -> String {
+    ///
+    /// `None` for MariaDB (P1 MariaDB UI design D5): a packaged MariaDB has no
+    /// Homebrew origin and never will, so there is no correct formula string —
+    /// not `""`, which would be a silent empty value in user-facing copy, and
+    /// not `"mariadb"`, which would name a formula this app never installs and
+    /// cannot uninstall. The type admits the absence instead, and every caller
+    /// below ([`Self::keg_provenance`], [`Self::uninstall_spec`]) has to
+    /// decide what an absent formula means for it, rather than inheriting a
+    /// PHP/MySQL assumption by default.
+    pub(crate) fn formula(&self) -> Option<String> {
         match self {
-            Target::Php(m) => openvhost_core::brew_formula(m),
-            Target::Mysql(m) => openvhost_core::mysql_brew_formula(m),
+            Target::Php(m) => Some(openvhost_core::brew_formula(m)),
+            Target::Mysql(m) => Some(openvhost_core::mysql_brew_formula(m)),
+            Target::Mariadb => None,
         }
     }
 
-    /// What [`Self::formula`]'s `opt` link actually resolves to on THIS machine.
+    /// What [`Self::formula`]'s `opt` link actually resolves to on THIS
+    /// machine — `None` when there is no formula to look one up for
+    /// (MariaDB).
     ///
     /// A filesystem read (a `canonicalize`), so it lives here rather than
     /// inside the pure [`blockers`] — the caller performs it and passes the
     /// answer in, exactly as it does for the supervisor snapshot and the site
     /// list. That keeps `blockers` a pure function of its inputs and keeps the
     /// executor's tests off the developer's own `/opt/homebrew`.
-    pub(crate) fn keg_provenance(&self) -> KegProvenance {
+    pub(crate) fn keg_provenance(&self) -> Option<KegProvenance> {
+        let formula = self.formula()?;
         let prefixes: Vec<&Path> = openvhost_core::BREW_PREFIXES
             .iter()
             .map(Path::new)
             .collect();
-        openvhost_core::keg_provenance(&prefixes, &self.formula())
+        Some(openvhost_core::keg_provenance(&prefixes, &formula))
     }
 
     /// `brew uninstall <formula>`, composed entirely inside `openvhost-core`.
+    ///
+    /// The MariaDB arm is unreachable in normal operation — [`inventory`]
+    /// never emits a [`Removal::BrewFormula`] step for [`Target::Mariadb`], so
+    /// nothing calls this for it — but the match stays exhaustive and explicit
+    /// rather than a wildcard: a future edit that DID wire a `BrewFormula`
+    /// removal to MariaDB by mistake gets a clear refusal here instead of a
+    /// formula string quietly built from nothing.
     pub(crate) fn uninstall_spec(&self, brew: &Path) -> Result<SpawnSpec, IpcError> {
         Ok(match self {
             Target::Php(m) => openvhost_core::brew_uninstall_spec(brew, m)?,
             Target::Mysql(m) => openvhost_core::mysql_brew_uninstall_spec(brew, m)?,
+            Target::Mariadb => {
+                return Err(IpcError::Core {
+                    message: "MariaDB has no Homebrew formula to uninstall".to_string(),
+                });
+            }
         })
     }
 }
@@ -303,6 +360,16 @@ pub(crate) enum Removal {
     /// `run`'s executor for why `remove_file` is the only filesystem call an
     /// uninstall makes.
     GeneratedFile { path: PathBuf, what: String },
+    /// A package tree THIS APP's OWN installer created under
+    /// `<home>/packages/` — never a Homebrew keg. MariaDB's only source
+    /// (`Target::formula` is `None` for it, P1 MariaDB UI design D5), so its
+    /// program files are removed by taking this tree off disk directly
+    /// instead of spawning `brew uninstall`, which has nothing to uninstall.
+    /// `path` is always built from compile-time constants
+    /// (`MARIADB_PACKAGE_NAME`/`MARIADB_SERIES`) joined onto the resolved
+    /// home — see `run`'s executor for the removal itself and why that path
+    /// shape needs no further containment.
+    PackageTree { path: PathBuf, what: String },
     /// `Supervisor::unregister` — the row on the Services page and in the tray.
     ServiceRow { id: String },
 }
@@ -330,6 +397,11 @@ impl Removal {
                  believes nothing else needs; its output names any it takes."
             ),
             Removal::GeneratedFile { path, what } => format!("{what} at {}", path.display()),
+            // No Homebrew caveat: unlike `BrewFormula`, this removal takes
+            // exactly what is named and nothing else — there is no dependency
+            // graph for OpenVHost's own package tree to pull in extra kegs
+            // from.
+            Removal::PackageTree { path, what } => format!("{what} at {}", path.display()),
             Removal::ServiceRow { id } => format!("The {id} entry in Services"),
         }
     }
@@ -392,7 +464,12 @@ pub(crate) fn inventory(target: &Target, home: &Path) -> Inventory {
             Inventory {
                 removes: vec![
                     Removal::BrewFormula {
-                        formula: target.formula(),
+                        // Not `target.formula()`: that returns `Option<String>`
+                        // now that MariaDB has to admit absence (D5), and this
+                        // arm already knows it has one — calling the same
+                        // builder `Target::formula` itself delegates to is the
+                        // one expression, not an `.expect()` on the option.
+                        formula: openvhost_core::brew_formula(major),
                         what: format!("The PHP {m} program files"),
                     },
                     Removal::GeneratedFile {
@@ -431,7 +508,8 @@ pub(crate) fn inventory(target: &Target, home: &Path) -> Inventory {
             Inventory {
                 removes: vec![
                     Removal::BrewFormula {
-                        formula: target.formula(),
+                        // See the PHP arm's matching comment above.
+                        formula: openvhost_core::mysql_brew_formula(major),
                         what: format!("The MySQL {m} program files"),
                     },
                     // NO GeneratedFile here, and that is load-bearing rather
@@ -457,6 +535,48 @@ pub(crate) fn inventory(target: &Target, home: &Path) -> Inventory {
                     kept("The stored root password", None),
                     kept("This instance's my.cnf", Some(paths.my_cnf.clone())),
                     kept("Your own MySQL overrides", Some(paths.custom_confd.clone())),
+                ],
+            }
+        }
+        // MariaDB's own arm, deliberately shaped like MySQL's rather than
+        // PHP's: no site setting references it, its datadir/credential/my.cnf
+        // are kept for the identical reason MySQL's are, and the ONE
+        // structural difference — no Homebrew formula, so the program files
+        // are `Removal::PackageTree`, not `Removal::BrewFormula` — is exactly
+        // the difference `Target::formula` returning `None` for this variant
+        // exists to force a decision about (D5).
+        Target::Mariadb => {
+            let root = openvhost_core::PackagesRoot::from_home(home);
+            let package_tree = root.major_dir(
+                openvhost_core::MARIADB_PACKAGE_NAME,
+                openvhost_core::MARIADB_SERIES,
+            );
+            let paths = openvhost_core::mariadb_paths(home);
+            Inventory {
+                removes: vec![
+                    Removal::PackageTree {
+                        path: package_tree,
+                        what: format!(
+                            "The MariaDB {} program files",
+                            openvhost_core::MARIADB_SERIES
+                        ),
+                    },
+                    Removal::ServiceRow {
+                        id: target.service_id(),
+                    },
+                ],
+                keeps: vec![
+                    // Same headline shape as MySQL's, and for the same reason
+                    // (plan principle 2): the confirmation says "Your
+                    // databases are not touched — they stay in <path>", naming
+                    // the datadir and nothing else.
+                    kept_headline("Your databases", Some(paths.datadir.clone())),
+                    kept("The stored root password", None),
+                    kept("This instance's my.cnf", Some(paths.my_cnf.clone())),
+                    kept(
+                        "Your own MariaDB overrides",
+                        Some(paths.custom_confd.clone()),
+                    ),
                 ],
             }
         }
@@ -495,16 +615,27 @@ pub(crate) fn service_blocker(id: &str, state: &ServiceState) -> Option<Blocker>
 /// Exhaustive over [`KegProvenance`] with **no wildcard arm**: the difference
 /// between these three is the difference between removing one PHP version and
 /// removing the user's linked `php`, which is not a decision a `_` should make.
+///
+/// `None` when `target` has no Homebrew formula at all ([`Target::formula`],
+/// P1 MariaDB UI design D5). In production this never happens: [`blockers`]
+/// only calls this function when it already holds a REAL `KegProvenance`,
+/// which [`Target::keg_provenance`] only ever produces for a formula-having
+/// target in the first place — so a formula-less target and a `Some(keg)`
+/// cannot occur together on that path. Kept as a graceful `None` here too,
+/// rather than fabricating a formula string, so that invariant does not have
+/// to be trusted by a caller who reaches this function some other way (this
+/// module's own tests among them).
 pub(crate) fn keg_blocker(target: &Target, keg: &KegProvenance) -> Option<Blocker> {
+    let formula = target.formula()?;
     match keg {
         KegProvenance::OwnKeg { .. } => None,
         KegProvenance::ForeignKeg { owner, keg } => Some(Blocker::ForeignKeg {
-            formula: target.formula(),
+            formula,
             owner: owner.clone(),
             keg: keg.display().to_string(),
         }),
         KegProvenance::Unresolved { searched } => Some(Blocker::UnknownKeg {
-            formula: target.formula(),
+            formula,
             searched: searched.iter().map(|p| p.display().to_string()).collect(),
         }),
     }
@@ -519,6 +650,9 @@ pub(crate) fn keg_blocker(target: &Target, keg: &KegProvenance) -> Option<Blocke
 /// filesystem by the caller for the same reason `services` and `sites` are —
 /// see [`Target::keg_provenance`].
 ///
+/// `keg` is `None` for a target with no Homebrew formula (MariaDB, D5): there
+/// is no keg to be aliased, so there is nothing for this check to refuse.
+///
 /// The keg check comes FIRST because it is categorically different from the
 /// other two: those say "do this, then retry", and this one says OpenVHost will
 /// never do it.
@@ -526,10 +660,12 @@ pub(crate) fn blockers(
     target: &Target,
     services: &[ServiceStatus],
     sites: &[Site],
-    keg: &KegProvenance,
+    keg: Option<&KegProvenance>,
 ) -> Vec<Blocker> {
     let mut out = Vec::new();
-    if let Some(blocker) = keg_blocker(target, keg) {
+    if let Some(keg) = keg
+        && let Some(blocker) = keg_blocker(target, keg)
+    {
         out.push(blocker);
     }
     let id = target.service_id();
@@ -557,6 +693,11 @@ pub(crate) fn blockers(
         // that round trip (uninstall, reinstall, read the data back) is
         // precisely what D2 promises.
         Target::Mysql(_) => {}
+        // Same reasoning as MySQL's arm immediately above, restated as its
+        // own arm (rather than folded into it with an `|`) so a future third
+        // formula-less engine cannot silently inherit "no blocker" without a
+        // reviewer seeing a new line added here.
+        Target::Mariadb => {}
     }
     out
 }
@@ -569,7 +710,7 @@ pub(crate) fn build_plan(
     home: &Path,
     services: &[ServiceStatus],
     sites: &[Site],
-    keg: &KegProvenance,
+    keg: Option<&KegProvenance>,
 ) -> UninstallPlan {
     let inv = inventory(target, home);
     UninstallPlan {
@@ -592,6 +733,11 @@ mod tests {
 
     pub(super) fn mysql(major: &str) -> Target {
         Target::parse(PackageKind::Mysql, major).expect("catalogue major")
+    }
+
+    pub(super) fn mariadb() -> Target {
+        Target::parse(PackageKind::Mariadb, openvhost_core::MARIADB_SERIES)
+            .expect("the pinned series")
     }
 
     /// The ordinary case: the formula owns its own keg, so nothing about
@@ -781,7 +927,13 @@ mod tests {
     fn the_headline_survives_reaching_the_wire() {
         // The flag exists for a UI in another language; a serde attribute typo
         // would only show up as a dialog quietly picking the wrong path again.
-        let plan = build_plan(&mysql("8.4"), Path::new("/tmp/ovh"), &[], &[], &own_keg());
+        let plan = build_plan(
+            &mysql("8.4"),
+            Path::new("/tmp/ovh"),
+            &[],
+            &[],
+            Some(&own_keg()),
+        );
         let v = serde_json::to_value(&plan).unwrap();
         assert_eq!(v["keeps"][0]["headline"], true);
         assert_eq!(v["keeps"][1]["headline"], false);
@@ -821,7 +973,7 @@ mod tests {
         // VACUITY: removing the second sentence from `Removal::BrewFormula`'s
         // arm makes both assertions fail for both kinds.
         for target in [php("8.4"), mysql("8.4")] {
-            let plan = build_plan(&target, Path::new("/tmp/ovh"), &[], &[], &own_keg());
+            let plan = build_plan(&target, Path::new("/tmp/ovh"), &[], &[], Some(&own_keg()));
             let brew_line = plan.removes.first().expect("the formula is removal #1");
             assert!(
                 brew_line.contains("may also remove dependencies"),
@@ -943,7 +1095,7 @@ mod tests {
             keg: PathBuf::from("/opt/homebrew/Cellar/php/8.5.9"),
         };
         assert_eq!(
-            blockers(&php("8.5"), &[], &[], &keg),
+            blockers(&php("8.5"), &[], &[], Some(&keg)),
             vec![Blocker::ForeignKeg {
                 formula: "php@8.5".to_string(),
                 owner: "php".to_string(),
@@ -953,7 +1105,7 @@ mod tests {
         // The prose has to name BOTH the formula the user would have clicked
         // and the thing that would actually be removed — a refusal that says
         // only "can't do that" teaches nothing.
-        let text = blockers(&php("8.5"), &[], &[], &keg)[0].describe();
+        let text = blockers(&php("8.5"), &[], &[], Some(&keg))[0].describe();
         assert!(text.contains("php@8.5"), "{text}");
         assert!(text.contains("/opt/homebrew/Cellar/php/8.5.9"), "{text}");
         assert!(text.contains("brew uninstall php"), "{text}");
@@ -969,7 +1121,7 @@ mod tests {
             keg: PathBuf::from("/opt/homebrew/Cellar/mysql/8.4.11"),
         };
         assert_eq!(
-            blockers(&mysql("8.4"), &[], &[], &keg),
+            blockers(&mysql("8.4"), &[], &[], Some(&keg)),
             vec![Blocker::ForeignKeg {
                 formula: "mysql@8.4".to_string(),
                 owner: "mysql".to_string(),
@@ -990,7 +1142,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            blockers(&php("8.4"), &[], &[], &keg),
+            blockers(&php("8.4"), &[], &[], Some(&keg)),
             vec![Blocker::UnknownKeg {
                 formula: "php@8.4".to_string(),
                 searched: vec![
@@ -1006,7 +1158,7 @@ mod tests {
         // The other side of the refusal — without this the check would be
         // indistinguishable from "uninstall never works".
         assert!(keg_blocker(&php("8.4"), &own_keg()).is_none());
-        assert!(blockers(&php("8.4"), &[], &[], &own_keg()).is_empty());
+        assert!(blockers(&php("8.4"), &[], &[], Some(&own_keg())).is_empty());
     }
 
     #[test]
@@ -1021,7 +1173,7 @@ mod tests {
             owner: "php".to_string(),
             keg: PathBuf::from("/opt/homebrew/Cellar/php/8.5.9"),
         };
-        let found = blockers(&php("8.5"), &services, &sites, &keg);
+        let found = blockers(&php("8.5"), &services, &sites, Some(&keg));
         assert_eq!(found.len(), 3, "got {found:?}");
         assert!(matches!(found[0], Blocker::ForeignKeg { .. }));
         assert!(matches!(found[1], Blocker::ServiceNotTerminal { .. }));
@@ -1077,7 +1229,7 @@ mod tests {
             site("blog", "blog.localhost", "8.1"),
             site("wiki", "wiki.localhost", "8.4"),
         ];
-        let found = blockers(&php("8.4"), &[], &sites, &own_keg());
+        let found = blockers(&php("8.4"), &[], &sites, Some(&own_keg()));
         assert_eq!(
             found,
             vec![Blocker::SitesPinned {
@@ -1089,7 +1241,7 @@ mod tests {
     #[test]
     fn a_php_major_no_site_uses_has_no_site_blocker() {
         let sites = vec![site("blog", "blog.localhost", "8.1")];
-        assert!(blockers(&php("8.4"), &[], &sites, &own_keg()).is_empty());
+        assert!(blockers(&php("8.4"), &[], &sites, Some(&own_keg())).is_empty());
     }
 
     #[test]
@@ -1100,7 +1252,7 @@ mod tests {
         let mut s = site("shop", "shop.localhost", "8.4");
         s.enabled = false;
         assert_eq!(
-            blockers(&php("8.4"), &[], &[s], &own_keg()),
+            blockers(&php("8.4"), &[], &[s], Some(&own_keg())),
             vec![Blocker::SitesPinned {
                 domains: vec!["shop.localhost".to_string()],
             }]
@@ -1114,7 +1266,7 @@ mod tests {
         // edit that "helpfully" blocked on an initialized datadir would break
         // D2's whole round trip, so pin it.
         let sites = vec![site("shop", "shop.localhost", "8.4")];
-        assert!(blockers(&mysql("8.4"), &[], &sites, &own_keg()).is_empty());
+        assert!(blockers(&mysql("8.4"), &[], &sites, Some(&own_keg())).is_empty());
     }
 
     #[test]
@@ -1123,7 +1275,7 @@ mod tests {
         // told about the sites has been made to guess twice.
         let services = vec![status("php-fpm-8.4", ServiceState::Running)];
         let sites = vec![site("shop", "shop.localhost", "8.4")];
-        let found = blockers(&php("8.4"), &services, &sites, &own_keg());
+        let found = blockers(&php("8.4"), &services, &sites, Some(&own_keg()));
         assert_eq!(found.len(), 2, "got {found:?}");
         assert!(matches!(found[0], Blocker::ServiceNotTerminal { .. }));
         assert!(matches!(found[1], Blocker::SitesPinned { .. }));
@@ -1138,12 +1290,18 @@ mod tests {
             status("nginx", ServiceState::Running),
             status("mysql-8.4", ServiceState::Running),
         ];
-        assert!(blockers(&php("8.4"), &services, &[], &own_keg()).is_empty());
+        assert!(blockers(&php("8.4"), &services, &[], Some(&own_keg())).is_empty());
     }
 
     #[test]
     fn a_plan_with_no_blockers_may_proceed_and_lists_both_halves() {
-        let plan = build_plan(&mysql("8.4"), Path::new("/tmp/ovh"), &[], &[], &own_keg());
+        let plan = build_plan(
+            &mysql("8.4"),
+            Path::new("/tmp/ovh"),
+            &[],
+            &[],
+            Some(&own_keg()),
+        );
         assert!(plan.blockers.is_empty());
         assert_eq!(plan.kind, PackageKind::Mysql);
         assert_eq!(plan.major, "8.4");
@@ -1161,7 +1319,7 @@ mod tests {
         // cannot re-order or filter one side only.
         let target = php("8.4");
         let home = Path::new("/tmp/ovh");
-        let plan = build_plan(&target, home, &[], &[], &own_keg());
+        let plan = build_plan(&target, home, &[], &[], Some(&own_keg()));
         let expected: Vec<String> = inventory(&target, home)
             .removes
             .iter()
@@ -1223,7 +1381,7 @@ mod tests {
             Path::new("/tmp/ovh"),
             &[],
             &[],
-            &own_keg(),
+            Some(&own_keg()),
         ))
         .unwrap();
         assert_eq!(v["kind"], "php");
@@ -1234,6 +1392,173 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<PackageKind>(serde_json::json!("mysql")).unwrap(),
             PackageKind::Mysql
+        );
+    }
+
+    // ---- MariaDB: no Homebrew formula, admitted rather than fabricated
+    // (P1 MariaDB UI design D5) -------------------------------------------
+
+    #[test]
+    fn mariadb_has_no_homebrew_formula_and_php_mysql_still_do() {
+        assert_eq!(mariadb().formula(), None);
+        assert_eq!(php("8.4").formula(), Some("php@8.4".to_string()));
+        assert_eq!(mysql("8.4").formula(), Some("mysql@8.4".to_string()));
+    }
+
+    #[test]
+    fn mariadb_has_no_keg_to_resolve() {
+        assert_eq!(mariadb().keg_provenance(), None);
+    }
+
+    /// VACUITY (neuter-and-watch-it-fail): temporarily made this arm
+    /// delegate to `openvhost_core::mysql_brew_uninstall_spec` with a
+    /// hand-built `MysqlMajor` (as if MariaDB were just another versioned
+    /// MySQL-shaped formula) — this test failed because a spec WAS produced
+    /// instead of an error, and its argv named `mysql@…`, not any MariaDB
+    /// identity. Restoring the explicit refusal arm made it pass again.
+    #[test]
+    fn mariadb_uninstall_spec_refuses_rather_than_fabricating_a_formula() {
+        let err = mariadb()
+            .uninstall_spec(Path::new("/opt/homebrew/bin/brew"))
+            .unwrap_err();
+        match err {
+            IpcError::Core { message } => assert!(
+                message.contains("Homebrew"),
+                "refusal should name the reason: {message}"
+            ),
+            other => panic!("expected IpcError::Core, got {other:?}"),
+        }
+    }
+
+    /// `keg_blocker` itself stays graceful (not a panic) for a formula-less
+    /// target reached some other way than through `blockers` — see its own
+    /// doc comment for why this is a documented fallback rather than the
+    /// production path.
+    #[test]
+    fn keg_blocker_admits_absence_for_a_formula_less_target_rather_than_fabricating_one() {
+        assert_eq!(keg_blocker(&mariadb(), &own_keg()), None);
+    }
+
+    #[test]
+    fn mariadb_parse_accepts_only_the_pinned_series() {
+        assert_eq!(
+            Target::parse(PackageKind::Mariadb, openvhost_core::MARIADB_SERIES).unwrap(),
+            Target::Mariadb
+        );
+        for bad in ["11.5", "10.4", "", "11.4.9"] {
+            let err = Target::parse(PackageKind::Mariadb, bad).unwrap_err();
+            match err {
+                IpcError::Validation { field, .. } => assert_eq!(field, "mariadb_version"),
+                other => panic!("expected Validation, got {other:?} for {bad:?}"),
+            }
+        }
+    }
+
+    /// The removal shape is `PackageTree` (never `BrewFormula`, D5) plus the
+    /// service row, and the keeps mirror MySQL's exactly — same headline
+    /// promise about the datadir, same stored-password and my.cnf entries.
+    ///
+    /// VACUITY: written before `Target::Mariadb`'s `inventory` arm existed —
+    /// it did not compile, then failed on every field once the arm existed
+    /// but still matched PHP's `BrewFormula` shape by copy-paste.
+    #[test]
+    fn a_mariadb_uninstall_removes_the_package_tree_and_the_row_and_keeps_the_data() {
+        let home = Path::new("/tmp/ovh");
+        let inv = inventory(&mariadb(), home);
+        assert_eq!(
+            inv.removes,
+            vec![
+                Removal::PackageTree {
+                    path: PathBuf::from("/tmp/ovh/packages/mariadb/11.4"),
+                    what: "The MariaDB 11.4 program files".to_string(),
+                },
+                Removal::ServiceRow {
+                    id: "mariadb-11.4".to_string(),
+                },
+            ]
+        );
+        assert_eq!(
+            inv.keeps,
+            vec![
+                KeptItem {
+                    what: "Your databases".to_string(),
+                    path: Some("/tmp/ovh/data/mariadb/11.4".to_string()),
+                    headline: true,
+                },
+                KeptItem {
+                    what: "The stored root password".to_string(),
+                    path: None,
+                    headline: false,
+                },
+                KeptItem {
+                    what: "This instance's my.cnf".to_string(),
+                    path: Some("/tmp/ovh/config/generated/mariadb/11.4/my.cnf".to_string()),
+                    headline: false,
+                },
+                KeptItem {
+                    what: "Your own MariaDB overrides".to_string(),
+                    path: Some("/tmp/ovh/config/custom/mariadb/11.4/conf.d".to_string()),
+                    headline: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_mariadb_uninstall_has_exactly_one_headline_kept_item_naming_the_datadir() {
+        let keeps = inventory(&mariadb(), Path::new("/tmp/ovh")).keeps;
+        let headlines: Vec<KeptItem> = keeps.into_iter().filter(|k| k.headline).collect();
+        assert_eq!(headlines.len(), 1, "got {headlines:?}");
+        assert_eq!(headlines[0].what, "Your databases");
+    }
+
+    /// No formula, no keg check, and nothing in state.db pins a site to
+    /// MariaDB — `blockers` must be empty regardless of services or sites,
+    /// mirroring `a_mysql_uninstall_is_never_blocked_by_sites`'s reasoning
+    /// extended to the keg check too (`keg` is `None` here, never `Some`).
+    #[test]
+    fn a_mariadb_uninstall_is_never_blocked_by_sites_or_the_keg_check() {
+        let sites = vec![site("shop", "shop.localhost", "8.4")];
+        assert!(blockers(&mariadb(), &[], &sites, None).is_empty());
+    }
+
+    /// The one blocker MariaDB CAN still have: its own service still
+    /// running. Proves `blockers`'s service check applies uniformly across
+    /// every `Target`, not only the formula-having ones.
+    #[test]
+    fn a_running_mariadb_service_still_blocks_its_own_uninstall() {
+        let services = vec![status("mariadb-11.4", ServiceState::Running)];
+        let found = blockers(&mariadb(), &services, &[], None);
+        assert_eq!(
+            found,
+            vec![Blocker::ServiceNotTerminal {
+                id: "mariadb-11.4".to_string(),
+                state: crate::control::state_label(&ServiceState::Running).to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_mariadb_plan_with_no_blockers_may_proceed_and_lists_both_halves() {
+        let plan = build_plan(&mariadb(), Path::new("/tmp/ovh"), &[], &[], None);
+        assert!(plan.blockers.is_empty());
+        assert_eq!(plan.kind, PackageKind::Mariadb);
+        assert_eq!(plan.major, "11.4");
+        assert_eq!(plan.removes.len(), 2);
+        assert!(
+            plan.keeps.iter().any(|k| k.what == "Your databases"),
+            "the dialog must be able to say the databases stay: {:?}",
+            plan.keeps
+        );
+    }
+
+    #[test]
+    fn the_mariadb_kind_reaches_the_wire_as_its_own_tag() {
+        let v = serde_json::to_value(PackageKind::Mariadb).unwrap();
+        assert_eq!(v, "mariadb");
+        assert_eq!(
+            serde_json::from_value::<PackageKind>(serde_json::json!("mariadb")).unwrap(),
+            PackageKind::Mariadb
         );
     }
 

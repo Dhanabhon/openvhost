@@ -8,11 +8,17 @@
 //! brew failure therefore changes no local state at all, which is what makes
 //! "nothing was destroyed" checkable rather than merely intended.
 //!
-//! The only filesystem call [`perform_uninstall`] itself makes is `remove_file`
-//! on a path `inventory` produced under `config/generated/`. Nothing there
-//! recurses, nothing follows a symlink to its target, and nothing touches
-//! `<home>/data`, `<home>/logs` or state.db's credential rows on ANY path,
-//! including error paths.
+//! [`perform_uninstall`] itself makes exactly two kinds of filesystem call:
+//! `remove_file` on a path `inventory` produced under `config/generated/`
+//! (PHP's generated pool config), and — P1 MariaDB UI design D5/D7 —
+//! `remove_dir_all` on the ONE package-tree path `inventory` produces for
+//! [`super::Target::Mariadb`] (`<home>/packages/mariadb/11.4/`, built entirely
+//! from compile-time constants; see [`super::Removal::PackageTree`]'s own doc
+//! comment). Neither recurses through a symlink to a target outside the tree
+//! it names — `remove_file` never follows one at all, and `remove_dir_all`
+//! removes a symlink entry it meets rather than descending into it — and
+//! nothing here touches `<home>/data`, `<home>/logs` or state.db's credential
+//! rows on ANY path, including error paths.
 //!
 //! That is a statement about the EXECUTOR, not about this file, and the
 //! difference matters when you audit it. The command wrapper
@@ -40,8 +46,9 @@ use tauri_specta::Event;
 
 use super::{Blocker, PackageKind, Target, UninstallPlan, build_plan, inventory};
 use crate::commands::{
-    InstallLock, IpcError, MysqlInstallLogEvent, PackageOperation, PhpInstallLogEvent,
-    RunningInstallGuard, now_ms, rescan_into_state, rescan_mysql_into_state, stack_paths,
+    InstallLock, IpcError, MariadbInstallLogEvent, MysqlInstallLogEvent, PackageOperation,
+    PhpInstallLogEvent, RunningInstallGuard, now_ms, rescan_into_state, rescan_mariadb_into_state,
+    rescan_mysql_into_state, stack_paths,
 };
 use crate::stack::StackPaths;
 
@@ -113,7 +120,10 @@ pub(crate) struct UninstallRun<'a> {
     /// every test of the executor would consult the developer's own
     /// `/opt/homebrew` and refuse or proceed depending on what is installed
     /// there.
-    pub(crate) keg: openvhost_core::KegProvenance,
+    ///
+    /// `None` for a target with no Homebrew formula at all (MariaDB, D5) —
+    /// there is no keg to resolve, so there is nothing for the caller to read.
+    pub(crate) keg: Option<openvhost_core::KegProvenance>,
     pub(crate) runner: Arc<dyn BrewRunner>,
     pub(crate) log: UninstallLogSink,
 }
@@ -142,7 +152,12 @@ pub(crate) enum UninstallOutcome {
 /// repointed. The plan is a view; this is the decision.
 pub(crate) async fn perform_uninstall(run: UninstallRun<'_>) -> Result<UninstallOutcome, IpcError> {
     // ---- Refusals, before anything is spawned (D3) ----------------------
-    let blockers = super::blockers(&run.target, &run.sup.snapshot(), &run.sites, &run.keg);
+    let blockers = super::blockers(
+        &run.target,
+        &run.sup.snapshot(),
+        &run.sites,
+        run.keg.as_ref(),
+    );
     if !blockers.is_empty() {
         return Err(refusal(&run.target, &blockers));
     }
@@ -173,6 +188,30 @@ pub(crate) async fn perform_uninstall(run: UninstallRun<'_>) -> Result<Uninstall
                     // Already gone (a previous attempt, a manual tidy-up, an
                     // apply that swept it). The post-state is what was asked
                     // for, so this is done, not failed.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => problems.push(format!(
+                        "{what} at {} could not be removed: {e}",
+                        path.display()
+                    )),
+                }
+            }
+            super::Removal::PackageTree { path, what } => {
+                // `remove_dir_all`, not `remove_file`: this names a whole
+                // package tree THIS app's own installer created (MariaDB has
+                // no Homebrew formula to spawn `brew uninstall` for at all —
+                // see `Target::formula`), and `path` is built entirely from
+                // compile-time constants (`MARIADB_PACKAGE_NAME`/
+                // `MARIADB_SERIES`) joined onto the resolved home in
+                // `inventory` — nothing from IPC or a client ever reaches it,
+                // so there is no traversal to guard against the way
+                // `GeneratedFile` above must. Mirrors
+                // `openvhost_core::mysql::sweep_stale_staging`'s own
+                // `remove_dir_all` under the package/data tree
+                // (security-auditor reviewed).
+                match std::fs::remove_dir_all(path) {
+                    Ok(()) => {}
+                    // Already gone — same "the post-state is what was asked
+                    // for" reasoning as `GeneratedFile` above.
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => problems.push(format!(
                         "{what} at {} could not be removed: {e}",
@@ -364,7 +403,7 @@ pub async fn uninstall_plan(
         &p.home,
         &sup.snapshot(),
         &sites,
-        &target.keg_provenance(),
+        target.keg_provenance().as_ref(),
     ))
 }
 
@@ -375,12 +414,13 @@ pub async fn uninstall_plan(
 /// Re-checks the blockers itself — the plan the dialog was built from may be
 /// stale — and streams brew's output through the same events `install_php`
 /// uses, so the Languages/Databases pages need no second log channel.
-// Nine parameters, seven of them managed state. Tauri extracts state per TYPE
+// Ten parameters, eight of them managed state. Tauri extracts state per TYPE
 // through the signature — there is no request object to bundle them into, and
 // the alternative (pulling them out of `app` with `try_state` inside the body)
 // would hide the dependency list rather than shorten it, which is the opposite
 // of what this lint is for. Every one is genuinely used: `db` for the pinned-
-// sites re-check, both runtime locks for the kind-specific rescan afterwards.
+// sites re-check, all three runtime locks for the kind-specific rescan
+// afterwards.
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 #[specta::specta]
@@ -391,6 +431,10 @@ pub async fn uninstall_package(
     db: tauri::State<'_, Db>,
     runtimes: tauri::State<'_, RwLock<Option<openvhost_core::InstalledRuntimes>>>,
     mysql_runtimes: tauri::State<'_, RwLock<Option<Vec<openvhost_core::mysql::MysqlRuntime>>>>,
+    mariadb_runtimes: tauri::State<
+        '_,
+        RwLock<Option<Vec<openvhost_core::mariadb::MariadbRuntime>>>,
+    >,
     paths: tauri::State<'_, Option<StackPaths>>,
     sup: tauri::State<'_, Arc<Supervisor>>,
     lock: tauri::State<'_, InstallLock>,
@@ -410,12 +454,25 @@ pub async fn uninstall_package(
     };
 
     let p = stack_paths(&paths)?;
-    let brew = openvhost_core::find_brew().ok_or_else(|| IpcError::Core {
-        message: format!(
-            "Homebrew was not found. Looked for bin/brew under: {}",
-            openvhost_core::BREW_PREFIXES.join(", ")
-        ),
-    })?;
+    // Homebrew is required only for a formula-having target (PHP/MySQL):
+    // `Target::formula` is `None` for MariaDB (P1 MariaDB UI design D5), whose
+    // uninstall never spawns brew at all (see `Removal::PackageTree`). Gating
+    // the lookup on that fact — rather than requiring Homebrew unconditionally
+    // — is what stops "Homebrew was not found" from refusing a MariaDB
+    // uninstall on a machine that never touched Homebrew in the first place.
+    // The placeholder path is never read on that arm: `run.target
+    // .uninstall_spec(&run.brew)` is called only from `run_brew`, itself only
+    // reached for a `Removal::BrewFormula` step, and MariaDB's inventory never
+    // produces one.
+    let brew = match target.formula() {
+        Some(_) => openvhost_core::find_brew().ok_or_else(|| IpcError::Core {
+            message: format!(
+                "Homebrew was not found. Looked for bin/brew under: {}",
+                openvhost_core::BREW_PREFIXES.join(", ")
+            ),
+        })?,
+        None => PathBuf::new(),
+    };
 
     let emitter = app.clone();
     let for_event = target.major().to_string();
@@ -454,6 +511,11 @@ pub async fn uninstall_package(
         PackageKind::Mysql => {
             rescan_mysql_into_state(mysql_runtimes.inner(), sup.inner(), &p.home, None).await?;
         }
+        // No seed parameter: MariaDB's rescan takes none — see
+        // `rescan_mariadb_into_state`'s own doc comment.
+        PackageKind::Mariadb => {
+            rescan_mariadb_into_state(mariadb_runtimes.inner(), sup.inner(), &p.home).await?;
+        }
     }
 
     match outcome {
@@ -470,6 +532,14 @@ pub async fn uninstall_package(
 /// One line of brew's output, on the event the matching install already uses.
 /// Exhaustive over [`PackageKind`]: a new kind must choose its surface here
 /// rather than defaulting into PHP's.
+///
+/// In practice MariaDB's own arm never fires: its uninstall is a
+/// `Removal::PackageTree` (a direct `remove_dir_all`, no child process, so
+/// nothing ever calls `run.log`), never a `Removal::BrewFormula`. It is still
+/// given a real arm rather than folded away, for the same reason
+/// `Target::uninstall_spec`'s MariaDB arm is: a future edit that DID wire a
+/// brew-style removal to this kind must route it somewhere real, not silently
+/// reuse MySQL's or PHP's channel.
 fn emit_uninstall_log(
     app: &tauri::AppHandle,
     kind: PackageKind,
@@ -490,6 +560,19 @@ fn emit_uninstall_log(
         PackageKind::Mysql => {
             let _ = MysqlInstallLogEvent {
                 major: major.to_string(),
+                ts_ms: now_ms(),
+                stream: stream.to_string(),
+                line,
+            }
+            .emit(app);
+        }
+        PackageKind::Mariadb => {
+            // No `major` field: this build ships exactly one series, so a
+            // field nothing can vary is left off — the same reasoning
+            // `MariadbInstance`'s own doc comment gives for leaving `major`
+            // off that struct. `major` (always `MARIADB_SERIES` here) is
+            // therefore unused on this arm.
+            let _ = MariadbInstallLogEvent {
                 ts_ms: now_ms(),
                 stream: stream.to_string(),
                 line,
@@ -667,7 +750,29 @@ mod tests {
             sup,
             lock,
             sites,
-            keg,
+            keg: Some(keg),
+            runner,
+            log: silent(),
+        }
+    }
+
+    /// [`run_for`] for a formula-less target (MariaDB): there is no keg to
+    /// resolve, so `keg` is `None` rather than a `KegProvenance` this target
+    /// has no formula to have looked one up for.
+    fn run_for_mariadb<'a>(
+        home: &std::path::Path,
+        sup: &'a Supervisor,
+        lock: &'a InstallLock,
+        runner: Arc<dyn BrewRunner>,
+    ) -> UninstallRun<'a> {
+        UninstallRun {
+            target: Target::Mariadb,
+            home: home.to_path_buf(),
+            brew: PathBuf::from("/opt/homebrew/bin/brew"),
+            sup,
+            lock,
+            sites: Vec::new(),
+            keg: None,
             runner,
             log: silent(),
         }
@@ -1446,5 +1551,186 @@ mod tests {
         );
 
         let _ = sup.stop("php-fpm-8.4");
+    }
+
+    // ------------------------------------------------------------------
+    // MariaDB (P1 MariaDB UI design D5/D7): `Removal::PackageTree`, never
+    // `Removal::BrewFormula` — its own fixture, mirroring
+    // `provisioned_home`/`untouched_fingerprint` but scoped to the paths
+    // this engine actually owns.
+    // ------------------------------------------------------------------
+
+    /// A home with a fake MariaDB package tree (two files under
+    /// `packages/mariadb/11.4/11.4.9/`, standing in for the real
+    /// `bin/`+`lib/plugin/` shape), a datadir holding a real "table" file, a
+    /// generated my.cnf, and the user's own override directory — everything
+    /// a MariaDB uninstall must either remove or leave completely alone.
+    fn provisioned_mariadb_home() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        for (path, contents) in [
+            ("packages/mariadb/11.4/11.4.9/bin/mariadbd", "#!/bin/sh\n"),
+            (
+                "packages/mariadb/11.4/11.4.9/lib/plugin/marker",
+                "a plugin file",
+            ),
+            ("config/generated/mariadb/11.4/my.cnf", "[mariadbd]\n"),
+            ("config/custom/mariadb/11.4/conf.d/mine.cnf", "# mine\n"),
+            ("data/mariadb/11.4/ibdata1", "\x00binary rows\x00"),
+        ] {
+            let p = home.join(path);
+            std::fs::create_dir_all(p.parent().expect("has a parent")).expect("mkdir");
+            std::fs::write(&p, contents).expect("write");
+        }
+        tmp
+    }
+
+    #[cfg(unix)]
+    fn untouched_mariadb_fingerprint(home: &std::path::Path) -> Vec<(PathBuf, Vec<u8>, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        [
+            "config/custom/mariadb/11.4/conf.d/mine.cnf",
+            "config/generated/mariadb/11.4/my.cnf",
+            "data/mariadb/11.4/ibdata1",
+        ]
+        .iter()
+        .map(|rel| {
+            let p = home.join(rel);
+            let meta =
+                std::fs::metadata(&p).unwrap_or_else(|e| panic!("{} must exist: {e}", p.display()));
+            (p.clone(), std::fs::read(&p).expect("readable"), meta.ino())
+        })
+        .collect()
+    }
+
+    /// The MariaDB mirror of `a_successful_mysql_uninstall_keeps_the_datadir_
+    /// byte_and_inode_identical` — the highest-value test in THIS engine's
+    /// slice, for the identical reason: a bug here destroys a user's
+    /// databases. Asserted on content AND inode, never on a `Result`.
+    ///
+    /// VACUITY: run with the datadir/my.cnf/custom_confd fixture paths
+    /// removed from `provisioned_mariadb_home` first — `untouched_mariadb_
+    /// fingerprint` then panics on a missing path before the executor is
+    /// even invoked, which is what proves the fixture (not an always-green
+    /// assertion) is what makes this test meaningful.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_successful_mariadb_uninstall_removes_the_package_tree_and_keeps_the_datadir_byte_and_inode_identical()
+     {
+        let home = provisioned_mariadb_home();
+        let before = untouched_mariadb_fingerprint(home.path());
+        let sup = supervisor_with("mariadb-11.4");
+        let lock = InstallLock::default();
+        let runner = RecordingRunner::ok();
+
+        let outcome = perform_uninstall(run_for_mariadb(home.path(), &sup, &lock, runner.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, UninstallOutcome::Done);
+        assert!(sup.snapshot().is_empty(), "the service row must be gone");
+        assert!(
+            !home.path().join("packages/mariadb/11.4").exists(),
+            "the whole package tree must be gone"
+        );
+        assert_untouched(&before);
+        // Named explicitly as well as covered by the fingerprint — the same
+        // promise D2 (carried from the MySQL slice) makes to the user, in so
+        // many words.
+        assert!(
+            home.path().join("data/mariadb/11.4/ibdata1").exists(),
+            "THE datadir must survive"
+        );
+        // Never Homebrew (D5): MariaDB's inventory has no `Removal::
+        // BrewFormula` step at all, so this runner — which WOULD record a
+        // call for one — must have recorded nothing.
+        assert!(
+            runner.spawns().is_empty(),
+            "a MariaDB uninstall must spawn NOTHING, recorded {:?}",
+            runner.spawns()
+        );
+    }
+
+    /// An already-missing package tree is not an error — mirrors
+    /// `an_already_missing_pool_config_is_not_an_error`'s reasoning, applied
+    /// to `remove_dir_all`'s `NotFound` arm instead of `remove_file`'s.
+    #[tokio::test]
+    async fn an_already_missing_mariadb_package_tree_is_not_an_error() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let sup = supervisor_with("mariadb-11.4");
+        let lock = InstallLock::default();
+
+        let outcome = perform_uninstall(run_for_mariadb(
+            home.path(),
+            &sup,
+            &lock,
+            RecordingRunner::ok(),
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, UninstallOutcome::Done);
+    }
+
+    /// A refused MariaDB uninstall (its own service still running) must
+    /// spawn nothing and remove nothing — mirroring
+    /// `a_live_service_refuses_the_uninstall_and_spawns_nothing`'s pattern
+    /// for reaching a genuinely live row (a real spawnable `/bin/sleep`,
+    /// polled until it leaves `Stopped`; `supervisor_with`'s `/nonexistent`
+    /// program cannot reach `Running`/`Starting` at all), adapted to a
+    /// target with no keg check (`keg: None`).
+    #[tokio::test]
+    async fn a_running_mariadb_service_refuses_the_uninstall_and_removes_nothing() {
+        let home = provisioned_mariadb_home();
+        let sup = Supervisor::new(default_driver());
+        sup.register(ServiceSpec {
+            id: "mariadb-11.4".into(),
+            display_name: "MariaDB 11.4".into(),
+            endpoint: None,
+            spawn: SpawnSpec {
+                program: PathBuf::from("/bin/sleep"),
+                args: vec![std::ffi::OsString::from("30")],
+                cwd: None,
+                env: vec![],
+            },
+            readiness: ReadinessProbe::default(),
+            grace: DEFAULT_GRACE,
+        });
+        sup.start("mariadb-11.4").expect("start");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match sup.snapshot()[0].state {
+                    ServiceState::Starting | ServiceState::Running => return,
+                    ServiceState::Stopped | ServiceState::Failed { .. } => {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the child must come up");
+
+        let lock = InstallLock::default();
+        let runner = RecordingRunner::ok();
+
+        let err = perform_uninstall(run_for_mariadb(home.path(), &sup, &lock, runner.clone()))
+            .await
+            .unwrap_err();
+
+        assert!(
+            format!("{err}").contains("mariadb-11.4"),
+            "the refusal must name the service: {err}"
+        );
+        assert!(
+            runner.spawns().is_empty(),
+            "a refusal must spawn NOTHING, recorded {:?}",
+            runner.spawns()
+        );
+        assert!(
+            home.path().join("packages/mariadb/11.4").exists(),
+            "a refusal must not delete anything"
+        );
+
+        let _ = sup.stop("mariadb-11.4");
     }
 }

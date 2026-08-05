@@ -546,7 +546,14 @@ pub(crate) fn mysql_datadir_is_initialized(home: &Path, rt: &MysqlRuntime) -> bo
 /// series is a migration this build does not perform, and starting a server
 /// against it would attempt one in place. A new variant must make this
 /// function fail to compile.
-#[cfg(target_os = "macos")]
+///
+/// Ungated (unlike [`macos_stack`]/[`MacosStack`], which stay macOS-only):
+/// its implementation is exactly as portable as
+/// [`mysql_datadir_is_initialized`]'s own — both call straight through to
+/// portable `openvhost-core` functions — and `commands.rs`'s
+/// `rescan_mariadb_into_state` (portable, compiled for every target) needs
+/// to call this directly rather than only through the macOS-only startup
+/// path.
 pub(crate) fn mariadb_datadir_is_initialized(home: &Path) -> bool {
     match classify_mariadb_datadir(&mariadb_paths(home).datadir) {
         Ok(MariadbDatadirState::Initialized { .. }) => true,
@@ -652,6 +659,13 @@ pub struct MacosStack {
     /// ones that got a supervisor row in `specs`). `None` under the identical
     /// condition `runtimes`/`paths` are `None` under.
     pub mysql_runtimes: Option<Vec<MysqlRuntime>>,
+    /// Every discovered MariaDB runtime — at most one, since this build ships
+    /// exactly one series (spec §13.3) — mirroring `mysql_runtimes` above for
+    /// the identical reason: the Databases page needs it even when its
+    /// datadir is not yet initialized (no supervisor row exists for that
+    /// case). `None` under the identical condition the other three are `None`
+    /// under.
+    pub mariadb_runtimes: Option<Vec<MariadbRuntime>>,
 }
 
 /// Build the supervised stack rows: one nginx row, and one `php-fpm-<major>`
@@ -675,6 +689,7 @@ pub fn macos_stack() -> MacosStack {
                 paths: None,
                 runtimes: None,
                 mysql_runtimes: None,
+                mariadb_runtimes: None,
             };
         }
     };
@@ -755,9 +770,15 @@ pub fn macos_stack() -> MacosStack {
     // comment argues why). Discovery still runs first, so a machine that has
     // never installed MariaDB is never asked about a datadir; it spawns
     // nothing either way, costing a `read_link` and three `is_file` calls.
-    for rt in discover_installed_mariadb(&home) {
+    //
+    // Bound to a variable (rather than iterated inline, the shape this loop
+    // had before the Databases UI slice) so the SAME discovered runtime — not
+    // a second, separate walk — is also handed out as managed state below,
+    // mirroring `mysql` above exactly.
+    let mariadb = discover_installed_mariadb(&home);
+    for rt in &mariadb {
         if mariadb_datadir_is_initialized(&home) {
-            specs.push(mariadb_spec(&home, &rt));
+            specs.push(mariadb_spec(&home, rt));
         }
     }
     specs.push(ServiceSpec {
@@ -794,6 +815,7 @@ pub fn macos_stack() -> MacosStack {
             php,
         }),
         mysql_runtimes: Some(mysql),
+        mariadb_runtimes: Some(mariadb),
     }
 }
 

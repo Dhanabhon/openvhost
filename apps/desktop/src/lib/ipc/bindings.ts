@@ -309,6 +309,89 @@ export const commands = {
 	 *  defaults-file (spec D7's "it works" moment for the Databases page).
 	 */
 	verifyMysqlConnection: (major: string) => typedError<MysqlConnectionProofDto, IpcError>(__TAURI_INVOKE("verify_mysql_connection", { major })),
+	mariadbEnvironment: () => typedError<MariadbEnvironmentDto, IpcError>(__TAURI_INVOKE("mariadb_environment")),
+	/**
+	 *  The explicit, user-initiated re-probe behind the Databases page's rescan
+	 *  affordance — mirrors `rescan_mysql`, including blocking on `InstallLock`
+	 *  for the identical reason (a rescan racing a completed install must never
+	 *  silently revert it).
+	 */
+	rescanMariadb: () => typedError<MariadbEnvironmentDto, IpcError>(__TAURI_INVOKE("rescan_mariadb")),
+	/**
+	 *  Install MariaDB's pinned 11.4.9 build from the compiled-in catalogue,
+	 *  streaming [`MariadbInstallProgressEvent`] as the pipeline advances, then
+	 *  rescan so a freshly installed runtime is picked up.
+	 * 
+	 *  Takes no arguments at all: unlike `install_mysql`, there is no major to
+	 *  parse — `openvhost_core::install_mariadb_package` resolves the ONE
+	 *  catalogued series itself (design D7: "none takes a series argument").
+	 * 
+	 *  The run is **spawned**, not awaited inline, so its `AbortHandle` can be
+	 *  recorded — mirrors `install_mysql`'s identical reasoning.
+	 */
+	installMariadb: () => typedError<MariadbInstallOutcomeDto, IpcError>(__TAURI_INVOKE("install_mariadb")),
+	/**
+	 *  Cancel an in-flight MariaDB install, if one is running.
+	 * 
+	 *  **Kind- and operation-checked**, exactly like `cancel_mysql_install`: the
+	 *  check and the abort happen under one `InstallLock::abort_running_if`
+	 *  acquisition, so the slot cannot change in between, and both discriminators
+	 *  (`InstallKind::Mariadb`, `PackageOperation::Install`) must match — a
+	 *  MariaDB install sharing MySQL's `(kind, operation)` pair would let this
+	 *  command fire on MySQL's run, which is audit F1 with a second engine
+	 *  (D4).
+	 */
+	cancelMariadbInstall: () => typedError<boolean, IpcError>(__TAURI_INVOKE("cancel_mariadb_install")),
+	/**
+	 *  Drives MariaDB's staged init (spec D7) via
+	 *  `openvhost_core::mariadb::initialize_mariadb`, which — unlike MySQL's
+	 *  `run_mysql_init` — already owns its whole staged sequence (slice A; see
+	 *  that module's own doc comment for why the driver lives in openvhost-core
+	 *  for this engine and not in this file). This command is therefore thin
+	 *  wiring: look the discovered runtime up, spawn the core function so its
+	 *  `AbortHandle` can be registered on the shared `InstallLock`
+	 *  (`MARIADB_INIT_RUN`, D4/F1), persist the generated password on success,
+	 *  then register the service row.
+	 * 
+	 *  **No live per-line log.** Unlike `run_mysql_init`, the core function
+	 *  reports no intermediate output — it returns a single terminal outcome —
+	 *  so there is nothing to stream WHILE a run is in progress. A `Failed`
+	 *  outcome's `reason` DOES carry real diagnostic content (it already
+	 *  includes the temp server's own log tail; see `mariadb::init`'s
+	 *  `server_log`), so that is relayed through [`MariadbInitLogEvent`] once
+	 *  the run ends, rather than left unsent — a post-hoc relay of something
+	 *  real, never a fabricated live one.
+	 */
+	initializeMariadb: () => typedError<MariadbInitOutcomeDto, IpcError>(__TAURI_INVOKE("initialize_mariadb")),
+	/**
+	 *  The stored root password for MariaDB (spec D7's outbound reveal) — the
+	 *  MariaDB mirror of [`mysql_root_password`], and the identical SECURITY
+	 *  discipline: audit H2's rule that this is the SOLE place sanctioned to
+	 *  de-redact a `RootPassword` into a plain `String` for a RETURN value
+	 *  applies here too, unchanged — see that command's own doc comment.
+	 */
+	mariadbRootPassword: () => typedError<string, IpcError>(__TAURI_INVOKE("mariadb_root_password")),
+	/**
+	 *  Regenerate MariaDB's root password: authenticates with the STORED (old)
+	 *  password via an ephemeral 0600 defaults-file, runs
+	 *  `openvhost_core::mariadb::root_password_sql` over stdin with a freshly
+	 *  generated password, and — only once that succeeds — persists the new
+	 *  value. The MariaDB mirror of [`reset_mysql_root_password`], with one
+	 *  deliberate difference: it runs MariaDB's own multi-statement
+	 *  `root_password_sql`, not MySQL's single-statement `alter_user_sql`.
+	 *  `mariadb::init`'s own doc comment measured root existing at FOUR hosts
+	 *  after this build's init (`localhost`, `127.0.0.1`, `::1`, plus a removed
+	 *  hostname row), so a single `ALTER USER 'root'@'localhost'` would leave the
+	 *  other two loopback accounts on their OLD password after a reset — the
+	 *  exact hole that comment documents finding.
+	 */
+	resetMariadbRootPassword: () => typedError<MariadbResetOutcomeDto, IpcError>(__TAURI_INVOKE("reset_mariadb_root_password")),
+	/**
+	 *  `SELECT VERSION(), @@port` through the running server's socket,
+	 *  authenticating with the stored credential via an ephemeral 0600
+	 *  defaults-file — the MariaDB mirror of [`verify_mysql_connection`].
+	 */
+	verifyMariadbConnection: () => typedError<MariadbConnectionProofDto, IpcError>(__TAURI_INVOKE("verify_mariadb_connection")),
 	/**
 	 *  The full log-source catalogue: nginx's two globals (always listed), one
 	 *  row per INSTALLED php-fpm major, two rows (access + error) per site in
@@ -360,6 +443,9 @@ export const commands = {
 
 /** Events */
 export const events = {
+	mariadbInitLogEvent: makeEvent<MariadbInitLogEvent>("mariadb-init-log-event"),
+	mariadbInstallLogEvent: makeEvent<MariadbInstallLogEvent>("mariadb-install-log-event"),
+	mariadbInstallProgressEvent: makeEvent<MariadbInstallProgressEvent>("mariadb-install-progress-event"),
 	mysqlInitLogEvent: makeEvent<MysqlInitLogEvent>("mysql-init-log-event"),
 	mysqlInstallLogEvent: makeEvent<MysqlInstallLogEvent>("mysql-install-log-event"),
 	mysqlInstallProgressEvent: makeEvent<MysqlInstallProgressEvent>("mysql-install-progress-event"),
@@ -509,7 +595,7 @@ export type HomeUsageDto = {
  *  itself carries no `specta::Type`/`Serialize`; it is purely an internal
  *  discriminator for `InstallLock`'s slot.
  */
-export type InstallKindDto = "php" | "mysql";
+export type InstallKindDto = "php" | "mysql" | "mariadb";
 
 /**
  *  The outcome of an `install_php` call. `detected: false` alongside
@@ -690,6 +776,185 @@ export type LogWindowQuery = {
 	caseSensitive: boolean,
 	minLevel: LogLevel | null,
 };
+
+/**
+ *  `verify_mariadb_connection`'s outcome — the MariaDB mirror of
+ *  [`MysqlConnectionProofDto`]: outcome-shaped, never an `IpcError`, so the
+ *  "Verify connection" button always has something to render.
+ */
+export type MariadbConnectionProofDto = { kind: "ok"; version: string; port: number } | { kind: "authFailed"; detail: string } | { kind: "failed"; detail: string };
+
+/**
+ *  Mirrors `openvhost_core::mariadb::MariadbDatadirState` 1:1 as a wire-safe
+ *  copy — the MariaDB counterpart of `MysqlDatadirStateDto`. No sibling of
+ *  `Foreign`'s message for a missing/unreadable datadir here either: same
+ *  "never silently downgrade to the safe-looking state" discipline as
+ *  `classify_datadir_dto` below.
+ */
+export type MariadbDatadirStateDto = { kind: "notInitialized" } | { kind: "initialized"; version: string } | { kind: "foreign"; detail: string };
+
+/**
+ *  The MariaDB row on the Databases page.
+ * 
+ *  A single struct, never a `Vec`: this build ships exactly one series
+ *  (`openvhost_core::MARIADB_SERIES`), so a list whose length is always 0 or
+ *  1 would invent a key nothing can vary — the same reasoning
+ *  `MariadbInstanceRepo`'s own doc comment gives for leaving a `major` field
+ *  off `MariadbInstance` (design D6: "the store holds scalars, not
+ *  dictionaries").
+ */
+export type MariadbEnvironmentDto = {
+	installed: boolean,
+	version: string | null,
+	path: string | null,
+	/**
+	 *  `Some` ONLY once BOTH installed and the datadir is genuinely
+	 *  Initialized — mirrors `MysqlInstanceDto::socket_path`'s identical gate
+	 *  (spec D6).
+	 */
+	socketPath: string | null,
+	serviceId: string | null,
+	datadirState: MariadbDatadirStateDto,
+	/**
+	 *  Whether THIS BUILD offers to install MariaDB on THIS host, and what it
+	 *  would install — see [`crate::mariadb_pkg::MariadbPackageOfferDto`] for
+	 *  the third state (`AwaitingRelease`) MySQL's own offer type does not
+	 *  need (design D2).
+	 */
+	offer: MariadbPackageOfferDto,
+};
+
+/**
+ *  One line of `initialize_mariadb`'s init sequence, relayed after the fact
+ *  on failure — see [`initialize_mariadb`]'s own doc comment for why this is
+ *  a post-hoc relay rather than a live stream, and [`MariadbInstallLogEvent`]
+ *  for why there is no `major`/`series` field.
+ */
+export type MariadbInitLogEvent = {
+	tsMs: number,
+	stream: string,
+	line: string,
+};
+
+/**
+ *  Mirrors `openvhost_core::mariadb::MariadbInitOutcome` 1:1 as a wire-safe
+ *  copy (spec D7's `initialize_mariadb`).
+ */
+export type MariadbInitOutcomeDto = { kind: "initialized" } | { kind: "alreadyInitialized" } | { kind: "foreign"; detail: string } | { kind: "failed"; step: MariadbInitStepDto; reason: string };
+
+/**
+ *  Mirrors `openvhost_core::mariadb::MariadbInitStep` 1:1 as a wire-safe
+ *  copy — the MariaDB counterpart of [`MysqlInitStepDto`]. No `Validate`
+ *  variant: MariaDB has no `--validate-config`, so there is no pre-flight
+ *  step to fail at (mirrors the core type's own doc comment).
+ */
+export type MariadbInitStepDto = "render" | "initialize" | "startTempServer" | "setPassword" | "shutdown" | "finalize";
+
+/**
+ *  One line of a MariaDB package operation's output, forwarded live while it
+ *  runs. Same shape and reasoning as [`MysqlInstallLogEvent`] — carries
+ *  **no `major`/`series` field**, unlike its PHP/MySQL siblings: this build
+ *  ships exactly one series, so a field nothing can vary would be pure
+ *  overhead (the same reasoning `MariadbInstance` gives for leaving `major`
+ *  off its own struct).
+ * 
+ *  In practice this channel is filled only by an uninstall's
+ *  `Removal::PackageTree` step failing to report through it — see
+ *  `uninstall::run::emit_uninstall_log`'s own doc comment for why it exists
+ *  as a real, registered channel even though MariaDB's ordinary uninstall
+ *  never streams through it either (no child process to stream from).
+ */
+export type MariadbInstallLogEvent = {
+	tsMs: number,
+	stream: string,
+	line: string,
+};
+
+/**
+ *  `install_mariadb`'s return: whether it installed, and how.
+ * 
+ *  No `major`/`series` field, unlike `mysql_pkg::MysqlInstallOutcomeDto` —
+ *  same reasoning as [`MariadbInstallProgressEvent`].
+ */
+export type MariadbInstallOutcomeDto = {
+	result: MariadbInstallResultDto,
+};
+
+/**
+ *  One step of the install pipeline, as the user watches it — the wire copy
+ *  of `openvhost_pkg::Progress`, identical in shape to
+ *  `mysql_pkg::MysqlInstallProgressDto` (the pipeline itself is shared — see
+ *  `install_mariadb_package`'s own doc comment). Kept as its own type rather
+ *  than reused, mirroring every other MariaDB DTO in this slice: the two
+ *  engines' wire shapes must be able to diverge without an edit to one
+ *  silently reaching the other.
+ */
+export type MariadbInstallProgressDto = { kind: "started"; total: number | null } | { kind: "downloaded"; bytes: number } | { kind: "verified" } | { kind: "extracted" } | { kind: "linked" };
+
+/**
+ *  One pipeline step, forwarded live while an install runs.
+ * 
+ *  No `major`/`series` field, unlike [`crate::mysql_pkg::MysqlInstallProgressEvent`]:
+ *  this build ships exactly one series, so a field nothing can vary would be
+ *  pure overhead — the same reasoning `MariadbInstance` gives for leaving
+ *  `major` off its own struct.
+ */
+export type MariadbInstallProgressEvent = {
+	tsMs: number,
+	progress: MariadbInstallProgressDto,
+};
+
+/**
+ *  How one `install_mariadb` call ended — the MariaDB mirror of
+ *  `mysql_pkg::MysqlInstallResultDto`, with `Unavailable` renamed nowhere and
+ *  one addition: `AwaitingRelease`, the release-not-published refusal
+ *  `install_mariadb_package` raises before any network or filesystem work
+ *  (design D2/D5).
+ */
+export type MariadbInstallResultDto = { kind: "installed"; version: string; detected: boolean; ledger: MariadbLedgerWriteDto } | { kind: "alreadyInstalled"; version: string } | { kind: "cancelled" } | { kind: "verificationFailed"; expected: string; actual: string } | { kind: "stalled"; detail: string } | 
+/**
+ *  The pinned build exists but the release that would serve it has not
+ *  been published — see [`MariadbPackageOfferDto::AwaitingRelease`].
+ *  `tag` is the release a human has to create.
+ */
+{ kind: "awaitingRelease"; tag: string } | { kind: "unavailable"; target: string } | { kind: "failed"; reason: string };
+
+/**
+ *  Whether the install was also recorded in `state.db`'s package ledger —
+ *  the MariaDB mirror of `mysql_pkg::MysqlLedgerWriteDto`. Reused from the
+ *  same `openvhost_core::mysql::LedgerWrite` the MySQL path returns (the
+ *  ledger is package-agnostic; see `MariadbPackageInstall`'s own doc
+ *  comment), so only the WIRE type is duplicated, not the underlying model.
+ */
+export type MariadbLedgerWriteDto = { kind: "recorded" } | { kind: "failed"; reason: string };
+
+/**
+ *  Whether this build can install MariaDB on THIS host, and what it would
+ *  install — the MariaDB counterpart of `mysql_pkg::MysqlPackageOfferDto`,
+ *  extended with the THIRD state design D2 requires (this module's own doc
+ *  comment explains why): a build exists and is pinned, but the release that
+ *  would serve it has not been published yet.
+ * 
+ *  Matched exhaustively wherever it is consumed, with **no wildcard arm**: a
+ *  fourth state must be decided about here rather than silently folded into
+ *  one of the first three.
+ */
+export type MariadbPackageOfferDto = { kind: "available"; version: string } | 
+/**
+ *  The pinned build exists and was audited, but the GitHub release that
+ *  would serve it has not been published — the next action belongs to
+ *  the maintainer, not the user. `tag` is the release to publish, e.g.
+ *  `"mariadb-11.4.9"`.
+ */
+{ kind: "awaitingRelease"; tag: string } | { kind: "unavailable"; target: string };
+
+/**
+ *  `reset_mariadb_root_password`'s outcome — the MariaDB mirror of
+ *  [`MysqlResetOutcomeDto`], and the identical reasoning: auth failure is an
+ *  EXPECTED, renderable outcome (the stored password may be stale), never
+ *  thrown as an `IpcError`.
+ */
+export type MariadbResetOutcomeDto = { kind: "reset" } | { kind: "authFailed"; detail: string };
 
 /**
  *  `verify_mysql_connection`'s outcome (spec D7: "returns version/port or
@@ -976,7 +1241,7 @@ export type MysqlRuntimeSourceDto = { kind: "packaged"; version: string } | { ki
  *  alternative (a `_` arm) is an uninstall that reports success having removed
  *  nothing.
  */
-export type PackageKind = "php" | "mysql";
+export type PackageKind = "php" | "mysql" | "mariadb";
 
 /**
  *  Wire-safe copy of [`PackageOperation`] — same relationship
