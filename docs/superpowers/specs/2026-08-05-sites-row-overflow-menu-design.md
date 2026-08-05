@@ -33,17 +33,25 @@ three interactions, which for a destructive action is a feature.
 The panel sets `overflow: hidden` to clip rows against its rounded corners, so a menu
 positioned inside a row is clipped.
 
-`position: fixed` looks like the cheap escape and **probably is not one here**: PR #45 added
-`container-type: inline-size` to `.rowlist`, and containment makes an element a containing
-block for fixed-position descendants — which would leave the menu inside the clipped subtree
-after all.
+*Corrected 2026-08-05, measured before any code was written:* an earlier draft of this
+section said `position: fixed` would **not** escape, because PR #45 gave `.rowlist`
+`container-type: inline-size` and containment makes an element a containing block for
+fixed-position descendants. **That was wrong**, and it was checked in real headless Chrome
+with `contain: layout` and `transform` as positive controls to validate the method itself:
+`container-type: inline-size` *alone* does not create the containing block —
+`getComputedStyle` reports `contain: none` for it, and a fixed descendant lands at true
+viewport coordinates. `contain: layout` does trap it, but that is not what `.rowlist`
+carries. So `position: fixed` would most likely have escaped the clip today.
 
-**Verify that claim before relying on either half of it.** It is written here as the reason
-for the decision, not as an established fact, and a wrong "why" in a comment is worse than
-no comment. Either way the decision stands: **portal the menu to `<body>`** and position it
-from the trigger's `getBoundingClientRect()`. That is correct whether or not containment
-bites, it is immune to any future ancestor gaining `transform` or `filter`, and — unlike the
-Popover API, which would also escape via the top layer — it is testable in jsdom.
+Recording the correction rather than quietly deleting it, because the decision below did not
+change and a reader who only sees the conclusion would not know which of its reasons
+survived.
+
+**The decision stands: portal the menu to `<body>`** and position it from the trigger's
+`getBoundingClientRect()`. Its surviving reasons are the containment-independent ones — it
+is immune to any future ancestor gaining `transform`, `filter` or `contain: layout` (each of
+which *would* trap a fixed descendant, as measured), and unlike the Popover API, which would
+also escape via the top layer, it can be tested in jsdom.
 
 Close the menu on scroll and on resize rather than trying to keep a portalled element glued
 to a moving trigger.
