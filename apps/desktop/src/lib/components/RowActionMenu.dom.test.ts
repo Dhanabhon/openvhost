@@ -106,9 +106,20 @@ async function click(el: Element): Promise<void> {
 	await tick();
 }
 
-async function keydown(target: EventTarget, key: string): Promise<void> {
-	target.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }));
+/** Returns the dispatched event (not just `void`, unlike every other helper here) so
+ * a caller can assert `defaultPrevented` — needed by the Tab tests below, which must
+ * prove the key was NOT prevented, not only that the menu closed. `init` is optional
+ * and additive (e.g. `{ shiftKey: true }`); every existing call site that omits it is
+ * unaffected. */
+async function keydown(
+	target: EventTarget,
+	key: string,
+	init: KeyboardEventInit = {}
+): Promise<KeyboardEvent> {
+	const event = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true, ...init });
+	target.dispatchEvent(event);
 	await tick();
+	return event;
 }
 
 async function dispatch(target: EventTarget, event: Event): Promise<void> {
@@ -292,6 +303,47 @@ describe('RowActionMenu keyboard', () => {
 		expect(document.body.querySelector('[role="menu"]')).toBeNull();
 		await teardown(s);
 	});
+
+	// Review fix wave: the original cut of this component had no `Tab` case at all,
+	// so the popup stayed open (`aria-expanded="true"`) even once focus had visibly
+	// left it via the browser's own native tab traversal — every OTHER deliberate
+	// close path already handled this correctly. Matches Select.svelte's own
+	// onTriggerKeydown precedent: Tab must never be trapped, so this only closes the
+	// menu and never calls `preventDefault`.
+	it("Tab closes the popup without preventing the browser's own tab traversal", async () => {
+		const s = await setup();
+		const trigger = getTrigger(s.host);
+		await click(trigger);
+		const [view] = menuItems();
+		const event = await keydown(view, 'Tab');
+		expect(document.body.querySelector('[role="menu"]')).toBeNull();
+		expect(trigger.getAttribute('aria-expanded')).toBe('false');
+		expect(event.defaultPrevented).toBe(false);
+		await teardown(s);
+	});
+
+	// Shift+Tab is still just `key: 'Tab'` (the modifier only changes which
+	// DIRECTION the browser's own default action moves in, which jsdom does not
+	// perform) — exercised from a DIFFERENT item than the plain-Tab test above, and
+	// from the destructive one specifically, so this cannot pass merely because
+	// index 0 happens to be special-cased somewhere.
+	it('Shift+Tab does the same, from an item other than the first', async () => {
+		const s = await setup();
+		const trigger = getTrigger(s.host);
+		await click(trigger);
+		const [, , del] = menuItems();
+		const event = await keydown(del, 'Tab', { shiftKey: true });
+		expect(document.body.querySelector('[role="menu"]')).toBeNull();
+		expect(trigger.getAttribute('aria-expanded')).toBe('false');
+		expect(event.defaultPrevented).toBe(false);
+		await teardown(s);
+	});
+	// Vacuity-proved together: temporarily removed the `case 'Tab':` block from
+	// `onMenuKeydown` (leaving every other case untouched) and re-ran this file.
+	// Both tests above went red — the popup stayed open and `aria-expanded` stayed
+	// `"true"` in both — while every other test in this describe block (Escape,
+	// arrows, Enter/Space) stayed green throughout, confirming the failure was
+	// specific to the missing Tab handling. Reverted before moving on.
 });
 
 describe('RowActionMenu focus management', () => {

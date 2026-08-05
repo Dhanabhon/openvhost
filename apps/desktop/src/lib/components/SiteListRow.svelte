@@ -60,6 +60,10 @@
 	 */
 	let confirming = $state(false);
 
+	/** This row's own root node — see the `$effect` below, which needs a subtree to
+	 * scope its fallback-focus lookup to. */
+	let rowEl: HTMLDivElement | undefined = $state();
+
 	/**
 	 * The row's three secondary actions (design spec D1), behind the `⋮` trigger.
 	 *
@@ -90,9 +94,43 @@
 			}
 		}
 	]);
+
+	/**
+	 * Focus fallback for the confirm step (review fix wave, HIGH 2 — focus was
+	 * landing on `<body>`). `RowActionMenu`'s own `closeAndRefocus()` already
+	 * focuses its trigger synchronously when Delete is chosen, in the SAME handler
+	 * that sets `confirming = true` here — but that trigger lives in the `{:else}`
+	 * branch below, which THIS SAME reactive flush tears down the moment
+	 * `confirming` goes true, since it is being replaced by the `{#if confirming}`
+	 * branch. The element that was just focused stops existing before anything
+	 * else claims focus, and it falls back to `<body>` — a keyboard user gets no
+	 * feedback that the destructive step's controls even appeared.
+	 *
+	 * Keyed on the STATE CHANGE, not called from the menu's own `onSelect` above:
+	 * this makes it correct regardless of what sets `confirming` (today, only the
+	 * `⋮` menu's Delete item; anything else that does the same later gets the same
+	 * fix for free, with nothing to remember to wire up at each new call site).
+	 *
+	 * Reuses `Button.svelte`'s existing `focusFallback` prop / `data-vh-focus-
+	 * fallback` hook — the same mechanism `SiteDrawer.svelte`'s own focus-
+	 * restoration cleanup already uses for "the element I meant to refocus may no
+	 * longer exist in the DOM" — rather than inventing a second way to find a
+	 * fallback button. Scoped to `rowEl` (this row's own subtree), NOT
+	 * `document`: the app-wide hook also marks `SitesPanel`'s "Add site" button,
+	 * and a plain `document.querySelector` would find THAT one first (it precedes
+	 * the row list in DOM order), not this row's Cancel button.
+	 *
+	 * Targets Cancel specifically, not the confirm Delete button below — landing
+	 * keyboard focus on a destructive default is its own hazard; the user must
+	 * choose to move to it.
+	 */
+	$effect(() => {
+		if (!confirming) return;
+		rowEl?.querySelector<HTMLElement>('[data-vh-focus-fallback]')?.focus();
+	});
 </script>
 
-<div class="row site-row" data-testid="site-{site.id}">
+<div class="row site-row" data-testid="site-{site.id}" bind:this={rowEl}>
 	<div>
 		<div class="primary">{site.name}</div>
 		<!-- `title` so an ellipsized domain stays readable: the cell now clips (see the CSS
@@ -138,6 +176,7 @@
 				variant="quiet"
 				size="sm"
 				ariaLabel="Keep {site.name}"
+				focusFallback
 				onclick={() => (confirming = false)}>Cancel</Button
 			>
 			<!-- The only danger-tinted control in the row: the destructive step itself, never
@@ -488,7 +527,7 @@
 		   flex-end` already keeps right-aligned, so they sit under the row's right edge exactly
 		   as they do on one line. `flex-shrink: 0` is the load-bearing half: button labels are
 		   text and cannot be squeezed, so the group must be allowed to claim its natural width
-		   and wrap instead. The 268px floor above is left alone — harmless here, since the
+		   and wrap instead. The floor above is left alone — harmless here, since the
 		   narrowest row this layout ever sees is ~694px and the actions have the line to
 		   themselves. */
 		.row-actions {

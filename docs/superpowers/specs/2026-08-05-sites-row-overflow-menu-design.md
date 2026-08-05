@@ -43,9 +43,19 @@ with `contain: layout` and `transform` as positive controls to validate the meth
 viewport coordinates. `contain: layout` does trap it, but that is not what `.rowlist`
 carries. So `position: fixed` would most likely have escaped the clip today.
 
+*Disputed, 2026-08-05, not reconciled:* the branch review read the CSS Containment /
+Container Queries spec as defining a non-`normal` `container-type` to itself imply layout
+containment — which, if that reading holds, *would* make `container-type: inline-size` alone
+enough to establish a containing block, independent of what `getComputedStyle().contain`
+reports (the specific thing the measurement above read). The reviewer could not verify this
+live and did not assert the measurement above is wrong; this section does not assert the
+spec reading is wrong either. Recording both rather than picking one, the same way the first
+correction is recorded rather than deleted: the Chrome-151 finding above should be read as
+version- or reading-specific, not as a settled fact about the platform.
+
 Recording the correction rather than quietly deleting it, because the decision below did not
 change and a reader who only sees the conclusion would not know which of its reasons
-survived.
+survived — and that is equally true of the dispute above: it changes nothing below either.
 
 **The decision stands: portal the menu to `<body>`** and position it from the trigger's
 `getBoundingClientRect()`. Its surviving reasons are the containment-independent ones — it

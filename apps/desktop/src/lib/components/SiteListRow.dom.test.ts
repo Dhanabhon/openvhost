@@ -182,8 +182,13 @@ describe('SiteListRow menu contents', () => {
 // has no `disabled` field at all, so there is no way to gate a link item today; this
 // pins the behaviour this row actually wants (View logs unconditionally present)
 // rather than relying on that absence as an implementation accident.
+//
+// Named for what THIS test actually checks — the menu's own contents — not for the
+// Open button, which it never touches; Open's disabled-when-the-site-is-disabled
+// behaviour is unchanged by this slice and stays covered by
+// SiteListRow.svelte.test.ts's own "disables opening for a disabled site".
 describe('SiteListRow menu contents when the site is disabled', () => {
-	it('still offers View logs, unlike Open', async () => {
+	it('still offers View logs, with the same target as when the site is enabled', async () => {
 		const s = await setup(disabledSite);
 		await click(getTrigger(s.host));
 		const items = menuItems();
@@ -231,6 +236,32 @@ describe('SiteListRow Delete menu item reaches the existing inline confirm', () 
 		expect(s.onDelete).toHaveBeenCalledWith(site.id);
 		await teardown(s);
 	});
+
+	// Review fix wave, HIGH 2: RowActionMenu's own `closeAndRefocus()` focuses its
+	// trigger synchronously in the SAME handler that sets `confirming = true` here —
+	// but that trigger lives in the `{:else}` branch this very state change tears
+	// down, so the freshly-focused node stops existing before anything else claims
+	// focus, and it fell back to `<body>` with nothing announced to a keyboard user.
+	// Lands on Cancel specifically, not the confirm Delete button: a destructive
+	// control must never be the keyboard-focus default.
+	it('lands focus on Cancel, not <body> and not the destructive confirm button', async () => {
+		const s = await setup();
+		await click(getTrigger(s.host));
+		const [, , del] = menuItems();
+		await click(del);
+		expect(document.activeElement).not.toBe(document.body);
+		expect(document.activeElement).toBe(
+			s.host.querySelector<HTMLButtonElement>('[aria-label="Keep shop"]')
+		);
+		await teardown(s);
+	});
+	// Vacuity-proved: temporarily removed the `focusFallback` attribute from the
+	// confirm block's Cancel `<Button>` in SiteListRow.svelte (leaving the new
+	// `$effect` itself, and everything else, untouched) and re-ran this file. This
+	// test went red — `document.activeElement` was `document.body` — while "closes
+	// the menu and shows the row's own confirm" above stayed green throughout,
+	// confirming the failure was specific to focus, not to the confirm state itself
+	// appearing. Reverted before moving on.
 });
 
 describe("SiteListRow's menu escapes the real SitesPanel .panel (design spec D2)", () => {

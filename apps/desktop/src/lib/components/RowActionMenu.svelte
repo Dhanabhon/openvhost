@@ -13,17 +13,26 @@
   containment would make `.rowlist` a containing block for a `position: fixed`
   descendant, trapping the menu inside `.panel`'s `overflow: hidden` anyway.
 
-  VERIFIED, and the claim does NOT hold for the rule actually in this codebase.
-  Checked empirically against real Chrome (151.0.7922.75): a `position: fixed`
-  descendant of a `container-type: inline-size` (no other `contain`) ancestor
-  resolves against the VIEWPORT exactly as an ordinary fixed element would —
-  `getComputedStyle` reports `contain: none` for that ancestor, and the fixed
-  descendant painted and hit-tested at its true viewport coordinates, not clipped by
-  an outer `overflow: hidden`. A `contain: layout` ancestor (not what `.rowlist`
-  carries) DOES trap it — confirmed as a positive control, alongside `transform`,
-  which is the textbook case. So `position: fixed` left in place would most likely
-  have escaped `.panel`'s clip today after all; the stated reason was wrong even
-  though the decision it argued for was right.
+  MEASURED IN CHROME 151.0.7922.75, and the claim did not hold THERE, for the rule
+  actually in this codebase: a `position: fixed` descendant of a `container-type:
+  inline-size` (no other `contain`) ancestor resolved against the VIEWPORT exactly
+  as an ordinary fixed element would — `getComputedStyle` reported `contain: none`
+  for that ancestor, and the fixed descendant painted and hit-tested at its true
+  viewport coordinates, not clipped by an outer `overflow: hidden`. A `contain:
+  layout` ancestor (not what `.rowlist` carries) DID trap it — confirmed as a
+  positive control, alongside `transform`, which is the textbook case, so the
+  method itself was validated, not just asserted.
+
+  NOT RECONCILED with the spec text: a later review of this file read the CSS
+  Containment / Container Queries spec as defining a non-`normal` `container-type`
+  to itself imply layout containment — which, if that reading is right, WOULD
+  establish a containing block for a fixed descendant regardless of what
+  `getComputedStyle().contain` reports (the specific thing the measurement above
+  read). That reviewer could not verify live and did not assert the measurement
+  above is wrong; this file does not assert the spec reading is wrong either. Both
+  are recorded because the decision below did not change either way — treat the
+  Chrome-151 finding as version- or reading-specific, not as a settled fact about
+  the platform.
 
   Portalling is still the correct call, for the reasons the spec gave that do NOT
   depend on the containment question: it is immune to any ANCESTOR later gaining
@@ -63,6 +72,15 @@
   is what makes "Enter/Space activate" true uniformly, and it is verified in jsdom
   rather than assumed, since jsdom does not reliably reproduce a live browser's
   default keyboard-activation behaviour for focused elements.
+
+  TAB is never trapped (review fix wave — the original cut of this file had no `Tab`
+  case at all, which is a real gap this comment used to say nothing about). Matches
+  `Select.svelte`'s own `onTriggerKeydown` precedent exactly: closes the menu and
+  does NOT `preventDefault`, so the browser's native focus navigation runs
+  uninterrupted rather than this widget deciding where Tab goes. Without it the menu
+  stayed open — stale `open`/`aria-expanded="true"` — even once focus had visibly
+  moved on, which every OTHER deliberate close path (Escape, an item, outside click)
+  already handled correctly.
 
   FOCUS RETURNS to the trigger on every path that closes the menu deliberately —
   Escape, choosing an item (button or link), and clicking outside — funnelled through
@@ -228,6 +246,19 @@
 				// item kind, rather than relying on each element's own native default.
 				e.preventDefault();
 				(e.target as HTMLElement | null)?.click();
+				return;
+			case 'Tab':
+				// Matches Select.svelte's own onTriggerKeydown precedent (this file's own
+				// header cites Select as its keyboard model): Tab is never trapped here,
+				// deliberately NOT `preventDefault`-ed, so the browser's native focus
+				// navigation runs uninterrupted. The menu still has to close itself,
+				// though — without this case it stayed open (stale `open`/
+				// `aria-expanded="true"`) even once focus had visibly left it, which
+				// Escape/click-outside/choosing an item all already handle but Tab did
+				// not. `closeMenu()`, not `closeAndRefocus()`: an explicit `.focus()`
+				// here would fight the tab key's own default action instead of getting
+				// out of its way.
+				closeMenu();
 				return;
 		}
 	}
