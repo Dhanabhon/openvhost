@@ -196,8 +196,16 @@ pub fn mariadb_staging_dir_path(staging_parent: &Path) -> PathBuf {
 /// `skip-name-resolve` is set and becomes usable the moment a user drop-in
 /// unsets it, which is not a door to leave for a credential the user was never
 /// shown. The anonymous account is removed on the same principle; this init
-/// does not create one, and a future upstream change that did would otherwise
-/// pass unnoticed. Both DELETEs use `mariadb-secure-installation`'s own idiom
+/// does not create one **because `--skip-test-db` is on the init argv**, which
+/// is what suppresses the anonymous pair upstream would otherwise add. So that
+/// DELETE is defence-in-depth today — and it stops being defence-in-depth the
+/// moment someone drops the flag, which is exactly why the flag is named here
+/// rather than left as a fact about this init that a reader has to take on
+/// faith. (Two independent live measurements on 2026-08-04 confirmed the
+/// account list: four root rows plus a locked `mariadb.sys`, no anonymous row.
+/// A review reading this comment without the flag named concluded the claim
+/// was false, so the flag earns its mention.) Both DELETEs use
+/// `mariadb-secure-installation`'s own idiom
 /// against `mysql.global_priv`, and `FLUSH PRIVILEGES` after them is what makes
 /// a direct grant-table edit take effect in the running server's ACL cache.
 ///
@@ -676,13 +684,38 @@ pub async fn initialize_mariadb(
     // ensured here for the same reason: `provision_home` creates `<home>/run`
     // on a normal launch, but this function must not silently depend on
     // having been called after it.
-    if let Some(run_dir) = ctx.paths.init_socket.parent()
-        && let Err(e) = std::fs::create_dir_all(run_dir)
-    {
-        fail!(
-            Step::Render,
-            format!("failed to create {}: {e}", run_dir.display())
-        );
+    // Created at 0700 rather than with a bare `create_dir_all`, because of
+    // WHEN this runs: for the whole of this init the temp server's root
+    // password is still empty, and the only thing keeping its socket out of
+    // another local user's reach is the home being untraversable.
+    // `provision_home` is what applies 0700 to the home — so a defensive
+    // create that carried no mode would be guarding the directory's EXISTENCE
+    // while silently depending on the very property it was written not to
+    // assume.
+    //
+    // The mode applies to components this call creates; an existing `run/` is
+    // deliberately left as it is, because it is shared with nginx, php-fpm and
+    // MySQL and silently re-moding it here would be a change to their
+    // containment made from the wrong place. The home's own 0700 is what
+    // covers that case. (MySQL's init has the identical shape and is recorded
+    // as a merge precondition on the packaged-MySQL slice, not fixed here.)
+    if let Some(run_dir) = ctx.paths.init_socket.parent() {
+        #[cfg(unix)]
+        let created = {
+            use std::os::unix::fs::DirBuilderExt as _;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(run_dir)
+        };
+        #[cfg(not(unix))]
+        let created = std::fs::create_dir_all(run_dir);
+        if let Err(e) = created {
+            fail!(
+                Step::Render,
+                format!("failed to create {}: {e}", run_dir.display())
+            );
+        }
     }
 
     // ---- Initialize into staging ----
@@ -1470,5 +1503,273 @@ exit 0
         };
 
         assert!(!path.exists(), "the guard must remove the file on drop");
+    }
+
+    // ---- The success path, hermetically ----
+
+    /// A package tree whose whole init sequence SUCCEEDS.
+    ///
+    /// [`fake_runtime`] hardcodes `mariadb-admin` to `exit 1`, so every test
+    /// built on it stops at `StartTempServer` — which meant that until this
+    /// fixture existed, `SetPassword` → `Shutdown` → `Finalize` →
+    /// `Initialized` was reachable ONLY through `tests/mariadb_live.rs`,
+    /// behind `OPENVHOST_MARIADB_LIVE_TESTS=1` and a gitignored ~125 MB
+    /// artifact. An ordinary `cargo test --workspace` proved nothing about the
+    /// single outcome this module exists to produce. (Found by the 2026-08-04
+    /// whole-branch review.)
+    ///
+    /// The shutdown handshake is real rather than timed: `initialize_mariadb`
+    /// WAITS on the temp server after `mariadb-admin shutdown` returns, so a
+    /// fake server that merely slept would hang the suite for its whole sleep.
+    /// Here `mariadb-admin shutdown` creates a file and `mariadbd` polls for
+    /// it, so the sequence is causally ordered instead of racing a clock, and
+    /// the poll is bounded so a regression cannot hang CI either.
+    #[cfg(unix)]
+    fn fake_runtime_that_completes(base: &Path) -> MariadbRuntime {
+        fake_tree(base);
+        let stop = base.join("shutdown-requested").display().to_string();
+
+        sh(
+            &base.join("scripts/mariadb-install-db"),
+            r#"
+for arg in "$@"; do
+  case "$arg" in --datadir=*) d="${arg#--datadir=}" ;; esac
+done
+mkdir -p "$d/mysql"
+printf '11.4.9-MariaDB\n' > "$d/mariadb_upgrade_info"
+exit 0
+"#,
+        );
+        sh(
+            &base.join("bin/mariadbd"),
+            &r#"
+i=0
+while [ ! -f "@STOP@" ] && [ "$i" -lt 600 ]; do
+  sleep 0.05
+  i=$((i+1))
+done
+exit 0
+"#
+            .replace("@STOP@", &stop),
+        );
+        sh(
+            &base.join("bin/mariadb-admin"),
+            &r#"
+for arg in "$@"; do
+  if [ "$arg" = shutdown ]; then : > "@STOP@"; fi
+done
+exit 0
+"#
+            .replace("@STOP@", &stop),
+        );
+        sh(&base.join("bin/mariadb"), "exit 0");
+
+        MariadbRuntime {
+            series: MARIADB_SERIES,
+            version: "11.4.9".to_string(),
+            mariadbd: base.join("bin/mariadbd"),
+            mariadb: base.join("bin/mariadb"),
+            mariadb_admin: base.join("bin/mariadb-admin"),
+        }
+    }
+
+    /// The outcome the whole module exists to produce, reached without a real
+    /// server: `Initialized`, a credential handed back exactly once, the
+    /// datadir at its FINAL path classifying `Initialized`, and no staging
+    /// directory left behind.
+    ///
+    /// VACUITY: proven by making `scripts/mariadb-install-db` write only
+    /// `mysql/` and skip `mariadb_upgrade_info` — `finalize_mariadb_staging`
+    /// then refuses and the run ends `Failed { step: Finalize }`, so the
+    /// `Initialized` assertion fails rather than passing on a technicality.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_init_that_completes_lands_the_datadir_and_yields_one_credential() {
+        let home = tmp_home();
+        let pkg = home.path().join("packages/mariadb/11.4/11.4.9");
+        let runtime = fake_runtime_that_completes(&pkg);
+
+        let ctx = MariadbInitCtx::new(home.path(), runtime);
+        let (outcome, pw) = initialize_mariadb(&ctx, openvhost_proc::default_driver()).await;
+
+        assert_eq!(
+            outcome,
+            MariadbInitOutcome::Initialized,
+            "the hermetic success path must be reachable without the live artifact"
+        );
+        assert!(
+            pw.is_some(),
+            "a successful init is the ONLY path that yields a credential"
+        );
+        assert!(
+            matches!(
+                classify_mariadb_datadir(&ctx.paths.datadir),
+                Ok(MariadbDatadirState::Initialized { .. })
+            ),
+            "the datadir must be Initialized at its final path, not just present"
+        );
+        assert!(
+            !mariadb_staging_dir_path(&ctx.paths.staging_parent).exists(),
+            "staging must not survive a successful finalize"
+        );
+    }
+
+    // ---- finalize_mariadb_staging ----
+    //
+    // VACUITY for this whole group: proven by returning
+    // `MariadbInitOutcome::Initialized` unconditionally at the top of
+    // `finalize_mariadb_staging` — all six fail.
+    //
+    // Worth knowing before reading them: the two "refuses a destination"
+    // cases are **doubly enforced**, and a narrower mutation showed it.
+    // Ignoring `clear_ignorable_clutter`'s error left all three refusal tests
+    // passing, because `rename(2)` independently refuses a non-empty
+    // destination. So these tests pin the OUTCOME (and that nothing is
+    // deleted), not the identity of the guard that produced it — do not read
+    // a green run here as evidence that the clutter guard specifically still
+    // works.
+
+    /// A staging directory carrying both sentinels, which is the only input
+    /// `finalize_mariadb_staging` will act on.
+    #[cfg(unix)]
+    fn initialized_staging(at: &Path) {
+        std::fs::create_dir_all(at.join("mysql")).unwrap();
+        std::fs::write(at.join("mariadb_upgrade_info"), b"11.4.9-MariaDB\n").unwrap();
+    }
+
+    /// The ordinary case: `rename` creates `final_dir` fresh.
+    #[cfg(unix)]
+    #[test]
+    fn finalize_moves_staging_into_an_absent_final_dir() {
+        let tmp = tmp_home();
+        let staging = tmp.path().join("staging");
+        let final_dir = tmp.path().join("final");
+        initialized_staging(&staging);
+
+        assert_eq!(
+            finalize_mariadb_staging(&staging, &final_dir),
+            MariadbInitOutcome::Initialized
+        );
+        assert!(!staging.exists(), "staging must be consumed by the rename");
+        assert!(final_dir.join("mariadb_upgrade_info").is_file());
+    }
+
+    /// `rename(2)` accepts an existing destination directory when it is empty.
+    #[cfg(unix)]
+    #[test]
+    fn finalize_moves_staging_into_an_empty_existing_final_dir() {
+        let tmp = tmp_home();
+        let staging = tmp.path().join("staging");
+        let final_dir = tmp.path().join("final");
+        initialized_staging(&staging);
+        std::fs::create_dir_all(&final_dir).unwrap();
+
+        assert_eq!(
+            finalize_mariadb_staging(&staging, &final_dir),
+            MariadbInitOutcome::Initialized
+        );
+        assert!(final_dir.join("mysql").is_dir());
+    }
+
+    /// Finder-only clutter is cleared first — `rename` has no notion of it and
+    /// would refuse a non-empty destination.
+    #[cfg(unix)]
+    #[test]
+    fn finalize_clears_finder_clutter_before_renaming() {
+        let tmp = tmp_home();
+        let staging = tmp.path().join("staging");
+        let final_dir = tmp.path().join("final");
+        initialized_staging(&staging);
+        std::fs::create_dir_all(&final_dir).unwrap();
+        std::fs::write(final_dir.join(".DS_Store"), b"finder").unwrap();
+
+        assert_eq!(
+            finalize_mariadb_staging(&staging, &final_dir),
+            MariadbInitOutcome::Initialized
+        );
+        assert!(!final_dir.join(".DS_Store").exists());
+        assert!(final_dir.join("mariadb_upgrade_info").is_file());
+    }
+
+    /// Anything that is not clutter blocks the move, and nothing is deleted —
+    /// the destination is somebody's data until proven otherwise.
+    #[cfg(unix)]
+    #[test]
+    fn finalize_refuses_a_final_dir_holding_more_than_clutter() {
+        let tmp = tmp_home();
+        let staging = tmp.path().join("staging");
+        let final_dir = tmp.path().join("final");
+        initialized_staging(&staging);
+        std::fs::create_dir_all(&final_dir).unwrap();
+        let theirs = final_dir.join("ibdata1");
+        std::fs::write(&theirs, b"somebody else's data").unwrap();
+
+        match finalize_mariadb_staging(&staging, &final_dir) {
+            MariadbInitOutcome::Failed { step, .. } => {
+                assert_eq!(step, MariadbInitStep::Finalize)
+            }
+            other => panic!("expected Failed at Finalize, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&theirs).unwrap(),
+            b"somebody else's data",
+            "a refused finalize must not touch the destination"
+        );
+        assert!(
+            staging.exists(),
+            "staging is the caller's to remove, not ours"
+        );
+    }
+
+    /// Half a datadir is not a datadir. `mysql/` without
+    /// `mariadb_upgrade_info` is exactly what a killed direct-bootstrap init
+    /// leaves behind, and promoting it would put an unusable datadir at the
+    /// path everything else trusts.
+    #[cfg(unix)]
+    #[test]
+    fn finalize_refuses_staging_that_is_missing_a_sentinel() {
+        let tmp = tmp_home();
+        let staging = tmp.path().join("staging");
+        let final_dir = tmp.path().join("final");
+        std::fs::create_dir_all(staging.join("mysql")).unwrap();
+
+        match finalize_mariadb_staging(&staging, &final_dir) {
+            MariadbInitOutcome::Failed { step, .. } => {
+                assert_eq!(step, MariadbInitStep::Finalize)
+            }
+            other => panic!("expected Failed at Finalize, got {other:?}"),
+        }
+        assert!(
+            !final_dir.exists(),
+            "the destination must not be touched AT ALL when staging is not initialized"
+        );
+    }
+
+    /// A symlink at the destination is refused rather than followed —
+    /// otherwise the clutter sweep would delete through it, into a directory
+    /// nobody named.
+    #[cfg(unix)]
+    #[test]
+    fn finalize_refuses_a_symlinked_final_dir() {
+        let tmp = tmp_home();
+        let staging = tmp.path().join("staging");
+        let real_target = tmp.path().join("elsewhere");
+        let final_dir = tmp.path().join("final");
+        initialized_staging(&staging);
+        std::fs::create_dir_all(&real_target).unwrap();
+        std::fs::write(real_target.join(".DS_Store"), b"finder").unwrap();
+        std::os::unix::fs::symlink(&real_target, &final_dir).unwrap();
+
+        match finalize_mariadb_staging(&staging, &final_dir) {
+            MariadbInitOutcome::Failed { step, .. } => {
+                assert_eq!(step, MariadbInitStep::Finalize)
+            }
+            other => panic!("expected Failed at Finalize, got {other:?}"),
+        }
+        assert!(staging.exists());
+        assert!(
+            real_target.join(".DS_Store").exists(),
+            "refusing must not delete through the symlink"
+        );
     }
 }
