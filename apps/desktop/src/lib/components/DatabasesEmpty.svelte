@@ -1,5 +1,7 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <script lang="ts">
+	import { engineDescriptor, type EngineKind } from '$lib/databases.derive';
+
 	/**
 	 * The one state a brand-new machine lands in that the rowlist cannot say
 	 * for itself: nothing is installed yet, so the rows below are all empty and
@@ -13,22 +15,51 @@
 	 * a *particular host* has a verified download is a per-row fact
 	 * (`MysqlInstanceDto.offer`), rendered by `MysqlRow` where the row's own
 	 * Install control is decided — not here.
+	 *
+	 * `engine` (P1 MariaDB UI design D1) — defaults to `'mysql'` so the
+	 * existing MySQL group's markup, test id and copy stay byte-for-byte
+	 * unchanged. The MariaDB group renders its own instance of this same
+	 * component with `engine="mariadb"` rather than a second, near-duplicate
+	 * one — the row/credentials precedent this task follows.
+	 *
+	 * `installable` (fix wave item 2) IS gated on `awaitingRelease`/
+	 * `unavailable`, unlike the paragraph above: the audit found this
+	 * component pitching "Install {label} to get started" — and describing
+	 * the download mechanism, Homebrew mention included — directly above a
+	 * row that offers no Install control at all in either of those two
+	 * states. Whether a *particular host* can install right now is still a
+	 * per-row fact this component does not diagnose (it names no target, no
+	 * release tag), but it must stop claiming an action, or a mechanism, that
+	 * is not actually on offer. Defaults to `true` so every existing caller
+	 * that never passes it — every MySQL call site, and every pre-existing
+	 * test — renders byte-for-byte what it always did.
 	 */
 	let {
-		anyInstalled
+		engine = 'mysql',
+		anyInstalled,
+		installable = true
 	}: {
+		engine?: EngineKind;
 		anyInstalled: boolean;
+		installable?: boolean;
 	} = $props();
+
+	const descriptor = $derived(engineDescriptor(engine));
 </script>
 
 {#if !anyInstalled}
-	<div class="empty invite" data-testid="databases-no-mysql">
-		<h3>Install MySQL to get started</h3>
-		<p>
-			OpenVHost downloads MySQL from Oracle, checks it against a checksum built into this app, and
-			unpacks it into its own packages folder — no Homebrew required. It then initializes a data
-			directory with a generated root password and runs it under the supervisor below.
-		</p>
+	<div class="empty invite" data-testid="databases-no-{descriptor.idPrefix}">
+		{#if installable}
+			<h3>Install {descriptor.label} to get started</h3>
+			<p>{descriptor.installInviteBody}</p>
+		{:else}
+			<!-- No target, no release tag, no download mechanism named here —
+			     the row below already carries that detail (its own
+			     `awaitingRelease`/`unavailable` notice), and this invite must not
+			     repeat, or drift from, whatever that says. -->
+			<h3>{descriptor.label} cannot be installed here right now</h3>
+			<p>See the explanation below.</p>
+		{/if}
 	</div>
 {/if}
 

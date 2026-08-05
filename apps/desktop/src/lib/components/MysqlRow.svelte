@@ -1,19 +1,21 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <script lang="ts">
 	import type {
+		MariadbInstallResultDto,
 		MysqlConnectionProofDto,
 		MysqlInstallOutcomeDto,
 		MysqlInstallProgressDto,
-		MysqlInstanceDto,
 		MysqlResetOutcomeDto,
 		ServiceStatus
 	} from '$lib/ipc';
 	import {
-		SHARED_DATADIR_DISCLOSURE,
+		engineAwaitingReleaseNotice,
+		engineDescriptor,
 		mysqlInitStepLabel,
-		mysqlPortConflictHint,
 		mysqlRowState,
 		unreachableMysqlRowState,
+		type EngineInstanceDto,
+		type EngineKind,
 		type MysqlInitFailure,
 		type UiLog
 	} from '$lib/databases.derive';
@@ -21,13 +23,13 @@
 		PACKAGED_UNINSTALL_UNAVAILABLE,
 		mysqlCancelLabel,
 		mysqlInstallProgressLabel,
-		mysqlInstallProgressPercent,
-		mysqlInstallResultNotice,
-		mysqlLedgerNotice,
-		mysqlPackageOfferNotice,
-		mysqlSourceBadge,
-		mysqlUninstallOffered
+		mysqlInstallProgressPercent
 	} from '$lib/mysql-install.derive';
+	import {
+		engineLedgerNotice,
+		engineOfferNotice,
+		engineOutcomeNotice
+	} from '$lib/mysql-row.derive';
 	import { uninstallActionDisabled, uninstallConfirmLabel } from '$lib/uninstall.derive';
 	import Button from './Button.svelte';
 	import LogPane from './LogPane.svelte';
@@ -35,12 +37,14 @@
 	import StatusPill from './StatusPill.svelte';
 
 	let {
+		engine = 'mysql',
 		instance,
 		installingMajor,
 		installProgress,
 		installTotal,
 		cancellingInstall = false,
 		installOutcome,
+		mariadbInstallOutcome = null,
 		installError = '',
 		initializingMajor,
 		initLog,
@@ -71,7 +75,12 @@
 		onReset,
 		onVerify
 	}: {
-		instance: MysqlInstanceDto;
+		/** Which engine this row paints (P1 MariaDB UI design D1) — defaults to
+		 *  `'mysql'` so every existing caller/test is unaffected. Resolved ONCE
+		 *  into {@link descriptor} below; nothing else in this file branches on
+		 *  it again ("no `{#if engine === …}` anywhere in a template"). */
+		engine?: EngineKind;
+		instance: EngineInstanceDto;
 		/** The major installing anywhere on the page, '' when idle — shared
 		 *  page-wide (one `InstallLock`), same as `LanguagesStore.installing`. */
 		installingMajor: string;
@@ -89,6 +98,20 @@
 		 *  renders it once it matches `instance.major` (mirrors
 		 *  `LanguageRow.svelte`'s `rowOutcome`). */
 		installOutcome: MysqlInstallOutcomeDto | null;
+		/** MariaDB's own settled `install_mariadb` outcome (P1 MariaDB UI
+		 *  design), read ONLY when `engine === 'mariadb'` — a SEPARATE prop
+		 *  rather than a widened {@link installOutcome}, because
+		 *  `MariadbInstallResultDto` is not a subtype of `MysqlInstallResultDto`
+		 *  (it adds `awaitingRelease`, design D2/D5): reading each engine's own
+		 *  correctly-typed prop is what lets {@link outcomeNotice}/
+		 *  {@link ledgerNotice} call the right notice function with no cast,
+		 *  where a single widened prop could not. `MariadbInstallOutcomeDto`
+		 *  itself carries no major (a field nothing can vary is overhead, the
+		 *  same reasoning `MariadbInstance` gives for leaving `major` off its
+		 *  own struct), so the tag is added at the boundary that builds this
+		 *  prop — mirrors `DatabasesStore.initOutcome`'s identical "tag it with
+		 *  what it's for" fix for a DTO that does not carry its own subject. */
+		mariadbInstallOutcome?: { major: string; result: MariadbInstallResultDto } | null;
 		/** A thrown install error, PRE-SCOPED by the page to this row (mirrors
 		 *  `+page.svelte`'s `lastAttempted` convention on the Languages page —
 		 *  `error` itself carries no major). Empty when this is not the row the
@@ -169,6 +192,11 @@
 	 */
 	let confirmingReset = $state(false);
 
+	/** The static, per-engine facts (P1 MariaDB UI design D1) — resolved ONCE,
+	 *  here, from the closed {@link EngineKind}. Everything below reads from
+	 *  this; nothing re-decides "which engine am I" anywhere else. */
+	const descriptor = $derived(engineDescriptor(engine));
+
 	const anyInstallOrInitRunning = $derived(installingMajor !== '' || initializingMajor !== '');
 	/** Page-wide, not per-row: `brew install`, `brew uninstall` and the staged
 	 *  init all serialize behind one `InstallLock` (design D1), so a second
@@ -185,8 +213,18 @@
 	const rowInstallOutcome = $derived(
 		installOutcome !== null && installOutcome.major === instance.major ? installOutcome : null
 	);
+	/** MariaDB's own settled outcome, tagged and matched the same way as
+	 *  {@link rowInstallOutcome} above — `null` whenever this row is not the
+	 *  one {@link mariadbInstallOutcome} names, or nothing has settled yet. */
+	const mariadbRowOutcome = $derived(
+		mariadbInstallOutcome !== null &&
+			mariadbInstallOutcome !== undefined &&
+			mariadbInstallOutcome.major === instance.major
+			? mariadbInstallOutcome
+			: null
+	);
 	const portConflictHint = $derived(
-		serviceState?.kind === 'failed' ? mysqlPortConflictHint(serviceState.stderrTail) : null
+		serviceState?.kind === 'failed' ? descriptor.portConflictHint(serviceState.stderrTail) : null
 	);
 
 	// Named `rowState`, not `state`: svelte-check's TS layer (svelte2tsx) gets
@@ -209,21 +247,26 @@
 	/** Which install put these binaries here — `null` when nothing is installed
 	 *  (design D3: two sources coexist during the migration, and "which mysqld
 	 *  am I actually running" must not be a guess). */
-	const sourceBadge = $derived(mysqlSourceBadge(instance.source));
+	const sourceBadge = $derived(descriptor.sourcePolicy(instance.source));
 	/** MANDATORY absence: `openvhost-pkg` has no uninstall counterpart at all
-	 *  yet, so the brew-driven dialog could only fail on a packaged runtime. */
-	const canUninstall = $derived(mysqlUninstallOffered(instance.source));
-	const offerNotice = $derived(mysqlPackageOfferNotice(instance.offer));
-	const outcomeNotice = $derived(
-		rowInstallOutcome === null ? null : mysqlInstallResultNotice(rowInstallOutcome.result)
-	);
-	/** A ledger row that could not be written — provenance lost, never the
-	 *  install. `null` on every other outcome and on the happy path. */
-	const ledgerNotice = $derived(
-		rowInstallOutcome !== null && rowInstallOutcome.result.kind === 'installed'
-			? mysqlLedgerNotice(rowInstallOutcome.result.ledger)
-			: null
-	);
+	 *  yet, so the brew-driven dialog could only fail on a packaged runtime.
+	 *  Descriptor-driven (design D1), NOT `mysqlUninstallOffered` inlined
+	 *  directly: a naively shared row that inherited MySQL's "packaged means
+	 *  no Uninstall" unchanged would render `PACKAGED_UNINSTALL_UNAVAILABLE`
+	 *  on every installed MariaDB row, whose packaged Uninstall genuinely
+	 *  works. */
+	const canUninstall = $derived(descriptor.uninstallPolicy(instance.source));
+	/** The settled-install banner, the ledger-write warning, and the
+	 *  not-yet-installed explanation — all three dispatch on `engine` the SAME
+	 *  way (design D1 follow-through, task 3 finding: EVERY engine used to
+	 *  render MySQL's own hardcoded copy until this dispatch existed). Pulled
+	 *  into `mysql-row.derive.ts` as a pure module (fix wave item 3): the
+	 *  `switch`-with-`never`-arm dispatch itself is unchanged, only where it
+	 *  lives — see that file for the full reasoning each of the three used to
+	 *  carry here inline. */
+	const outcomeNotice = $derived(engineOutcomeNotice(engine, rowInstallOutcome, mariadbRowOutcome));
+	const ledgerNotice = $derived(engineLedgerNotice(engine, rowInstallOutcome, mariadbRowOutcome));
+	const offerNotice = $derived(engineOfferNotice(engine, rowState));
 </script>
 
 {#if !instance.cataloged}
@@ -235,9 +278,9 @@
 	     Initialize, no Start/Stop/Retry, no credentials block. The pill is the
 	     one exception — it is informational (what IS running), not an action —
 	     rendered only if a supervisor row happens to exist for it. -->
-	<div class="row mysql-row" data-testid="mysql-row-{instance.major}">
+	<div class="row engine-row" data-testid="{descriptor.idPrefix}-row-{instance.major}">
 		<div class="primary">
-			<span class="version">MySQL {instance.major}</span>
+			<span class="version">{descriptor.label} {instance.major}</span>
 			<span class="badge unmanaged">Not managed</span>
 			<!-- Informational, like the pill beside it: WHERE this unmanaged
 			     runtime came from is exactly the question a migration raises, and
@@ -246,26 +289,26 @@
 				<span
 					class="badge source source-{instance.source?.kind}"
 					title={sourceBadge.title}
-					data-testid="mysql-source-{instance.major}">{sourceBadge.label}</span
+					data-testid="{descriptor.idPrefix}-source-{instance.major}">{sourceBadge.label}</span
 				>
 			{/if}
 		</div>
 		<div class="pill-cell">
 			{#if serviceState}
-				<StatusPill kind={serviceState.kind} testId="mysql-pill-{instance.major}" />
+				<StatusPill kind={serviceState.kind} testId="{descriptor.idPrefix}-pill-{instance.major}" />
 			{/if}
 		</div>
 		<div class="row-actions"></div>
 	</div>
 	<p class="note" data-testid="out-of-catalogue-{instance.major}">
-		MySQL {instance.major} is installed, but this build only manages MySQL {catalogedMajorsList.join(
-			', '
-		)}. Shown for visibility only — no actions are offered here.
+		{descriptor.label}
+		{instance.major} is installed, but this build only manages {descriptor.label}
+		{catalogedMajorsList.join(', ')}. Shown for visibility only — no actions are offered here.
 	</p>
 {:else}
-	<div class="row mysql-row" data-testid="mysql-row-{instance.major}">
+	<div class="row engine-row" data-testid="{descriptor.idPrefix}-row-{instance.major}">
 		<div class="primary">
-			<span class="version">MySQL {instance.major}</span>
+			<span class="version">{descriptor.label} {instance.major}</span>
 			<!-- WHICH INSTALL these binaries came from (design D3). Absent when
 			     nothing is installed. The Homebrew badge deliberately carries no
 			     version: brew's exact patch release is only knowable by executing
@@ -275,27 +318,27 @@
 				<span
 					class="badge source source-{instance.source?.kind}"
 					title={sourceBadge.title}
-					data-testid="mysql-source-{instance.major}">{sourceBadge.label}</span
+					data-testid="{descriptor.idPrefix}-source-{instance.major}">{sourceBadge.label}</span
 				>
 			{/if}
 		</div>
 		<div class="pill-cell">
 			{#if serviceState}
-				<StatusPill kind={serviceState.kind} testId="mysql-pill-{instance.major}" />
+				<StatusPill kind={serviceState.kind} testId="{descriptor.idPrefix}-pill-{instance.major}" />
 			{/if}
 		</div>
 		<div class="row-actions">
-			{#if rowState.kind === 'unavailable' || rowState.kind === 'datadirForeign'}
-				<!-- Nothing to offer: no checksum-verified download for this host,
-				     or a foreign datadir this app will not touch. The absence is
-				     explained below the row, never rendered as a button that
-				     throws. -->
+			{#if rowState.kind === 'unavailable' || rowState.kind === 'awaitingRelease' || rowState.kind === 'datadirForeign'}
+				<!-- Nothing to offer: no checksum-verified download for this host, a
+				     build that is pinned but not yet published, or a foreign datadir
+				     this app will not touch. The absence is explained below the row,
+				     never rendered as a button that throws. -->
 			{:else if rowState.kind === 'notInstalled'}
 				<Button
 					variant="primary"
 					size="sm"
 					testId="install-{instance.major}"
-					ariaLabel="Install MySQL {rowState.version}"
+					ariaLabel="Install {descriptor.label} {rowState.version}"
 					disabled={anyInstallOrInitRunning}
 					onclick={() => onInstall(instance.major)}
 				>
@@ -312,7 +355,7 @@
 					variant="quiet"
 					size="sm"
 					testId="cancel-install-{instance.major}"
-					ariaLabel="Cancel installing MySQL {instance.major}"
+					ariaLabel="Cancel installing {descriptor.label} {instance.major}"
 					disabled={cancellingInstall}
 					onclick={() => onCancelInstall()}
 				>
@@ -325,7 +368,7 @@
 					testId={rowState.kind === 'initFailed'
 						? `retry-init-${instance.major}`
 						: `initialize-${instance.major}`}
-					ariaLabel="Initialize MySQL {instance.major}"
+					ariaLabel="Initialize {descriptor.label} {instance.major}"
 					disabled={anyInstallOrInitRunning}
 					onclick={() => onInitialize(instance.major)}
 				>
@@ -340,7 +383,7 @@
 							variant="quiet"
 							size="sm"
 							testId="retry-{instance.serviceId}"
-							ariaLabel="Retry MySQL {instance.major}"
+							ariaLabel="Retry {descriptor.label} {instance.major}"
 							onclick={() => onStart(instance.serviceId ?? '')}>Retry</Button
 						>
 					{:else if serviceState.kind === 'stopped'}
@@ -348,7 +391,7 @@
 							variant="quiet"
 							size="sm"
 							testId="start-{instance.serviceId}"
-							ariaLabel="Start MySQL {instance.major}"
+							ariaLabel="Start {descriptor.label} {instance.major}"
 							onclick={() => onStart(instance.serviceId ?? '')}>Start</Button
 						>
 					{:else}
@@ -356,7 +399,7 @@
 							variant="quiet"
 							size="sm"
 							testId="stop-{instance.serviceId}"
-							ariaLabel="Stop MySQL {instance.major}"
+							ariaLabel="Stop {descriptor.label} {instance.major}"
 							onclick={() => onStop(instance.serviceId ?? '')}>Stop</Button
 						>
 					{/if}
@@ -373,15 +416,17 @@
 				     one that was never initialized. Opens a confirmation; it
 				     uninstalls nothing by itself.
 
-				     ABSENT for a PACKAGED runtime, deliberately: the uninstall
+				     ABSENT for a PACKAGED MySQL runtime, deliberately: the uninstall
 				     slice drives `brew uninstall`, and `openvhost-pkg` has no
 				     uninstall counterpart at all yet. An affordance that is present
-				     and fails is worse than one that is absent. -->
+				     and fails is worse than one that is absent. A packaged MariaDB
+				     runtime is NOT excluded here — its `uninstallPolicy` says so
+				     (design D1). -->
 				<Button
 					variant="quiet"
 					size="sm"
 					testId="uninstall-{instance.major}"
-					ariaLabel="Uninstall MySQL {instance.major}"
+					ariaLabel="Uninstall {descriptor.label} {instance.major}"
 					disabled={uninstallDisabled}
 					onclick={() => onUninstall(instance.major)}
 				>
@@ -395,17 +440,28 @@
 		<!-- An honest ABSENCE, not an error (design D2): Oracle publishes an
 		     x86_64 build, but its bytes never went through the signature check
 		     the catalogue's pin rests on, so this build offers nothing for it and
-		     says exactly that — with the route that does still work. -->
-		<p class="note warn" data-testid="mysql-unavailable-{instance.major}">
-			<strong>{offerNotice.title}.</strong>
-			{offerNotice.body}
+		     says exactly that — with the route that does still work. `offerNotice`
+		     is resolved once in the script above, per engine. -->
+		<p class="note warn" data-testid="{descriptor.idPrefix}-unavailable-{instance.major}">
+			<strong>{offerNotice?.title}.</strong>
+			{offerNotice?.body}
+		</p>
+	{:else if rowState.kind === 'awaitingRelease'}
+		<!-- The ninth row state (design D2): a build exists and is pinned, but
+		     the release that would serve it has not been published, so the next
+		     action belongs to the maintainer, not the user. Its own copy, its
+		     own test id — never folded into `unavailable`'s "no build at all". -->
+		{@const notice = engineAwaitingReleaseNotice(descriptor, rowState.tag)}
+		<p class="note warn" data-testid="{descriptor.idPrefix}-awaiting-release-{instance.major}">
+			<strong>{notice.title}.</strong>
+			{notice.body}
 		</p>
 	{:else if rowState.kind === 'notInstalled'}
 		<p class="note" data-testid="offer-{instance.major}">
-			<strong>{offerNotice.title}.</strong>
-			{offerNotice.body}
+			<strong>{offerNotice?.title}.</strong>
+			{offerNotice?.body}
 		</p>
-		<p class="note" data-testid="disclosure-{instance.major}">{SHARED_DATADIR_DISCLOSURE}</p>
+		<p class="note" data-testid="disclosure-{instance.major}">{descriptor.datadirDisclosure}</p>
 		{#if installError !== ''}
 			<p class="error" role="alert" style="white-space: pre-wrap">{installError}</p>
 		{/if}
@@ -433,7 +489,7 @@
 			<div
 				class="bar"
 				role="progressbar"
-				aria-label="Downloading MySQL {instance.major}"
+				aria-label="Downloading {descriptor.label} {instance.major}"
 				aria-valuemin={0}
 				aria-valuemax={100}
 				aria-valuenow={mysqlInstallProgressPercent(rowState.progress, rowState.total)}
@@ -466,7 +522,7 @@
 			     would be the bigger lie. -->
 			<p class="note warn" data-testid="ledger-warning-{instance.major}">{ledgerNotice}</p>
 		{/if}
-		<p class="note" data-testid="disclosure-{instance.major}">{SHARED_DATADIR_DISCLOSURE}</p>
+		<p class="note" data-testid="disclosure-{instance.major}">{descriptor.datadirDisclosure}</p>
 		{#if initError !== ''}
 			<p class="error" role="alert" style="white-space: pre-wrap">{initError}</p>
 		{/if}
@@ -494,14 +550,17 @@
 		     stops there. What to do with the foreign content itself is the
 		     user's call, made outside this app. -->
 		<p class="note warn" data-testid="datadir-foreign-{instance.major}">
-			MySQL {instance.major}'s data directory already has unexpected content and OpenVHost will not
-			touch it: <span class="mono">{rowState.detail}</span>. Once it looks like an empty MySQL {instance.major}
-			data directory again, use Check again above.
+			{descriptor.label}
+			{instance.major}'s data directory already has unexpected content and OpenVHost will not touch
+			it: <span class="mono">{rowState.detail}</span>. Once it looks like an empty
+			{descriptor.label}
+			{instance.major} data directory again, use Check again above.
 		</p>
 	{:else if rowState.kind === 'ready'}
 		{#if serviceState?.kind === 'failed'}
 			<p class="error" role="alert" data-testid="pool-failed-{instance.serviceId}">
-				MySQL {instance.major} failed{#if serviceState.exit !== null}&nbsp;(exit {serviceState.exit}){/if}.
+				{descriptor.label}
+				{instance.major} failed{#if serviceState.exit !== null}&nbsp;(exit {serviceState.exit}){/if}.
 			</p>
 			{#if serviceState.stderrTail.length > 0}
 				<pre class="pool-stderr">{serviceState.stderrTail.join('\n')}</pre>
@@ -513,6 +572,7 @@
 			{/if}
 		{/if}
 		<MysqlCredentials
+			{engine}
 			major={instance.major}
 			socketPath={instance.socketPath ?? ''}
 			{password}
@@ -569,7 +629,11 @@
 	.row:hover {
 		background: color-mix(in oklab, var(--vh-text) 3%, var(--vh-surface));
 	}
-	.mysql-row {
+	/* Was `.mysql-row`: renamed engine-neutral now that this row is shared
+	   (design D1). Purely a styling hook — no test asserts this class name,
+	   only `data-testid`s, which keep their own `mysql-`/`mariadb-` prefix via
+	   `descriptor.idPrefix` instead. */
+	.engine-row {
 		grid-template-columns: minmax(160px, 0.6fr) 120px auto;
 	}
 	.pill-cell {

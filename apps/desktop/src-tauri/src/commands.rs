@@ -2159,6 +2159,7 @@ pub struct InstallLock {
 pub(crate) enum InstallKind {
     Php,
     Mysql,
+    Mariadb,
 }
 
 /// Wire-safe copy of [`InstallKind`] for [`PendingInstallDto`] — `InstallKind`
@@ -2169,6 +2170,7 @@ pub(crate) enum InstallKind {
 pub enum InstallKindDto {
     Php,
     Mysql,
+    Mariadb,
 }
 
 impl From<InstallKind> for InstallKindDto {
@@ -2176,6 +2178,7 @@ impl From<InstallKind> for InstallKindDto {
         match kind {
             InstallKind::Php => Self::Php,
             InstallKind::Mysql => Self::Mysql,
+            InstallKind::Mariadb => Self::Mariadb,
         }
     }
 }
@@ -2252,6 +2255,33 @@ pub(crate) const MYSQL_INSTALL_RUN: (InstallKind, PackageOperation) =
 /// rather than silently re-arming the cancel.
 pub(crate) const MYSQL_INIT_RUN: (InstallKind, PackageOperation) =
     (InstallKind::Mysql, PackageOperation::Initialize);
+
+/// The `(kind, operation)` pair a MariaDB **install** run is tagged with, and
+/// the pair the Databases page's Cancel button
+/// ([`crate::mariadb_pkg::cancel_mariadb_install`]) fires on — the MariaDB
+/// mirror of [`MYSQL_INSTALL_RUN`], for the identical reason.
+///
+/// SECURITY (P1 MariaDB UI design D4/F1). This is not a symmetry nicety: the
+/// audit F1 finding was exactly a run sharing another run's `(kind,
+/// operation)` pair and differing only in a `label` that
+/// [`InstallLock::abort_running_if`] does not and must not consult. Had
+/// MariaDB's install shared [`MYSQL_INSTALL_RUN`] here, `cancel_mysql_install`
+/// would abort a MariaDB install (and vice versa via `cancel_mariadb_install`)
+/// — F1 again, with a second engine. `InstallKind::Mariadb` is what makes this
+/// pair a genuinely different value rather than an identical one wearing new
+/// prose.
+pub(crate) const MARIADB_INSTALL_RUN: (InstallKind, PackageOperation) =
+    (InstallKind::Mariadb, PackageOperation::Install);
+
+/// The `(kind, operation)` pair a MariaDB **datadir initialization** run is
+/// tagged with ([`initialize_mariadb`]) — the MariaDB mirror of
+/// [`MYSQL_INIT_RUN`].
+///
+/// Deliberately distinct from [`MARIADB_INSTALL_RUN`], for the same audit F1
+/// reason `MYSQL_INIT_RUN` is distinct from `MYSQL_INSTALL_RUN`:
+/// `a_mariadb_init_is_not_tagged_as_an_install` is what says so.
+pub(crate) const MARIADB_INIT_RUN: (InstallKind, PackageOperation) =
+    (InstallKind::Mariadb, PackageOperation::Initialize);
 
 /// What [`pending_install`] reports: which kind of run occupies
 /// `InstallLock`'s shared slot, what it is doing, and its label — e.g. `"8.4"`
@@ -6269,6 +6299,1132 @@ exit 1
             ))
         );
         init.abort();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MariaDB (Databases page)
+// spec docs/superpowers/specs/2026-08-05-p1-mariadb-ui-design.md
+// ---------------------------------------------------------------------------
+
+/// Mirrors `openvhost_core::mariadb::MariadbDatadirState` 1:1 as a wire-safe
+/// copy — the MariaDB counterpart of `MysqlDatadirStateDto`. No sibling of
+/// `Foreign`'s message for a missing/unreadable datadir here either: same
+/// "never silently downgrade to the safe-looking state" discipline as
+/// `classify_datadir_dto` below.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum MariadbDatadirStateDto {
+    NotInitialized,
+    Initialized { version: String },
+    Foreign { detail: String },
+}
+
+impl From<openvhost_core::MariadbDatadirState> for MariadbDatadirStateDto {
+    fn from(s: openvhost_core::MariadbDatadirState) -> Self {
+        match s {
+            openvhost_core::MariadbDatadirState::NotInitialized => Self::NotInitialized,
+            openvhost_core::MariadbDatadirState::Initialized { version } => {
+                Self::Initialized { version }
+            }
+            openvhost_core::MariadbDatadirState::Foreign { detail } => Self::Foreign { detail },
+        }
+    }
+}
+
+/// Classify MariaDB's datadir for the wire — see `classify_datadir_dto`'s
+/// matching doc comment for why an `io::Error` folds into `Foreign` rather
+/// than `NotInitialized`.
+fn classify_mariadb_datadir_dto(dir: &Path) -> MariadbDatadirStateDto {
+    match openvhost_core::classify_mariadb_datadir(dir) {
+        Ok(state) => state.into(),
+        Err(e) => MariadbDatadirStateDto::Foreign {
+            detail: format!("could not inspect {}: {e}", dir.display()),
+        },
+    }
+}
+
+/// The MariaDB row on the Databases page.
+///
+/// A single struct, never a `Vec`: this build ships exactly one series
+/// (`openvhost_core::MARIADB_SERIES`), so a list whose length is always 0 or
+/// 1 would invent a key nothing can vary — the same reasoning
+/// `MariadbInstanceRepo`'s own doc comment gives for leaving a `major` field
+/// off `MariadbInstance` (design D6: "the store holds scalars, not
+/// dictionaries").
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct MariadbEnvironmentDto {
+    pub installed: bool,
+    pub version: Option<String>,
+    pub path: Option<String>,
+    /// `Some` ONLY once BOTH installed and the datadir is genuinely
+    /// Initialized — mirrors `MysqlInstanceDto::socket_path`'s identical gate
+    /// (spec D6).
+    pub socket_path: Option<String>,
+    pub service_id: Option<String>,
+    pub datadir_state: MariadbDatadirStateDto,
+    /// Whether THIS BUILD offers to install MariaDB on THIS host, and what it
+    /// would install — see [`crate::mariadb_pkg::MariadbPackageOfferDto`] for
+    /// the third state (`AwaitingRelease`) MySQL's own offer type does not
+    /// need (design D2).
+    pub offer: crate::mariadb_pkg::MariadbPackageOfferDto,
+}
+
+/// One line of a MariaDB package operation's output, forwarded live while it
+/// runs. Same shape and reasoning as [`MysqlInstallLogEvent`] — carries
+/// **no `major`/`series` field**, unlike its PHP/MySQL siblings: this build
+/// ships exactly one series, so a field nothing can vary would be pure
+/// overhead (the same reasoning `MariadbInstance` gives for leaving `major`
+/// off its own struct).
+///
+/// In practice this channel is filled only by an uninstall's
+/// `Removal::PackageTree` step failing to report through it — see
+/// `uninstall::run::emit_uninstall_log`'s own doc comment for why it exists
+/// as a real, registered channel even though MariaDB's ordinary uninstall
+/// never streams through it either (no child process to stream from).
+#[derive(Debug, Clone, serde::Serialize, specta::Type, tauri_specta::Event)]
+#[serde(rename_all = "camelCase")]
+pub struct MariadbInstallLogEvent {
+    pub ts_ms: u64,
+    pub stream: String,
+    pub line: String,
+}
+
+/// One line of `initialize_mariadb`'s init sequence, relayed after the fact
+/// on failure — see [`initialize_mariadb`]'s own doc comment for why this is
+/// a post-hoc relay rather than a live stream, and [`MariadbInstallLogEvent`]
+/// for why there is no `major`/`series` field.
+#[derive(Debug, Clone, serde::Serialize, specta::Type, tauri_specta::Event)]
+#[serde(rename_all = "camelCase")]
+pub struct MariadbInitLogEvent {
+    pub ts_ms: u64,
+    pub stream: String,
+    pub line: String,
+}
+
+/// Mirrors `openvhost_core::mariadb::MariadbInitStep` 1:1 as a wire-safe
+/// copy — the MariaDB counterpart of [`MysqlInitStepDto`]. No `Validate`
+/// variant: MariaDB has no `--validate-config`, so there is no pre-flight
+/// step to fail at (mirrors the core type's own doc comment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub enum MariadbInitStepDto {
+    Render,
+    Initialize,
+    StartTempServer,
+    SetPassword,
+    Shutdown,
+    Finalize,
+}
+
+impl From<openvhost_core::mariadb::MariadbInitStep> for MariadbInitStepDto {
+    fn from(s: openvhost_core::mariadb::MariadbInitStep) -> Self {
+        use openvhost_core::mariadb::MariadbInitStep as S;
+        match s {
+            S::Render => Self::Render,
+            S::Initialize => Self::Initialize,
+            S::StartTempServer => Self::StartTempServer,
+            S::SetPassword => Self::SetPassword,
+            S::Shutdown => Self::Shutdown,
+            S::Finalize => Self::Finalize,
+        }
+    }
+}
+
+/// Mirrors `openvhost_core::mariadb::MariadbInitOutcome` 1:1 as a wire-safe
+/// copy (spec D7's `initialize_mariadb`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, specta::Type)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum MariadbInitOutcomeDto {
+    Initialized,
+    AlreadyInitialized,
+    Foreign {
+        detail: String,
+    },
+    Failed {
+        step: MariadbInitStepDto,
+        reason: String,
+    },
+}
+
+impl From<openvhost_core::mariadb::MariadbInitOutcome> for MariadbInitOutcomeDto {
+    fn from(o: openvhost_core::mariadb::MariadbInitOutcome) -> Self {
+        use openvhost_core::mariadb::MariadbInitOutcome as O;
+        match o {
+            O::Initialized => Self::Initialized,
+            O::AlreadyInitialized => Self::AlreadyInitialized,
+            O::Foreign { detail } => Self::Foreign { detail },
+            O::Failed { step, reason } => Self::Failed {
+                step: step.into(),
+                reason,
+            },
+        }
+    }
+}
+
+/// `reset_mariadb_root_password`'s outcome — the MariaDB mirror of
+/// [`MysqlResetOutcomeDto`], and the identical reasoning: auth failure is an
+/// EXPECTED, renderable outcome (the stored password may be stale), never
+/// thrown as an `IpcError`.
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum MariadbResetOutcomeDto {
+    Reset,
+    AuthFailed { detail: String },
+}
+
+/// `verify_mariadb_connection`'s outcome — the MariaDB mirror of
+/// [`MysqlConnectionProofDto`]: outcome-shaped, never an `IpcError`, so the
+/// "Verify connection" button always has something to render.
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum MariadbConnectionProofDto {
+    Ok { version: String, port: u32 },
+    AuthFailed { detail: String },
+    Failed { detail: String },
+}
+
+/// Build the MariaDB row — the single-instance mirror of `mysql_rows`.
+fn mariadb_row(
+    home: &Path,
+    installed: Option<&openvhost_core::MariadbRuntime>,
+) -> MariadbEnvironmentDto {
+    let paths = openvhost_core::mariadb_paths(home);
+    let datadir_state = classify_mariadb_datadir_dto(&paths.datadir);
+    let registered =
+        installed.is_some() && matches!(datadir_state, MariadbDatadirStateDto::Initialized { .. });
+    MariadbEnvironmentDto {
+        installed: installed.is_some(),
+        version: installed.map(|rt| rt.version.clone()),
+        path: installed.map(|rt| rt.mariadbd.display().to_string()),
+        socket_path: registered.then(|| paths.socket.display().to_string()),
+        service_id: registered
+            .then(|| crate::stack::mariadb_service_id(openvhost_core::MARIADB_SERIES)),
+        datadir_state,
+        offer: crate::mariadb_pkg::package_offer(),
+    }
+}
+
+/// Probe OpenVHost's own package tree for a MariaDB install, write the
+/// result into the managed `RwLock`, and register a supervisor row when one
+/// is found with an Initialized datadir — the single-series mirror of
+/// `rescan_mysql_into_state`, called both from [`rescan_mariadb`] below and
+/// from `uninstall::run::uninstall_package`'s post-uninstall reconciliation.
+///
+/// No seed parameter, unlike `rescan_mysql_into_state`: a seed exists only to
+/// paper over an expensive post-install probe (a freshly `brew install`ed
+/// `mysqld`'s first execution under Gatekeeper), and MariaDB's version is a
+/// directory name chosen at install time, never probed at all — a rescan
+/// immediately after `install_mariadb` already sees the fresh tree with
+/// nothing to seed.
+pub(crate) async fn rescan_mariadb_into_state(
+    runtimes: &RwLock<Option<Vec<openvhost_core::MariadbRuntime>>>,
+    sup: &Supervisor,
+    home: &Path,
+) -> Result<Vec<openvhost_core::MariadbRuntime>, IpcError> {
+    let root = openvhost_core::PackagesRoot::from_home(home);
+    let found = openvhost_core::discover_mariadb(&root).runtimes;
+    *runtimes.write().map_err(|_| IpcError::Core {
+        message: "mariadb runtime list is poisoned".into(),
+    })? = Some(found.clone());
+
+    let id = crate::stack::mariadb_service_id(openvhost_core::MARIADB_SERIES);
+    let already_registered = sup.snapshot().into_iter().any(|s| s.id == id);
+    match found.first() {
+        Some(rt) if !already_registered && crate::stack::mariadb_datadir_is_initialized(home) => {
+            sup.register(crate::stack::mariadb_spec(home, rt));
+        }
+        _ => {}
+    }
+    // Mirrors `unregister_vanished`'s reasoning for a single row (design D5):
+    // an in-app uninstall or a manually removed package tree must converge
+    // the Services page on the next rescan exactly as PHP/MySQL's already do.
+    if found.is_empty() && already_registered {
+        let _ = sup.unregister(&id);
+    }
+    Ok(found)
+}
+
+/// Look up the cached, already-discovered MariaDB runtime — the single-series
+/// mirror of `find_mysql_runtime`: there is no major to match against, only
+/// "is anything installed at all".
+fn find_mariadb_runtime(
+    runtimes: &RwLock<Option<Vec<openvhost_core::MariadbRuntime>>>,
+) -> Result<openvhost_core::MariadbRuntime, IpcError> {
+    runtimes
+        .read()
+        .map_err(|_| IpcError::Core {
+            message: "mariadb runtime list is poisoned".into(),
+        })?
+        .as_ref()
+        .and_then(|rts| rts.first().cloned())
+        .ok_or_else(|| IpcError::Core {
+            message: format!(
+                "MariaDB {} is not installed",
+                openvhost_core::MARIADB_SERIES
+            ),
+        })
+}
+
+/// Tag `InstallLock`'s shared slot as a MariaDB datadir initialization.
+///
+/// A named function rather than an inlined `set_running` call inside
+/// [`initialize_mariadb`], for the identical audit F1 reason
+/// `set_running_mysql_init` is one: [`initialize_mariadb`] takes an
+/// `AppHandle<Wry>`, which `tauri::test::mock_builder` cannot produce, so its
+/// body is unreachable from a test and an inlined tag would be a value no
+/// test can see.
+fn set_running_mariadb_init(lock: &InstallLock, abort: tokio::task::AbortHandle) {
+    let (kind, operation) = MARIADB_INIT_RUN;
+    lock.set_running(
+        kind,
+        operation,
+        format!("MariaDB {}", openvhost_core::MARIADB_SERIES),
+        abort,
+    );
+}
+
+fn emit_mariadb_init_log(app: &tauri::AppHandle, stream: &str, line: String) {
+    let _ = MariadbInitLogEvent {
+        ts_ms: now_ms(),
+        stream: stream.to_string(),
+        line,
+    }
+    .emit(app);
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn mariadb_environment(
+    runtimes: tauri::State<'_, RwLock<Option<Vec<openvhost_core::MariadbRuntime>>>>,
+    paths: tauri::State<'_, Option<StackPaths>>,
+) -> Result<MariadbEnvironmentDto, IpcError> {
+    let p = stack_paths(&paths)?;
+    let installed = runtimes
+        .read()
+        .map_err(|_| IpcError::Core {
+            message: "mariadb runtime list is poisoned".into(),
+        })?
+        .clone()
+        .unwrap_or_default();
+    Ok(mariadb_row(&p.home, installed.first()))
+}
+
+/// The explicit, user-initiated re-probe behind the Databases page's rescan
+/// affordance — mirrors `rescan_mysql`, including blocking on `InstallLock`
+/// for the identical reason (a rescan racing a completed install must never
+/// silently revert it).
+#[tauri::command]
+#[specta::specta]
+pub async fn rescan_mariadb(
+    runtimes: tauri::State<'_, RwLock<Option<Vec<openvhost_core::MariadbRuntime>>>>,
+    paths: tauri::State<'_, Option<StackPaths>>,
+    sup: tauri::State<'_, Arc<Supervisor>>,
+    lock: tauri::State<'_, InstallLock>,
+) -> Result<MariadbEnvironmentDto, IpcError> {
+    let p = stack_paths(&paths)?;
+    let _guard = lock.inner().guard.lock().await;
+    let found = rescan_mariadb_into_state(runtimes.inner(), sup.inner(), &p.home).await?;
+    Ok(mariadb_row(&p.home, found.first()))
+}
+
+/// Scrub a freshly generated password out of a `Failed` init outcome's
+/// `reason` before it can reach [`MariadbInitLogEvent`] or the returned
+/// [`MariadbInitOutcomeDto`] — defence in depth, the MariaDB counterpart of
+/// `redact`'s own reasoning for `run_mysql_init`'s SetPassword/Shutdown
+/// steps (see `redact`'s doc comment).
+///
+/// SECURITY (audit Low 3). `openvhost_core::mariadb::initialize_mariadb`
+/// pairs EVERY `Failed` outcome with `password: None` — its own doc comment
+/// says the password is returned only alongside `Initialized` — so
+/// `password` is never `Some` here against a real run today: the temp
+/// server's log tail is captured before the password is generated
+/// (`mariadb::init.rs:839` vs `:850`), and the one step where a live
+/// password exists (`SetPassword`) quotes only the client's own stderr,
+/// never the SQL sent over stdin. The gap that reasoning does not close: a
+/// MariaDB client echoing a statement fragment back in a `near '...'`
+/// syntax error, which today's pure-hex generator cannot trigger but
+/// `root_password_sql`'s own doc comment already names as the assumption a
+/// future user-chosen password would break. Redacting here costs nothing on
+/// the expected path (nothing to replace) and closes that gap the moment it
+/// stops being hypothetical.
+///
+/// Split out of [`initialize_mariadb`] for the identical testability reason
+/// `initialize_mysql_gate` is: the command takes an `AppHandle<Wry>`, which
+/// `tauri::test::mock_builder` cannot produce, so the command's own body is
+/// unreachable from a test. This function needs no `AppHandle`.
+fn redact_mariadb_init_outcome(
+    outcome: openvhost_core::mariadb::MariadbInitOutcome,
+    password: &Option<openvhost_core::mysql::RootPassword>,
+) -> openvhost_core::mariadb::MariadbInitOutcome {
+    use openvhost_core::mariadb::MariadbInitOutcome as O;
+    match outcome {
+        O::Initialized => O::Initialized,
+        O::AlreadyInitialized => O::AlreadyInitialized,
+        O::Foreign { detail } => O::Foreign { detail },
+        O::Failed { step, reason } => O::Failed {
+            step,
+            reason: match password {
+                Some(password) => redact(&reason, password.expose()),
+                None => reason,
+            },
+        },
+    }
+}
+
+/// Drives MariaDB's staged init (spec D7) via
+/// `openvhost_core::mariadb::initialize_mariadb`, which — unlike MySQL's
+/// `run_mysql_init` — already owns its whole staged sequence (slice A; see
+/// that module's own doc comment for why the driver lives in openvhost-core
+/// for this engine and not in this file). This command is therefore thin
+/// wiring: look the discovered runtime up, spawn the core function so its
+/// `AbortHandle` can be registered on the shared `InstallLock`
+/// (`MARIADB_INIT_RUN`, D4/F1), persist the generated password on success,
+/// then register the service row.
+///
+/// **No live per-line log.** Unlike `run_mysql_init`, the core function
+/// reports no intermediate output — it returns a single terminal outcome —
+/// so there is nothing to stream WHILE a run is in progress. A `Failed`
+/// outcome's `reason` DOES carry real diagnostic content (it already
+/// includes the temp server's own log tail; see `mariadb::init`'s
+/// `server_log`), so that is relayed through [`MariadbInitLogEvent`] once
+/// the run ends, rather than left unsent — a post-hoc relay of something
+/// real, never a fabricated live one. [`redact_mariadb_init_outcome`] runs
+/// first, so a redacted `reason` is what BOTH that relay and the returned
+/// DTO ever see (audit Low 3).
+#[tauri::command]
+#[specta::specta]
+pub async fn initialize_mariadb(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, Db>,
+    runtimes: tauri::State<'_, RwLock<Option<Vec<openvhost_core::MariadbRuntime>>>>,
+    paths: tauri::State<'_, Option<StackPaths>>,
+    sup: tauri::State<'_, Arc<Supervisor>>,
+    lock: tauri::State<'_, InstallLock>,
+) -> Result<MariadbInitOutcomeDto, IpcError> {
+    let p = stack_paths(&paths)?;
+
+    let Ok(_guard) = lock.inner().guard.try_lock() else {
+        return Err(IpcError::Core {
+            message: "an install is already running".into(),
+        });
+    };
+
+    let runtime = find_mariadb_runtime(runtimes.inner())?;
+    let ctx = openvhost_core::mariadb::MariadbInitCtx::new(&p.home, runtime.clone());
+
+    let init_task = tokio::spawn(async move {
+        openvhost_core::mariadb::initialize_mariadb(&ctx, openvhost_proc::default_driver()).await
+    });
+    let abort_handle = init_task.abort_handle();
+    set_running_mariadb_init(lock.inner(), abort_handle.clone());
+    let _running_guard = RunningInstallGuard {
+        lock: lock.inner(),
+        abort: abort_handle,
+    };
+
+    let (outcome, password) = match init_task.await {
+        Ok(result) => result,
+        Err(join_err) if join_err.is_cancelled() => {
+            return Err(IpcError::Proc {
+                message: "the initialization was aborted because the app is quitting".into(),
+            });
+        }
+        Err(join_err) => {
+            return Err(IpcError::Proc {
+                message: format!("the initialization task ended unexpectedly: {join_err}"),
+            });
+        }
+    };
+    let outcome = redact_mariadb_init_outcome(outcome, &password);
+
+    if let openvhost_core::mariadb::MariadbInitOutcome::Failed { reason, .. } = &outcome {
+        for line in reason.lines() {
+            emit_mariadb_init_log(&app, "stderr", line.to_string());
+        }
+    }
+
+    if let (openvhost_core::mariadb::MariadbInitOutcome::Initialized, Some(password)) =
+        (&outcome, &password)
+    {
+        openvhost_core::mariadb::MariadbInstanceRepo::new(db.inner())
+            .upsert(password)
+            .await?;
+        sup.register(crate::stack::mariadb_spec(&p.home, &runtime));
+    }
+
+    Ok(outcome.into())
+}
+
+/// The stored root password for MariaDB (spec D7's outbound reveal) — the
+/// MariaDB mirror of [`mysql_root_password`], and the identical SECURITY
+/// discipline: audit H2's rule that this is the SOLE place sanctioned to
+/// de-redact a `RootPassword` into a plain `String` for a RETURN value
+/// applies here too, unchanged — see that command's own doc comment.
+#[tauri::command]
+#[specta::specta]
+pub async fn mariadb_root_password(db: tauri::State<'_, Db>) -> Result<String, IpcError> {
+    let repo = openvhost_core::mariadb::MariadbInstanceRepo::new(db.inner());
+    let instance = repo.get().await?.ok_or_else(|| IpcError::Core {
+        message: format!(
+            "no stored root password for MariaDB {}",
+            openvhost_core::MARIADB_SERIES
+        ),
+    })?;
+    Ok(instance.root_password.expose().to_string())
+}
+
+/// Regenerate MariaDB's root password: authenticates with the STORED (old)
+/// password via an ephemeral 0600 defaults-file, runs
+/// `openvhost_core::mariadb::root_password_sql` over stdin with a freshly
+/// generated password, and — only once that succeeds — persists the new
+/// value. The MariaDB mirror of [`reset_mysql_root_password`], with one
+/// deliberate difference: it runs MariaDB's own multi-statement
+/// `root_password_sql`, not MySQL's single-statement `alter_user_sql`.
+/// `mariadb::init`'s own doc comment measured root existing at FOUR hosts
+/// after this build's init (`localhost`, `127.0.0.1`, `::1`, plus a removed
+/// hostname row), so a single `ALTER USER 'root'@'localhost'` would leave the
+/// other two loopback accounts on their OLD password after a reset — the
+/// exact hole that comment documents finding.
+#[tauri::command]
+#[specta::specta]
+pub async fn reset_mariadb_root_password(
+    db: tauri::State<'_, Db>,
+    paths: tauri::State<'_, Option<StackPaths>>,
+    runtimes: tauri::State<'_, RwLock<Option<Vec<openvhost_core::MariadbRuntime>>>>,
+) -> Result<MariadbResetOutcomeDto, IpcError> {
+    let p = stack_paths(&paths)?;
+    let runtime = find_mariadb_runtime(runtimes.inner())?;
+    let mp = openvhost_core::mariadb_paths(&p.home);
+
+    let repo = openvhost_core::mariadb::MariadbInstanceRepo::new(db.inner());
+    let current = repo.get().await?.ok_or_else(|| IpcError::Core {
+        message: format!(
+            "MariaDB {} has no stored credential to reset",
+            openvhost_core::MARIADB_SERIES
+        ),
+    })?;
+
+    let defaults_file =
+        EphemeralDefaultsFile::write(&mp.socket, &current.root_password).map_err(|e| {
+            IpcError::Core {
+                message: format!("failed to write the ephemeral credential file: {e}"),
+            }
+        })?;
+
+    let new_password = openvhost_core::mysql::generate_root_password();
+    let sql = openvhost_core::mariadb::root_password_sql(&new_password);
+    // `mysql_exec_with_defaults_file` is reused in place: it is generic in
+    // what it runs (a `--defaults-file`-authenticated batch script over
+    // stdin against whatever binary `mysql_bin` names), and MariaDB's own
+    // `mariadb` client accepts the same `--defaults-file`/`--batch`/
+    // `--skip-column-names` flags this function builds — see
+    // `mariadb_admin_ping_argv`'s doc comment for the ONE flag that
+    // genuinely differs between the two clients (`--no-login-paths`, which
+    // this function never uses either).
+    let result = crate::mysql_admin::mysql_exec_with_defaults_file(
+        &runtime.mariadb,
+        &defaults_file.path,
+        &sql,
+    )
+    .await;
+    drop(defaults_file); // RAII delete, before acting on the result.
+    let secrets = [current.root_password.expose(), new_password.expose()];
+
+    let outcome = result.map_err(|e| IpcError::Core {
+        message: redact_all(&e.to_string(), &secrets),
+    })?;
+    if outcome.ok {
+        repo.upsert(&new_password).await?;
+        Ok(MariadbResetOutcomeDto::Reset)
+    } else if looks_like_auth_failure(&outcome.stderr) {
+        Ok(MariadbResetOutcomeDto::AuthFailed {
+            detail: redact_all(&outcome.stderr, &secrets),
+        })
+    } else {
+        Err(IpcError::Core {
+            message: redact_all(
+                &if outcome.stderr.trim().is_empty() {
+                    "ALTER USER failed".to_string()
+                } else {
+                    outcome.stderr
+                },
+                &secrets,
+            ),
+        })
+    }
+}
+
+/// `SELECT VERSION(), @@port` through the running server's socket,
+/// authenticating with the stored credential via an ephemeral 0600
+/// defaults-file — the MariaDB mirror of [`verify_mysql_connection`].
+#[tauri::command]
+#[specta::specta]
+pub async fn verify_mariadb_connection(
+    db: tauri::State<'_, Db>,
+    paths: tauri::State<'_, Option<StackPaths>>,
+    runtimes: tauri::State<'_, RwLock<Option<Vec<openvhost_core::MariadbRuntime>>>>,
+) -> Result<MariadbConnectionProofDto, IpcError> {
+    let p = stack_paths(&paths)?;
+    let runtime = find_mariadb_runtime(runtimes.inner())?;
+    let mp = openvhost_core::mariadb_paths(&p.home);
+
+    let repo = openvhost_core::mariadb::MariadbInstanceRepo::new(db.inner());
+    let Some(instance) = repo.get().await? else {
+        return Ok(MariadbConnectionProofDto::Failed {
+            detail: format!(
+                "no stored root password for MariaDB {} — initialize it, or reset the \
+                 password if the folder is already initialized",
+                openvhost_core::MARIADB_SERIES
+            ),
+        });
+    };
+    let secret = instance.root_password.expose().to_string();
+
+    let defaults_file = match EphemeralDefaultsFile::write(&mp.socket, &instance.root_password) {
+        Ok(f) => f,
+        Err(e) => {
+            return Err(IpcError::Core {
+                message: format!("failed to write the ephemeral credential file: {e}"),
+            });
+        }
+    };
+
+    let result = crate::mysql_admin::mysql_exec_with_defaults_file(
+        &runtime.mariadb,
+        &defaults_file.path,
+        "SELECT VERSION(), @@port;",
+    )
+    .await;
+    drop(defaults_file); // RAII delete, before acting on the result.
+
+    let outcome = match result {
+        Ok(o) => o,
+        Err(e) => {
+            return Ok(MariadbConnectionProofDto::Failed {
+                detail: redact(&e.to_string(), &secret),
+            });
+        }
+    };
+
+    if !outcome.ok {
+        return Ok(if looks_like_auth_failure(&outcome.stderr) {
+            MariadbConnectionProofDto::AuthFailed {
+                detail: redact(&outcome.stderr, &secret),
+            }
+        } else {
+            MariadbConnectionProofDto::Failed {
+                detail: redact(
+                    &if outcome.stderr.trim().is_empty() {
+                        "the connection attempt failed".to_string()
+                    } else {
+                        outcome.stderr
+                    },
+                    &secret,
+                ),
+            }
+        });
+    }
+
+    Ok(match parse_version_and_port(&outcome.stdout) {
+        Some((version, port)) => MariadbConnectionProofDto::Ok { version, port },
+        None => MariadbConnectionProofDto::Failed {
+            detail: redact(
+                &format!("could not parse a version/port from: {:?}", outcome.stdout),
+                &secret,
+            ),
+        },
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod mariadb_ipc_tests {
+    use tauri::Manager;
+
+    use super::*;
+    use openvhost_proc::{Supervisor, default_driver};
+
+    fn fake_cli(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    fn fake_runtime(
+        home: &Path,
+        version: &str,
+        mariadb: PathBuf,
+    ) -> openvhost_core::MariadbRuntime {
+        openvhost_core::MariadbRuntime {
+            series: openvhost_core::MARIADB_SERIES,
+            version: version.to_string(),
+            mariadbd: home.join("mariadbd"),
+            mariadb,
+            mariadb_admin: home.join("mariadb-admin"),
+        }
+    }
+
+    /// Lay down `<home>/packages/mariadb/11.4/<version>/bin/{mariadbd,
+    /// mariadb,mariadb-admin}` and swing `current` onto it — the minimum
+    /// shape `discover_mariadb`'s "all three or nothing" rule requires.
+    fn install_fake_mariadb_package(home: &Path, version: &str) {
+        let dir = home.join("packages/mariadb/11.4").join(version).join("bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["mariadbd", "mariadb", "mariadb-admin"] {
+            std::fs::write(dir.join(name), "#!/bin/sh\nexit 0\n").unwrap();
+        }
+        let current = home.join("packages/mariadb/11.4/current");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(version, &current).unwrap();
+    }
+
+    fn app_with(lock: InstallLock) -> tauri::App<tauri::test::MockRuntime> {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(lock);
+        app
+    }
+
+    /// Whether a spawned run is still going — see `mysql_ipc_tests`'s
+    /// identical helper for why this is not a bare `is_finished()` check.
+    async fn still_running(task: &mut tokio::task::JoinHandle<()>) -> bool {
+        tokio::time::timeout(std::time::Duration::from_millis(200), task)
+            .await
+            .is_err()
+    }
+
+    // ------------------------------------------------------------------
+    // Group 1 — the discriminators (D4/F1). THE required property: Cancel
+    // on one engine's install must never abort the other's.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn mariadbs_install_pair_is_distinct_from_mysqls_on_the_kind_discriminator() {
+        assert_ne!(MARIADB_INSTALL_RUN, MYSQL_INSTALL_RUN);
+        assert_ne!(MARIADB_INSTALL_RUN.0, MYSQL_INSTALL_RUN.0);
+        // Same operation on both — it really is the KIND that must differ,
+        // not merely the pair as an opaque whole.
+        assert_eq!(MARIADB_INSTALL_RUN.1, MYSQL_INSTALL_RUN.1);
+    }
+
+    #[test]
+    fn a_mariadb_init_is_not_tagged_as_an_install() {
+        assert_ne!(
+            MARIADB_INIT_RUN, MARIADB_INSTALL_RUN,
+            "an initialization tagged as an install is cancellable by \
+             cancel_mariadb_install, whatever its label says"
+        );
+        assert_eq!(MARIADB_INIT_RUN.1, PackageOperation::Initialize);
+    }
+
+    /// THE property this task exists to prove, both directions in one test
+    /// so neither can be fixed at the expense of the other.
+    ///
+    /// VACUITY (neuter-and-watch-it-fail): retagging `MARIADB_INSTALL_RUN` to
+    /// `(InstallKind::Mysql, PackageOperation::Install)` — i.e. sharing
+    /// MySQL's pair, the audit F1 shape — turned BOTH halves of this test
+    /// red: direction 1's `abort_running_if(mariadb_kind, ...)` then matched
+    /// the running MySQL install and aborted it, and direction 2's own
+    /// MariaDB install could then be stopped by `MYSQL_INSTALL_RUN` too
+    /// (the pairs were now identical). Restoring the distinct
+    /// `InstallKind::Mariadb` discriminator made it pass again.
+    #[tokio::test]
+    async fn a_mariadb_install_and_a_mysql_install_cannot_abort_each_other() {
+        // Direction 1: a MySQL install is running; MariaDB's cancel must not
+        // touch it.
+        {
+            let lock = InstallLock::default();
+            let mut mysql_install = tokio::spawn(std::future::pending::<()>());
+            let (kind, operation) = MYSQL_INSTALL_RUN;
+            lock.set_running(
+                kind,
+                operation,
+                "MySQL 8.4".to_string(),
+                mysql_install.abort_handle(),
+            );
+
+            let (mariadb_kind, mariadb_operation) = MARIADB_INSTALL_RUN;
+            assert!(
+                !lock.abort_running_if(mariadb_kind, mariadb_operation),
+                "a MariaDB-install cancel claimed it stopped a running MySQL install"
+            );
+            assert!(
+                still_running(&mut mysql_install).await,
+                "a MariaDB-install cancel ABORTED a running MySQL install"
+            );
+            mysql_install.abort();
+        }
+
+        // Direction 2: a MariaDB install is running; MySQL's cancel must not
+        // touch it.
+        {
+            let lock = InstallLock::default();
+            let mut mariadb_install = tokio::spawn(std::future::pending::<()>());
+            let (kind, operation) = MARIADB_INSTALL_RUN;
+            lock.set_running(
+                kind,
+                operation,
+                "MariaDB 11.4".to_string(),
+                mariadb_install.abort_handle(),
+            );
+
+            let (mysql_kind, mysql_operation) = MYSQL_INSTALL_RUN;
+            assert!(
+                !lock.abort_running_if(mysql_kind, mysql_operation),
+                "a MySQL-install cancel claimed it stopped a running MariaDB install"
+            );
+            assert!(
+                still_running(&mut mariadb_install).await,
+                "a MySQL-install cancel ABORTED a running MariaDB install"
+            );
+            mariadb_install.abort();
+        }
+    }
+
+    /// Non-vacuity twin: MariaDB's own cancel must still stop MariaDB's own
+    /// install. Without this, a `cancel_mariadb_install` that aborted
+    /// nothing whatsoever would pass the isolation test above.
+    #[tokio::test]
+    async fn the_same_cancel_still_stops_a_real_mariadb_install() {
+        let lock = InstallLock::default();
+        let install = tokio::spawn(std::future::pending::<()>());
+        let (kind, operation) = MARIADB_INSTALL_RUN;
+        lock.set_running(
+            kind,
+            operation,
+            "MariaDB 11.4".to_string(),
+            install.abort_handle(),
+        );
+        let app = app_with(lock);
+
+        assert!(
+            crate::mariadb_pkg::cancel_mariadb_install(app.state::<InstallLock>())
+                .await
+                .unwrap()
+        );
+
+        match tokio::time::timeout(std::time::Duration::from_secs(5), install)
+            .await
+            .expect("the install did not settle after its own cancel fired")
+        {
+            Err(join_err) => assert!(join_err.is_cancelled(), "got {join_err:?}"),
+            Ok(()) => panic!("the cancel returned true but the install ran to completion"),
+        }
+    }
+
+    /// The audit F1 shape reproduced for MariaDB's own init: a Cancel that
+    /// targets an INSTALL must not touch an INITIALIZATION, even for the
+    /// same engine.
+    #[tokio::test]
+    async fn a_running_mariadb_init_survives_the_databases_page_install_cancel() {
+        let lock = InstallLock::default();
+        let mut init = tokio::spawn(std::future::pending::<()>());
+        set_running_mariadb_init(&lock, init.abort_handle());
+
+        let (kind, operation) = MARIADB_INSTALL_RUN;
+        assert!(
+            !lock.abort_running_if(kind, operation),
+            "the Databases page's install-cancel claimed it stopped a datadir initialization"
+        );
+        assert!(
+            still_running(&mut init).await,
+            "the Databases page's install-cancel ABORTED a datadir initialization"
+        );
+        init.abort();
+    }
+
+    #[tokio::test]
+    async fn an_initialization_is_tagged_as_one_and_labelled_plainly() {
+        let lock = InstallLock::default();
+        let init = tokio::spawn(std::future::pending::<()>());
+        set_running_mariadb_init(&lock, init.abort_handle());
+
+        assert_eq!(
+            lock.running_install(),
+            Some((
+                InstallKind::Mariadb,
+                PackageOperation::Initialize,
+                "MariaDB 11.4".to_string()
+            ))
+        );
+        init.abort();
+    }
+
+    // ------------------------------------------------------------------
+    // Group 2 — the offer and outcome DTOs.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn every_mariadb_init_outcome_state_serializes_distinctly() {
+        let tag = |v: &MariadbInitOutcomeDto| serde_json::to_value(v).unwrap()["kind"].clone();
+        let all = [
+            MariadbInitOutcomeDto::Initialized,
+            MariadbInitOutcomeDto::AlreadyInitialized,
+            MariadbInitOutcomeDto::Foreign { detail: "x".into() },
+            MariadbInitOutcomeDto::Failed {
+                step: MariadbInitStepDto::SetPassword,
+                reason: "boom".into(),
+            },
+        ];
+        let tags: Vec<_> = all.iter().map(tag).collect();
+        for (i, a) in tags.iter().enumerate() {
+            for (j, b) in tags.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "{:?} and {:?} share a tag", all[i], all[j]);
+                }
+            }
+        }
+    }
+
+    /// SECURITY (audit Low 3), defence in depth: [`redact_mariadb_init_outcome`]
+    /// must scrub a generated password out of a `Failed` reason before it can
+    /// reach either consumer — `reason.lines()`'s per-line
+    /// `MariadbInitLogEvent`s, and the `MariadbInitOutcomeDto` `.into()`
+    /// produces — even though that function's own doc comment explains why
+    /// today's core `initialize_mariadb` never actually pairs `Failed` with
+    /// `Some(password)`. Exercised directly rather than through the full
+    /// `initialize_mariadb` command for the same `AppHandle<Wry>` reason
+    /// [`redact_mariadb_init_outcome`] is split out at all.
+    ///
+    /// VACUITY: temporarily changed the `Some(password)` arm to return
+    /// `reason` unredacted — this test failed with the password still
+    /// present, both assertions below firing.
+    #[test]
+    fn redact_mariadb_init_outcome_scrubs_a_generated_password_from_a_failure_reason() {
+        let password = openvhost_core::mysql::generate_root_password();
+        let outcome = openvhost_core::mariadb::MariadbInitOutcome::Failed {
+            step: openvhost_core::mariadb::MariadbInitStep::SetPassword,
+            reason: format!(
+                "failed to set the root password: ERROR 1064 (42000): You have an error in \
+                 your SQL syntax; check the manual … near '{}' at line 2",
+                password.expose()
+            ),
+        };
+
+        let redacted = redact_mariadb_init_outcome(outcome, &Some(password.clone()));
+
+        // Reaches `MariadbInitLogEvent` as `reason.lines()` — asserted
+        // directly on the (redacted) reason string `initialize_mariadb`
+        // emits line-by-line.
+        match &redacted {
+            openvhost_core::mariadb::MariadbInitOutcome::Failed { reason, .. } => {
+                assert!(
+                    !reason.contains(password.expose()),
+                    "the generated password leaked into a Failed init reason: {reason:?}"
+                );
+                assert!(reason.contains("<redacted>"), "got {reason:?}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+
+        // Reaches the returned DTO as a straight field copy of `reason` (see
+        // `From<MariadbInitOutcome> for MariadbInitOutcomeDto>`), so
+        // asserting on `redacted` itself — what `initialize_mariadb` passes
+        // to `.into()` — is enough to cover it too.
+        match redacted.into() {
+            MariadbInitOutcomeDto::Failed { reason, .. } => {
+                assert!(!reason.contains(password.expose()), "got {reason:?}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Group 3 — environment/rescan, against a real fake package tree.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn mariadb_environment_reports_not_installed_when_nothing_is_discovered() {
+        let home = tempfile::tempdir().unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(Some(StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: home.path().join("nginx"),
+            nginx_conf: home.path().join("nginx.conf"),
+        }));
+        app.manage(RwLock::<Option<Vec<openvhost_core::MariadbRuntime>>>::new(
+            None,
+        ));
+
+        let env = mariadb_environment(
+            app.state::<RwLock<Option<Vec<openvhost_core::MariadbRuntime>>>>(),
+            app.state::<Option<StackPaths>>(),
+        )
+        .await
+        .unwrap();
+        assert!(!env.installed);
+        assert!(env.version.is_none());
+        assert!(env.service_id.is_none());
+        assert!(env.socket_path.is_none());
+        assert!(matches!(
+            env.datadir_state,
+            MariadbDatadirStateDto::NotInitialized
+        ));
+    }
+
+    /// VACUITY: run against a home with NO fake package laid down first —
+    /// `found.len()` was 0 and this failed, confirming the fixture (not an
+    /// always-true `discover_mariadb` stub) is what makes it pass.
+    #[tokio::test]
+    async fn rescan_discovers_a_packaged_install_and_reports_it_uninitialized() {
+        let home = tempfile::tempdir().unwrap();
+        install_fake_mariadb_package(home.path(), "11.4.9");
+
+        let sup = Supervisor::new(default_driver());
+        let runtimes: RwLock<Option<Vec<openvhost_core::MariadbRuntime>>> = RwLock::new(None);
+
+        let found = rescan_mariadb_into_state(&runtimes, &sup, home.path())
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].version, "11.4.9");
+
+        let env = mariadb_row(home.path(), found.first());
+        assert!(env.installed);
+        assert_eq!(env.version.as_deref(), Some("11.4.9"));
+        // The datadir was never initialized, so no supervisor row registered
+        // and no socket path reported — "installed" is not "running".
+        assert!(env.service_id.is_none());
+        assert!(env.socket_path.is_none());
+        assert!(sup.snapshot().is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Group 4 — the credential never reaches argv (plan Global Constraints
+    // SECRETS block).
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn mariadb_root_password_returns_the_stored_value() {
+        let db = Db::open_in_memory().await.unwrap();
+        let password = openvhost_core::mysql::generate_root_password();
+        openvhost_core::mariadb::MariadbInstanceRepo::new(&db)
+            .upsert(&password)
+            .await
+            .unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(db);
+
+        let returned = mariadb_root_password(app.state::<Db>()).await.unwrap();
+        assert_eq!(returned, password.expose());
+    }
+
+    /// The mandated test: drive the REAL command, against a fake `mariadb`
+    /// that records its own argv (never its stdin) to a side file, and
+    /// assert the stored (OLD) password never appears in it.
+    #[tokio::test]
+    async fn reset_mariadb_never_puts_the_password_on_argv() {
+        let home = tempfile::tempdir().unwrap();
+        let evidence = home.path().join("argv.txt");
+
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let db = Db::open_in_memory().await.unwrap();
+        let old_password = openvhost_core::mysql::generate_root_password();
+        openvhost_core::mariadb::MariadbInstanceRepo::new(&db)
+            .upsert(&old_password)
+            .await
+            .unwrap();
+        app.manage(db);
+        app.manage(Some(StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: home.path().join("nginx"),
+            nginx_conf: home.path().join("nginx.conf"),
+        }));
+        let fake_mariadb = fake_cli(
+            home.path(),
+            "mariadb",
+            &format!(r#"echo "$@" >> "{}"; exit 0"#, evidence.display()),
+        );
+        app.manage(RwLock::new(Some(vec![fake_runtime(
+            home.path(),
+            "11.4.9",
+            fake_mariadb,
+        )])));
+
+        let outcome = reset_mariadb_root_password(
+            app.state::<Db>(),
+            app.state::<Option<StackPaths>>(),
+            app.state::<RwLock<Option<Vec<openvhost_core::MariadbRuntime>>>>(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, MariadbResetOutcomeDto::Reset));
+
+        let argv_seen = std::fs::read_to_string(&evidence).unwrap();
+        assert!(
+            !argv_seen.contains(old_password.expose()),
+            "the stored password reached argv: {argv_seen:?}"
+        );
+        assert!(argv_seen.contains("--defaults-file="), "got {argv_seen:?}");
+        assert!(argv_seen.contains("--batch"), "got {argv_seen:?}");
+        assert!(!argv_seen.contains("--password"), "got {argv_seen:?}");
+    }
+
+    #[tokio::test]
+    async fn verify_mariadb_connection_never_puts_the_password_on_argv() {
+        let home = tempfile::tempdir().unwrap();
+        let evidence = home.path().join("argv.txt");
+
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let db = Db::open_in_memory().await.unwrap();
+        let password = openvhost_core::mysql::generate_root_password();
+        openvhost_core::mariadb::MariadbInstanceRepo::new(&db)
+            .upsert(&password)
+            .await
+            .unwrap();
+        app.manage(db);
+        app.manage(Some(StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: home.path().join("nginx"),
+            nginx_conf: home.path().join("nginx.conf"),
+        }));
+        let fake_mariadb = fake_cli(
+            home.path(),
+            "mariadb",
+            &format!(
+                "echo \"$@\" >> \"{}\"; printf '11.4.9\\t3307\\n'",
+                evidence.display()
+            ),
+        );
+        app.manage(RwLock::new(Some(vec![fake_runtime(
+            home.path(),
+            "11.4.9",
+            fake_mariadb,
+        )])));
+
+        let outcome = verify_mariadb_connection(
+            app.state::<Db>(),
+            app.state::<Option<StackPaths>>(),
+            app.state::<RwLock<Option<Vec<openvhost_core::MariadbRuntime>>>>(),
+        )
+        .await
+        .unwrap();
+        match outcome {
+            MariadbConnectionProofDto::Ok { version, port } => {
+                assert_eq!(version, "11.4.9");
+                assert_eq!(port, 3307);
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+
+        let argv_seen = std::fs::read_to_string(&evidence).unwrap();
+        assert!(
+            !argv_seen.contains(password.expose()),
+            "the stored password reached argv: {argv_seen:?}"
+        );
     }
 }
 

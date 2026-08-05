@@ -1,7 +1,11 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <script lang="ts">
 	import type { MysqlConnectionProofDto, MysqlResetOutcomeDto } from '$lib/ipc';
-	import { MASKED_PASSWORD_PLACEHOLDER, STALE_CREDENTIAL_RECOVERY } from '$lib/databases.derive';
+	import {
+		MASKED_PASSWORD_PLACEHOLDER,
+		engineDescriptor,
+		type EngineKind
+	} from '$lib/databases.derive';
 	import { copyToClipboard } from '$lib/utils/clipboard';
 	import Button from './Button.svelte';
 
@@ -13,9 +17,10 @@
 	// every rendered state directly, rather than leaving the confirm step's
 	// consequence copy to the manual click-list.
 	let {
+		engine = 'mysql',
 		major,
 		host = '127.0.0.1',
-		port = 3306,
+		port,
 		socketPath,
 		user = 'root',
 		password,
@@ -37,8 +42,16 @@
 		onConfirmReset,
 		onVerify
 	}: {
+		/** Which engine this block belongs to (P1 MariaDB UI design D1) —
+		 *  defaults to `'mysql'` so every existing caller/test is unaffected.
+		 *  Resolved ONCE into {@link descriptor}; drives `resolvedPort`'s default
+		 *  and the "MySQL"/"MariaDB" word in this block's own copy. */
+		engine?: EngineKind;
 		major: string;
 		host?: string;
+		/** The fixed port to show, or `undefined` to fall back to the engine's
+		 *  own default (3306 for MySQL, 3307 for MariaDB) — see
+		 *  {@link resolvedPort}. */
 		port?: number;
 		socketPath: string;
 		user?: string;
@@ -83,6 +96,14 @@
 		onVerify: () => void;
 	} = $props();
 
+	/** The static, per-engine facts (P1 MariaDB UI design D1) — resolved ONCE,
+	 *  here, from the closed {@link EngineKind}. */
+	const descriptor = $derived(engineDescriptor(engine));
+	/** The port actually shown: the caller's explicit override, or the
+	 *  engine's own default — never a bare literal `3306` (that was MySQL's
+	 *  own hardcoded default before this block was shared). */
+	const resolvedPort = $derived(port ?? descriptor.defaultPort);
+
 	/** Both signals must agree: `revealed` is the user's ask, `password !==
 	 *  undefined` is a defensive floor so a `revealed: true` with nothing yet
 	 *  cached (a race, or a caller bug) can never try to render `undefined`
@@ -107,28 +128,28 @@
 	</div>
 {/snippet}
 
-<div class="credentials" data-testid="mysql-credentials-{major}">
+<div class="credentials" data-testid="{descriptor.idPrefix}-credentials-{major}">
 	<div class="conn-block">
 		<h3 class="block-title">Connection</h3>
 		<div class="conn-grid">
 			{@render connField('Host', host, `host-${major}`)}
-			{@render connField('Port', String(port), `port-${major}`)}
+			{@render connField('Port', String(resolvedPort), `port-${major}`)}
 			{@render connField('Socket', socketPath, `socket-${major}`)}
 			{@render connField('User', user, `user-${major}`)}
 		</div>
 	</div>
 
 	<div class="password-block">
-		<label for="mysql-password-{major}">Root password</label>
+		<label for="{descriptor.idPrefix}-password-{major}">Root password</label>
 		<div class="input-group">
 			<input
 				class="input mono"
-				id="mysql-password-{major}"
+				id="{descriptor.idPrefix}-password-{major}"
 				type={isRevealed ? 'text' : 'password'}
 				readonly
 				value={displayValue}
 				data-testid="password-field-{major}"
-				aria-label="MySQL {major} root password"
+				aria-label="{descriptor.label} {major} root password"
 			/>
 			<button
 				type="button"
@@ -156,9 +177,9 @@
 		{#if confirmingReset}
 			<div class="reset-confirm" data-testid="reset-confirm-{major}">
 				<p>
-					This regenerates MySQL {major}'s root password. The current password stops working
-					immediately, and the new one is stored in OpenVHost's local database (state.db), not in
-					Keychain.
+					This regenerates {descriptor.label}
+					{major}'s root password. The current password stops working immediately, and the new one
+					is stored in OpenVHost's local database (state.db), not in Keychain.
 				</p>
 				<div class="reset-actions">
 					<Button variant="quiet" size="sm" testId="cancel-reset-{major}" onclick={onCancelReset}>
@@ -185,7 +206,7 @@
 			<p class="ok" role="status" data-testid="reset-ok-{major}">Password regenerated.</p>
 		{:else if resetOutcome?.kind === 'authFailed'}
 			<p class="error" role="alert" data-testid="reset-auth-failed-{major}">
-				Reset failed: {resetOutcome.detail}. {STALE_CREDENTIAL_RECOVERY}
+				Reset failed: {resetOutcome.detail}. {descriptor.staleCredentialRecovery}
 			</p>
 		{/if}
 		{#if resetError !== ''}
@@ -205,11 +226,12 @@
 		</Button>
 		{#if verifyResult?.kind === 'ok'}
 			<p class="ok" role="status" data-testid="verify-ok-{major}">
-				Connected — MySQL {verifyResult.version} on port {verifyResult.port}.
+				Connected — {descriptor.label}
+				{verifyResult.version} on port {verifyResult.port}.
 			</p>
 		{:else if verifyResult?.kind === 'authFailed'}
 			<p class="error" role="alert" data-testid="verify-auth-failed-{major}">
-				{verifyResult.detail}. {STALE_CREDENTIAL_RECOVERY}
+				{verifyResult.detail}. {descriptor.staleCredentialRecovery}
 			</p>
 		{:else if verifyResult?.kind === 'failed'}
 			<p class="error" role="alert" data-testid="verify-failed-{major}">{verifyResult.detail}</p>

@@ -87,20 +87,18 @@ describe('DatabasesStore — environment load', () => {
 		expect(s.env?.instances.map((i) => i.major)).toEqual(['8.4']);
 	});
 
-	it('exposes brewFound and anyInstalled from the loaded environment', async () => {
+	it('exposes anyInstalled from the loaded environment', async () => {
 		const s = new DatabasesStore(
 			api({
 				mysqlEnvironment: vi.fn(async () => env([instance({ installed: true })], false))
 			})
 		);
 		await s.refresh();
-		expect(s.brewFound).toBe(false);
 		expect(s.anyInstalled).toBe(true);
 	});
 
-	it('is neither brewFound nor anyInstalled before the first load settles', () => {
+	it('is not anyInstalled before the first load settles', () => {
 		const s = new DatabasesStore(api());
-		expect(s.brewFound).toBe(false);
 		expect(s.anyInstalled).toBe(false);
 	});
 

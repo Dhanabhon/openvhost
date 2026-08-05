@@ -6,11 +6,15 @@
 // hoc in a template.
 
 import type {
+	MariadbPackageOfferDto,
 	MysqlDatadirStateDto,
 	MysqlInitStepDto,
 	MysqlInstallProgressDto,
-	MysqlInstanceDto
+	MysqlInstanceDto,
+	MysqlPackageOfferDto,
+	MysqlRuntimeSourceDto
 } from './ipc';
+import { mysqlSourceBadge, mysqlUninstallOffered, type Notice } from './mysql-install.derive';
 
 /** Same shape `LogPane.svelte` renders (`services.svelte.ts`'s `UiLog`),
  *  redeclared here rather than imported — same reasoning as
@@ -22,6 +26,109 @@ export interface UiLog {
 	tsMs: number;
 	level: 'info' | 'warn' | 'error';
 	line: string;
+}
+
+/**
+ * Which install pipeline a row belongs to (P1 MariaDB UI design D1). Closed:
+ * {@link engineDescriptor} switches over it with a `const _: never` arm, so a
+ * third engine fails typecheck there rather than silently reusing MySQL's
+ * copy and policies.
+ */
+export type EngineKind = 'mysql' | 'mariadb';
+
+/**
+ * The union of every engine's package-offer DTO — MySQL's own
+ * `MysqlPackageOfferDto` (`available`/`unavailable`) plus MariaDB's
+ * `MariadbPackageOfferDto`, which adds the third `awaitingRelease` state
+ * (design D2). A real `MysqlPackageOfferDto` value satisfies this union
+ * structurally (every one of its members matches a member here), so
+ * `mysqlRowState` can keep handing it a plain `MysqlInstanceDto['offer']`
+ * with no cast — this type only widens what {@link notInstalledRowState}
+ * accepts, it does not change what MySQL ever actually produces.
+ */
+export type EngineOfferDto = MysqlPackageOfferDto | MariadbPackageOfferDto;
+
+/** Where a runtime came from, in the shape {@link EngineDescriptor}'s
+ *  `sourcePolicy`/`uninstallPolicy` need to answer "show a badge?"/"offer
+ *  Uninstall?" — MySQL's own `MysqlRuntimeSourceDto` (`packaged`/`homebrew`).
+ *  MariaDB has no source concept of its own to report (no Homebrew install
+ *  path ever existed for it), so its policies below ignore this parameter
+ *  entirely rather than pretending to interpret a shape that never varies. */
+export type EngineSourceDto = MysqlRuntimeSourceDto;
+
+/**
+ * The generic shape the shared row/credentials render from — structurally
+ * `MysqlInstanceDto` with `offer` widened to {@link EngineOfferDto}. A real
+ * `MysqlInstanceDto` satisfies this type as-is (its narrower `offer` is a
+ * subset), so every existing MySQL call site is unaffected; a future MariaDB
+ * adapter (task 3) builds one of these from `MariadbEnvironmentDto` instead.
+ */
+export type EngineInstanceDto = Omit<MysqlInstanceDto, 'offer'> & { offer: EngineOfferDto };
+
+/**
+ * The static, per-engine facts the shared row/credentials need to paint
+ * themselves without ever asking "which engine am I" in a template (design
+ * D1: "no `{#if engine === …}` anywhere in a template"). Resolved ONCE, by
+ * {@link engineDescriptor}; every value below is data, not a decision left
+ * for the template to make.
+ */
+export interface EngineDescriptor {
+	/** The word this engine's name reads as in a sentence — "MySQL"/"MariaDB". */
+	label: string;
+	/** The literal word old "mysql-row-…"/"mysql-credentials-…" test ids
+	 *  hardcoded, now substituted from here — kept as `'mysql'` for MySQL so
+	 *  every existing test id is byte-for-byte unchanged (design D1's own
+	 *  stated gate for this refactor). Test ids that never carried an engine
+	 *  word (`install-{major}`, `uninstall-{major}`, …) are untouched: their
+	 *  uniqueness across engines is the CALLER's job (the identity value it
+	 *  passes as `major`), not this prefix's. */
+	idPrefix: string;
+	/** The fixed port the credentials block shows when the caller does not
+	 *  override it — 3306 for MySQL, 3307 for MariaDB (the two run side by
+	 *  side, spec §10 point 7). */
+	defaultPort: number;
+	/** MySQL's own `mysqlPortConflictHint`, reused verbatim; MariaDB's own
+	 *  equivalent, naming no Homebrew service — none exists to suggest
+	 *  stopping. */
+	portConflictHint: (stderrTail: readonly string[]) => string | null;
+	/** The disclosure shown under a not-yet-ready row, explaining this
+	 *  engine's datadir story. MySQL's is `SHARED_DATADIR_DISCLOSURE`
+	 *  (datadirs are shared ACROSS its two install sources); MariaDB has no
+	 *  second source to share one with, so it gets its own, simpler fact. */
+	datadirDisclosure: string;
+	/** The manual-recovery sentence for a stale stored credential, rendered by
+	 *  BOTH the reset-`authFailed` and verify-`authFailed` states (fix wave
+	 *  item 1). MySQL's is {@link STALE_CREDENTIAL_RECOVERY}, unchanged;
+	 *  MariaDB's own equivalent names MariaDB's own `--skip-grant-tables`
+	 *  recovery procedure, never MySQL's. Previously a bare module constant
+	 *  `MysqlCredentials.svelte` rendered unconditionally for both engines —
+	 *  a fourth instance of the "shared component says MySQL" bug this file's
+	 *  own D1 discipline exists to prevent, missed by an earlier sweep because
+	 *  it is a STRING, not a function call site. */
+	staleCredentialRecovery: string;
+	/** What provenance badge to show beside the version, or none. MySQL's own
+	 *  `mysqlSourceBadge`, reused verbatim; MariaDB shows none — with exactly
+	 *  one possible source, there is nothing to disambiguate. */
+	sourcePolicy: (source: EngineSourceDto | null) => { label: string; title: string } | null;
+	/** Whether an installed row may offer Uninstall. MySQL's own
+	 *  `mysqlUninstallOffered` (`false` for a `packaged` source — no
+	 *  `openvhost-pkg` uninstall counterpart existed when that shipped);
+	 *  MariaDB's is `true` unconditionally — its uninstall already goes
+	 *  through the shared `PackageKind::Mariadb` path. NOT cosmetic (design
+	 *  D1): a shared row that inherited MySQL's default unchanged would
+	 *  render `PACKAGED_UNINSTALL_UNAVAILABLE` on every installed MariaDB
+	 *  row. */
+	uninstallPolicy: (source: EngineSourceDto | null) => boolean;
+	/** The "get started" invite `DatabasesEmpty.svelte` shows above an empty
+	 *  rowlist — what pressing Install actually does, in this engine's own
+	 *  words (task 3: "give `DatabasesEmpty` what it needs to speak for
+	 *  either engine"). A plain string field, like {@link datadirDisclosure},
+	 *  rather than an inline `{#if engine === …}` in that component's
+	 *  template — the identical D1 discipline this file already applies to
+	 *  every other per-engine fact. Not gated on availability: whether a
+	 *  PARTICULAR host can install right now is a per-row fact this invite has
+	 *  never concerned itself with, for either engine. */
+	installInviteBody: string;
 }
 
 /**
@@ -40,6 +147,16 @@ export type MysqlRowState =
 	 *  `noBrew` state, which the move off Homebrew made false: installing MySQL
 	 *  no longer involves brew, so a machine without it is no longer stuck. */
 	| { kind: 'unavailable'; target: string }
+	/** The ninth row state (P1 MariaDB UI design D2) — never reachable for
+	 *  MySQL itself (`MysqlPackageOfferDto` has no such member), carried here
+	 *  because the row that renders it is shared. A build exists and is
+	 *  pinned, but the release that would serve it (`tag`) has not been
+	 *  published, so the URL 404s. Deliberately NOT a flavour of
+	 *  `unavailable`: that means "no build exists for this machine at all"; this
+	 *  means "a build exists — nobody can have it yet". The next action
+	 *  belongs to the maintainer, not the user, so this renders its own copy
+	 *  and no Install control, same as `unavailable`. */
+	| { kind: 'awaitingRelease'; tag: string }
 	| { kind: 'notInstalled'; version: string }
 	| {
 			kind: 'installing';
@@ -71,7 +188,7 @@ export interface MysqlInitFailure {
 }
 
 export interface MysqlRowInputs {
-	instance: MysqlInstanceDto;
+	instance: EngineInstanceDto;
 	/** The major currently running `install_mysql`, or `''` when idle —
 	 *  shared page-wide, the same single-flight rule `LanguagesStore.installing`
 	 *  already follows (one `InstallLock`, spec D7). */
@@ -134,15 +251,53 @@ export function mysqlRowState(inputs: MysqlRowInputs): MysqlRowState {
 	return datadirRowState(instance.datadirState, instance.major, inputs.initFailure);
 }
 
-/** A not-yet-installed row's state, from what this build can actually offer on
- *  this host. Exhaustive over `MysqlPackageOfferDto` — a third offer state must
- *  decide here rather than inherit "Install is fine". */
-function notInstalledRowState(offer: MysqlInstanceDto['offer']): MysqlRowState {
+/**
+ * A not-yet-installed row's state, from what this build can actually offer on
+ * this host. Exhaustive over {@link EngineOfferDto} — a third offer state
+ * must decide here rather than inherit "Install is fine" (this doc comment's
+ * own long-standing promise; P1 MariaDB UI design D2 is what cashes it in).
+ *
+ * Widened beyond `MysqlInstanceDto['offer']` (`MysqlPackageOfferDto`, a closed
+ * two-member union that can never actually carry `awaitingRelease`) so this
+ * one function stays the single, shared, exhaustive home for BOTH engines'
+ * offer unions — `mysqlRowState` below still only ever calls it with a real
+ * MySQL offer, which structurally satisfies this wider parameter without a
+ * cast. Exported so the `awaitingRelease` arm is directly testable with a
+ * hand-built offer no real `MysqlInstanceDto` can produce.
+ */
+export function notInstalledRowState(offer: EngineOfferDto): MysqlRowState {
 	switch (offer.kind) {
 		case 'available':
 			return { kind: 'notInstalled', version: offer.version };
+		case 'awaitingRelease':
+			return { kind: 'awaitingRelease', tag: offer.tag };
 		case 'unavailable':
 			return { kind: 'unavailable', target: offer.target };
+		default: {
+			const unreachable: never = offer;
+			return unreachable;
+		}
+	}
+}
+
+/**
+ * Whether this engine currently has anything to press Install on — the
+ * question `DatabasesEmpty.svelte`'s own "get started" invite needs answered
+ * before it claims an action exists (fix wave item 2): `awaitingRelease` and
+ * `unavailable` both mean no Install control exists anywhere on the page,
+ * even before anything is installed, so the invite must not describe an
+ * install, or name a mechanism (Homebrew), that this engine is not actually
+ * offering right now. Exhaustive over {@link EngineOfferDto} for the same
+ * reason {@link notInstalledRowState} is: a third offer state must decide
+ * here, not silently inherit "yes, installable".
+ */
+export function engineInstallOffered(offer: EngineOfferDto): boolean {
+	switch (offer.kind) {
+		case 'available':
+			return true;
+		case 'awaitingRelease':
+		case 'unavailable':
+			return false;
 		default: {
 			const unreachable: never = offer;
 			return unreachable;
@@ -290,4 +445,119 @@ export function anyMysqlInstalled(instances: readonly MysqlInstanceDto[]): boole
  */
 export function catalogedMajors(instances: readonly MysqlInstanceDto[]): string[] {
 	return instances.filter((i) => i.cataloged).map((i) => i.major);
+}
+
+/** MariaDB's own port-conflict hint (P1 MariaDB UI design). Same
+ *  "address already in use" match {@link mysqlPortConflictHint} uses above,
+ *  but names no Homebrew service — MariaDB never had one to stop (design D2:
+ *  "no Homebrew fallback… anywhere in this app").
+ *
+ *  Task 3 review: an earlier draft named "another MariaDB or MySQL server"
+ *  as the likely occupant of port 3307. That was not an honest guess —
+ *  OpenVHost's own MySQL always binds 3306, never 3307 (`MARIADB_ENDPOINT`'s
+ *  own doc comment: the two engines' distinct ports are what let both run at
+ *  once), and nothing else commonly defaults to 3307 the way MySQL's own
+ *  Homebrew formula defaults to 3306. Naming a specific-but-unlikely product
+ *  would read as a diagnosis; this names none, which is the honest version. */
+function mariadbPortConflictHint(stderrTail: readonly string[]): string | null {
+	const isPortConflict = stderrTail.some((line) => /address already in use/i.test(line));
+	if (!isPortConflict) return null;
+	return (
+		'This looks like a port 3307 conflict. Nothing else in OpenVHost uses this port — check what ' +
+		'else on this machine is bound to it, stop that, then try again.'
+	);
+}
+
+/** MariaDB's datadir disclosure. This build ships exactly one series, so
+ *  there is no cross-source sharing story to tell, unlike MySQL's
+ *  {@link SHARED_DATADIR_DISCLOSURE} (which exists because Homebrew and
+ *  OpenVHost's own installer can both produce a MySQL of the same major). */
+const MARIADB_DATADIR_DISCLOSURE =
+	"MariaDB's data directory is created the first time you initialize it below.";
+
+/** MariaDB's own manual-recovery copy for a stale stored credential (fix wave
+ *  item 1) — mirrors {@link STALE_CREDENTIAL_RECOVERY} exactly, substituting
+ *  MariaDB's own `--skip-grant-tables` recovery procedure for MySQL's, the
+ *  same substitution {@link mariadbPortConflictHint}/
+ *  {@link MARIADB_DATADIR_DISCLOSURE} already make for their own facts. */
+const MARIADB_STALE_CREDENTIAL_RECOVERY =
+	"The stored password doesn't match this data directory — it may have been restored from a backup or changed outside OpenVHost. There is no in-app recovery yet: reset MariaDB's root password manually (MariaDB's own --skip-grant-tables recovery procedure), then use Reset here once you're back in.";
+
+/** MySQL's "get started" invite body — moved here VERBATIM from
+ *  `DatabasesEmpty.svelte`'s own markup (task 3), so its rendered text is
+ *  byte-for-byte unchanged and that component's existing tests stay green. */
+const MYSQL_INSTALL_INVITE_BODY =
+	'OpenVHost downloads MySQL from Oracle, checks it against a checksum built into this app, and ' +
+	'unpacks it into its own packages folder — no Homebrew required. It then initializes a data ' +
+	'directory with a generated root password and runs it under the supervisor below.';
+
+/** MariaDB's own "get started" invite body (task 3) — names its real source
+ *  (OpenVHost's own GitHub release, never Oracle) and states plainly that
+ *  Homebrew was never involved, rather than "not required" (which would
+ *  wrongly imply an optional Homebrew path exists — design D2: "no Homebrew
+ *  fallback for MariaDB anywhere in this app"). */
+const MARIADB_INSTALL_INVITE_BODY =
+	'OpenVHost downloads MariaDB from its own GitHub release, checks it against a checksum built ' +
+	'into this app, and unpacks it into its own packages folder. MariaDB has never gone through ' +
+	'Homebrew in this app. It then initializes a data directory with a generated root password and ' +
+	'runs it under the supervisor below.';
+
+const MYSQL_DESCRIPTOR: EngineDescriptor = {
+	label: 'MySQL',
+	idPrefix: 'mysql',
+	defaultPort: 3306,
+	portConflictHint: mysqlPortConflictHint,
+	datadirDisclosure: SHARED_DATADIR_DISCLOSURE,
+	staleCredentialRecovery: STALE_CREDENTIAL_RECOVERY,
+	sourcePolicy: mysqlSourceBadge,
+	uninstallPolicy: mysqlUninstallOffered,
+	installInviteBody: MYSQL_INSTALL_INVITE_BODY
+};
+
+const MARIADB_DESCRIPTOR: EngineDescriptor = {
+	label: 'MariaDB',
+	idPrefix: 'mariadb',
+	defaultPort: 3307,
+	portConflictHint: mariadbPortConflictHint,
+	datadirDisclosure: MARIADB_DATADIR_DISCLOSURE,
+	staleCredentialRecovery: MARIADB_STALE_CREDENTIAL_RECOVERY,
+	sourcePolicy: () => null,
+	uninstallPolicy: () => true,
+	installInviteBody: MARIADB_INSTALL_INVITE_BODY
+};
+
+/**
+ * Resolved ONCE per row (design D1): a `switch` over the closed
+ * {@link EngineKind}, `const _: never` at the end, so a third engine fails
+ * typecheck here rather than silently falling back to MySQL's values.
+ */
+export function engineDescriptor(engine: EngineKind): EngineDescriptor {
+	switch (engine) {
+		case 'mysql':
+			return MYSQL_DESCRIPTOR;
+		case 'mariadb':
+			return MARIADB_DESCRIPTOR;
+		default: {
+			const unreachable: never = engine;
+			return unreachable;
+		}
+	}
+}
+
+/**
+ * Copy for the ninth row state (design D2): a build exists and is pinned,
+ * but the release that would serve it has not been published, so there is
+ * nothing to install here until it is. Visibly distinct from the
+ * `unavailable` state's "there is no build for this machine at all" — this
+ * names a release tag and a maintainer action, not a permanent absence.
+ */
+export function engineAwaitingReleaseNotice(descriptor: EngineDescriptor, tag: string): Notice {
+	return {
+		tone: 'warn',
+		title: `${descriptor.label} is not published yet`,
+		body:
+			`OpenVHost has a ${descriptor.label} build pinned and audited (release "${tag}"), but that ` +
+			`release has not been published yet, so there is nothing to install here until it is. This ` +
+			`is not something you can fix from here — check back once it ships.`
+	};
 }

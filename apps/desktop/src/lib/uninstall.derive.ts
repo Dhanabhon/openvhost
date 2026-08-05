@@ -24,8 +24,13 @@
  * binding Task 2 emits — the assignment in `uninstall.shared.svelte.ts` is
  * what pins the two together, so a drift in the Rust contract fails typecheck
  * at that seam instead of being discovered at runtime.
+ *
+ * `'mariadb'` (P1 MariaDB UI design D5) reuses this same shared uninstall
+ * pipeline — MariaDB's own command surface has no `uninstall_mariadb` of its
+ * own; removing a packaged install goes through `PackageKind::Mariadb` here,
+ * same as PHP and MySQL.
  */
-export type PackageKind = 'php' | 'mysql';
+export type PackageKind = 'php' | 'mysql' | 'mariadb';
 
 /** One thing an uninstall leaves alone, with its on-disk location when it has
  *  one. `path: null` is a kept thing that is not a file — the stored root
@@ -85,6 +90,8 @@ export function packageLabel(kind: PackageKind): string {
 			return 'PHP';
 		case 'mysql':
 			return 'MySQL';
+		case 'mariadb':
+			return 'MariaDB';
 		default: {
 			const unreachable: never = kind;
 			return unreachable;
@@ -130,6 +137,10 @@ export function keptSentence(kind: PackageKind, major: string, keeps: readonly K
 			return `Your databases are not touched${stay}, and your root password is kept, so reinstalling ${major} picks up where you left off.`;
 		case 'php':
 			return `Your logs are not touched${stay}, and any site still set to PHP ${major} keeps that setting until you change it.`;
+		case 'mariadb':
+			// Same guarantee as MySQL's, in the same shape (P1 MariaDB UI spec
+			// §10 point 4: "leaves the datadir and the credential row intact").
+			return `Your databases are not touched${stay}, and your root password is kept, so reinstalling ${major} picks up where you left off.`;
 		default: {
 			const unreachable: never = kind;
 			return unreachable;
@@ -306,15 +317,18 @@ export function offersUninstall(row: UninstallOffer): boolean {
  * leaving exactly the state an in-app uninstall would have.
  */
 export function outOfCatalogueNote(kind: PackageKind, major: string): string {
-	return (
-		`${packageLabel(kind)} ${major} was installed outside the versions this build manages, so ` +
-		`OpenVHost won't uninstall it. Remove it with Homebrew yourself — ` +
-		`\`brew uninstall ${brewFormula(kind, major)}\` — then press Check again.`
-	);
+	const formula = brewFormula(kind, major);
+	const removal =
+		formula === null
+			? `OpenVHost won't uninstall it. Remove it yourself, then press Check again.`
+			: `OpenVHost won't uninstall it. Remove it with Homebrew yourself — ` +
+				`\`brew uninstall ${formula}\` — then press Check again.`;
+	return `${packageLabel(kind)} ${major} was installed outside the versions this build manages, so ${removal}`;
 }
 
 /**
- * The Homebrew formula for a version, for COPY ONLY.
+ * The Homebrew formula for a version, for COPY ONLY — `null` when this kind
+ * has no Homebrew formula at all (P1 MariaDB UI design D5).
  *
  * Mirrors `openvhost_core::brew_formula` / `mysql_brew_formula` (`php@8.3`,
  * `mysql@8.4`) so the command in {@link outOfCatalogueNote} is the one that
@@ -323,13 +337,21 @@ export function outOfCatalogueNote(kind: PackageKind, major: string): string {
  * catalogue-gated major, which is exactly why the out-of-catalogue case has no
  * in-app path in the first place. Exhaustive over `PackageKind` with the
  * never-typed arm, so a third kind cannot inherit PHP's naming by accident.
+ *
+ * MariaDB returns `null` rather than `''` or a plausible-looking `'mariadb'`:
+ * a packaged MariaDB has no Homebrew origin and never will, so there is no
+ * formula name to invent, silent or otherwise. Every caller decides — here,
+ * {@link outOfCatalogueNote} drops the `brew uninstall` clause entirely
+ * rather than print one naming a formula that does not exist.
  */
-function brewFormula(kind: PackageKind, major: string): string {
+function brewFormula(kind: PackageKind, major: string): string | null {
 	switch (kind) {
 		case 'php':
 			return `php@${major}`;
 		case 'mysql':
 			return `mysql@${major}`;
+		case 'mariadb':
+			return null;
 		default: {
 			const unreachable: never = kind;
 			return unreachable;

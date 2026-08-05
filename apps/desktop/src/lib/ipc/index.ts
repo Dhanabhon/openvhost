@@ -27,6 +27,20 @@ import type {
 	LogSourceRowDto,
 	LogWindowDto,
 	LogWindowQuery,
+	MariadbConnectionProofDto,
+	MariadbDatadirStateDto,
+	MariadbEnvironmentDto,
+	MariadbInitLogEvent,
+	MariadbInitOutcomeDto,
+	MariadbInitStepDto,
+	MariadbInstallLogEvent,
+	MariadbInstallOutcomeDto,
+	MariadbInstallProgressDto,
+	MariadbInstallProgressEvent,
+	MariadbInstallResultDto,
+	MariadbLedgerWriteDto,
+	MariadbPackageOfferDto,
+	MariadbResetOutcomeDto,
 	MysqlConnectionProofDto,
 	MysqlDatadirStateDto,
 	MysqlEnvironmentDto,
@@ -81,6 +95,20 @@ export type {
 	LogSourceRowDto,
 	LogWindowDto,
 	LogWindowQuery,
+	MariadbConnectionProofDto,
+	MariadbDatadirStateDto,
+	MariadbEnvironmentDto,
+	MariadbInitLogEvent,
+	MariadbInitOutcomeDto,
+	MariadbInitStepDto,
+	MariadbInstallLogEvent,
+	MariadbInstallOutcomeDto,
+	MariadbInstallProgressDto,
+	MariadbInstallProgressEvent,
+	MariadbInstallResultDto,
+	MariadbLedgerWriteDto,
+	MariadbPackageOfferDto,
+	MariadbResetOutcomeDto,
 	MysqlConnectionProofDto,
 	MysqlDatadirStateDto,
 	MysqlEnvironmentDto,
@@ -580,6 +608,136 @@ export async function resetMysqlRootPassword(major: string): Promise<MysqlResetO
  */
 export async function verifyMysqlConnection(major: string): Promise<MysqlConnectionProofDto> {
 	return unwrap(commands.verifyMysqlConnection(major));
+}
+
+/**
+ * Read-only MariaDB environment summary for the Databases page — the
+ * single-instance mirror of {@link mysqlEnvironment} (P1 MariaDB UI design
+ * D6/D7): whether the one series this build ships is installed, and its
+ * on-disk datadir state. Spawns nothing — safe to call on page mount and
+ * after every install/initialize.
+ */
+export async function mariadbEnvironment(): Promise<MariadbEnvironmentDto> {
+	return unwrap(commands.mariadbEnvironment());
+}
+
+/**
+ * Explicit, user-initiated re-probe behind the MariaDB group's rescan
+ * affordance — the mirror of {@link rescanMysql}.
+ */
+export async function rescanMariadb(): Promise<MariadbEnvironmentDto> {
+	return unwrap(commands.rescanMariadb());
+}
+
+/**
+ * Install the pinned MariaDB series from OpenVHost's own GitHub release —
+ * download, SHA-256 verify, extract. **No Homebrew is, or ever was,
+ * involved.** Takes no major: unlike {@link installMysql}, there is no
+ * series to name — this build ships exactly one (design D7).
+ *
+ * Streams typed pipeline states through {@link onMariadbInstallProgress}
+ * while it runs, then resolves with an OUTCOME rather than throwing — same
+ * discipline as {@link installMysql}. Shares the same install lock as every
+ * other package operation: one of `installPhp`/`installMysql`/
+ * `initializeMysql`/`installMariadb`/`initializeMariadb`/`uninstallPackage`
+ * at a time.
+ */
+export async function installMariadb(): Promise<MariadbInstallOutcomeDto> {
+	return unwrap(commands.installMariadb());
+}
+
+/**
+ * Cancel an in-flight MariaDB install — the mirror of
+ * {@link cancelMysqlInstall}, and the identical reasoning: the download has
+ * no wall-clock bound and the install permit is process-wide, so an install
+ * nobody can stop starves every later one.
+ */
+export async function cancelMariadbInstall(): Promise<boolean> {
+	return unwrap(commands.cancelMariadbInstall());
+}
+
+/** Subscribe to `mariadb-install-log` — same dual-purpose channel design D3
+ *  gives MySQL's own `mysql-install-log`: MariaDB's install progress reports
+ *  through {@link onMariadbInstallProgress}, so this carries an uninstall's
+ *  output only. Same `IpcError` contract as {@link onServiceState}. */
+export async function onMariadbInstallLog(
+	cb: (ev: MariadbInstallLogEvent) => void
+): Promise<() => void> {
+	try {
+		return await events.mariadbInstallLogEvent.listen((e) => cb(e.payload));
+	} catch (e) {
+		throw normalizeError(e);
+	}
+}
+
+/** Subscribe to `mariadb-install-progress` — one typed state per pipeline
+ *  step, the mirror of {@link onMysqlInstallProgress}. Same `IpcError`
+ *  contract as {@link onServiceState}. */
+export async function onMariadbInstallProgress(
+	cb: (ev: MariadbInstallProgressEvent) => void
+): Promise<() => void> {
+	try {
+		return await events.mariadbInstallProgressEvent.listen((e) => cb(e.payload));
+	} catch (e) {
+		throw normalizeError(e);
+	}
+}
+
+/**
+ * Initialize MariaDB's datadir: the staged init sequence with a generated
+ * root password, and — on success — register the service so it appears in
+ * the Services panel. **No live per-line log**, unlike
+ * {@link initializeMysql}: the core function reports nothing intermediate,
+ * only a single terminal outcome, so there is nothing to stream while a run
+ * is in progress. A `failed` outcome's `reason` already carries the
+ * diagnostic in full, relayed post-hoc through {@link onMariadbInitLog} once
+ * the run ends. Shares the install lock — see {@link installMariadb}.
+ */
+export async function initializeMariadb(): Promise<MariadbInitOutcomeDto> {
+	return unwrap(commands.initializeMariadb());
+}
+
+/** Subscribe to `mariadb-init-log`. POST-HOC ONLY (see
+ *  {@link initializeMariadb}) — this fires once, after a failed run ends,
+ *  never while `initializeMariadb`'s promise is still pending. Same
+ *  `IpcError` contract as {@link onServiceState}. */
+export async function onMariadbInitLog(cb: (ev: MariadbInitLogEvent) => void): Promise<() => void> {
+	try {
+		return await events.mariadbInitLogEvent.listen((e) => cb(e.payload));
+	} catch (e) {
+		throw normalizeError(e);
+	}
+}
+
+/**
+ * Reveal the stored root password for the MariaDB instance, for the masked
+ * password field's Reveal/Copy affordance — the mirror of
+ * {@link mysqlRootPassword}, minus the major: MariaDB ships exactly one
+ * series. Throws if it has never been initialized.
+ */
+export async function mariadbRootPassword(): Promise<string> {
+	return unwrap(commands.mariadbRootPassword());
+}
+
+/**
+ * Regenerate the MariaDB instance's root password (reset-by-regenerate) —
+ * the mirror of {@link resetMysqlRootPassword}. `authFailed` is a distinct,
+ * renderable outcome (never a thrown error): the stored password may be
+ * stale, e.g. after restoring a datadir from an old backup outside the app.
+ */
+export async function resetMariadbRootPassword(): Promise<MariadbResetOutcomeDto> {
+	return unwrap(commands.resetMariadbRootPassword());
+}
+
+/**
+ * `SELECT VERSION(), @@port` through the running server, authenticating with
+ * the stored credential — the MariaDB group's "Verify connection"
+ * affordance, mirroring {@link verifyMysqlConnection}. Every failure mode is
+ * a renderable outcome, never a thrown error, so the button always has
+ * something to show.
+ */
+export async function verifyMariadbConnection(): Promise<MariadbConnectionProofDto> {
+	return unwrap(commands.verifyMariadbConnection());
 }
 
 /**

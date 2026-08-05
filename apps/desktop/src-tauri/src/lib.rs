@@ -18,10 +18,15 @@ mod commands;
 // over the supervisor and the two bulk locks. Ungated: the handler is
 // portable, and `openvhost_proc::control::bind` is what refuses off-unix.
 mod control;
+/// MariaDB from OpenVHost's own package tree over IPC — the DTOs, the
+/// progress event and the two install commands. A sibling of `mysql_pkg`
+/// (P1 MariaDB UI design D3/D7), mirroring its shape deliberately.
+mod mariadb_pkg;
 // The MySQL admin-CLI spawns (`mysqladmin`/`mysql` — ping, ALTER USER,
 // shutdown): orchestration-layer child processes, not config generation —
 // see this module's own doc comment for why they live here rather than in
-// openvhost-conf (review fix wave finding 4).
+// openvhost-conf (review fix wave finding 4). Also MariaDB's own reuse of
+// the same defaults-file exec helper — see that module's doc comment.
 mod mysql_admin;
 /// MySQL from OpenVHost's own package tree over IPC — the DTOs, the progress
 /// event and the two install commands. A sibling of `commands` rather than more
@@ -99,6 +104,14 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::mysql_root_password,
             commands::reset_mysql_root_password,
             commands::verify_mysql_connection,
+            commands::mariadb_environment,
+            commands::rescan_mariadb,
+            mariadb_pkg::install_mariadb,
+            mariadb_pkg::cancel_mariadb_install,
+            commands::initialize_mariadb,
+            commands::mariadb_root_password,
+            commands::reset_mariadb_root_password,
+            commands::verify_mariadb_connection,
             commands::list_log_sources,
             commands::read_log_window,
             commands::reveal_log_folder,
@@ -114,6 +127,9 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::MysqlInstallLogEvent,
             mysql_pkg::MysqlInstallProgressEvent,
             commands::MysqlInitLogEvent,
+            commands::MariadbInstallLogEvent,
+            mariadb_pkg::MariadbInstallProgressEvent,
+            commands::MariadbInitLogEvent,
             quit::QuitRequestedEvent
         ])
         // `LogLine`/`ServiceLogEvent` carry `ts_ms: u64` (millisecond epoch
@@ -359,23 +375,29 @@ pub fn run() {
                             #[cfg(debug_assertions)]
                             supervisor.register(demo_ticker_spec());
                             #[cfg(target_os = "macos")]
-                            let (stack_paths, stack_runtimes, mysql_runtimes) = {
+                            let (stack_paths, stack_runtimes, mysql_runtimes, mariadb_runtimes) = {
                                 let stack = stack::macos_stack();
                                 for spec in stack.specs {
                                     supervisor.register(spec);
                                 }
-                                (stack.paths, stack.runtimes, stack.mysql_runtimes)
+                                (
+                                    stack.paths,
+                                    stack.runtimes,
+                                    stack.mysql_runtimes,
+                                    stack.mariadb_runtimes,
+                                )
                             };
                             // No stack builder for this target yet, so `None` is the
                             // NORMAL state here — the home resolved fine, there is
                             // simply nothing to point the Web Server page at. See
                             // `commands::stack_paths` for the message that renders.
                             #[cfg(not(target_os = "macos"))]
-                            let (stack_paths, stack_runtimes, mysql_runtimes): (
+                            let (stack_paths, stack_runtimes, mysql_runtimes, mariadb_runtimes): (
                                 Option<stack::StackPaths>,
                                 Option<openvhost_core::InstalledRuntimes>,
                                 Option<Vec<openvhost_core::mysql::MysqlRuntime>>,
-                            ) = (None, None, None);
+                                Option<Vec<openvhost_core::mariadb::MariadbRuntime>>,
+                            ) = (None, None, None, None);
                             // Manage the Option ITSELF, unconditionally. Tauri implements
                             // `CommandArg` only for `State<'r, T>` — there is no impl for
                             // `Option<State<'r, T>>` — so a command cannot take an
@@ -412,6 +434,12 @@ pub fn run() {
                             // `initialize_mysql`/`reset_mysql_root_password`/
                             // `verify_mysql_connection` read it rather than re-probing.
                             app.manage(std::sync::RwLock::new(mysql_runtimes));
+                            // Same reasoning again, for MariaDB's own runtime list (P1
+                            // MariaDB UI design D7): `install_mariadb`/`rescan_mariadb`
+                            // write through this after launch, and
+                            // `initialize_mariadb`/`reset_mariadb_root_password`/
+                            // `verify_mariadb_connection` read it rather than re-probing.
+                            app.manage(std::sync::RwLock::new(mariadb_runtimes));
                             let mut rx = supervisor.subscribe();
                             let handle = app.handle().clone();
                             tauri::async_runtime::spawn(async move {

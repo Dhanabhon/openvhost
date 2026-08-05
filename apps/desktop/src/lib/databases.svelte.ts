@@ -132,10 +132,6 @@ export class DatabasesStore {
 
 	constructor(private api: DatabasesApi) {}
 
-	get brewFound(): boolean {
-		return this.env?.brewFound ?? false;
-	}
-
 	get anyInstalled(): boolean {
 		return this.env !== null && anyMysqlInstalled(this.env.instances);
 	}
