@@ -5,6 +5,7 @@
 	import { enabledPill, phpVersionMissing } from '$lib/sites.derive';
 	import { logSourceQuery } from '$lib/logs.derive';
 	import Button from './Button.svelte';
+	import RowActionMenu, { type RowActionMenuItem } from './RowActionMenu.svelte';
 
 	let {
 		site,
@@ -41,9 +42,11 @@
 	// The site's ERROR log, not access — spec D6's deep-link entry point
 	// matches the live-proof narrative ("the site's error log shows the PHP
 	// fatal"). The `/logs` page's own toolbar lets the user switch to the
-	// access stream for the same domain once there. Built inline at the
-	// `href` site below (not as a `$derived` here) so the eslint
-	// block-disable comment there can sit right next to what it excuses.
+	// access stream for the same domain once there. Kept as its own
+	// `$derived` (rather than inlined into the menu item below) because the
+	// href is now assembled inside `rowMenuItems`, not at a template `<a
+	// href>` site in this file — that anchor, and the eslint block-disable
+	// its `href` needs, now live in `RowActionMenu.svelte` instead.
 	const viewLogsQuery = $derived(logSourceQuery({ kind: 'siteError', domain: site.domain }));
 
 	/**
@@ -56,6 +59,37 @@
 	 * is the version that would put a red Delete under the wrong site.
 	 */
 	let confirming = $state(false);
+
+	/**
+	 * The row's three secondary actions (design spec D1), behind the `⋮` trigger.
+	 *
+	 * View logs stays a real navigation link — `RowActionMenu` renders whatever `href`
+	 * it is given as a genuine `<a>` (never coerced into a button), so this only moves
+	 * WHERE that target is built, not what it points at or how it navigates.
+	 *
+	 * Delete's `onSelect` sets `confirming`, the SAME local state the inline confirm
+	 * above already reads (D3) — choosing Delete here only REVEALS that confirm, it
+	 * does not commit anything itself, so there is exactly one place a site is ever
+	 * actually deleted from.
+	 *
+	 * No per-item `aria-label`: `RowActionMenuItem` carries only a plain text `label`
+	 * (see that component), so an item's accessible name is its visible text, read in
+	 * the context of the menu's own `aria-label` ("More actions for {site.name}"
+	 * below) — the same pattern any OS context menu uses, rather than repeating the
+	 * site name on every item.
+	 */
+	const rowMenuItems = $derived<RowActionMenuItem[]>([
+		{ kind: 'link', label: 'View logs', href: `${resolve('/logs')}${viewLogsQuery}` },
+		{ kind: 'button', label: 'Edit', onSelect: () => onEdit(site) },
+		{
+			kind: 'button',
+			label: 'Delete',
+			destructive: true,
+			onSelect: () => {
+				confirming = true;
+			}
+		}
+	]);
 </script>
 
 <div class="row site-row" data-testid="site-{site.id}">
@@ -124,53 +158,12 @@
 		</div>
 	{:else}
 		<div class="row-actions">
-			<!-- "View logs" — spec D6's deep link, first of the two icon-only "look at this
-			     site" actions. A real `<a href>`, not a `Button`: this is NAVIGATION (to
-			     `/logs?source=…`), never an IPC action, so `Button.svelte`'s `onclick` shape
-			     does not fit — same reasoning ServiceRow.svelte's own new "View logs" link
-			     uses. Hand-rolled `.icon-link` styling below reproduces `Button`'s quiet/sm
-			     look locally, mirroring how this file ALREADY hand-rolls a `.btn` subset for
-			     the danger-confirm button below (Button has no danger variant either) — same
-			     precedent, applied to "not a button" this time instead of "no matching
-			     variant". Never disabled (unlike Open): a disabled site's PAST logs are still
-			     worth reading, arguably more so, while it cannot serve a live page to open.
-
-			     eslint-plugin-svelte's `no-navigation-without-resolve` cannot see THROUGH a
-			     template literal that combines a genuine `resolve(...)` call with a second
-			     interpolated expression (checked against the rule's own source — its
-			     `expressionIsResolveCall` only recognises a BARE `resolve(...)` call or an
-			     aliasing variable) — a block disable/enable, not `-next-line`, since prettier is
-			     free to re-wrap this element and `-next-line` would then silently stop covering
-			     the `href` line. -->
-			<!-- eslint-disable svelte/no-navigation-without-resolve -->
-			<a
-				class="icon-link"
-				href={`${resolve('/logs')}${viewLogsQuery}`}
-				aria-label="View logs for {site.name}"
-			>
-				<span class="icon" title="View logs for {site.domain}" aria-hidden="true">
-					<svg
-						viewBox="0 0 18 18"
-						width="13"
-						height="13"
-						fill="none"
-						stroke="currentColor"
-						stroke-width="1.6"
-						stroke-linecap="round"
-					>
-						<!-- Same three-line glyph as the rail's own Logs destination
-						     (Rail.svelte) — one mark for "logs" across the app. -->
-						<path d="M3 4.5h12M3 9h12M3 13.5h7" />
-					</svg>
-				</span>
-			</a>
-			<!-- eslint-enable svelte/no-navigation-without-resolve -->
-			<!-- Icon-only, and second in the group. The row already carries three text
-			     buttons; a fourth word would crowd the strip and push Delete further from
-			     the eye's landing point. `ariaLabel` names the site because an icon has no
-			     text at all — without it a screen reader announces nothing usable, and
-			     every row's button would be identical anyway. `title` gives sighted users
-			     the same sentence on hover, since the glyph alone does not say WHICH site.
+			<!-- Icon-only, first in the group now that View logs and the row's text actions
+			     moved into the `⋮` menu below (design spec D1). `ariaLabel` names the site
+			     because an icon has no text at all — without it a screen reader announces
+			     nothing usable, and every row's button would be identical anyway. `title`
+			     gives sighted users the same sentence on hover, since the glyph alone does
+			     not say WHICH site.
 
 			     Disabled when the site is disabled: a disabled site is not being served, so
 			     the button would open a page that cannot load. `busy` covers the in-flight
@@ -210,15 +203,14 @@
 				onclick={() => onToggleEnabled(site, !site.enabled)}
 				>{site.enabled ? 'Disable' : 'Enable'}</Button
 			>
-			<Button variant="ghost" size="sm" ariaLabel="Edit {site.name}" onclick={() => onEdit(site)}
-				>Edit</Button
-			>
-			<Button
-				variant="quiet"
-				size="sm"
-				ariaLabel="Delete {site.name}"
-				onclick={() => (confirming = true)}>Delete</Button
-			>
+			<!-- View logs / Edit / Delete (design spec D1), in that priority order — the
+			     safest of the three first, the destructive one last, same ordering D3
+			     reasons about. `RowActionMenu` owns the trigger's own icon/markup entirely;
+			     this file supplies only `items` (built above) and the accessible name. The
+			     wording matches the row's other actions ("{Verb} {site.name}") as closely as
+			     the extra noun allows — "More actions" has no single verb to put the name
+			     directly after. -->
+			<RowActionMenu ariaLabel="More actions for {site.name}" items={rowMenuItems} />
 		</div>
 	{/if}
 </div>
@@ -351,67 +343,37 @@
 	}
 	.row-actions {
 		/* The action track is `auto` (content-sized), and this row now has three different
-		   action states of three different natural widths — Disable/Edit/Delete,
-		   Enable/Edit/Delete, and the confirm question + Cancel + Delete. Without a floor the
-		   track resizes on every state change, which steals width from the `1.4fr` name
-		   column and slides PHP, the web server and the pill sideways: pressing Delete
-		   visibly jolted three columns left. This floor is wider than all three states, so
-		   the track is constant and only the buttons themselves change.
+		   action states of three different natural widths — Disable + Open + ⋮, Enable +
+		   Open + ⋮, and the confirm question + Cancel + Delete. Without a floor the track
+		   resizes on every state change, which steals width from the `1.4fr` name column and
+		   slides PHP, the web server and the pill sideways: pressing Delete visibly jolted
+		   three columns left. This floor must stay wider than all three states, so the track
+		   is constant and only the buttons themselves change.
 
-		   268px = the original 232px (measured, not derived — the confirm state plus a
-		   little air) PLUS one icon-only button's width (View logs, spec D6 — a second icon
-		   button alongside Open, ~30px including its `gap: 4px` neighbour). Verified against
-		   a "964px content width (1180px window minus the rail)" — a figure that never
-		   described this row. `.content` is not the row: the panel takes 24px of margin on
-		   each side and 1px of border, so at a 1180px window the row itself gets 914px and
-		   was ALREADY clipping this group by ~48px. The real break-even is a 1228px window;
-		   measure the row, never the column it sits in. The wrapped layout at the bottom of
-		   this block is what handles everything below that; this floor still applies there
-		   and is simply never the binding constraint. */
-		min-width: 268px;
+		   232px, reused unchanged from the confirm state's own PRE-View-logs floor (spec
+		   2026-08-05-sites-row-overflow-menu-design.md D1): the row's overflow menu moved
+		   View logs, Edit and Delete OUT of this track (into the `⋮` trigger below), so the
+		   two states this floor now has to cover are Open + Disable/Enable + the `⋮` trigger,
+		   and the confirm question + Cancel + Delete. The confirm state's own controls did
+		   not change in this slice, so its previously-measured width (232px — "measured, not
+		   derived", per the note this comment used to carry) is still valid, and it is the
+		   wider of the two: the `⋮` trigger is deliberately sized to match the `Open` icon
+		   button (RowActionMenu.svelte's own header), so the new normal state is Open (~35px)
+		   + gap (4px) + "Disable" (the longer of the two toggle labels: ~10px padding either
+		   side of ~13px-font text, well under 100px even generously) + gap (4px) + ⋮ (~35px)
+		   — on the order of 150–190px, tens of pixels short of 232px even under a pessimistic
+		   text-width estimate. This is an ARITHMETIC bound, not a fresh real-browser
+		   measurement (unlike the 232px figure it reuses) — a headless-browser remeasurement
+		   was attempted for this slice and abandoned for an unrelated tooling reason, so the
+		   number errs conservative rather than shaving the floor to the new state's own tight
+		   minimum. If a future change ever widens the normal state close to 232px, re-measure
+		   both states for real rather than trusting this arithmetic further. */
+		min-width: 232px;
 		display: flex;
 		gap: 4px;
 		justify-content: flex-end;
 		align-items: center;
 		opacity: 0.85;
-	}
-	/* Reproduces Button.svelte's `.btn`/`.btn-ghost`/`.btn-sm` recipe locally for an `<a>` —
-	   Button always renders a `<button>`, which is wrong for NAVIGATION (this is a real link
-	   to `/logs?source=…`, not an onclick action). Same "hand-roll a `.btn` subset outside
-	   Button.svelte" precedent this file already uses for `.btn-danger` below.
-
-	   It says `.btn-ghost` because this rule has always had a transparent resting border, so
-	   for its whole life it looked like a variant that did not exist yet: next to `Open`,
-	   which was `.btn-quiet`, one icon sat bare and its neighbour sat in a box. `.btn-ghost`
-	   is the level this was already written at, and Open now uses it too. */
-	.icon-link {
-		display: inline-flex;
-		align-items: center;
-		padding: 4px 10px;
-		border-radius: var(--vh-radius-control);
-		border: 1px solid transparent;
-		color: var(--vh-text);
-		text-decoration: none;
-		cursor: pointer;
-		transition:
-			background var(--vh-dur-fast) var(--vh-ease-out),
-			border-color var(--vh-dur-fast) var(--vh-ease-out);
-	}
-	/* Border on hover as well as background, to stay in step with `.btn-ghost:hover`. Without
-	   it the two icon links would be the only controls in the strip that never draw an edge,
-	   so pointing at one would look like a different kind of control from pointing at Edit. */
-	.icon-link:hover {
-		background: color-mix(in oklab, var(--vh-text) 6%, transparent);
-		border-color: var(--vh-border-strong);
-	}
-	/* Same doubled-frame fix as `.btn-quiet`/`.btn-ghost:focus-visible` (Button.svelte) — this
-	   control has no border of its own in the ordinary state (transparent), but a focus RING
-	   alone would still look inconsistent with every other icon-only control in this row group
-	   once `Button`'s OWN shared `:focus-visible` rule is accounted for; matching it exactly
-	   keeps the whole row-actions group looking like one family of controls. */
-	.icon-link:focus-visible {
-		border-color: var(--vh-focus-ring);
-		outline-offset: 0;
 	}
 	/* The name cell must clip, not push. `min-width: 0` overrides the grid item's `auto`
 	   minimum (which refuses to shrink below min-content) and the children ellipsize, so a
@@ -426,8 +388,9 @@
 		text-overflow: ellipsis;
 		white-space: nowrap;
 	}
-	/* Extra air before Delete, so the destructive control is not flush against Edit and an
-	   overshooting click lands on nothing rather than on the wrong action. */
+	/* Extra air before the last control in the strip — the "More actions" trigger now that
+	   Edit/Delete moved behind it — so it is not flush against the toggle and an overshooting
+	   click lands on nothing rather than opening the menu by accident. */
 	.row-actions > :last-child {
 		margin-left: var(--vh-space-2);
 	}
@@ -477,17 +440,20 @@
 		font-size: var(--vh-text-table);
 	}
 
-	/* The one-line row costs 962px, added up rather than guessed: the name floor 220 + the
-	   three fixed tracks 168 + 90 + 120 + the action floor 268 = 866, plus four 16px gaps and
-	   the row's own 2x16px padding. Below that the grid cannot fit and does not try — px
-	   tracks refuse to shrink, so it overflowed into `.panel`'s `overflow: hidden` and ate the
-	   Delete button from the right edge. Reachable in an ordinary window rather than a
-	   contrived one: `minWidth` is 960 and the rail takes 216, so the app's own smallest legal
-	   window leaves a row about 700px and loses Delete entirely.
+	/* The one-line row costs 926px, added up rather than guessed: the name floor 220 + the
+	   three fixed tracks 168 + 90 + 120 + the action floor 232 (design spec
+	   2026-08-05-sites-row-overflow-menu-design.md D1 — see `.row-actions`'s own comment for
+	   where 232 comes from now that the menu holds three of the five controls) = 830, plus
+	   four 16px gaps and the row's own 2x16px padding. Below that the grid cannot fit and
+	   does not try — px tracks refuse to shrink, so it would overflow into `.panel`'s
+	   `overflow: hidden` and eat the last control from the right edge. Reachable in an
+	   ordinary window rather than a contrived one: `minWidth` is 960 and the rail takes 216,
+	   so the app's own smallest legal window leaves a row about 700px.
 
-	   The threshold is 980, not 962, and the 18px is deliberate. 268 above is a MEASURED
-	   value — it tracks the width of the words on the buttons — so a sum built on it is only
-	   as stable as today's labels. Wrapping 18px earlier than strictly necessary is invisible;
+	   The threshold is 944, not 926, and the 18px is deliberate (same slack this rule has
+	   always carried, kept rather than re-picked). 232 above is a REUSED, not freshly
+	   remeasured, value — see that comment's own honesty note — so a sum built on it is only
+	   as stable as that reasoning. Wrapping 18px earlier than strictly necessary is invisible;
 	   wrapping 1px too late clips a destructive control. If you change a track above, change
 	   this with it, and keep the slack.
 
@@ -496,7 +462,7 @@
 	   PHP, the web server and the pill still line up down the list, and only the actions drop
 	   to a line of their own. The name keeps its `flex-shrink`, so a long domain still
 	   ellipsizes rather than forcing a third line. */
-	@container rowlist (width < 980px) {
+	@container rowlist (width < 944px) {
 		.row {
 			display: flex;
 			flex-wrap: wrap;
