@@ -24,8 +24,11 @@
 // this codebase keeps re-shipping (a state collapsed onto one rendering).
 
 /** Which package family occupies the shared install lock. Mirrors the generated
- *  `InstallKindDto`; the assignment in `+layout.svelte` pins the two together. */
-export type PendingOperationKind = 'php' | 'mysql';
+ *  `InstallKindDto`; the assignment in `+layout.svelte` pins the two together.
+ *  `'mariadb'` (P1 MariaDB UI design D4) shares this same slot: a MariaDB
+ *  install or datadir init occupies `InstallLock` exactly like MySQL's do, so
+ *  it needs the identical in-flight sentence machinery. */
+export type PendingOperationKind = 'php' | 'mysql' | 'mariadb';
 
 /** What the run is doing to the package. Mirrors the generated
  *  `PackageOperationDto`.
@@ -85,6 +88,11 @@ function operationLead(kind: PendingOperationKind): string {
 		case 'php':
 			return 'PHP ';
 		case 'mysql':
+			return '';
+		case 'mariadb':
+			// `set_running_mariadb_init`/`install_mariadb` label the slot
+			// `"MariaDB {MARIADB_SERIES}"` — already a complete phrase, the
+			// identical convention MySQL's label follows.
 			return '';
 		default: {
 			const unreachable: never = kind;

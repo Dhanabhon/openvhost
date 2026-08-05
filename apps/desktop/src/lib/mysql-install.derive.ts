@@ -184,6 +184,20 @@ export function mysqlInstallResultNotice(result: MysqlInstallResultDto): Notice 
 	}
 }
 
+/**
+ * The Homebrew-fallback sentence for a target this build has no verified
+ * MySQL download for — Homebrew remains that machine's only source today.
+ *
+ * Exported (P1 MariaDB UI design D2/D1) so the shared engine descriptor
+ * (`databases.derive.ts`) can point at this exact sentence rather than a
+ * second copy of the words. MariaDB's own descriptor entry returns `null`
+ * instead: there is no Homebrew fallback for MariaDB anywhere in this app, so
+ * that fact belongs here, on MySQL's side, and nowhere generic.
+ */
+export function mysqlUnavailableFallback(target: string): string {
+	return `Homebrew is the way to install MySQL on ${target} today.`;
+}
+
 /** The honest-absence copy, shared by the row's own "you cannot install this
  *  here" note and by the (rarer) settled `unavailable` outcome, so the two
  *  cannot tell the user different stories about the same fact. */
@@ -192,7 +206,7 @@ function unavailableBody(target: string): string {
 		`OpenVHost only ships a MySQL download whose checksum it has verified, and it has none for ` +
 		`${target}. Oracle does publish a build for it — OpenVHost has just not verified those bytes, ` +
 		`and shipping an unchecked download is the one thing this pipeline exists to refuse. ` +
-		`Homebrew is the way to install MySQL on ${target} today.`
+		`${mysqlUnavailableFallback(target)}`
 	);
 }
 
