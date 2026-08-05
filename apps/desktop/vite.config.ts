@@ -45,16 +45,47 @@ export default defineConfig({
 				test: {
 					name: 'server',
 					environment: 'node',
-					// No separate browser/jsdom project exists yet, so `*.svelte.test.ts`
-					// is NOT excluded here (unlike the sveltekit default template) — a
-					// rune-based `.svelte.ts` store (e.g. `sites.svelte.ts`) has no DOM
+					// A jsdom project now exists below for anything that needs a live DOM —
+					// user events, focus, measurement (the Sites row overflow menu is the
+					// feature that triggered adding it; see
+					// `docs/superpowers/specs/2026-08-05-sites-row-overflow-menu-design.md`
+					// D4). `*.dom.test.ts` is that project's opt-in file suffix and is
+					// EXCLUDED here so no file runs under both projects.
+					//
+					// `*.svelte.test.ts` (without the `.dom` infix) still is NOT excluded —
+					// a rune-based `.svelte.ts` store (e.g. `sites.svelte.ts`) has no DOM
 					// dependency and runs fine under `node`, and so does rendering a
 					// `.svelte` component through `svelte/server` (see
 					// `SiteDrawer.svelte.test.ts`), whose markup carries the `selected`/
-					// `value` attributes a browser would apply. A test that needs a live
-					// DOM — user events, focus, measurement — would fail loudly here (no
-					// `document`); that is the right time to add a browser/jsdom project.
-					include: ['src/**/*.{test,spec}.{js,ts}']
+					// `value` attributes a browser would apply.
+					include: ['src/**/*.{test,spec}.{js,ts}'],
+					exclude: ['src/**/*.dom.test.{js,ts}']
+				}
+			},
+			{
+				extends: './vite.config.ts',
+				test: {
+					name: 'dom',
+					environment: 'jsdom',
+					// Opt-in by filename suffix, not by directory — a DOM test sits right next
+					// to the component it exercises, same as every `server`-project test
+					// already does. `*.dom.test.ts` is excluded from `server` above for exactly
+					// this pattern, so a file never runs under both projects.
+					include: ['src/**/*.dom.test.{js,ts}']
+				},
+				resolve: {
+					// Vitest transforms modules through Vite's SSR-style resolution
+					// regardless of `environment`, so without this override `import { mount,
+					// unmount } from 'svelte'` would still resolve svelte's "default" export
+					// condition (`src/index-server.js`, whose `mount`/`unmount` are stubs
+					// that throw `lifecycle_function_unavailable`) instead of the "browser"
+					// condition (`src/index-client.js`) that actually mounts a component into
+					// a real DOM — confirmed against the installed svelte package's own
+					// `exports` map. It also steers `@sveltejs/vite-plugin-svelte` (which
+					// compiles a `.svelte` file to `generate: 'server'` markup-only output or
+					// `generate: 'client'` DOM-mounting output based on the same SSR signal)
+					// toward the client build, which is the one this project's tests need.
+					conditions: ['browser']
 				}
 			}
 		]

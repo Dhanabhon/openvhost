@@ -60,20 +60,32 @@ describe('SiteListRow actions', () => {
 		expect(off).not.toContain('>Disable<');
 	});
 
-	// Every row renders the same three verbs, so an accessible name of just "Delete" is
-	// ambiguous across a list. Each must name its site.
-	it('names the site in every action label', () => {
+	// Every row repeats the same toggle verb, so an accessible name of just "Disable" is
+	// ambiguous across a list — it must name its site. Replaces a wider version of this
+	// test (design 2026-08-05-sites-row-overflow-menu-design.md D1): Edit and Delete's
+	// OWN aria-labels moved with them into the row's `⋮` menu, where an item's
+	// accessible name is its visible text ("Edit", "Delete") read in the context of the
+	// menu's OWN aria-label, not a per-item one — see SiteListRow.dom.test.ts's "More
+	// actions" trigger/menu-contents groups for that half; Open's own naming is already
+	// covered above by "names the site on the icon-only open button".
+	it('names the site on the enable/disable toggle', () => {
 		const html = rowHtml(site(true));
 		expect(html).toContain('aria-label="Disable shop"');
-		expect(html).toContain('aria-label="Edit shop"');
-		expect(html).toContain('aria-label="Delete shop"');
 	});
 
-	// One press must only ASK. `btn-danger` is applied to exactly one control in this
-	// component — the confirm step — so its absence here is the assertion that the
-	// destructive control is not reachable in a single click.
-	it('does not render the destructive control before confirming', () => {
-		expect(rowHtml(site(true))).not.toContain('btn-danger');
+	// One press must only ASK — no destructive control reachable in a single click.
+	// `btn-danger` (the confirm step's own real Delete button) is the strongest form of
+	// that: an inline, always-clickable destructive control. Extended (design
+	// 2026-08-05-sites-row-overflow-menu-design.md D1) to also cover the menu-shaped
+	// route to the same mistake: an initial render must not carry an already-open menu
+	// at all (its Delete item lives only inside that, gated by `{#if open}`) —
+	// RowActionMenu's `open` state starts `false` and cannot be initialised any other
+	// way today, so this is a regression guard on that invariant rather than a
+	// currently-reachable bug.
+	it('does not render the destructive control before confirming, inline or in the menu', () => {
+		const html = rowHtml(site(true));
+		expect(html).not.toContain('btn-danger');
+		expect(html).not.toContain('role="menu"');
 	});
 
 	// An icon has no text, so its accessible name is the ONLY thing a screen reader
@@ -156,51 +168,44 @@ describe('SiteListRow actions', () => {
 	});
 });
 
-// Spec D6: every site row (not only a "broken" one — SiteDto carries no
-// state to be broken) gains a "View logs" deep link, defaulting to the
-// site's ERROR log (the live-proof entry point).
-describe('SiteListRow View logs deep link', () => {
-	it('links to /logs with the site error log preselected', () => {
-		const html = rowHtml(site(true));
-		expect(html).toContain('href="/logs?source=site-error%3Ashop.localhost"');
-	});
+// Spec D6 put a "View logs" deep link on every site row (not only a "broken" one —
+// SiteDto carries no state to be broken), defaulting to the site's ERROR log (the
+// live-proof entry point). Design 2026-08-05-sites-row-overflow-menu-design.md D1
+// moved it, with Edit and Delete, into the row's `⋮` menu — which this file, being a
+// no-DOM `svelte/server` render with the menu always closed, structurally cannot see
+// (its items live inside `RowActionMenu`'s `{#if open}`). Every property this describe
+// block used to check still holds; it is proven in `SiteListRow.dom.test.ts` instead,
+// which can actually open the menu:
+//   - exact href (site-error target)      → "menu contents" > "View logs is a real
+//                                            link to the site error log, not a button"
+//   - real `<a>`, never a button           → same test
+//   - reachable even when the site is disabled → "SiteListRow menu contents when the
+//                                            site is disabled" > "still offers View
+//                                            logs, unlike Open"
+//   - names the site                       → the menu's own `aria-label` now carries
+//                                            that context (RowActionMenu.svelte reuses
+//                                            one `ariaLabel` for both the trigger and
+//                                            the popup) — see "More actions" trigger >
+//                                            "the open menu carries the same name, so
+//                                            every item reads in that context"
 
-	it('names the site, not just "View logs" — the icon has no other text', () => {
-		const html = rowHtml(site(true));
-		expect(html).toContain('aria-label="View logs for shop"');
-		expect(html).toContain('title="View logs for shop.localhost"');
-	});
-
-	it('stays reachable even when the site is disabled, unlike Open', () => {
-		const html = rowHtml(site(false));
-		const link = html.match(/<a[^>]*aria-label="View logs for shop"[^>]*>/)?.[0];
-		expect(link).not.toContain('disabled');
-	});
-
-	it('is a real navigation link, not a button pretending to be one', () => {
-		const html = rowHtml(site(true));
-		expect(html).toMatch(/<a[^>]*aria-label="View logs for shop"/);
-	});
-});
-
-// Delete is the only framed control in the strip. Everything else is `ghost` — no resting
-// border — so the row reads as a place to act rather than a grid of boxes, and the one
-// irreversible action is the one thing with an edge around it. That distinction is invisible
-// to a reader of the markup (all four are just `<Button>`s), so a later tidy-up that makes
-// them uniform would silently strip the frame off the destructive one. Asserted both ways so
-// "all ghost" and "all quiet" each fail.
-describe('only the destructive action is framed', () => {
+// Open and the enable/disable toggle are the two actions design 2026-08-05's D1 left
+// inline; both stay `btn-ghost` — no resting border — so the row keeps reading as a
+// place to act, not a grid of boxes. Replaces a wider version of this test that also
+// covered Edit and Delete (moved into the `⋮` menu, where destructive/routine is now a
+// TEXT colour — `.item`/`.item.destructive` — not a border; see
+// SiteListRow.dom.test.ts's "marks Delete destructive and leaves Edit and View logs
+// unmarked"). Asserted both ways so "all ghost" and "all quiet" each fail.
+describe('the still-inline actions stay ghost, not quiet', () => {
 	const tagFor = (html: string, label: string) => {
 		const m = html.match(new RegExp(`<button[^>]*aria-label="${label}"[^>]*>`));
 		expect(m, `no button labelled "${label}"`).not.toBeNull();
 		return m?.[0] ?? '';
 	};
 
-	it('frames Delete and ghosts the routine actions', () => {
+	it('keeps Open and the toggle on btn-ghost, never btn-quiet', () => {
 		const html = rowHtml(site(true));
-		expect(tagFor(html, 'Delete shop')).toContain('btn-quiet');
-		expect(tagFor(html, 'Delete shop')).not.toContain('btn-ghost');
-		for (const label of ['Disable shop', 'Edit shop', 'Open shop in a browser']) {
+		for (const label of ['Disable shop', 'Open shop in a browser']) {
 			expect(tagFor(html, label)).toContain('btn-ghost');
 			expect(tagFor(html, label)).not.toContain('btn-quiet');
 		}
