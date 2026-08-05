@@ -101,8 +101,20 @@ package resolves those four out of its *compiled-in prefix* when the config does
 otherwise — which is exactly how the first MariaDB artifact came to resolve `plugin_dir`
 out of a mode-1777 tree. The build-time fix (a prefix nothing unprivileged can create)
 removed the reachable attack; **pinning them in the config removes the dependence on the
-prefix altogether.** Doing it for MariaDB alone would leave MySQL relying on a property of
-Homebrew's prefix that nobody has checked.
+prefix for any server this app starts with its own config.** Doing it for MariaDB alone
+would leave MySQL relying on a property of Homebrew's prefix that nobody has checked.
+
+*Corrected 2026-08-04 by the security audit, which measured it:* an earlier draft of that
+sentence said "removes the dependence on the prefix **altogether**", and that is an
+overstatement. `!includedir` is the last line of the generated `my.cnf`, so a
+`custom_confd` drop-in wins over everything above it — including all four directives and
+`bind-address`. The auditor moved `@@plugin_dir` to a directory of its choosing that way on
+a live server. This is not a privilege boundary being crossed: the drop-in directory is
+same-user, under a `0700` home, and it is the documented customization point. But "the
+config pins it" and "nothing can move it" are different claims, and only the first one is
+true. Pinning the four on the spawn argv instead would make them genuinely unoverridable,
+at the cost of taking away a customization affordance we deliberately offer — not a trade
+worth making for a same-user surface.
 
 Cost, stated so it is not a surprise: touching MySQL's template means re-running
 `crates/openvhost-core/tests/mysql_live.rs`.
@@ -162,6 +174,17 @@ Two things genuinely differ and must be verified live rather than assumed:
    server binds a mode-0777 `/tmp/mysqlx.sock` while root is still open. **Establish
    what MariaDB's equivalent exposure is, if any, before the temp server is started for the
    first time.** Answering "there is none" is fine; assuming it is not.
+
+*Both were established live, and one of my numbers was wrong.* `--mysqlx=OFF` is rejected
+by this server and there is nothing to close: `lsof` on the live temp server showed exactly
+one FD, the unix socket named on argv, and zero TCP rows. And this init creates **four**
+root accounts plus a locked `mariadb.sys` — **no anonymous accounts at all**, because
+`--skip-test-db` is on the init argv and suppresses the anonymous pair. An earlier draft of
+this spec said six including two anonymous, and I carried that number into a reviewer's
+brief, which produced a confident finding that the code's own (correct) comment was false.
+The `DELETE FROM mysql.global_priv WHERE User=''` is therefore defence-in-depth against an
+upstream change, exactly as `init.rs:198` says. Recording it because a wrong number in a
+spec does not stay in the spec — it propagates into every brief written from it.
 
 ## 9. What slice A must prove
 

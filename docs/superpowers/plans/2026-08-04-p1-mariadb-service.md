@@ -19,6 +19,7 @@
 - **This worktree may be shared.** Mutation experiments in a disposable detached worktree, never here. Stage by explicit path; never `git add -A`. Never leave a mutation on disk when you stop.
 - Gates per task: `cargo test --workspace` → `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings`. **Gate the commit on the test result** — `cargo test --workspace && git commit`, not two statements on one line. A commit hook here rejects a command line containing `-n` near `git commit` (it reads as `--no-verify`).
 - Two known flakes, both in crates this slice does not touch: `a_force_quit_leftover_socket_still_lets_status_and_list_answer` (CLI) and `a_non_zero_validator_exit_is_a_rejection_on_the_named_field` (conf). Re-run in isolation, **name them**, say so, do not fix them here.
+- **A THIRD flake, first seen at this slice's end gate (2026-08-04):** `an_unchanged_stop_is_a_success` (`apps/cli/tests/two_process.rs:304`). Measured: 1 failure in 3 full-suite runs, **3/3 green in isolation**, failing on `assert_eq!(code, 0)`. The test does `Server::start()` and immediately runs `stop nginx`, so under parallel load it reads a server that is not answering yet — a readiness race in the CLI test harness, not a product defect. Same crate and same shape as the first known flake; worth fixing them together, and not in a MariaDB slice.
 - The artifact is at `build/out/mariadb-11.4.9-macos-arm64.tar.gz`, sha256 `76ea96a4…`, matching the catalogue pin. Install it into a hermetic `OPENVHOST_HOME` under **`/tmp`, not `$TMPDIR`** — the 103-byte `sun_path` ceiling has bitten twice, most recently at 159 bytes.
 
 ---
@@ -92,9 +93,34 @@ A `mariadb_spec` beside `mysql_spec` (`stack.rs:243-267`): `program` = the disco
       install the real artifact into a hermetic `OPENVHOST_HOME` under `/tmp` → initialize → set a root password → start under the Supervisor → create a table, insert → **restart, read the row back** → stop cleanly, no orphan, registry consistent → **with MySQL 8.4 running throughout**, both reachable, neither datadir touched (content **and** inode) → `mariadbd --verbose --help` names the four pinned directories from the config, not the compiled-in prefix.
 - [ ] **Step 4:** One fix wave; re-run gates. PR; squash-merge on green.
 
+## Merge preconditions handed to later slices (from the 2026-08-04 end gate)
+
+The security audit found three gaps that are **not reachable on this branch** and are not
+fixed here. They are preconditions on named future slices, not backlog items — record them
+where that slice will read them, not only here.
+
+- **MySQL's init argv lacks the four pinned directories while root is passwordless.**
+  `apps/desktop/src-tauri/src/commands.rs:4171-4174` (`--initialize-insecure`) and
+  `:4216-4220` (temp server) carry `--no-defaults` and none of `--basedir`,
+  `--plugin-dir`, `--character-sets-dir`, `--lc-messages-dir`, so both resolve out of the
+  compiled-in prefix. Unreachable **today** only because MySQL is Homebrew-only and both
+  Homebrew prefixes are owned by the installing user — no cross-user write. **This must
+  land before any packaged (non-Homebrew) MySQL ships.** `--initialize-insecure` writes the
+  datadir, so a hostile plugin dir there is code execution just as surely as at the temp
+  server. The plumbing is cheap: `mysql_runtime_dirs` is already called in the same driver
+  function at the Render step. Mirror `mariadb/init.rs:390-410`.
+- **MySQL's generated `my.cnf` is never re-rendered either.** MariaDB's half is fixed in
+  this slice's fix wave; MySQL's is deliberately untouched so a `mysql_live.rs` re-run does
+  not land immediately before a security gate. Same precondition as above.
+- **MySQL's init creates the socket's run directory without asserting `0700`** — identical
+  shape to the one fixed here. Same precondition.
+
 ## Recorded before it bites
 
 - **The sentinel is the whole ballgame.** Get it wrong in the permissive direction and `--initialize` runs on a populated datadir. Every test that asserts "not initialized" must be proven able to fail.
 - **`current` must never be spawned through.** Prove it by swapping the symlink under a running service and showing the process still holds the original path.
 - **Publishing is owner-gated and slice A does not need it** — the live proof installs from the local artifact, which matches the pin. **Slice B does need it**: a Databases row whose Install returns `PackageNotPublished` is a broken promise on screen.
 - The four pinned directories close the *dependence* on the compiled-in prefix; the build-time refusal closes the *reachability*. Neither replaces the other, and a future reader will be tempted to drop one.
+- **The live gate cannot reach `mariadb_spec` by its real name.** `mod stack` is private, so the 2026-08-04 proof harness copied the function verbatim (one-line delta: the `crate::mysql_admin::` path). Same code text, real Supervisor, real binary — but the seam *"the desktop crate's registration path calls this function"* is covered only by that crate's own unit tests. Either widen the visibility for tests or accept the seam knowingly; do not let the next reader mistake the copy for the thing.
+- **Two concurrent live gates collide on port 3307.** A peer session's `mariadbd` held it at the start of the proof run; the agent correctly waited rather than killing it. Anything running two MariaDB live gates at once needs its own port, not a retry loop.
+- **On a case-insensitive volume the server sets `lower_case_table_names=2`** and logs that it did. Benign for us today, but MariaDB's identifier casing is therefore volume-dependent — it matters the moment anything compares table names.
