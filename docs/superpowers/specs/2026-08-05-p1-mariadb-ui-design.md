@@ -2,9 +2,20 @@
 
 # MariaDB on the Databases page — design (slice B)
 
-**Status:** design, ready to plan. The one owner decision from slice A (§10) is **made**:
-publish the release first, then build.
+**Status:** design, ready to plan.
 **Date:** 2026-08-05.
+
+**The release decision, and its reversal.** The owner first chose to publish
+`mariadb-11.4.9` before building, then — later the same day, with two slices in flight —
+**deferred it until the system settles**. That is the standing position. The repository was
+made public in the meantime, so the only remaining blocker to publishing is the owner's
+timing, not a technical one.
+
+**Consequence, stated so it is not lost:** slice B ships with `availability` still
+`AwaitingRelease`, which is the state D2 exists to render honestly — a disabled control and
+a clear reason, not an Install button that errors. **The download path therefore merges
+unproven.** That is acceptable *only* because the UI never invites the user down it; it is
+not acceptable the moment `availability` flips. See §10.
 **Follows:** slice A (#54, `a79a80f`). MariaDB runs as a supervised service; nothing in the
 app can install, initialize or see it.
 
@@ -149,9 +160,18 @@ split so Copy cannot un-mask.
 
 ## 10. What slice B must prove
 
-1. On a machine with no MariaDB installed, the row **installs** the pinned 11.4.9 from the
-   published release, verifying the SHA-256 — the first end-to-end exercise of the download
-   path, which is why the release had to exist first.
+1. ~~On a machine with no MariaDB installed, the row **installs** the pinned 11.4.9 from the
+   published release, verifying the SHA-256.~~ **Cannot run: the release is deferred.**
+   Instead prove the honest refusal — the row renders `awaitingRelease`, names no false
+   reason, and **offers no control that would start a download**. Then prove install works
+   against a *local* artifact, exactly as slice A's proof did, so everything downstream of
+   the fetch is still exercised.
+
+   **This is the one gap this slice knowingly merges with, and it has a named owner:**
+   before `availability` is flipped to `Published`, someone must run the real download once
+   and confirm the served bytes hash to `76ea96a4…18304`. Until then no one may claim the
+   download path works — the unit tests say nothing about it, and a green suite here is
+   exactly the "success path nothing could reach" that slice A's gate caught.
 2. Initialize, then start, then a real SQL round-trip, then stop — driven from the UI's
    command surface, not from a test harness calling core directly.
 3. The credential shown in the UI is the one the server accepts, and **Copy does not

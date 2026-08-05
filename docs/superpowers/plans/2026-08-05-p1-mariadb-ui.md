@@ -10,9 +10,17 @@ uninstalls without touching the data — **with MySQL's rows rendering identical
 **READ IT FIRST; D1–D7 are binding.** Its §2 table was measured against `a79a80f`; do not
 re-derive those numbers, and do not contradict them without measuring again.
 
-**Precondition, already satisfied when you start:** the GitHub release `mariadb-11.4.9`
-exists and `catalogue.rs` says `Availability::Published`. If it does not, **stop and report**
-— task 1 flips that constant and task 3's proof depends on it.
+**Precondition — CHANGED 2026-08-05, read this before task 1.** An earlier draft said the
+release `mariadb-11.4.9` would already exist and that task 1 flips `availability` to
+`Published`. **The owner has deferred the release until the system settles.** So:
+
+- **Do not flip `availability`.** It stays `Availability::AwaitingRelease`, and that is the
+  state the shipped UI renders — honestly, with no control that would start a download.
+- The repository is now public, so publishing is a timing decision and not a technical
+  blocker.
+- **The download path merges unproven.** Before anyone flips that constant later, they must
+  run the real download once and confirm the bytes hash to `76ea96a4…18304`. That is a
+  merge precondition on the flip, not a backlog item.
 
 ## Global Constraints
 
