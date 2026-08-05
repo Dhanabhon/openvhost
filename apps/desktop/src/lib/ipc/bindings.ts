@@ -360,7 +360,9 @@ export const commands = {
 	 *  includes the temp server's own log tail; see `mariadb::init`'s
 	 *  `server_log`), so that is relayed through [`MariadbInitLogEvent`] once
 	 *  the run ends, rather than left unsent — a post-hoc relay of something
-	 *  real, never a fabricated live one.
+	 *  real, never a fabricated live one. [`redact_mariadb_init_outcome`] runs
+	 *  first, so a redacted `reason` is what BOTH that relay and the returned
+	 *  DTO ever see (audit Low 3).
 	 */
 	initializeMariadb: () => typedError<MariadbInitOutcomeDto, IpcError>(__TAURI_INVOKE("initialize_mariadb")),
 	/**

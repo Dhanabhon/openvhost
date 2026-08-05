@@ -202,9 +202,21 @@ pub(crate) async fn perform_uninstall(run: UninstallRun<'_>) -> Result<Uninstall
                 // see `Target::formula`), and `path` is built entirely from
                 // compile-time constants (`MARIADB_PACKAGE_NAME`/
                 // `MARIADB_SERIES`) joined onto the resolved home in
-                // `inventory` — nothing from IPC or a client ever reaches it,
-                // so there is no traversal to guard against the way
-                // `GeneratedFile` above must. Mirrors
+                // `inventory` — no IPC or client input ever reaches a
+                // component of it.
+                //
+                // That does NOT make this call traversal-proof: verified on
+                // this toolchain (security-auditor), `remove_dir_all` DOES
+                // resolve a symlinked INTERMEDIATE component — replacing
+                // `<home>/packages` or `<home>/packages/mariadb` with a
+                // symlink redirects the delete to the link's target. That
+                // needs write access inside the OpenVHost home already —
+                // this app's own privilege level — so it crosses no
+                // boundary and is not a regression; it is simply not a
+                // property this call provides. What DOES hold: `path`'s own
+                // LAST component is one of the compile-time constants above,
+                // and a symlink planted AT that exact target is unlinked
+                // rather than followed — its target survives. Mirrors
                 // `openvhost_core::mysql::sweep_stale_staging`'s own
                 // `remove_dir_all` under the package/data tree
                 // (security-auditor reviewed).
@@ -588,6 +600,7 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::commands::InstallKind;
+    use openvhost_core::mariadb::MariadbInstanceRepo;
     use openvhost_core::mysql::{MysqlInstanceRepo, MysqlMajor, generate_root_password};
     use openvhost_proc::{
         DEFAULT_GRACE, ReadinessProbe, ServiceSpec, ServiceState, Supervisor, default_driver,
@@ -1648,6 +1661,68 @@ mod tests {
             runner.spawns().is_empty(),
             "a MariaDB uninstall must spawn NOTHING, recorded {:?}",
             runner.spawns()
+        );
+    }
+
+    /// The MariaDB mirror of `the_stored_root_password_survives_the_uninstall`
+    /// — the same D2 promise ("keeping the data and throwing away the key is
+    /// the same as destroying it"), and `uninstall_plan`'s `keeps` list
+    /// already says "The stored root password" for this target. Pinned here
+    /// because nothing else does (audit Low 2): `MariadbInstanceRepo::delete`
+    /// has zero production callers today and `rescan_mariadb_into_state`
+    /// performs no deletion, so the property currently holds only by
+    /// construction.
+    ///
+    /// Asserted on the value AND on `initialized_at`, not on content alone:
+    /// `upsert` stamps `initialized_at` to `now_ms()` on EVERY call (its own
+    /// doc comment), so a row that was deleted and immediately re-upserted
+    /// with an identical password would still carry a FRESH timestamp — a
+    /// content-only comparison cannot see that rewrite.
+    ///
+    /// A raw SQLite `rowid` read (the literal analogue of
+    /// `untouched_mariadb_fingerprint`'s file-inode check above) was
+    /// considered and rejected in favour of `initialized_at`: verified
+    /// empirically against this exact schema, deleting and reinserting the
+    /// ONLY row of a `major TEXT PRIMARY KEY` table reuses rowid 1 both
+    /// times — the table passes through empty between the two statements,
+    /// and SQLite's non-`AUTOINCREMENT` allocator restarts there. A file's
+    /// inode changing on delete-and-recreate does not carry over to this
+    /// table's rowid, so `initialized_at` is the signal that actually holds.
+    ///
+    /// VACUITY: confirmed by temporarily having `perform_uninstall` also
+    /// delete the MariaDB credential row for this target — this test failed
+    /// on the missing row (`.expect("row")` panicked) before either
+    /// assertion below even ran; reverted immediately after.
+    #[tokio::test]
+    async fn the_stored_mariadb_root_password_survives_the_uninstall() {
+        let home = provisioned_mariadb_home();
+        let db = Db::open(home.path()).await.expect("state.db");
+        let repo = MariadbInstanceRepo::new(&db);
+        let password = generate_root_password();
+        repo.upsert(&password).await.expect("upsert");
+        let before = repo.get().await.expect("query").expect("row");
+
+        let sup = supervisor_with("mariadb-11.4");
+        let lock = InstallLock::default();
+        perform_uninstall(run_for_mariadb(
+            home.path(),
+            &sup,
+            &lock,
+            RecordingRunner::ok(),
+        ))
+        .await
+        .unwrap();
+
+        let after = repo.get().await.expect("query").expect("row");
+        assert_eq!(
+            after.root_password.expose(),
+            password.expose(),
+            "the root password must survive the engine"
+        );
+        assert_eq!(
+            after.initialized_at, before.initialized_at,
+            "the row was rewritten (a fresh `initialized_at`) even though its \
+             content came back the same"
         );
     }
 

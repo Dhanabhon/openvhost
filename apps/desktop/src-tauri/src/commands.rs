@@ -6629,6 +6629,50 @@ pub async fn rescan_mariadb(
     Ok(mariadb_row(&p.home, found.first()))
 }
 
+/// Scrub a freshly generated password out of a `Failed` init outcome's
+/// `reason` before it can reach [`MariadbInitLogEvent`] or the returned
+/// [`MariadbInitOutcomeDto`] — defence in depth, the MariaDB counterpart of
+/// `redact`'s own reasoning for `run_mysql_init`'s SetPassword/Shutdown
+/// steps (see `redact`'s doc comment).
+///
+/// SECURITY (audit Low 3). `openvhost_core::mariadb::initialize_mariadb`
+/// pairs EVERY `Failed` outcome with `password: None` — its own doc comment
+/// says the password is returned only alongside `Initialized` — so
+/// `password` is never `Some` here against a real run today: the temp
+/// server's log tail is captured before the password is generated
+/// (`mariadb::init.rs:839` vs `:850`), and the one step where a live
+/// password exists (`SetPassword`) quotes only the client's own stderr,
+/// never the SQL sent over stdin. The gap that reasoning does not close: a
+/// MariaDB client echoing a statement fragment back in a `near '...'`
+/// syntax error, which today's pure-hex generator cannot trigger but
+/// `root_password_sql`'s own doc comment already names as the assumption a
+/// future user-chosen password would break. Redacting here costs nothing on
+/// the expected path (nothing to replace) and closes that gap the moment it
+/// stops being hypothetical.
+///
+/// Split out of [`initialize_mariadb`] for the identical testability reason
+/// `initialize_mysql_gate` is: the command takes an `AppHandle<Wry>`, which
+/// `tauri::test::mock_builder` cannot produce, so the command's own body is
+/// unreachable from a test. This function needs no `AppHandle`.
+fn redact_mariadb_init_outcome(
+    outcome: openvhost_core::mariadb::MariadbInitOutcome,
+    password: &Option<openvhost_core::mysql::RootPassword>,
+) -> openvhost_core::mariadb::MariadbInitOutcome {
+    use openvhost_core::mariadb::MariadbInitOutcome as O;
+    match outcome {
+        O::Initialized => O::Initialized,
+        O::AlreadyInitialized => O::AlreadyInitialized,
+        O::Foreign { detail } => O::Foreign { detail },
+        O::Failed { step, reason } => O::Failed {
+            step,
+            reason: match password {
+                Some(password) => redact(&reason, password.expose()),
+                None => reason,
+            },
+        },
+    }
+}
+
 /// Drives MariaDB's staged init (spec D7) via
 /// `openvhost_core::mariadb::initialize_mariadb`, which — unlike MySQL's
 /// `run_mysql_init` — already owns its whole staged sequence (slice A; see
@@ -6646,7 +6690,9 @@ pub async fn rescan_mariadb(
 /// includes the temp server's own log tail; see `mariadb::init`'s
 /// `server_log`), so that is relayed through [`MariadbInitLogEvent`] once
 /// the run ends, rather than left unsent — a post-hoc relay of something
-/// real, never a fabricated live one.
+/// real, never a fabricated live one. [`redact_mariadb_init_outcome`] runs
+/// first, so a redacted `reason` is what BOTH that relay and the returned
+/// DTO ever see (audit Low 3).
 #[tauri::command]
 #[specta::specta]
 pub async fn initialize_mariadb(
@@ -6691,6 +6737,7 @@ pub async fn initialize_mariadb(
             });
         }
     };
+    let outcome = redact_mariadb_init_outcome(outcome, &password);
 
     if let openvhost_core::mariadb::MariadbInitOutcome::Failed { reason, .. } = &outcome {
         for line in reason.lines() {
@@ -7131,6 +7178,59 @@ mod mariadb_ipc_tests {
                     assert_ne!(a, b, "{:?} and {:?} share a tag", all[i], all[j]);
                 }
             }
+        }
+    }
+
+    /// SECURITY (audit Low 3), defence in depth: [`redact_mariadb_init_outcome`]
+    /// must scrub a generated password out of a `Failed` reason before it can
+    /// reach either consumer — `reason.lines()`'s per-line
+    /// `MariadbInitLogEvent`s, and the `MariadbInitOutcomeDto` `.into()`
+    /// produces — even though that function's own doc comment explains why
+    /// today's core `initialize_mariadb` never actually pairs `Failed` with
+    /// `Some(password)`. Exercised directly rather than through the full
+    /// `initialize_mariadb` command for the same `AppHandle<Wry>` reason
+    /// [`redact_mariadb_init_outcome`] is split out at all.
+    ///
+    /// VACUITY: temporarily changed the `Some(password)` arm to return
+    /// `reason` unredacted — this test failed with the password still
+    /// present, both assertions below firing.
+    #[test]
+    fn redact_mariadb_init_outcome_scrubs_a_generated_password_from_a_failure_reason() {
+        let password = openvhost_core::mysql::generate_root_password();
+        let outcome = openvhost_core::mariadb::MariadbInitOutcome::Failed {
+            step: openvhost_core::mariadb::MariadbInitStep::SetPassword,
+            reason: format!(
+                "failed to set the root password: ERROR 1064 (42000): You have an error in \
+                 your SQL syntax; check the manual … near '{}' at line 2",
+                password.expose()
+            ),
+        };
+
+        let redacted = redact_mariadb_init_outcome(outcome, &Some(password.clone()));
+
+        // Reaches `MariadbInitLogEvent` as `reason.lines()` — asserted
+        // directly on the (redacted) reason string `initialize_mariadb`
+        // emits line-by-line.
+        match &redacted {
+            openvhost_core::mariadb::MariadbInitOutcome::Failed { reason, .. } => {
+                assert!(
+                    !reason.contains(password.expose()),
+                    "the generated password leaked into a Failed init reason: {reason:?}"
+                );
+                assert!(reason.contains("<redacted>"), "got {reason:?}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+
+        // Reaches the returned DTO as a straight field copy of `reason` (see
+        // `From<MariadbInitOutcome> for MariadbInitOutcomeDto>`), so
+        // asserting on `redacted` itself — what `initialize_mariadb` passes
+        // to `.into()` — is enough to cover it too.
+        match redacted.into() {
+            MariadbInitOutcomeDto::Failed { reason, .. } => {
+                assert!(!reason.contains(password.expose()), "got {reason:?}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
         }
     }
 

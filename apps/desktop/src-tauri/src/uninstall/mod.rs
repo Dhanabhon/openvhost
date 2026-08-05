@@ -367,8 +367,9 @@ pub(crate) enum Removal {
     /// instead of spawning `brew uninstall`, which has nothing to uninstall.
     /// `path` is always built from compile-time constants
     /// (`MARIADB_PACKAGE_NAME`/`MARIADB_SERIES`) joined onto the resolved
-    /// home — see `run`'s executor for the removal itself and why that path
-    /// shape needs no further containment.
+    /// home — see `run`'s executor for the removal itself and exactly what
+    /// that path shape does, and does not, guarantee about the
+    /// `remove_dir_all` it feeds.
     PackageTree { path: PathBuf, what: String },
     /// `Supervisor::unregister` — the row on the Services page and in the tray.
     ServiceRow { id: String },
