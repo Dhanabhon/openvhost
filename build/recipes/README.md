@@ -60,7 +60,8 @@ to a tool that cannot see the driver reading them.
 | `RECIPE_BUILD_TOOLS` | `()` | tools resolved to absolute paths **before** `PATH` is scrubbed. Anything not in `/usr/bin` or `/bin` belongs here: `cmake`, `make`, `bison`, `gpg`, `perl`. |
 | `RECIPE_DEPENDS` | `()` | `name:version` entries built first, with `--stage-only`. Find them with `bp_dep_prefix <name> <version>`. |
 | `RECIPE_IGNORE_PREFIXES` | `/opt/homebrew /usr/local /Applications/ServBay` | prefixes a configure step must ignore. Join them with `bp_ignore_prefix_path`. |
-| `RECIPE_SERVER_BIN` | `""` | the server binary, relative to the tree root, that contract checks 5 and 6 exercise — `bin/mariadbd`, `sbin/nginx`. Empty means the package has no server, and both checks report `SKIPPED (no server binary)`. |
+| `RECIPE_REQUIRED_LAYOUT` | `(bin share)` | the directories contract check 1 requires directly under the tree root. `PackagesRoot` and every discovery path in this app speak `bin/`, so that one is not really optional — but not every package has a use for `share/`; a package whose `install` stage never produces it declares its own list rather than the driver inventing an empty one to satisfy the check (`build/recipes/nginx.sh`: `(bin)`). |
+| `RECIPE_SERVER_BIN` | `""` | the server binary, relative to the tree root, that contract checks 5 and 6 exercise — `bin/mariadbd`, `bin/nginx`. Empty means the package has no server, and both checks report `SKIPPED (no server binary)`. |
 | `RECIPE_SERVER_VERSION_ARGS` | `(--version)` | how to ask that binary to identify itself and exit 0. |
 | `RECIPE_INERT_PATHS` | `()` | subtrees of the package that contract check 7 does not scan — documentation, test fixtures. Named in every audit run. Checks 1-3 still cover every Mach-O inside them. |
 | `RECIPE_ALLOWED_WRITABLE_PATHS` | `()` | individual embedded paths contract check 7 may allow despite a world-writable ancestor. Trace each to the file that carries it, and say next to it why nothing resolves it. Printed on every audit run. |
@@ -72,7 +73,7 @@ to a tool that cannot see the driver reading them.
 | Function | Default | Must do |
 |---|---|---|
 | `recipe_normalize` | no-op | rewrite install names so every reference is `@loader_path/...`. Runs **before** signing, because `install_name_tool` invalidates a signature. Static linking makes this unnecessary, which is why D3 chose it. |
-| `recipe_serve_probe <tree> <scratch>` | none | contract check 6. Start the server, create a table, insert a row, restart, read it back. Exit 0 only if the row came back. |
+| `recipe_serve_probe <tree> <scratch>` | none | contract check 6: start the server, prove it actually serves, stop it, start it again, prove it still serves. What "prove it serves" means is package-specific — a table inserted and read back for a database, a real HTTP GET compared byte-for-byte for a web server. Exit 0 only if the second proof also holds. Print a one-line summary as the last thing written to stdout before returning 0; `audit.sh` uses that exact line as check 6's PASS note, so it is the only place the proof is worded — do not leave it to the driver to guess what your probe proved. |
 | `recipe_manifest_extra` | none | print one JSON value (object or array) recorded under `"recipe"` in the manifest. |
 
 ### What `recipe_serve_probe` may touch
