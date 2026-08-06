@@ -6,14 +6,17 @@
 # Implements the seven points of the build-pipeline design (D6, spec §8). A
 # package is acceptable only if ALL of them hold:
 #
-#   1. layout      a single root containing bin/ and share/
+#   1. layout      a single root containing the recipe's required directories
+#                  (RECIPE_REQUIRED_LAYOUT, default bin share)
 #   2. linkage     every otool -L entry of every Mach-O is /usr/lib/*,
 #                  /System/*, @loader_path/... or @rpath/..., AND every
 #                  LC_RPATH is @loader_path-relative — nothing else
 #   3. signature   every Mach-O is signed and codesign --verify passes
 #   4. identity    the tree carries no trace of the machine that built it
 #   5. relocation  copy to path A, run; move to path B, run again
-#   6. service     start the server, create a table, insert, restart, read back
+#   6. service     the recipe's own serve-and-survive probe (recipe_serve_probe)
+#                  passes — what that proves is package-specific and printed
+#                  by the recipe, not this script
 #   7. plantable   no absolute path embedded anywhere in the tree has a
 #                  world-writable ancestor
 #
@@ -307,6 +310,14 @@ fi
 
 RECIPE_SERVER_BIN="${RECIPE_SERVER_BIN:-}"
 RECIPE_SERVER_VERSION_ARGS=(--version)
+# Check 1's required layout. `bin share` was the whole contract while MariaDB
+# was the only package; nginx's `make install` has no use for `share/` at all
+# (D1, docs/superpowers/specs/2026-08-06-p2-nginx-recipe-design.md) and a
+# recipe declares what its own `install` stage actually produces instead of
+# the driver guessing one shape for every package. Defaulted here, ahead of
+# the recipe being sourced, so a recipe that says nothing keeps today's
+# behaviour exactly.
+RECIPE_REQUIRED_LAYOUT=(bin share)
 # Check 7 allowances. Both are empty by default, both are printed on every run,
 # and both belong to the recipe rather than to this script: an upstream that
 # writes /tmp into its own documentation is a fact about that upstream, and the
@@ -332,6 +343,14 @@ if [ "$SERVER_BIN_SET" -eq 1 ]; then
 	RECIPE_SERVER_BIN="$SERVER_BIN_ARG"
 fi
 
+# No package can legitimately require zero directories under its root; an
+# empty RECIPE_REQUIRED_LAYOUT is a mistake in the recipe, not a declaration.
+# Refused here, before any check runs, for the same reason a floor is refused
+# where check 7's allowances are read below: a malformed declaration is a
+# question about the recipe, not a verdict on the artifact.
+[ "${#RECIPE_REQUIRED_LAYOUT[@]}" -gt 0 ] ||
+	die "RECIPE_REQUIRED_LAYOUT is empty; no package can legitimately require zero directories under its root. Name at least one, or leave the variable unset to keep the default (bin share)."
+
 say "auditing $TARGET"
 say ""
 
@@ -356,17 +375,24 @@ if [ -n "$TARBALL" ]; then
 	fi
 fi
 
-for want in bin share; do
+layout_required_note=""
+for want in ${RECIPE_REQUIRED_LAYOUT[@]+"${RECIPE_REQUIRED_LAYOUT[@]}"}; do
 	if [ ! -d "$TREE/$want" ]; then
 		printf 'missing directory: %s/\n' "$want" >>"$layout_problems"
 	fi
+	# Printed whether or not the check passes, same rule check 7's allowances
+	# already follow: an allowance (or here, a requirement) nobody can see is
+	# how a later reader cannot tell the check ran for real.
+	layout_required_note="$layout_required_note${layout_required_note:+, }$want"
 done
 
 if [ -s "$layout_problems" ]; then
 	check_fail "the tree is not a valid package root"
 	report_lines "$layout_problems"
 else
-	check_pass "$SINGLE_ROOT_NOTE"
+	layout_pass_note="required: $layout_required_note"
+	if [ -n "$SINGLE_ROOT_NOTE" ]; then layout_pass_note="$SINGLE_ROOT_NOTE; $layout_pass_note"; fi
+	check_pass "$layout_pass_note"
 fi
 
 # ------------------------------------------------------------ Mach-O inventory --
@@ -702,7 +728,27 @@ elif [ -n "$RECIPE_SERVER_BIN" ]; then
 		# scratch directory — see build/recipes/README.md.
 		if recipe_serve_probe "$TREE" "$probe_scratch" >"$probe_log" 2>&1; then
 			service_state="pass"
-			service_note="started, created, inserted, restarted, read back"
+			# Recipe-supplied, not hardcoded: "started, created, inserted,
+			# restarted, read back" is a database's probe, and printing it for
+			# every package would be a lie about whatever check 6 actually did
+			# for a package that is not one (D4,
+			# docs/superpowers/specs/2026-08-06-p2-nginx-recipe-design.md).
+			#
+			# The FIRST line beginning with "PROBE-SUMMARY: " is the note, with
+			# the prefix stripped — not simply the log's last line. A probe that
+			# is careful to send everything after its summary to /dev/null (as
+			# recipes/nginx.sh's is) makes "last line" safe today, but a less
+			# careful probe would publish a stray warning as the note instead of
+			# what the recipe actually proved; a marker line cannot be displaced
+			# by output that comes after it. A probe with no marked line falls
+			# back to the log's own last line — today's behaviour, unchanged —
+			# which is what recipes/mariadb.sh's probe still gets, since it
+			# predates the marker and is not touched here.
+			service_note="$(LC_ALL=C awk -v p='PROBE-SUMMARY: ' \
+				'index($0, p) == 1 { print substr($0, length(p) + 1); found = 1; exit 0 }
+				 END { if (!found) exit 1 }' "$probe_log")" ||
+				service_note="$(tail -n 1 "$probe_log")"
+			[ -n "$service_note" ] || service_note="the probe passed but printed nothing"
 		else
 			service_state="fail"
 			service_note="the serve-and-survive probe failed"
@@ -712,10 +758,7 @@ fi
 
 check_start "6 service"
 case "$service_state" in
-pass)
-	check_pass "$service_note"
-	if [ -s "$probe_log" ]; then detail "$(tail -n 1 "$probe_log")"; fi
-	;;
+pass) check_pass "$service_note" ;;
 skip) check_skip "$service_note" ;;
 *)
 	check_fail "$service_note"
