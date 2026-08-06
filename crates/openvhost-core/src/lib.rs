@@ -89,7 +89,8 @@ pub use mysql::{
 pub use nginx::{
     NGINX_PACKAGE_NAME, NGINX_PACKAGES, NGINX_SERIES, NGINX_WARMUP_BINARY, NginxPackage,
     NginxPackageInstall, NginxRuntime, NginxRuntimeSource, discover_nginx, install_nginx_package,
-    nginx_package_for_host, nginx_package_for_target, packaged_nginx_runtime,
+    nginx_package_for_host, nginx_package_for_target, nginx_prefix_dir, nginx_spawn_argv,
+    packaged_nginx_runtime,
 };
 /// The package-pipeline types that appear in this crate's own public
 /// signatures, re-exported so the desktop app and the CLI need no direct

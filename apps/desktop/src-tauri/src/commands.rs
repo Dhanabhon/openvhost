@@ -858,7 +858,9 @@ pub async fn apply_config(
     let validator = openvhost_core::NginxValidator {
         bin: nginx_bin,
         err_log: openvhost_core::LogPaths::new(&stack.home).nginx_error(),
-        home: stack.home.clone(),
+        // `-p`'s target, never `stack.home` itself — see
+        // `NginxValidator::home`'s own doc comment (4B fix-wave, item 1).
+        home: openvhost_core::nginx_prefix_dir(&stack.home),
     };
     let outcome = openvhost_core::apply(&p, &validator).await?;
 
@@ -994,14 +996,21 @@ enum WebServerBrand {
 /// prose guardrail the next editor has to remember — the same move this repo
 /// already made at `89471df`.
 enum ValidationTarget<'a> {
-    /// `<bin> -e <err_log> -p <home> -t -c <conf>`. Only ever constructed for
-    /// `Nginx`. `-p <home>` (nginx discovery design D4) rides alongside `-e`
-    /// for the identical reason.
+    /// `<bin> -e <err_log> -p <prefix> -t -c <conf>`. Only ever constructed
+    /// for `Nginx`. `-p` (nginx discovery design D4) rides alongside `-e` for
+    /// a related but stronger reason (4B fix-wave, item 1): `home` is
+    /// carrying `state.db`, and a relative path in a user-authored custom
+    /// nginx file resolved under `-p`'s target would serve it verbatim, so
+    /// `home` FIELD is [`openvhost_core::nginx_prefix_dir`]'s answer — a
+    /// dedicated, empty, provisioned directory — never `paths.home` itself.
+    /// `PathBuf`, not `&'a Path`, because unlike `conf`/`bin` it is not
+    /// borrowed out of managed state: it is derived fresh, the same way
+    /// `err_log` already is.
     NginxT {
         bin: &'a Path,
         conf: &'a Path,
         err_log: PathBuf,
-        home: &'a Path,
+        home: PathBuf,
     },
 }
 
@@ -1121,7 +1130,7 @@ impl WebServerBrand {
                     bin,
                     conf: &paths.nginx_conf,
                     err_log: openvhost_core::LogPaths::new(&paths.home).nginx_error(),
-                    home: &paths.home,
+                    home: openvhost_core::nginx_prefix_dir(&paths.home),
                 })
             }
             // Unreachable while `Nginx` is the only `supported()` brand: the gate
@@ -1290,8 +1299,19 @@ pub async fn list_web_servers(
     let err_log = openvhost_core::LogPaths::new(&p.home).nginx_error();
     // Design D3: no binary, no probe — `None` reaches the row honestly rather
     // than spawning against a path that does not exist.
+    //
+    // `-p`'s target is `nginx_prefix_dir(&p.home)`, never `p.home` itself
+    // (4B fix-wave, item 1) — see that function's own doc comment for the
+    // credential-exposure finding this closes.
     let version = match p.nginx_bin.as_deref() {
-        Some(bin) => openvhost_conf::probe_nginx_version(bin, &err_log, &p.home).await,
+        Some(bin) => {
+            openvhost_conf::probe_nginx_version(
+                bin,
+                &err_log,
+                &openvhost_core::nginx_prefix_dir(&p.home),
+            )
+            .await
+        }
         None => None,
     };
     // `tokio::fs`, not `Path::exists()`: a sync stat pins a tokio WORKER, and an
@@ -1364,7 +1384,7 @@ pub async fn validate_web_server_config(
             conf,
             err_log,
             home,
-        } => openvhost_conf::validate_live(bin, conf, &err_log, home).await,
+        } => openvhost_conf::validate_live(bin, conf, &err_log, &home).await,
     }
     .map_err(|e| IpcError::Core {
         message: e.to_string(),
@@ -8046,6 +8066,17 @@ mod web_server_ipc_tests {
     /// the right four values out of managed state — including `err_log`, which is
     /// derived rather than borrowed and so is the piece a refactor can silently
     /// change.
+    ///
+    /// `home` is asserted against [`openvhost_core::nginx_prefix_dir`], AND
+    /// against `p.home` directly with `assert_ne!` (4B fix-wave, item 1):
+    /// `-p` must be the dedicated prefix, never the real home that carries
+    /// `state.db`.
+    ///
+    /// VACUITY (neuter-and-watch-it-fail): reverted `validation_target`'s
+    /// `home` field to `paths.home.clone()` — failed on the `assert_eq!`
+    /// above (`left: paths.home, right: nginx_prefix_dir(&paths.home)`)
+    /// before the `assert_ne!` even ran; restoring `nginx_prefix_dir` made it
+    /// pass again.
     #[test]
     fn the_validator_invocation_is_resolved_as_one_unit_from_the_brand() {
         let p = sample_paths();
@@ -8059,7 +8090,11 @@ mod web_server_ipc_tests {
                 assert_eq!(bin, p.nginx_bin.as_deref().unwrap());
                 assert_eq!(conf, p.nginx_conf.as_path());
                 assert_eq!(err_log, p.home.join("logs/nginx.error.log"));
-                assert_eq!(home, p.home.as_path());
+                assert_eq!(home, openvhost_core::nginx_prefix_dir(&p.home));
+                assert_ne!(
+                    home, p.home,
+                    "-p must never be the real home — it carries state.db"
+                );
             }
             Err(e) => panic!("nginx must yield a validator invocation, got {e:?}"),
         }
@@ -8070,6 +8105,26 @@ mod web_server_ipc_tests {
             Err(IpcError::Validation { field, .. }) => assert_eq!(field, "id"),
             Err(other) => panic!("expected Validation, got {other:?}"),
             Ok(_) => panic!("apache must not yield a validator invocation"),
+        }
+    }
+
+    /// Design D3, one of the six decision sites the 4B fix-wave audit found
+    /// untested (item 2): with no nginx binary at all, `validation_target`
+    /// must refuse honestly — the SAME message `apply_config` gives for the
+    /// identical condition — rather than handing back a validator invocation
+    /// for a binary that does not exist.
+    #[test]
+    fn validation_target_refuses_honestly_when_no_nginx_binary_was_found() {
+        let p = StackPaths {
+            nginx_bin: None,
+            ..sample_paths()
+        };
+        match WebServerBrand::Nginx.validation_target(&p) {
+            Err(IpcError::Core { message }) => {
+                assert_eq!(message, "no nginx binary was found on this machine");
+            }
+            Err(other) => panic!("expected Core, got {other:?}"),
+            Ok(_) => panic!("nginx must not yield a validator invocation with no binary"),
         }
     }
 
@@ -8102,6 +8157,8 @@ mod web_server_ipc_tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod apply_ipc_tests {
+    use tauri::Manager;
+
     use super::*;
 
     /// The dialog switches on these; a rename here silently breaks its badges.
@@ -8190,6 +8247,54 @@ mod apply_ipc_tests {
         let seen = state.read().unwrap().clone().unwrap();
         assert_eq!(seen.php.len(), 1);
         assert_eq!(seen.php[0].major, "8.3");
+    }
+
+    /// One of the six decision sites the 4B fix-wave audit found untested
+    /// (item 2): with no nginx binary at all, `apply_config` must refuse
+    /// honestly and by name, rather than handing `NginxValidator` a path to a
+    /// binary that does not exist.
+    ///
+    /// Zero sites and zero installed PHP majors, deliberately: `render_set`
+    /// unconditionally renders the main nginx config and the catch-all site
+    /// regardless of either, so on a fresh, empty home the plan is still
+    /// non-empty (A3's "nothing to write means nothing to restart" early
+    /// return is NOT taken) and the nginx_bin check downstream is actually
+    /// reached.
+    #[tokio::test]
+    async fn apply_config_refuses_up_front_when_no_nginx_binary_was_found() {
+        let home = tempfile::tempdir().unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(Db::open_in_memory().await.unwrap());
+        app.manage(RwLock::new(Some(InstalledRuntimes {
+            nginx_bin: None,
+            php: vec![],
+        })));
+        app.manage(Some(StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: None,
+            nginx_conf: home.path().join("config/generated/nginx/nginx.conf"),
+        }));
+        app.manage(Arc::new(Supervisor::new(openvhost_proc::default_driver())));
+        app.manage(ApplyLock::default());
+
+        let err = apply_config(
+            app.state::<Db>(),
+            app.state::<RwLock<Option<InstalledRuntimes>>>(),
+            app.state::<Option<StackPaths>>(),
+            app.state::<Arc<Supervisor>>(),
+            app.state::<ApplyLock>(),
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            IpcError::Core { message } => {
+                assert_eq!(message, "no nginx binary was found on this machine");
+            }
+            other => panic!("expected Core, got {other:?}"),
+        }
     }
 }
 
@@ -8285,6 +8390,59 @@ mod list_web_servers_tests {
         assert_eq!(
             nginx.supports_hot_reload,
             openvhost_conf::NginxAdapter.supports_hot_reload()
+        );
+    }
+
+    /// Design D3, another of the six decision sites the 4B fix-wave audit
+    /// found untested (item 2): with no nginx binary at all, the row must
+    /// report BOTH fields as `None` — `binary_path` because there is nothing
+    /// to name, and `version` because there is nothing to spawn a probe
+    /// against.
+    ///
+    /// VACUITY (neuter-and-watch-it-fail), two mutations: (1) changed the
+    /// `None` arm to `Some("FAKE".to_string())` — failed, `left: Some("FAKE")
+    /// right: None`; (2) the REALISTIC regression this guards against —
+    /// changed the `None` arm to probe a hardcoded
+    /// `/opt/homebrew/opt/nginx/bin/nginx` (the exact shape of the retired
+    /// `fallback_brew()` bug) — ALSO failed here, `left: Some("1.31.3")`,
+    /// because this machine happens to have that binary installed. Both
+    /// reverts restored a pass.
+    ///
+    /// LIMITATION, stated rather than left implicit: mutation (2) only fails
+    /// BECAUSE this machine has a real Homebrew nginx at that exact path — on
+    /// a machine without one, `probe_nginx_version` would return `None` for
+    /// the missing-binary case exactly as it does for the correct "no probe
+    /// at all" case, and this assertion could not tell the two apart. This
+    /// test is therefore hermetic in the sense of not touching any binary
+    /// ITSELF, but its discriminating power against a REINTRODUCED hardcoded
+    /// fallback is machine-dependent. `list_web_servers` has no injectable
+    /// prober seam (unlike `discover_php_in`'s closure parameter) that would
+    /// let a fake binary stand in regardless of machine state.
+    #[tokio::test]
+    async fn list_web_servers_reports_no_binary_and_no_version_when_none_was_found() {
+        let home = tempfile::tempdir().unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(Some(StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: None,
+            nginx_conf: home.path().join("conf/nginx.conf"),
+        }));
+
+        let rows = list_web_servers(app.state()).await.unwrap();
+        let nginx = rows
+            .iter()
+            .find(|r| r.id == "nginx")
+            .unwrap_or_else(|| panic!("nginx must still be listed, got {rows:?}"));
+
+        assert_eq!(
+            nginx.binary_path, None,
+            "design D3: no binary was found, so none may be invented"
+        );
+        assert_eq!(
+            nginx.version, None,
+            "design D3: with no binary, list_web_servers must not spawn a probe at all"
         );
     }
 
@@ -8448,6 +8606,8 @@ mod list_web_servers_tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod web_server_settings_ipc_tests {
+    use tauri::Manager;
+
     use super::*;
 
     /// A DTO whose every field differs from the default, so a test that
@@ -8732,6 +8892,57 @@ mod web_server_settings_ipc_tests {
         let db = Db::open_in_memory().await.unwrap();
         write_settings(&db, valid_dto(), None).await.unwrap();
         assert_eq!(read_settings(&db).await.unwrap(), valid_dto());
+    }
+
+    /// The command-level half of `settings_still_save_when_nginx_is_not_installed`
+    /// above — one of the six decision sites the 4B fix-wave audit found
+    /// untested (item 2). That test drives `write_settings` directly with a
+    /// hand-supplied `None`; nothing before this test proved
+    /// `save_web_server_settings` itself actually threads `input` through and
+    /// reaches the repository at all, rather than e.g. panicking on the
+    /// `.map` or silently dropping the submitted values.
+    ///
+    /// VACUITY (neuter-and-watch-it-fail): changed the command to save
+    /// `WebServerSettingsDto::default()` instead of `input` — failed with
+    /// `left` (the stored defaults) `!= right` (`valid_dto()`); restoring
+    /// `input` made it pass again.
+    ///
+    /// LIMITATION, stated rather than left implicit: this test does NOT
+    /// hermetically prove `checker` came out `None` rather than
+    /// `Some(NginxSettingsChecker { bin: <some other path>, .. })` — a
+    /// checker built with the WRONG (e.g. hardcoded-fallback) `bin` and
+    /// `write_settings`'s own `Err(ConfError::ValidatorSpawn { .. }) => save
+    /// anyway` degradation (see `a_validator_that_cannot_be_spawned_does_not_block_the_save`
+    /// below, which pins that behaviour deliberately) produce the IDENTICAL
+    /// observable outcome this test checks. Distinguishing the two would need
+    /// a way to inject a spy checker into `save_web_server_settings` itself,
+    /// which the command does not offer today.
+    #[tokio::test]
+    async fn save_web_server_settings_saves_unchecked_when_no_nginx_binary_was_found() {
+        let home = tempfile::tempdir().unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(Db::open_in_memory().await.unwrap());
+        app.manage(Some(StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: None,
+            nginx_conf: home.path().join("config/generated/nginx/nginx.conf"),
+        }));
+
+        save_web_server_settings(
+            app.state::<Db>(),
+            app.state::<Option<StackPaths>>(),
+            valid_dto(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            read_settings(app.state::<Db>().inner()).await.unwrap(),
+            valid_dto(),
+            "design D3: with no nginx binary, the save must go through unchecked, not be blocked"
+        );
     }
 
     /// A checker whose binary cannot be spawned, and one that hangs. The two

@@ -32,6 +32,7 @@ fn provisioning_creates_the_directories_and_seeds_the_welcome_page() {
         "www",
         "run",
         "run/nginx",
+        "run/nginx-prefix",
         "logs",
         "logs/sites",
         "logs/services",
@@ -149,6 +150,18 @@ fn provisioning_seeds_the_log_parent_directories_at_0700() {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "{dir} must be 0700 (spec D5), got {mode:o}");
     }
+}
+
+/// nginx discovery design D4, hardened by the 4B fix-wave audit (item 1):
+/// `-p`'s target must exist BEFORE the first supervised nginx spawn, and it
+/// must be exactly [`openvhost_core::nginx_prefix_dir`]'s own answer — not a
+/// literal re-typed here, which could drift from the path every `-p`
+/// argument in the app actually uses.
+#[test]
+fn provisioning_creates_exactly_the_directory_nginx_prefix_dir_names() {
+    let home = short_home();
+    provision_home(home.path()).unwrap();
+    assert!(openvhost_core::nginx_prefix_dir(home.path()).is_dir());
 }
 
 /// Mirrors `provisioning_locks_the_home_directory_to_0700_even_when_it_already_existed_looser`:

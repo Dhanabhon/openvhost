@@ -17,12 +17,26 @@ pub fn resolve_home() -> Result<PathBuf, CoreError> {
 }
 
 /// Pure core of [`resolve_home`], testable without touching process env.
+///
+/// The override is absolutized (audit finding L4, 4B fix-wave item 7): with
+/// nginx's `-p` now pointing at [`crate::nginx::nginx_prefix_dir`] rather
+/// than `home` itself, a RELATIVE `home` double-prefixes — nginx resolves a
+/// relative `-p` against its own cwd, then resolves a relative `-c
+/// <home>/…` against THAT already-resolved prefix, landing on a path that
+/// does not exist rather than the config file it should. It fails loudly
+/// rather than silently reaching some other real file, but absolutizing
+/// here closes the whole class cheaply and lexically — no filesystem access,
+/// so this is safe to call before `home` exists at all (a first run).
 pub(crate) fn resolve_home_from(
     override_val: Option<&OsStr>,
     home_dir: Option<&Path>,
 ) -> Result<PathBuf, CoreError> {
     if let Some(v) = override_val.filter(|v| !v.is_empty()) {
-        return Ok(PathBuf::from(v));
+        return std::path::absolute(v).map_err(|source| CoreError::Io {
+            op: "absolutize",
+            path: PathBuf::from(v),
+            source,
+        });
     }
     home_dir
         .map(|h| h.join(".openvhost"))
@@ -111,6 +125,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p, PathBuf::from("/custom/openvhost-home"));
+    }
+
+    /// Audit finding L4 (4B fix-wave, item 7): a relative `OPENVHOST_HOME`
+    /// double-prefixes once `-p` points at a subdirectory of home rather than
+    /// home itself. Absolutizing here is the fix.
+    ///
+    /// VACUITY (neuter-and-watch-it-fail): reverted `resolve_home_from`'s
+    /// override branch to `return Ok(PathBuf::from(v));` — this test failed,
+    /// `left: "relative-openvhost-home"` not absolute; restoring the
+    /// `std::path::absolute` call made it pass again.
+    #[test]
+    fn a_relative_env_override_is_absolutized_against_the_current_directory() {
+        let p = resolve_home_from(
+            Some(OsStr::new("relative-openvhost-home")),
+            Some(Path::new("/Users/x")),
+        )
+        .unwrap();
+        assert!(p.is_absolute(), "got {p:?}");
+        assert_eq!(
+            p,
+            std::env::current_dir()
+                .unwrap()
+                .join("relative-openvhost-home")
+        );
     }
 
     #[test]

@@ -26,7 +26,7 @@ use openvhost_core::mariadb::{
 use openvhost_core::mysql::{
     DatadirState, MysqlRuntime, classify_datadir, mysql_paths, write_generated_config,
 };
-use openvhost_core::nginx::{NginxRuntime, discover_nginx};
+use openvhost_core::nginx::{NginxRuntime, discover_nginx, nginx_spawn_argv};
 // Re-exported by `openvhost-core` so this crate needs no direct `openvhost-pkg`
 // dependency. Minted only from a resolved home — never from IPC input.
 use openvhost_core::PackagesRoot;
@@ -684,10 +684,20 @@ pub struct MacosStack {
 /// resolved it to a concrete version directory (or to a Homebrew path, which
 /// has no `current` link to begin with).
 ///
-/// `-p <home>` (nginx discovery design D4) rides alongside the `-e <err_log>`
-/// already mandatory for the identical reason: nothing this app generates is
-/// relative today, so this closes a gap before a future template author could
-/// open it, rather than after.
+/// `-p <nginx_prefix_dir(home)>` (nginx discovery design D4) rides alongside
+/// the `-e <err_log>` already mandatory for a related but stronger reason,
+/// hardened by the 4B fix-wave audit (item 1): `-p` is what stops a RELATIVE
+/// path in a config from resolving under nginx's compiled-in prefix — but
+/// `main.conf.tera` explicitly invites the user to author their own nginx
+/// files, so "nothing WE generate is relative" was true but insufficient.
+/// The audit reproduced it live: `-p home` let a relative `root .;` in a
+/// custom file serve `state.db` (MySQL/MariaDB root credentials at rest)
+/// verbatim. `-p` must therefore point at [`nginx_prefix_dir`] — a
+/// dedicated, empty, provisioned directory holding nothing a relative root
+/// could ever expose — never at `home` itself. Built through
+/// [`nginx_spawn_argv`] rather than a second hand-written argv here, so this
+/// — the app's own supervised spawn — and every live-proof test that spawns
+/// a real nginx server cannot drift apart again.
 fn nginx_spec(home: &Path, nginx_conf: &Path, rt: &NginxRuntime) -> ServiceSpec {
     ServiceSpec {
         id: "nginx".into(),
@@ -695,16 +705,7 @@ fn nginx_spec(home: &Path, nginx_conf: &Path, rt: &NginxRuntime) -> ServiceSpec 
         endpoint: Some(format!("http://127.0.0.1:{LISTEN_PORT}")),
         spawn: SpawnSpec {
             program: rt.bin.clone(),
-            args: vec![
-                OsString::from("-e"),
-                openvhost_core::LogPaths::new(home)
-                    .nginx_error()
-                    .into_os_string(),
-                OsString::from("-p"),
-                home.to_path_buf().into_os_string(),
-                OsString::from("-c"),
-                nginx_conf.to_path_buf().into_os_string(),
-            ],
+            args: nginx_spawn_argv(home, nginx_conf),
             cwd: None,
             env: vec![],
         },
@@ -782,6 +783,18 @@ pub fn macos_stack() -> MacosStack {
     // every reader of `nginx_bin` below decides what that means for it
     // instead of being handed a path to a binary that does not exist.
     let nginx = discover_nginx(&PackagesRoot::from_home(&home), &prefixes);
+    // Audit finding L2: nothing in production read `NginxRuntimeSource` —
+    // only tests did — so on a machine carrying both a packaged and a
+    // Homebrew nginx, the only way to learn which one is actually running was
+    // to open the Web Server page. One line here answers it from the app's
+    // own log instead.
+    if let Some(rt) = &nginx {
+        eprintln!(
+            "stack: nginx resolved to {} ({})",
+            rt.bin.display(),
+            rt.source.as_str()
+        );
+    }
     let nginx_bin: Option<PathBuf> = nginx.as_ref().map(|rt| rt.bin.clone());
 
     let php: Vec<PhpRuntime> = discover_installed_php(&prefixes, &|bin| {
@@ -869,7 +882,9 @@ mod tests {
     // Test-only, same reasoning as the MariaDB import above: production reads
     // the series/version through `rt`/discovery, never through these
     // constants directly.
-    use openvhost_core::nginx::{NGINX_PACKAGE_NAME, NGINX_SERIES, NginxRuntimeSource};
+    use openvhost_core::nginx::{
+        NGINX_PACKAGE_NAME, NGINX_SERIES, NginxRuntimeSource, nginx_prefix_dir,
+    };
 
     /// Post-live-run finding: a REAL mysqld aborts with "Fatal error in
     /// defaults handling. Program aborted!" when `!includedir` names a
@@ -1373,9 +1388,23 @@ mod tests {
         );
     }
 
-    /// D4: `-p <home>` rides alongside the `-e <err_log>` already mandatory
-    /// for the identical reason, on the REAL spawn spec the supervisor is
-    /// handed — not just on the validator/probe paths `openvhost-conf` owns.
+    /// D4: `-p <nginx_prefix_dir(home)>` rides alongside the `-e <err_log>`
+    /// already mandatory for the identical reason, on the REAL spawn spec the
+    /// supervisor is handed — not just on the validator/probe paths
+    /// `openvhost-conf` owns.
+    ///
+    /// 4B fix-wave, item 1: `-p` must be the DEDICATED prefix directory, never
+    /// `home` itself — `home` holds `state.db`, and the audit reproduced a
+    /// relative `root .;` in a custom nginx file serving it verbatim when `-p`
+    /// pointed at `home`. The `assert_ne!` below is the regression this test
+    /// exists to catch: it fails the moment `nginx_spec` goes back to passing
+    /// `home` directly.
+    ///
+    /// VACUITY (neuter-and-watch-it-fail): reverted `nginx_spec`'s `-p`
+    /// argument to `home.to_path_buf().into_os_string()` — failed on the
+    /// `assert_eq!` below (`left: home, right: nginx_prefix_dir(home)`)
+    /// before the `assert_ne!` even ran; restoring `nginx_spawn_argv` made it
+    /// pass again.
     #[test]
     fn the_nginx_spec_passes_the_mandatory_prefix_flag_alongside_the_error_log() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1408,7 +1437,12 @@ mod tests {
             .iter()
             .position(|a| a == "-p")
             .expect("nginx spawns with -p");
-        assert_eq!(args[p + 1], home.to_string_lossy());
+        assert_eq!(args[p + 1], nginx_prefix_dir(home).to_string_lossy());
+        assert_ne!(
+            args[p + 1],
+            home.to_string_lossy(),
+            "-p must never be home itself — home holds state.db"
+        );
     }
 
     // ------------------------------------------------------------------

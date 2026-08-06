@@ -92,6 +92,21 @@ pub fn provision_home(home: &Path) -> Result<(), CoreError> {
             source,
         })?;
     }
+    // nginx discovery design D4, hardened by the 4B fix-wave audit (item 1):
+    // `-p`'s target must be a dedicated, EMPTY directory distinct from `home`
+    // itself — `home` holds `state.db` (MySQL/MariaDB root credentials at
+    // rest), and a relative path in a user-authored custom nginx file (which
+    // `main.conf.tera` explicitly invites via its custom-sites include) would
+    // otherwise resolve under `home` and serve it. `nginx_prefix_dir` is the
+    // ONE place this path is computed; provisioned here alongside its
+    // siblings `run`/`run/nginx` above so every `-p` argument in the app
+    // always finds it already on disk.
+    let nginx_prefix = crate::nginx::nginx_prefix_dir(home);
+    std::fs::create_dir_all(&nginx_prefix).map_err(|source| CoreError::ProvisionIo {
+        op: "create_dir_all",
+        path: nginx_prefix,
+        source,
+    })?;
     for dir in ["logs", "logs/sites", "logs/services"] {
         let d = home.join(dir);
         crate::logs::ensure_log_dir(&d).map_err(|source| CoreError::ProvisionIo {

@@ -70,6 +70,17 @@ probe.
 An honest error at each site is the deliverable. The affordance that offers to install one is
 slice C.
 
+**The Services-row consequence, recorded so the next reader does not re-derive it** (4B
+fix-wave review, MEDIUM): with no nginx at all, no `"nginx"` `ServiceSpec` registers, so the
+Services panel shows nothing for it — whereas the retired `fallback_brew()`'s own doc recorded
+the prior contract as "rows still register, and Start yields an honest `Failed` naming the
+missing path." This is intentional, and stays. It matches MySQL and MariaDB in the exact same
+function (`macos_stack`): neither registers a row for an engine with nothing to start either.
+And the Web Server page does not depend on the Services panel to tell the truth — it renders
+its nginx row from `web_servers`, not from the supervisor's registered specs, and already
+handles `binary_path: None` (this same D3) — so the user still learns the truth there, on the
+page whose whole job is reporting it.
+
 ## 6. D4 — Pass `-p`, and stop relying on a property someone has to keep true
 
 nginx resolves **relative** config paths against its compiled-in prefix. Nothing the app

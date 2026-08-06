@@ -435,13 +435,32 @@ async fn an_empty_gzip_types_list_still_passes_real_nginx() {
 /// comment relies on for `-e`), so a relative `error_log` directive either
 /// lands under `home` or this test sees that it did not.
 ///
-/// VACUITY, confirmed by hand against the real installed nginx before writing
-/// this test: removing `-p` from the invocation does not merely leave the
-/// file somewhere else — it makes `nginx -t` FAIL outright, `[emerg] open()
-/// "<nginx's own Cellar prefix>/logs/relative.log" failed (2: No such file or
-/// directory)`, exit 1. So a regression here is not "the file moved", it is
-/// "the whole validation starts failing" — the loudest possible signal, and
-/// exactly the class of bug D4 exists to make impossible.
+/// VACUITY, confirmed by hand against BOTH builds this app ships — and they
+/// disagree, which is worth recording precisely rather than as one "loudest
+/// possible signal" claim (4B fix-wave, item 4 — a prior version of this
+/// comment made exactly that claim and was wrong about the build actually
+/// shipped):
+///
+/// - **Homebrew 1.31.3**: removing `-p` makes `nginx -t` FAIL outright —
+///   `[emerg] open() "<nginx's own Cellar prefix>/logs/relative.log" failed
+///   (2: No such file or directory)`, exit 1. The claim this comment used to
+///   make in general is true HERE.
+/// - **Our own packaged 1.30.4 does not fail at all.** It exits 0, silently,
+///   and writes into `/opt/openvhost-build/nginx-1.30.4/logs/` —
+///   `build/recipes/nginx.sh`'s `$BUILD_PREFIX`, the build host's staging
+///   directory, baked in at `./configure` time (`--prefix=$BUILD_PREFIX`)
+///   and shipped inside the tarball unchanged. On the machine that built it
+///   that directory still happens to exist, so the relative path resolves
+///   there instead of failing.
+///
+/// So the case for `-p` is STRONGER than "the loudest possible signal", not
+/// weaker: for the build this app actually ships, dropping `-p` is a SILENT
+/// divergence — nginx keeps running, `-t` keeps exiting 0, and a relative
+/// path simply lands in a directory an end user's machine will never even
+/// have. There is no loud failure to notice unless you happen to be running
+/// against Homebrew. This codebase treats a wrong "why" as worse than none,
+/// so this records the measured fact for both builds rather than the
+/// convenient one for a single build.
 #[tokio::test]
 async fn a_relative_path_in_the_config_resolves_under_home_not_under_the_prefix() {
     let Some(brew) = find_brew_binaries() else {

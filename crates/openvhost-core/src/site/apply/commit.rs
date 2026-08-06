@@ -27,9 +27,16 @@ pub trait ConfigValidator: Send + Sync {
 pub struct NginxValidator {
     pub bin: PathBuf,
     pub err_log: PathBuf,
-    /// `-p`'s target. MUST be the same home `err_log` and `main_conf` were
-    /// derived from, or a relative path in the config would resolve under
-    /// the wrong tree.
+    /// `-p`'s target. MUST be [`crate::nginx::nginx_prefix_dir`] of the SAME
+    /// home `err_log` and `main_conf` were derived from — NEVER that home
+    /// directly (4B fix-wave, item 1). Passing the home itself let a relative
+    /// path in a user-authored custom nginx file resolve under it and serve
+    /// `state.db` (MySQL/MariaDB root credentials at rest) verbatim; the
+    /// dedicated prefix directory holds nothing a relative path could ever
+    /// expose. A field NAMED `home` still holding the PREFIX, not home
+    /// itself, is deliberate — every other caller of `validate_live` in this
+    /// codebase follows the identical convention (see that function's own
+    /// doc comment).
     pub home: PathBuf,
 }
 
