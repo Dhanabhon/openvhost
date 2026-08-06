@@ -25,6 +25,11 @@ pub mod logs;
 // only — the service itself is the next slice.
 pub mod mariadb;
 pub mod mysql;
+// nginx from OpenVHost's OWN build (upstream publishes no macOS binaries
+// either): the compiled-in pin and the wiring that installs it. Catalogue and
+// install only — discovery and replacing Homebrew at runtime are later
+// slices.
+pub mod nginx;
 pub mod php;
 pub mod settings_repo;
 pub mod site;
@@ -63,6 +68,21 @@ pub use mysql::{
     install_mysql_package, mysql_brew_formula, mysql_brew_install_spec, mysql_brew_uninstall_spec,
     mysql_package_for_host, mysql_package_for_target, mysql_paths, packaged_mysql_runtime,
     remove_staging_dir, staging_dir_path, sweep_stale_staging,
+};
+/// nginx's package surface. Nothing here is wired to a Tauri command, a CLI
+/// subcommand or a UI control, and the install path may not be until the
+/// owner publishes the release the catalogue pins — see
+/// `nginx::Availability`. Exported so the pin is inspectable (and testable)
+/// without exposing an install a user could trigger into a 404.
+///
+/// **`Availability` is deliberately absent from this list.** nginx's copy and
+/// [`mariadb::Availability`] above are two distinct types that happen to share
+/// a name (design decision: duplicated per package, not shared), and Rust
+/// cannot flatten two same-named items into one module's namespace. It stays
+/// reachable at `nginx::Availability`, not `crate::Availability`.
+pub use nginx::{
+    NGINX_PACKAGE_NAME, NGINX_PACKAGES, NGINX_SERIES, NGINX_WARMUP_BINARY, NginxPackage,
+    NginxPackageInstall, install_nginx_package, nginx_package_for_host, nginx_package_for_target,
 };
 /// The package-pipeline types that appear in this crate's own public
 /// signatures, re-exported so the desktop app and the CLI need no direct
