@@ -87,13 +87,44 @@ nginx resolves **relative** config paths against its compiled-in prefix. Nothing
 generates is relative today, so this is latent rather than live — which is exactly why it
 should be closed now, deliberately, rather than discovered later.
 
-Pass `-p <home>` on every invocation, alongside the `-e <err_log>` that is already mandatory
-for the identical reason. It converts "no relative path is generated today" from a property a
-future template author must not break into one nginx cannot act on. It costs one argument and
-changes nothing about today's behaviour, because every generated path is absolute.
+Pass `-p` on every invocation, alongside the `-e <err_log>` that is already mandatory for the
+identical reason. It converts "no relative path is generated today" from a property a future
+template author must not break into one nginx cannot act on. It costs one argument and changes
+nothing about today's behaviour, because every generated path is absolute.
 
-Prove it: a config carrying a deliberately relative path must resolve under our home, not
-under the package tree or `/opt/homebrew/var`.
+*Corrected 2026-08-06 by the security audit, which reproduced it live:* the paragraph above
+originally said **`-p <home>`**, and that was wrong in a way that mattered. `<home>` holds
+`state.db` — MySQL's and MariaDB's root credentials at rest — and mode 0600 does not help,
+because nginx runs as the same user. Same config, same relative `root .;`, measured both ways:
+
+| | relative root resolves to | `GET /state.db` |
+|---|---|---|
+| before this slice (no `-p`) | `/opt/homebrew/Cellar/nginx/…` | **404** |
+| `-p <home>` as first drafted | `<home>` | **served the credential file verbatim** |
+
+My reasoning was that nothing the app *generates* is relative — true, and insufficient. The
+generated main config **invites the user to author their own nginx files**
+(`main.conf.tera:72`, `include "{{ custom_sites_glob }}"`), and nothing *included* is under our
+control. The slice as drafted moved the footgun's muzzle off a secrets-free package prefix and
+onto the credential store.
+
+So `-p` points at a **dedicated, empty, provisioned directory** — `<home>/run/nginx-prefix`,
+computed once in `nginx::prefix::nginx_prefix_dir` — and the three sites that share a live home
+share that one prefix, or `nginx -t` stops testing what actually runs. The two validators that
+render into disposable scratch directories keep using those; they hold nothing.
+
+Recording the correction rather than quietly editing it, because the conclusion ("pass `-p`")
+survived and only its target changed — and a reader who saw only the conclusion would inherit
+the original mistake.
+
+Prove it: a config carrying a deliberately relative path must resolve under that prefix, and a
+relative `root` must not be able to serve `state.db`.
+
+**A second correction, from the live proof.** The claim that omitting `-p` "fails loudly" is
+true of Homebrew's build and **false of the build we ship**: packaged nginx 1.30.4 exits 0
+silently and writes into `/opt/openvhost-build/nginx-1.30.4/logs/`, the build host's staging
+prefix baked into the tarball. So the case for `-p` is *stronger* than this section first
+claimed, not weaker — the loud failure was never guaranteed.
 
 ## 7. D5 — The packaged tree ships a stock `conf/nginx.conf`, and that is fine
 
