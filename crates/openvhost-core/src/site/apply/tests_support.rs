@@ -29,7 +29,7 @@ pub(crate) fn site(name: &str, domain: &str, php: &str, enabled: bool) -> Site {
 
 pub(crate) fn runtimes(majors: &[&str]) -> InstalledRuntimes {
     InstalledRuntimes {
-        nginx_bin: PathBuf::from("/opt/homebrew/opt/nginx/bin/nginx"),
+        nginx_bin: Some(PathBuf::from("/opt/homebrew/opt/nginx/bin/nginx")),
         php: majors
             .iter()
             .map(|m| PhpRuntime {

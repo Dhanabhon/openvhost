@@ -163,7 +163,7 @@ async fn site_apply_serves_a_real_site_end_to_end() {
         home: home.path().to_path_buf(),
         sites: vec![site],
         runtimes: InstalledRuntimes {
-            nginx_bin: brew.nginx.clone(),
+            nginx_bin: Some(brew.nginx.clone()),
             php: vec![PhpRuntime {
                 major: major.clone(),
                 fpm_bin: brew.php_fpm.clone(),
@@ -180,6 +180,7 @@ async fn site_apply_serves_a_real_site_end_to_end() {
     let validator = NginxValidator {
         bin: brew.nginx.clone(),
         err_log: err_log.clone(),
+        home: home.path().to_path_buf(),
     };
     let outcome = apply(&site_plan, &validator).await;
     assert!(outcome.is_ok(), "apply() was rejected: {:?}", outcome.err());

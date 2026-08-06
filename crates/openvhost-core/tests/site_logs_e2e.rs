@@ -284,7 +284,7 @@ async fn per_site_logs_capture_the_real_request_and_the_fatal() {
         home: home.path().to_path_buf(),
         sites: vec![site_a.clone(), site_b.clone()],
         runtimes: InstalledRuntimes {
-            nginx_bin: brew.nginx.clone(),
+            nginx_bin: Some(brew.nginx.clone()),
             php: vec![PhpRuntime {
                 major: major.clone(),
                 fpm_bin: brew.php_fpm.clone(),
@@ -303,6 +303,7 @@ async fn per_site_logs_capture_the_real_request_and_the_fatal() {
     let validator = NginxValidator {
         bin: brew.nginx.clone(),
         err_log: err_log.clone(),
+        home: home.path().to_path_buf(),
     };
     let outcome = apply(&site_plan, &validator).await;
     assert!(outcome.is_ok(), "apply() was rejected: {:?}", outcome.err());

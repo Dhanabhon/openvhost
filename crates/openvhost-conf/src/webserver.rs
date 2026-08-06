@@ -331,6 +331,11 @@ impl WebServerAdapter for NginxAdapter {
         let out = tokio::process::Command::new(bin)
             .arg("-e")
             .arg(&err_log) // MANDATORY: without -e, nginx leaks to /opt/homebrew/var
+            // MANDATORY for the identical reason, one level up (nginx
+            // discovery design D4): without -p, a RELATIVE path anywhere else
+            // in the config leaks to nginx's compiled-in prefix too.
+            .arg("-p")
+            .arg(&ctx.home)
             .arg("-t")
             .arg("-c")
             .arg(&main.path)

@@ -845,9 +845,20 @@ pub async fn apply_config(
         });
     }
 
+    // Design D3: `nginx_bin` is `None` when discovery found neither a
+    // packaged nor a Homebrew nginx. An honest refusal here, rather than
+    // handing `NginxValidator` a path to a binary that does not exist —
+    // Apply always validates through nginx, so there is nothing this command
+    // can do without one.
+    let Some(nginx_bin) = stack.nginx_bin.clone() else {
+        return Err(IpcError::Core {
+            message: "no nginx binary was found on this machine".into(),
+        });
+    };
     let validator = openvhost_core::NginxValidator {
-        bin: stack.nginx_bin.clone(),
+        bin: nginx_bin,
         err_log: openvhost_core::LogPaths::new(&stack.home).nginx_error(),
+        home: stack.home.clone(),
     };
     let outcome = openvhost_core::apply(&p, &validator).await?;
 
@@ -983,11 +994,14 @@ enum WebServerBrand {
 /// prose guardrail the next editor has to remember — the same move this repo
 /// already made at `89471df`.
 enum ValidationTarget<'a> {
-    /// `<bin> -e <err_log> -t -c <conf>`. Only ever constructed for `Nginx`.
+    /// `<bin> -e <err_log> -p <home> -t -c <conf>`. Only ever constructed for
+    /// `Nginx`. `-p <home>` (nginx discovery design D4) rides alongside `-e`
+    /// for the identical reason.
     NginxT {
         bin: &'a Path,
         conf: &'a Path,
         err_log: PathBuf,
+        home: &'a Path,
     },
 }
 
@@ -1095,11 +1109,21 @@ impl WebServerBrand {
     fn validation_target(self, paths: &StackPaths) -> Result<ValidationTarget<'_>, IpcError> {
         self.require_supported()?;
         match self {
-            Self::Nginx => Ok(ValidationTarget::NginxT {
-                bin: &paths.nginx_bin,
-                conf: &paths.nginx_conf,
-                err_log: openvhost_core::LogPaths::new(&paths.home).nginx_error(),
-            }),
+            // Design D3: an absent `nginx_bin` is refused here, honestly,
+            // rather than borrowed as a path to a binary that does not exist.
+            Self::Nginx => {
+                let Some(bin) = paths.nginx_bin.as_deref() else {
+                    return Err(IpcError::Core {
+                        message: "no nginx binary was found on this machine".into(),
+                    });
+                };
+                Ok(ValidationTarget::NginxT {
+                    bin,
+                    conf: &paths.nginx_conf,
+                    err_log: openvhost_core::LogPaths::new(&paths.home).nginx_error(),
+                    home: &paths.home,
+                })
+            }
             // Unreachable while `Nginx` is the only `supported()` brand: the gate
             // above already returned. Deliberately an error and not
             // `unreachable!()`, for the same reason as `live_config_path` — marking
@@ -1240,7 +1264,9 @@ fn web_server_rows(
             display_name: "nginx".into(),
             supported: true,
             service_id: Some("nginx".into()),
-            binary_path: Some(p.nginx_bin.display().to_string()),
+            // Design D3: `None` is an honest "no nginx was found", not a
+            // path this row should invent.
+            binary_path: p.nginx_bin.as_ref().map(|b| b.display().to_string()),
             version,
             supports_hot_reload: openvhost_conf::NginxAdapter.supports_hot_reload(),
             config_path: Some(p.nginx_conf.display().to_string()),
@@ -1262,7 +1288,12 @@ pub async fn list_web_servers(
     // this app runs can write into nginx's compiled-in prefix instead of our home
     // — see `openvhost_conf::probe_nginx_version`'s own doc comment.
     let err_log = openvhost_core::LogPaths::new(&p.home).nginx_error();
-    let version = openvhost_conf::probe_nginx_version(&p.nginx_bin, &err_log).await;
+    // Design D3: no binary, no probe — `None` reaches the row honestly rather
+    // than spawning against a path that does not exist.
+    let version = match p.nginx_bin.as_deref() {
+        Some(bin) => openvhost_conf::probe_nginx_version(bin, &err_log, &p.home).await,
+        None => None,
+    };
     // `tokio::fs`, not `Path::exists()`: a sync stat pins a tokio WORKER, and an
     // OPENVHOST_HOME on a stalled network mount would take the supervisor event
     // pump down with it — the same hazard `read_web_server_config` documents
@@ -1328,9 +1359,12 @@ pub async fn validate_web_server_config(
     // read-only with respect to the FILESYSTEM, though — it creates whatever
     // `error_log`/`access_log`/`*_temp_path` the config declares. See spec §3.2.
     let report = match brand.validation_target(p)? {
-        ValidationTarget::NginxT { bin, conf, err_log } => {
-            openvhost_conf::validate_live(bin, conf, &err_log).await
-        }
+        ValidationTarget::NginxT {
+            bin,
+            conf,
+            err_log,
+            home,
+        } => openvhost_conf::validate_live(bin, conf, &err_log, home).await,
     }
     .map_err(|e| IpcError::Core {
         message: e.to_string(),
@@ -1597,10 +1631,14 @@ pub async fn save_web_server_settings(
     paths: tauri::State<'_, Option<StackPaths>>,
     input: WebServerSettingsDto,
 ) -> Result<(), IpcError> {
-    // No stack (nginx not installed) => no checker; see `write_settings`.
-    let checker = paths.inner().as_ref().map(|p| NginxSettingsChecker {
-        bin: p.nginx_bin.clone(),
-        scratch_root: p.home.join("run"),
+    // No stack, or a stack with no nginx binary resolved (design D3: neither
+    // a packaged nor a Homebrew nginx was found) => no checker; see
+    // `write_settings`.
+    let checker = paths.inner().as_ref().and_then(|p| {
+        p.nginx_bin.as_ref().map(|bin| NginxSettingsChecker {
+            bin: bin.clone(),
+            scratch_root: p.home.join("run"),
+        })
     });
     write_settings(
         db.inner(),
@@ -2796,7 +2834,7 @@ mod php_ipc_tests {
         let home = tempfile::tempdir().unwrap();
         let paths = StackPaths {
             home: home.path().to_path_buf(),
-            nginx_bin: home.path().join("nginx"),
+            nginx_bin: Some(home.path().join("nginx")),
             nginx_conf: home.path().join("nginx.conf"),
         };
         let sup = Supervisor::new(openvhost_proc::default_driver());
@@ -2855,7 +2893,7 @@ mod php_ipc_tests {
         let home = tempfile::tempdir().unwrap();
         let paths = StackPaths {
             home: home.path().to_path_buf(),
-            nginx_bin: home.path().join("nginx"),
+            nginx_bin: Some(home.path().join("nginx")),
             nginx_conf: home.path().join("nginx.conf"),
         };
         let sup = Supervisor::new(openvhost_proc::default_driver());
@@ -3162,7 +3200,7 @@ mod php_ipc_tests {
         app.manage(RwLock::new(None::<InstalledRuntimes>));
         app.manage(Some(StackPaths {
             home: home.path().to_path_buf(),
-            nginx_bin: home.path().join("nginx"),
+            nginx_bin: Some(home.path().join("nginx")),
             nginx_conf: home.path().join("nginx.conf"),
         }));
         app.manage(Arc::new(Supervisor::new(openvhost_proc::default_driver())));
@@ -5985,7 +6023,7 @@ esac
         app.manage(db);
         app.manage(Some(StackPaths {
             home: home.path().to_path_buf(),
-            nginx_bin: home.path().join("nginx"),
+            nginx_bin: Some(home.path().join("nginx")),
             nginx_conf: home.path().join("nginx.conf"),
         }));
         let fake_mysql = fake_cli(
@@ -6050,7 +6088,7 @@ esac
         app.manage(db);
         app.manage(Some(StackPaths {
             home: home.path().to_path_buf(),
-            nginx_bin: home.path().join("nginx"),
+            nginx_bin: Some(home.path().join("nginx")),
             nginx_conf: home.path().join("nginx.conf"),
         }));
         let fake_mysql = fake_cli(
@@ -6147,7 +6185,7 @@ exit 1
         app.manage(db);
         app.manage(Some(StackPaths {
             home: home.path().to_path_buf(),
-            nginx_bin: home.path().join("nginx"),
+            nginx_bin: Some(home.path().join("nginx")),
             nginx_conf: home.path().join("nginx.conf"),
         }));
         // An exotic fake that echoes its own defaults-file's contents back on
@@ -7246,7 +7284,7 @@ mod mariadb_ipc_tests {
             .unwrap();
         app.manage(Some(StackPaths {
             home: home.path().to_path_buf(),
-            nginx_bin: home.path().join("nginx"),
+            nginx_bin: Some(home.path().join("nginx")),
             nginx_conf: home.path().join("nginx.conf"),
         }));
         app.manage(RwLock::<Option<Vec<openvhost_core::MariadbRuntime>>>::new(
@@ -7338,7 +7376,7 @@ mod mariadb_ipc_tests {
         app.manage(db);
         app.manage(Some(StackPaths {
             home: home.path().to_path_buf(),
-            nginx_bin: home.path().join("nginx"),
+            nginx_bin: Some(home.path().join("nginx")),
             nginx_conf: home.path().join("nginx.conf"),
         }));
         let fake_mariadb = fake_cli(
@@ -7388,7 +7426,7 @@ mod mariadb_ipc_tests {
         app.manage(db);
         app.manage(Some(StackPaths {
             home: home.path().to_path_buf(),
-            nginx_bin: home.path().join("nginx"),
+            nginx_bin: Some(home.path().join("nginx")),
             nginx_conf: home.path().join("nginx.conf"),
         }));
         let fake_mariadb = fake_cli(
@@ -7896,7 +7934,7 @@ mod web_server_ipc_tests {
     fn sample_paths() -> StackPaths {
         StackPaths {
             home: PathBuf::from("/nonexistent/openvhost-test-home"),
-            nginx_bin: PathBuf::from("/nonexistent/openvhost-test-home/bin/nginx"),
+            nginx_bin: Some(PathBuf::from("/nonexistent/openvhost-test-home/bin/nginx")),
             nginx_conf: PathBuf::from("/nonexistent/openvhost-test-home/conf/nginx.conf"),
         }
     }
@@ -7961,7 +7999,7 @@ mod web_server_ipc_tests {
         assert!(nginx.supported);
         assert_eq!(nginx.service_id.as_deref(), Some("nginx"));
         assert_eq!(nginx.version.as_deref(), Some("1.27.3"));
-        let bin = p.nginx_bin.display().to_string();
+        let bin = p.nginx_bin.as_deref().unwrap().display().to_string();
         let conf = p.nginx_conf.display().to_string();
         assert_eq!(nginx.binary_path.as_deref(), Some(bin.as_str()));
         assert_eq!(nginx.config_path.as_deref(), Some(conf.as_str()));
@@ -8005,17 +8043,23 @@ mod web_server_ipc_tests {
     /// The compiler carries most of this: `ValidationTarget` has one variant, so a
     /// new brand cannot reach `validate_web_server_config` without an arm being
     /// written for it. What a test can still add is that the ONE variant is wired to
-    /// the right three values out of managed state — including `err_log`, which is
+    /// the right four values out of managed state — including `err_log`, which is
     /// derived rather than borrowed and so is the piece a refactor can silently
     /// change.
     #[test]
     fn the_validator_invocation_is_resolved_as_one_unit_from_the_brand() {
         let p = sample_paths();
         match WebServerBrand::Nginx.validation_target(&p) {
-            Ok(ValidationTarget::NginxT { bin, conf, err_log }) => {
-                assert_eq!(bin, p.nginx_bin.as_path());
+            Ok(ValidationTarget::NginxT {
+                bin,
+                conf,
+                err_log,
+                home,
+            }) => {
+                assert_eq!(bin, p.nginx_bin.as_deref().unwrap());
                 assert_eq!(conf, p.nginx_conf.as_path());
                 assert_eq!(err_log, p.home.join("logs/nginx.error.log"));
+                assert_eq!(home, p.home.as_path());
             }
             Err(e) => panic!("nginx must yield a validator invocation, got {e:?}"),
         }
@@ -8137,7 +8181,7 @@ mod apply_ipc_tests {
         let state = RwLock::new(None::<InstalledRuntimes>);
         assert!(state.read().unwrap().is_none());
         *state.write().unwrap() = Some(InstalledRuntimes {
-            nginx_bin: PathBuf::from("/opt/homebrew/opt/nginx/bin/nginx"),
+            nginx_bin: Some(PathBuf::from("/opt/homebrew/opt/nginx/bin/nginx")),
             php: vec![openvhost_core::PhpRuntime {
                 major: "8.3".into(),
                 fpm_bin: PathBuf::from("/opt/homebrew/opt/php@8.3/sbin/php-fpm"),
@@ -8205,7 +8249,7 @@ mod list_web_servers_tests {
             .unwrap();
         app.manage(Some(StackPaths {
             home: home.path().to_path_buf(),
-            nginx_bin: bin.clone(),
+            nginx_bin: Some(bin.clone()),
             nginx_conf: home.path().join("conf/nginx.conf"),
         }));
 
@@ -8253,7 +8297,7 @@ mod list_web_servers_tests {
         // moves the tri-state through; it never invents a third value.
         let p = StackPaths {
             home: PathBuf::from("/x/.openvhost"),
-            nginx_bin: PathBuf::from("/opt/homebrew/opt/nginx/bin/nginx"),
+            nginx_bin: Some(PathBuf::from("/opt/homebrew/opt/nginx/bin/nginx")),
             nginx_conf: PathBuf::from("/x/.openvhost/config/generated/nginx/nginx.conf"),
         };
 
@@ -8325,7 +8369,7 @@ mod list_web_servers_tests {
             .unwrap();
         app.manage(Some(StackPaths {
             home: home.path().to_path_buf(),
-            nginx_bin: bin,
+            nginx_bin: Some(bin),
             nginx_conf: conf.clone(),
         }));
 
@@ -9400,7 +9444,7 @@ mod log_ipc_tests {
     fn stack(home: &Path) -> Option<StackPaths> {
         Some(StackPaths {
             home: home.to_path_buf(),
-            nginx_bin: home.join("nginx"),
+            nginx_bin: Some(home.join("nginx")),
             nginx_conf: home.join("nginx.conf"),
         })
     }
@@ -9529,7 +9573,7 @@ mod log_ipc_tests {
         app.manage(Db::open_in_memory().await.unwrap());
         app.manage(stack(home.path()));
         app.manage(RwLock::new(Some(InstalledRuntimes {
-            nginx_bin: home.path().join("nginx"),
+            nginx_bin: Some(home.path().join("nginx")),
             php: vec![],
         })));
 
@@ -9741,7 +9785,7 @@ mod log_ipc_tests {
         app.manage(db);
         app.manage(stack(home.path()));
         app.manage(RwLock::new(Some(InstalledRuntimes {
-            nginx_bin: home.path().join("nginx"),
+            nginx_bin: Some(home.path().join("nginx")),
             php: vec![openvhost_core::PhpRuntime {
                 major: "8.3".into(),
                 fpm_bin: home.path().join("php-fpm"),

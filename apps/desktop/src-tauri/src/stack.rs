@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[cfg(target_os = "macos")]
-use openvhost_core::platform::macos::demo_stack::{BrewStack, find_brew_binaries, provision_home};
+use openvhost_core::platform::macos::demo_stack::provision_home;
 #[cfg(target_os = "macos")]
 use openvhost_core::site::apply::LISTEN_PORT;
 // Portable: `InstalledRuntimes`/`PhpRuntime` are plain data (see `StackPaths`'s
@@ -26,31 +26,27 @@ use openvhost_core::mariadb::{
 use openvhost_core::mysql::{
     DatadirState, MysqlRuntime, classify_datadir, mysql_paths, write_generated_config,
 };
+use openvhost_core::nginx::{NginxRuntime, discover_nginx};
 // Re-exported by `openvhost-core` so this crate needs no direct `openvhost-pkg`
 // dependency. Minted only from a resolved home — never from IPC input.
 use openvhost_core::PackagesRoot;
 use openvhost_core::{InstalledRuntimes, PhpRuntime};
 use openvhost_proc::{DEFAULT_GRACE, ReadinessProbe, ServiceSpec, SpawnSpec};
 
-/// Apple Silicon default paths, used when probing finds nothing: the rows
-/// still register, and Start yields an honest Failed naming the missing
-/// path (the P0-3 spawn-fail contract) instead of the rows vanishing.
-#[cfg(target_os = "macos")]
-fn fallback_brew() -> BrewStack {
-    BrewStack {
-        nginx: PathBuf::from("/opt/homebrew/opt/nginx/bin/nginx"),
-        php_fpm: PathBuf::from("/opt/homebrew/opt/php/sbin/php-fpm"),
-    }
-}
-
 /// The paths the stack actually registered, so the Web Server page can report
 /// them instead of re-probing and possibly disagreeing. Read out of the managed
 /// `Option<StackPaths>` state by `commands::list_web_servers` and friends.
 ///
-/// Portable by construction — three `PathBuf`s, nothing platform-specific — so
-/// it is defined for EVERY target and `commands.rs` can name it ungated. Only
-/// building one is platform-specific (`macos_stack` below); targets with no
-/// stack builder manage `None`.
+/// Portable by construction — nothing platform-specific — so it is defined
+/// for EVERY target and `commands.rs` can name it ungated. Only building one
+/// is platform-specific (`macos_stack` below); targets with no stack builder
+/// manage `None`.
+///
+/// `nginx_bin` is `None` when discovery finds neither a packaged nor a
+/// Homebrew nginx (nginx discovery design D3) — the honest replacement for
+/// the removed `fallback_brew()`, which used to hand out a hardcoded path to
+/// a binary that might not exist. Every reader decides for itself what an
+/// absent nginx means at its own call site.
 // On a target with no stack builder this type is named and its fields are read
 // by ungated `commands.rs` code, but nothing CONSTRUCTS it, which is rustc's
 // separate "struct is never constructed" dead_code diagnostic. Reproduced in
@@ -67,7 +63,7 @@ fn fallback_brew() -> BrewStack {
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub struct StackPaths {
     pub home: PathBuf,
-    pub nginx_bin: PathBuf,
+    pub nginx_bin: Option<PathBuf>,
     pub nginx_conf: PathBuf,
 }
 
@@ -668,6 +664,56 @@ pub struct MacosStack {
     pub mariadb_runtimes: Option<Vec<MariadbRuntime>>,
 }
 
+/// The `nginx` service row for one discovered runtime: id, display name,
+/// endpoint and the exact spawn spec — the nginx counterpart of
+/// [`mysql_spec`]/[`mariadb_spec`], extracted out of `macos_stack` so the
+/// seam that matters (design D5: the supervisor spawns a CONCRETE version
+/// directory, and a later `current` swap must not change which binary a
+/// restart brings up) is provable directly, the same way it already is for
+/// the other two engines.
+///
+/// `nginx_conf` is taken as a parameter rather than re-derived here: unlike
+/// `mysql_paths`/`mariadb_paths`, there is no single canonical deriver for
+/// nginx's generated config path, and `macos_stack` also needs the exact same
+/// value for [`StackPaths`] independently of any particular runtime — passing
+/// it through is what keeps this to ONE spelling of
+/// `config/generated/nginx/nginx.conf` rather than two that could drift.
+///
+/// `program: rt.bin.clone()` is never re-resolved and the `current` link is
+/// never spawned through: `rt` came from [`discover_nginx`], which already
+/// resolved it to a concrete version directory (or to a Homebrew path, which
+/// has no `current` link to begin with).
+///
+/// `-p <home>` (nginx discovery design D4) rides alongside the `-e <err_log>`
+/// already mandatory for the identical reason: nothing this app generates is
+/// relative today, so this closes a gap before a future template author could
+/// open it, rather than after.
+fn nginx_spec(home: &Path, nginx_conf: &Path, rt: &NginxRuntime) -> ServiceSpec {
+    ServiceSpec {
+        id: "nginx".into(),
+        display_name: "nginx".into(),
+        endpoint: Some(format!("http://127.0.0.1:{LISTEN_PORT}")),
+        spawn: SpawnSpec {
+            program: rt.bin.clone(),
+            args: vec![
+                OsString::from("-e"),
+                openvhost_core::LogPaths::new(home)
+                    .nginx_error()
+                    .into_os_string(),
+                OsString::from("-p"),
+                home.to_path_buf().into_os_string(),
+                OsString::from("-c"),
+                nginx_conf.to_path_buf().into_os_string(),
+            ],
+            cwd: None,
+            env: vec![],
+        },
+        // Defaults only — see `php_fpm_spec`'s matching comment.
+        readiness: ReadinessProbe::default(),
+        grace: DEFAULT_GRACE,
+    }
+}
+
 /// Build the supervised stack rows: one nginx row, and one `php-fpm-<major>`
 /// row per installed PHP major. Provision errors are logged and non-fatal
 /// (rows register; Start surfaces the problem honestly). Only a
@@ -697,9 +743,6 @@ pub fn macos_stack() -> MacosStack {
         eprintln!("stack: provisioning failed (rows registered anyway): {e}");
     }
     sweep_stale_mysql_staging_at_startup(&home);
-    // nginx is unaffected by the C2 fix below: `find_brew_binaries` (or the
-    // Apple Silicon fallback) is still what locates it.
-    let brew = find_brew_binaries().unwrap_or_else(fallback_brew);
 
     // C2 fix (branch-review-fix-report.md): this used to probe ONLY
     // `brew.php_fpm` — the single path `find_brew_binaries` returns, which is
@@ -730,6 +773,17 @@ pub fn macos_stack() -> MacosStack {
         .iter()
         .map(Path::new)
         .collect();
+
+    // nginx discovery design D2/D3: packaged first, then Homebrew, then
+    // honest absence — never `find_brew_binaries`'s combined nginx+php-fpm
+    // probe (its php-fpm requirement has no bearing on nginx and only ever
+    // degraded this exact walk, per the C2 history above), and never a
+    // fabricated fallback path. `None` here means neither source has nginx;
+    // every reader of `nginx_bin` below decides what that means for it
+    // instead of being handed a path to a binary that does not exist.
+    let nginx = discover_nginx(&PackagesRoot::from_home(&home), &prefixes);
+    let nginx_bin: Option<PathBuf> = nginx.as_ref().map(|rt| rt.bin.clone());
+
     let php: Vec<PhpRuntime> = discover_installed_php(&prefixes, &|bin| {
         tauri::async_runtime::block_on(openvhost_conf::probe_php_fpm_version(bin))
     });
@@ -781,39 +835,23 @@ pub fn macos_stack() -> MacosStack {
             specs.push(mariadb_spec(&home, rt));
         }
     }
-    specs.push(ServiceSpec {
-        id: "nginx".into(),
-        display_name: "nginx".into(),
-        endpoint: Some(format!("http://127.0.0.1:{LISTEN_PORT}")),
-        spawn: SpawnSpec {
-            program: brew.nginx.clone(),
-            args: vec![
-                OsString::from("-e"),
-                openvhost_core::LogPaths::new(&home)
-                    .nginx_error()
-                    .into_os_string(),
-                OsString::from("-c"),
-                nginx_conf.clone().into_os_string(),
-            ],
-            cwd: None,
-            env: vec![],
-        },
-        // Defaults only — see `php_fpm_spec`'s matching comment above.
-        readiness: ReadinessProbe::default(),
-        grace: DEFAULT_GRACE,
-    });
+    // Registered only when a real binary was found (nginx discovery design
+    // D3), mirroring the MySQL/MariaDB rule immediately above: there is
+    // nothing to start otherwise, and inventing a spec whose `spawn.program`
+    // names a file that does not exist is exactly the dishonest fallback this
+    // design retires.
+    if let Some(rt) = &nginx {
+        specs.push(nginx_spec(&home, &nginx_conf, rt));
+    }
 
     MacosStack {
         specs,
         paths: Some(StackPaths {
             home,
-            nginx_bin: brew.nginx.clone(),
+            nginx_bin: nginx_bin.clone(),
             nginx_conf,
         }),
-        runtimes: Some(InstalledRuntimes {
-            nginx_bin: brew.nginx,
-            php,
-        }),
+        runtimes: Some(InstalledRuntimes { nginx_bin, php }),
         mysql_runtimes: Some(mysql),
         mariadb_runtimes: Some(mariadb),
     }
@@ -828,6 +866,10 @@ mod tests {
     // `discover_mariadb`, never through the constants directly — which is
     // what keeps a spec describing the tree it was really found in.
     use openvhost_core::mariadb::{MARIADB_PACKAGE_NAME, MARIADB_SERIES};
+    // Test-only, same reasoning as the MariaDB import above: production reads
+    // the series/version through `rt`/discovery, never through these
+    // constants directly.
+    use openvhost_core::nginx::{NGINX_PACKAGE_NAME, NGINX_SERIES, NginxRuntimeSource};
 
     /// Post-live-run finding: a REAL mysqld aborts with "Fatal error in
     /// defaults handling. Program aborted!" when `!includedir` names a
@@ -1001,9 +1043,9 @@ mod tests {
     }
 
     /// The paths handed to the UI must be the SAME ones baked into the specs.
-    /// A second `find_brew_binaries()` call could disagree with the first (it
-    /// returns None unless BOTH nginx and php-fpm exist), so this pins that the
-    /// page and the supervisor cannot drift.
+    /// nginx discovery (design D2/D3) runs exactly once per `macos_stack()`
+    /// call and the result is threaded into both `StackPaths` and the spec —
+    /// this pins that the page and the supervisor cannot drift.
     #[test]
     fn reported_paths_match_the_registered_nginx_spec() {
         let stack = macos_stack();
@@ -1013,12 +1055,19 @@ mod tests {
             assert!(stack.specs.is_empty());
             return;
         };
+        let Some(nginx_bin) = paths.nginx_bin.clone() else {
+            // Design D3: neither a packaged nor a Homebrew nginx exists on
+            // this machine, so the "nginx" row must not register at all —
+            // there is nothing else for this test to pin.
+            assert!(!stack.specs.iter().any(|s| s.id == "nginx"));
+            return;
+        };
         let nginx = stack
             .specs
             .iter()
             .find(|s| s.id == "nginx")
-            .expect("nginx spec should be registered when a home resolves");
-        assert_eq!(nginx.spawn.program, paths.nginx_bin);
+            .expect("nginx spec should be registered when nginx_bin resolved");
+        assert_eq!(nginx.spawn.program, nginx_bin);
         // The spec spawns with `-c <conf>`; the reported conf must be that path.
         let args: Vec<String> = nginx
             .spawn
@@ -1221,6 +1270,145 @@ mod tests {
             b"8.4.11 server\n",
             "a current swap changed the engine an already-registered spec spawns"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // nginx discovery design D2/D3/D5 — the seam that matters, mirroring the
+    // MySQL group immediately above. `openvhost-core` owns the merge rules
+    // and its own thorough test suite (`nginx::discover`'s tests); what is
+    // provable ONLY here is that the discovered runtime's path survives,
+    // unaltered, into `ServiceSpec::spawn.program` — the value a child is
+    // really spawned from.
+    // ------------------------------------------------------------------
+
+    /// Lay down `<home>/packages/nginx/1.30/<version>/bin/nginx` with the
+    /// binary's body set to `body`, exactly as an install leaves it — so a
+    /// test can tell one version's binary from another's by CONTENT rather
+    /// than by the path it was reached through.
+    #[cfg(unix)]
+    fn install_fake_nginx_package(home: &Path, version: &str, body: &str) {
+        let bin = PackagesRoot::from_home(home)
+            .package_dir(NGINX_PACKAGE_NAME, NGINX_SERIES, version)
+            .join("bin");
+        std::fs::create_dir_all(&bin).expect("mkdir package bin");
+        std::fs::write(bin.join("nginx"), body.as_bytes()).expect("write fake binary");
+    }
+
+    /// D3, at the startup seam: `macos_stack`'s nginx resolution must see
+    /// OpenVHost's OWN package tree, not just Homebrew. Run with NO brew
+    /// prefixes, so the only way this can pass is by reading
+    /// `<home>/packages/`, and it cannot pass by falling through to a keg on
+    /// the machine running the test.
+    #[cfg(unix)]
+    #[test]
+    fn startup_discovery_finds_a_packaged_nginx_with_no_homebrew_at_all() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        install_fake_nginx_package(home, "1.30.4", "1.30.4 server\n");
+        point_current(home, NGINX_PACKAGE_NAME, NGINX_SERIES, "1.30.4");
+
+        let found = discover_nginx(&PackagesRoot::from_home(home), &[])
+            .expect("a packaged nginx is installed");
+        assert_eq!(
+            found.source,
+            NginxRuntimeSource::Packaged {
+                version: "1.30.4".to_string()
+            },
+            "the runtime must be able to say where it came from"
+        );
+    }
+
+    /// D5, at the seam that matters: the path a supervised child is spawned
+    /// from is the concrete version directory, and a later `current` swap
+    /// does not reach back and change which binary a restart brings up.
+    ///
+    /// VACUITY, proven by mutation: rewriting `packaged_nginx_runtime` in
+    /// `openvhost-core` to build its path from `root.current_link(...)`
+    /// instead of `root.package_dir(...)` fails this test (proven directly
+    /// against `openvhost-core`'s own copy of this same assertion, in
+    /// `crate::nginx::discover`'s test suite — see that module's report).
+    #[cfg(unix)]
+    #[test]
+    fn a_packaged_nginx_spec_spawns_a_concrete_version_and_survives_a_current_swap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        install_fake_nginx_package(home, "1.30.3", "1.30.3 server\n");
+        install_fake_nginx_package(home, "1.30.4", "1.30.4 server\n");
+        point_current(home, NGINX_PACKAGE_NAME, NGINX_SERIES, "1.30.4");
+
+        let found =
+            discover_nginx(&PackagesRoot::from_home(home), &[]).expect("a runtime is found");
+        let nginx_conf = home.join("config/generated/nginx/nginx.conf");
+        let spec = nginx_spec(home, &nginx_conf, &found);
+
+        assert!(
+            spec.spawn
+                .program
+                .starts_with(PackagesRoot::from_home(home).package_dir(
+                    NGINX_PACKAGE_NAME,
+                    NGINX_SERIES,
+                    "1.30.4"
+                )),
+            "the supervisor would spawn {:?}, which is not the concrete version directory",
+            spec.spawn.program
+        );
+        assert!(
+            !spec
+                .spawn
+                .program
+                .components()
+                .any(|c| c.as_os_str() == "current"),
+            "the supervisor would spawn through the current link: {:?}",
+            spec.spawn.program
+        );
+
+        // A `current` swap is a legitimate operation (a future upgrade flow
+        // does exactly this). It must not silently change which binary the
+        // already-registered spec starts.
+        point_current(home, NGINX_PACKAGE_NAME, NGINX_SERIES, "1.30.3");
+        assert_eq!(
+            std::fs::read(&spec.spawn.program).expect("read the spawned binary"),
+            b"1.30.4 server\n",
+            "a current swap changed the binary an already-registered spec spawns"
+        );
+    }
+
+    /// D4: `-p <home>` rides alongside the `-e <err_log>` already mandatory
+    /// for the identical reason, on the REAL spawn spec the supervisor is
+    /// handed — not just on the validator/probe paths `openvhost-conf` owns.
+    #[test]
+    fn the_nginx_spec_passes_the_mandatory_prefix_flag_alongside_the_error_log() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        let rt = NginxRuntime {
+            bin: PathBuf::from("/nowhere/bin/nginx"),
+            source: NginxRuntimeSource::Homebrew,
+        };
+        let nginx_conf = home.join("config/generated/nginx/nginx.conf");
+
+        let spec = nginx_spec(home, &nginx_conf, &rt);
+
+        let args: Vec<String> = spec
+            .spawn
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let e = args
+            .iter()
+            .position(|a| a == "-e")
+            .expect("nginx spawns with -e");
+        assert_eq!(
+            args[e + 1],
+            openvhost_core::LogPaths::new(home)
+                .nginx_error()
+                .to_string_lossy()
+        );
+        let p = args
+            .iter()
+            .position(|a| a == "-p")
+            .expect("nginx spawns with -p");
+        assert_eq!(args[p + 1], home.to_string_lossy());
     }
 
     // ------------------------------------------------------------------

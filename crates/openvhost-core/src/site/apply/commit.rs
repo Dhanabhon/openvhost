@@ -21,11 +21,16 @@ pub trait ConfigValidator: Send + Sync {
     ) -> Result<openvhost_conf::ValidationReport, ApplyError>;
 }
 
-/// The real validator. `-e <err_log>` is mandatory on every nginx invocation,
-/// which `validate_live` handles.
+/// The real validator. `-e <err_log>` and `-p <home>` are mandatory on every
+/// nginx invocation (nginx discovery design D4), which `validate_live`
+/// handles.
 pub struct NginxValidator {
     pub bin: PathBuf,
     pub err_log: PathBuf,
+    /// `-p`'s target. MUST be the same home `err_log` and `main_conf` were
+    /// derived from, or a relative path in the config would resolve under
+    /// the wrong tree.
+    pub home: PathBuf,
 }
 
 #[async_trait::async_trait]
@@ -34,7 +39,7 @@ impl ConfigValidator for NginxValidator {
         &self,
         main_conf: &Path,
     ) -> Result<openvhost_conf::ValidationReport, ApplyError> {
-        Ok(openvhost_conf::validate_live(&self.bin, main_conf, &self.err_log).await?)
+        Ok(openvhost_conf::validate_live(&self.bin, main_conf, &self.err_log, &self.home).await?)
     }
 }
 

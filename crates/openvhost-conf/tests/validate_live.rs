@@ -180,7 +180,7 @@ async fn both_probes_pass_real_nginx_in_the_assembled_environment() {
         .unwrap();
     let err_log = ctx.home.join("logs/nginx.error.log");
 
-    let live = validate_live(&brew.nginx, &main.path, &err_log)
+    let live = validate_live(&brew.nginx, &main.path, &err_log, &ctx.home)
         .await
         .unwrap();
     assert!(
@@ -192,7 +192,7 @@ async fn both_probes_pass_real_nginx_in_the_assembled_environment() {
         live.stderr
     );
 
-    let version = probe_nginx_version(&brew.nginx, &err_log).await;
+    let version = probe_nginx_version(&brew.nginx, &err_log, &ctx.home).await;
     assert!(
         version.is_some(),
         "real `nginx -v` produced no parseable banner under the assembled probe \
@@ -232,7 +232,7 @@ async fn non_default_settings_pass_real_nginx() {
     let main_path = materialize_with(&ctx, &settings);
     let err_log = ctx.home.join("logs/nginx.error.log");
 
-    let report = validate_live(&brew.nginx, &main_path, &err_log)
+    let report = validate_live(&brew.nginx, &main_path, &err_log, &ctx.home)
         .await
         .unwrap();
     assert!(
@@ -334,7 +334,7 @@ async fn the_documented_gzip_types_maximum_loads_in_real_nginx() {
     let main_path = materialize_with(&ctx, &settings);
     let err_log = ctx.home.join("logs/nginx.error.log");
 
-    let report = validate_live(&brew.nginx, &main_path, &err_log)
+    let report = validate_live(&brew.nginx, &main_path, &err_log, &ctx.home)
         .await
         .unwrap();
     assert!(
@@ -379,7 +379,7 @@ async fn the_largest_body_sizes_we_accept_load_in_real_nginx() {
         };
         let main_path = materialize_with(&ctx, &settings);
         let err_log = ctx.home.join("logs/nginx.error.log");
-        let report = validate_live(&brew.nginx, &main_path, &err_log)
+        let report = validate_live(&brew.nginx, &main_path, &err_log, &ctx.home)
             .await
             .unwrap();
         assert!(
@@ -410,7 +410,7 @@ async fn an_empty_gzip_types_list_still_passes_real_nginx() {
     };
     let main_path = materialize_with(&ctx, &settings);
     let err_log = ctx.home.join("logs/nginx.error.log");
-    let report = validate_live(&brew.nginx, &main_path, &err_log)
+    let report = validate_live(&brew.nginx, &main_path, &err_log, &ctx.home)
         .await
         .unwrap();
     assert!(
@@ -418,5 +418,64 @@ async fn an_empty_gzip_types_list_still_passes_real_nginx() {
         "an empty gzip_types list must render as NO directive; a bare \
          `gzip_types;` is what nginx is rejecting here:\n{}",
         report.stderr
+    );
+}
+
+/// nginx discovery design D4's own proof requirement: `-p <home>` makes a
+/// RELATIVE path in the config resolve under our home, not under nginx's
+/// compiled-in prefix or `/opt/homebrew/var`.
+///
+/// Deliberately NOT one of the app's own generated configs: every path this
+/// crate's templates emit is already absolute (`to_config_path`), so a
+/// relative path has to be hand-written to exist at all — which is the
+/// property D4 exists to keep true by construction rather than by accident.
+/// `-t` is enough to prove it: nginx creates the files a config's
+/// `error_log`/`access_log`/`*_temp_path` name as it parses, even in test
+/// mode (the same fact `commands.rs`'s `validate_web_server_config` doc
+/// comment relies on for `-e`), so a relative `error_log` directive either
+/// lands under `home` or this test sees that it did not.
+///
+/// VACUITY, confirmed by hand against the real installed nginx before writing
+/// this test: removing `-p` from the invocation does not merely leave the
+/// file somewhere else — it makes `nginx -t` FAIL outright, `[emerg] open()
+/// "<nginx's own Cellar prefix>/logs/relative.log" failed (2: No such file or
+/// directory)`, exit 1. So a regression here is not "the file moved", it is
+/// "the whole validation starts failing" — the loudest possible signal, and
+/// exactly the class of bug D4 exists to make impossible.
+#[tokio::test]
+async fn a_relative_path_in_the_config_resolves_under_home_not_under_the_prefix() {
+    let Some(brew) = find_brew_binaries() else {
+        eprintln!(
+            "SKIP a_relative_path_in_the_config_resolves_under_home_not_under_the_prefix: \
+             brew nginx not found"
+        );
+        return;
+    };
+    let home = tempfile::Builder::new()
+        .prefix("ovh conf p-flag ")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let conf = home.path().join("nginx.conf");
+    // A directive nginx accepts even with no `http{}`/`server{}` at all — the
+    // RELATIVE path is the entire point.
+    std::fs::write(&conf, "error_log logs/relative.log;\nevents {}\n").unwrap();
+    let err_log = home.path().join("logs/nginx.error.log"); // -e's target, always absolute
+    std::fs::create_dir_all(err_log.parent().unwrap()).unwrap();
+
+    let report = validate_live(&brew.nginx, &conf, &err_log, home.path())
+        .await
+        .unwrap();
+    assert!(
+        report.ok,
+        "nginx rejected a config it accepts unassisted at a shell:\n{}",
+        report.stderr
+    );
+
+    let resolved = home.path().join("logs/relative.log");
+    assert!(
+        resolved.is_file(),
+        "the config's relative `error_log logs/relative.log;` did not resolve under \
+         -p {} — either -p is not reaching nginx, or nginx is ignoring it",
+        home.path().display()
     );
 }
