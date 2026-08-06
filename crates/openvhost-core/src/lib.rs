@@ -69,11 +69,17 @@ pub use mysql::{
     mysql_package_for_host, mysql_package_for_target, mysql_paths, packaged_mysql_runtime,
     remove_staging_dir, staging_dir_path, sweep_stale_staging,
 };
-/// nginx's package surface. Nothing here is wired to a Tauri command, a CLI
-/// subcommand or a UI control, and the install path may not be until the
-/// owner publishes the release the catalogue pins — see
+/// nginx's package and discovery surface. Nothing here is wired to a Tauri
+/// command, a CLI subcommand or a UI control, and the install path may not be
+/// until the owner publishes the release the catalogue pins — see
 /// `nginx::Availability`. Exported so the pin is inspectable (and testable)
 /// without exposing an install a user could trigger into a 404.
+///
+/// `discover_nginx`/`packaged_nginx_runtime`/`NginxRuntime`/
+/// `NginxRuntimeSource` (off-Homebrew slice 4B) need no such gate: they only
+/// ever READ the package tree and a Homebrew prefix, so they are safe to call
+/// — and are called, by `apps/desktop/src-tauri/src/stack.rs`'s startup
+/// seam — whether or not a packaged nginx has ever been published.
 ///
 /// **`Availability` is deliberately absent from this list.** nginx's copy and
 /// [`mariadb::Availability`] above are two distinct types that happen to share
@@ -82,7 +88,9 @@ pub use mysql::{
 /// reachable at `nginx::Availability`, not `crate::Availability`.
 pub use nginx::{
     NGINX_PACKAGE_NAME, NGINX_PACKAGES, NGINX_SERIES, NGINX_WARMUP_BINARY, NginxPackage,
-    NginxPackageInstall, install_nginx_package, nginx_package_for_host, nginx_package_for_target,
+    NginxPackageInstall, NginxRuntime, NginxRuntimeSource, discover_nginx, install_nginx_package,
+    nginx_package_for_host, nginx_package_for_target, nginx_prefix_dir, nginx_spawn_argv,
+    packaged_nginx_runtime,
 };
 /// The package-pipeline types that appear in this crate's own public
 /// signatures, re-exported so the desktop app and the CLI need no direct

@@ -319,9 +319,16 @@ fn kill_process_group(pgid: Option<u32>) {
 /// `-e` — and openvhost-pkg ships its own nginx, so this only affects someone
 /// pointing OpenVHost at a system nginx older than 1.19.5, who sees the version as
 /// unknown rather than anything breaking.
-pub async fn probe_nginx_version(bin: &Path, err_log: &Path) -> Option<String> {
+///
+/// `-p <home>` (nginx discovery design D4) is passed for the identical reason:
+/// nginx resolves a RELATIVE path in its config against its compiled-in
+/// prefix, and `-p` is what fixes that prefix at our home instead. Nothing
+/// this probe passes is relative — it names no config at all — so this is
+/// belt-and-braces today, converting "nothing here happens to be relative"
+/// into a property nginx itself cannot violate.
+pub async fn probe_nginx_version(bin: &Path, err_log: &Path, home: &Path) -> Option<String> {
     let mut cmd = tokio::process::Command::new(bin);
-    cmd.arg("-e").arg(err_log).arg("-v");
+    cmd.arg("-e").arg(err_log).arg("-p").arg(home).arg("-v");
     let out = run_bounded(&mut cmd, None).await.ok()?;
     // nginx writes its banner to STDERR, not stdout.
     parse_version(&String::from_utf8_lossy(&out.stderr))
@@ -434,6 +441,14 @@ fn parse_mysqld_version_line(line: &str) -> Option<String> {
 /// `-e <err_log>` is MANDATORY: without it nginx writes into its compiled-in
 /// prefix (`/opt/homebrew/var`) rather than our home.
 ///
+/// `-p <home>` (nginx discovery design D4) is MANDATORY for the identical
+/// reason, one level up: nginx resolves any RELATIVE path in `conf` — not
+/// just the error log — against its compiled-in prefix unless `-p` overrides
+/// it. Nothing this app generates is relative today, so this is latent rather
+/// than live, and is passed so it stays that way rather than being
+/// discovered later. `home` MUST be the same home `conf` and `err_log` were
+/// derived from.
+///
 /// LIMITATION worth knowing before you call this: the bounded wait joins on EOF
 /// of the child's stdout/stderr pipes, not on the child's own exit. A validator
 /// that exits 0 promptly but leaves a grandchild holding the inherited stderr
@@ -445,9 +460,16 @@ pub async fn validate_live(
     bin: &Path,
     conf: &Path,
     err_log: &Path,
+    home: &Path,
 ) -> Result<ValidationReport, ConfError> {
     let mut cmd = tokio::process::Command::new(bin);
-    cmd.arg("-e").arg(err_log).arg("-t").arg("-c").arg(conf);
+    cmd.arg("-e")
+        .arg(err_log)
+        .arg("-p")
+        .arg(home)
+        .arg("-t")
+        .arg("-c")
+        .arg(conf);
     let out = run_bounded(&mut cmd, None).await?;
     Ok(ValidationReport {
         // Exit code ONLY — nginx writes to stderr even on success.
@@ -560,7 +582,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let bin = fake_bin(d.path(), "nginx", "echo 'nginx version: nginx/1.27.3' 1>&2");
         assert_eq!(
-            probe_nginx_version(&bin, Path::new("/tmp/e.log"))
+            probe_nginx_version(&bin, Path::new("/tmp/e.log"), Path::new("/tmp"))
                 .await
                 .as_deref(),
             Some("1.27.3")
@@ -576,7 +598,7 @@ mod tests {
             "echo 'nginx version: nginx/1.25.1 (Ubuntu)' 1>&2",
         );
         assert_eq!(
-            probe_nginx_version(&bin, Path::new("/tmp/e.log"))
+            probe_nginx_version(&bin, Path::new("/tmp/e.log"), Path::new("/tmp"))
                 .await
                 .as_deref(),
             Some("1.25.1")
@@ -588,7 +610,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let bin = fake_bin(d.path(), "nginx", "echo 'totally unrelated' 1>&2");
         assert_eq!(
-            probe_nginx_version(&bin, Path::new("/tmp/e.log")).await,
+            probe_nginx_version(&bin, Path::new("/tmp/e.log"), Path::new("/tmp")).await,
             None
         );
     }
@@ -597,7 +619,12 @@ mod tests {
     async fn version_is_none_when_the_binary_does_not_exist() {
         // A missing binary must not be an error that fails a whole page load.
         assert_eq!(
-            probe_nginx_version(Path::new("/nonexistent/nginx"), Path::new("/tmp/e.log")).await,
+            probe_nginx_version(
+                Path::new("/nonexistent/nginx"),
+                Path::new("/tmp/e.log"),
+                Path::new("/tmp"),
+            )
+            .await,
             None
         );
     }
@@ -619,11 +646,33 @@ mod tests {
                 argv.display()
             ),
         );
-        let v = probe_nginx_version(&bin, Path::new("/tmp/err.log")).await;
+        let v = probe_nginx_version(&bin, Path::new("/tmp/err.log"), Path::new("/tmp")).await;
         assert_eq!(v.as_deref(), Some("1.27.3"));
         let recorded = std::fs::read_to_string(&argv).unwrap();
         assert!(recorded.contains("-e /tmp/err.log"), "argv was: {recorded}");
         assert!(recorded.contains("-v"), "argv was: {recorded}");
+    }
+
+    /// New alongside the mandatory `-e` proof above (nginx discovery design
+    /// D4): `-p <home>` is passed on every nginx invocation, the version
+    /// probe included, for the identical reason `-e` is — so a relative path
+    /// in a future config cannot resolve against nginx's compiled-in prefix.
+    #[tokio::test]
+    async fn version_probe_passes_the_mandatory_prefix_flag() {
+        let d = tempfile::tempdir().unwrap();
+        let argv = d.path().join("argv.txt");
+        let bin = fake_bin(
+            d.path(),
+            "nginx",
+            &format!(
+                "echo \"$@\" > \"{}\"\necho 'nginx version: nginx/1.27.3' 1>&2",
+                argv.display()
+            ),
+        );
+        let v = probe_nginx_version(&bin, Path::new("/tmp/err.log"), Path::new("/tmp/home")).await;
+        assert_eq!(v.as_deref(), Some("1.27.3"));
+        let recorded = std::fs::read_to_string(&argv).unwrap();
+        assert!(recorded.contains("-p /tmp/home"), "argv was: {recorded}");
     }
 
     /// Condition (6) of the module doc's reading, half one: the allowlist is
@@ -704,9 +753,14 @@ mod tests {
         // failure.
         let d = tempfile::tempdir().unwrap();
         let bin = fake_bin(d.path(), "nginx", "echo 'syntax is ok' 1>&2; exit 0");
-        let r = validate_live(&bin, Path::new("/tmp/x.conf"), Path::new("/tmp/e.log"))
-            .await
-            .unwrap();
+        let r = validate_live(
+            &bin,
+            Path::new("/tmp/x.conf"),
+            Path::new("/tmp/e.log"),
+            Path::new("/tmp"),
+        )
+        .await
+        .unwrap();
         assert!(r.ok);
         assert!(r.stderr.contains("syntax is ok"));
     }
@@ -719,9 +773,14 @@ mod tests {
             "nginx",
             "echo 'unknown directive \"bogus\"' 1>&2; exit 1",
         );
-        let r = validate_live(&bin, Path::new("/tmp/x.conf"), Path::new("/tmp/e.log"))
-            .await
-            .unwrap();
+        let r = validate_live(
+            &bin,
+            Path::new("/tmp/x.conf"),
+            Path::new("/tmp/e.log"),
+            Path::new("/tmp"),
+        )
+        .await
+        .unwrap();
         assert!(!r.ok);
         assert!(r.stderr.contains("unknown directive"));
     }
@@ -733,9 +792,14 @@ mod tests {
         // of ours. The fake echoes its args so the test can read them back.
         let d = tempfile::tempdir().unwrap();
         let bin = fake_bin(d.path(), "nginx", r#"echo "$@" 1>&2"#);
-        let r = validate_live(&bin, Path::new("/tmp/live.conf"), Path::new("/tmp/err.log"))
-            .await
-            .unwrap();
+        let r = validate_live(
+            &bin,
+            Path::new("/tmp/live.conf"),
+            Path::new("/tmp/err.log"),
+            Path::new("/tmp"),
+        )
+        .await
+        .unwrap();
         assert!(
             r.stderr.contains("-e /tmp/err.log"),
             "argv was: {}",
@@ -749,12 +813,31 @@ mod tests {
         );
     }
 
+    /// New alongside the mandatory `-e`/`-c` proof above (nginx discovery
+    /// design D4): `-p <home>` is passed on every validation, for the
+    /// identical reason `-e` is.
+    #[tokio::test]
+    async fn validate_passes_the_mandatory_prefix_flag() {
+        let d = tempfile::tempdir().unwrap();
+        let bin = fake_bin(d.path(), "nginx", r#"echo "$@" 1>&2"#);
+        let r = validate_live(
+            &bin,
+            Path::new("/tmp/live.conf"),
+            Path::new("/tmp/err.log"),
+            Path::new("/tmp/home"),
+        )
+        .await
+        .unwrap();
+        assert!(r.stderr.contains("-p /tmp/home"), "argv was: {}", r.stderr);
+    }
+
     #[tokio::test]
     async fn validate_errors_when_the_binary_cannot_be_launched() {
         let e = validate_live(
             Path::new("/nonexistent/nginx"),
             Path::new("/tmp/x.conf"),
             Path::new("/tmp/e.log"),
+            Path::new("/tmp"),
         )
         .await
         .unwrap_err();
@@ -790,7 +873,13 @@ mod tests {
         // clock: the grandchild has to exist before the timeout fires, or there
         // is nothing to observe.
         let probe = tokio::spawn(async move {
-            validate_live(&bin, Path::new("/tmp/x.conf"), Path::new("/tmp/e.log")).await
+            validate_live(
+                &bin,
+                Path::new("/tmp/x.conf"),
+                Path::new("/tmp/e.log"),
+                Path::new("/tmp"),
+            )
+            .await
         });
         // One poll is enough to reach the probe's first await point: `spawn()`
         // is synchronous, so when this yield returns the child is running and

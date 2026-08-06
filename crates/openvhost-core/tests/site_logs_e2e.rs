@@ -89,7 +89,8 @@ use openvhost_core::platform::macos::demo_stack::{find_brew_binaries, provision_
 use openvhost_core::site::apply::LISTEN_PORT;
 use openvhost_core::{
     ApplyInput, Docroot, Domain, InstalledRuntimes, LogLimits, LogPaths, LogQuery, NginxValidator,
-    PhpRuntime, PhpVersion, Site, SiteId, SiteName, WebServer, apply, plan, read_window,
+    PhpRuntime, PhpVersion, Site, SiteId, SiteName, WebServer, apply, nginx_prefix_dir,
+    nginx_spawn_argv, plan, read_window,
 };
 
 // ---------------------------------------------------------------------------
@@ -284,7 +285,7 @@ async fn per_site_logs_capture_the_real_request_and_the_fatal() {
         home: home.path().to_path_buf(),
         sites: vec![site_a.clone(), site_b.clone()],
         runtimes: InstalledRuntimes {
-            nginx_bin: brew.nginx.clone(),
+            nginx_bin: Some(brew.nginx.clone()),
             php: vec![PhpRuntime {
                 major: major.clone(),
                 fpm_bin: brew.php_fpm.clone(),
@@ -303,6 +304,10 @@ async fn per_site_logs_capture_the_real_request_and_the_fatal() {
     let validator = NginxValidator {
         bin: brew.nginx.clone(),
         err_log: err_log.clone(),
+        // `-p`'s target — see `NginxValidator::home`'s own doc comment (4B
+        // fix-wave, item 1). Never `home.path()` itself, so this validator
+        // proves the SAME invocation shape production uses.
+        home: nginx_prefix_dir(home.path()),
     };
     let outcome = apply(&site_plan, &validator).await;
     assert!(outcome.is_ok(), "apply() was rejected: {:?}", outcome.err());
@@ -351,7 +356,11 @@ async fn per_site_logs_capture_the_real_request_and_the_fatal() {
     }
 
     let mut nginx_cmd = Command::new(&brew.nginx);
-    nginx_cmd.arg("-e").arg(&err_log).arg("-c").arg(&main_conf);
+    // THE production argv (4B fix-wave, item 3) — see `site_apply_e2e.rs`'s
+    // identical comment: this used to be a hand-written copy that had
+    // silently dropped `-p`, with nothing in the regression net able to
+    // notice.
+    nginx_cmd.args(nginx_spawn_argv(home.path(), &main_conf));
     let nginx_child = spawn_in_new_group(&mut nginx_cmd)
         .unwrap_or_else(|e| panic!("failed to spawn nginx ({}): {e}", brew.nginx.display()));
     let nginx_pid = nginx_child.id();

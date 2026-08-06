@@ -21,11 +21,23 @@ pub trait ConfigValidator: Send + Sync {
     ) -> Result<openvhost_conf::ValidationReport, ApplyError>;
 }
 
-/// The real validator. `-e <err_log>` is mandatory on every nginx invocation,
-/// which `validate_live` handles.
+/// The real validator. `-e <err_log>` and `-p <home>` are mandatory on every
+/// nginx invocation (nginx discovery design D4), which `validate_live`
+/// handles.
 pub struct NginxValidator {
     pub bin: PathBuf,
     pub err_log: PathBuf,
+    /// `-p`'s target. MUST be [`crate::nginx::nginx_prefix_dir`] of the SAME
+    /// home `err_log` and `main_conf` were derived from — NEVER that home
+    /// directly (4B fix-wave, item 1). Passing the home itself let a relative
+    /// path in a user-authored custom nginx file resolve under it and serve
+    /// `state.db` (MySQL/MariaDB root credentials at rest) verbatim; the
+    /// dedicated prefix directory holds nothing a relative path could ever
+    /// expose. A field NAMED `home` still holding the PREFIX, not home
+    /// itself, is deliberate — every other caller of `validate_live` in this
+    /// codebase follows the identical convention (see that function's own
+    /// doc comment).
+    pub home: PathBuf,
 }
 
 #[async_trait::async_trait]
@@ -34,7 +46,7 @@ impl ConfigValidator for NginxValidator {
         &self,
         main_conf: &Path,
     ) -> Result<openvhost_conf::ValidationReport, ApplyError> {
-        Ok(openvhost_conf::validate_live(&self.bin, main_conf, &self.err_log).await?)
+        Ok(openvhost_conf::validate_live(&self.bin, main_conf, &self.err_log, &self.home).await?)
     }
 }
 

@@ -47,9 +47,16 @@ pub struct PhpRuntime {
 /// here, so every test constructs it by hand and no test depends on what the
 /// machine running it happens to have. `php` is ordered: the first entry is
 /// the catch-all's runtime.
+///
+/// `nginx_bin` is `None` when discovery finds neither a packaged nor a
+/// Homebrew nginx (nginx discovery design D3) — an honest absence rather than
+/// a path to a binary that does not exist. Nothing in this module currently
+/// reads it (`render_set` only ever consults `php`); it is carried here so
+/// the desktop app's seam has one shape to fill in for both `InstalledRuntimes`
+/// and `crate::platform` callers, mirroring `StackPaths.nginx_bin`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledRuntimes {
-    pub nginx_bin: PathBuf,
+    pub nginx_bin: Option<PathBuf>,
     pub php: Vec<PhpRuntime>,
 }
 

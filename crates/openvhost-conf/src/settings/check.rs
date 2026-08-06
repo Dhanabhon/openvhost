@@ -188,9 +188,12 @@ async fn check_in(
     // `dir` is a fresh scratch directory (see `scratch_dir`'s doc comment),
     // removed right after this check returns — scratch plumbing for
     // `nginx -t`, not the live log path `openvhost_core::logs::LogPaths`
-    // owns, so it is not routed through it.
+    // owns, so it is not routed through it. It also doubles as `-p`'s target
+    // (nginx discovery design D4): the candidate render lives entirely under
+    // `dir`, so `dir` is the correct prefix for anything relative in it to
+    // resolve against.
     let err_log = dir.join("logs/nginx.error.log");
-    let report = crate::inspect::validate_live(bin, &main.path, &err_log).await?;
+    let report = crate::inspect::validate_live(bin, &main.path, &err_log, dir).await?;
     Ok(if report.ok {
         SettingsCheck::Accepted {
             stderr: report.stderr,
@@ -413,7 +416,7 @@ mod tests {
                 std::fs::create_dir_all(dir.join(d)).unwrap();
             }
             let err_log = dir.join("logs/nginx.error.log");
-            let report = crate::inspect::validate_live(&brew.nginx, &main.path, &err_log)
+            let report = crate::inspect::validate_live(&brew.nginx, &main.path, &err_log, dir)
                 .await
                 .unwrap();
             assert!(
