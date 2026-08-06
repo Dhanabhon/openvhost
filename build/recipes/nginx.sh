@@ -512,9 +512,13 @@ _nginx_pid_gone() {
 }
 
 # A free TCP port on 127.0.0.1, PROVEN free by a real connection attempt —
-# never assumed, and never 80 or 8080. RANDOM only picks where to start
-# looking, so two audits running at once do not race for the same
-# candidate; the proof is `nc -z` failing to connect, not the arithmetic.
+# never assumed, and never 80 or 8080. This is still check-then-bind, a
+# textbook TOCTOU: RANDOM only lowers the odds that two audits running at
+# once start looking at the same candidate, it does not remove the race
+# between the `nc -z` check here and nginx's own bind a few lines later.
+# Low impact when it does happen — the loser fails loudly as a probe
+# failure (nginx cannot bind the port), never a false pass — but that is a
+# mitigation, not a proof, and is not claimed as one.
 _nginx_free_port() {
 	local base candidate tries=0
 	base=$((20000 + (RANDOM % 20000)))
@@ -579,7 +583,7 @@ http {
 
         location ~ \.php\$ {
             try_files \$uri =404;
-            fastcgi_pass unix:$scratch/run/no-such-php.sock;
+            fastcgi_pass "unix:$scratch/run/no-such-php.sock";
             fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
             fastcgi_param QUERY_STRING \$query_string;
         }
@@ -658,7 +662,7 @@ _nginx_get_and_compare() {
 }
 
 recipe_serve_probe() {
-	local tree="$1" scratch="$2" port conf docfile
+	local tree="$1" scratch="$2" port conf docfile stop_note
 
 	port="$(_nginx_free_port)" || {
 		printf 'could not find a free TCP port on 127.0.0.1\n'
@@ -694,8 +698,19 @@ recipe_serve_probe() {
 		return 1
 	fi
 
-	_nginx_probe_stop >/dev/null 2>&1 || true
-	printf 'served on 127.0.0.1:%s, GET matched byte-for-byte (cmp), restarted, GET matched again\n' "$port"
+	# Status captured, not discarded: nothing is orphaned either way (SIGKILL +
+	# wait below), so this is reporting only — but a server that needed
+	# SIGKILL to stop is exactly what this check exists to notice, and a
+	# summary that stays silent about it would hide the one thing check 6
+	# cares about most.
+	stop_note=""
+	_nginx_probe_stop >/dev/null 2>&1 || stop_note=" (note: SIGTERM alone did not stop it within 30s; needed SIGKILL)"
+	# PROBE-SUMMARY: marks the line audit.sh's check 6 takes as its PASS note
+	# (build/recipes/README.md) — the first line carrying this prefix, so
+	# nothing printed afterward (including the stop note above, on the
+	# happy path there is none) can displace it.
+	printf 'PROBE-SUMMARY: served on 127.0.0.1:%s, GET matched byte-for-byte (cmp), restarted, GET matched again%s\n' \
+		"$port" "$stop_note"
 	return 0
 }
 
@@ -704,8 +719,8 @@ recipe_serve_probe() {
 recipe_manifest_extra() {
 	local pcre2_actual
 	pcre2_actual="$(shasum -a 256 -- "$(_nginx_pcre2_archive)" 2>/dev/null | cut -d' ' -f1)"
-	printf '{"openssl": {"version": "%s", "linkage": "static"}, "pcre2": {"version": "%s", "sha256": "%s", "sha256_on_disk": "%s", "release_date": "%s", "verified": "gpg+sha256", "signing_key_fingerprint": "%s", "usage": "header only (src/pcre2.h.generic); linked against the system /usr/lib/libpcre2-8.dylib, never compiled or shipped"}, "zlib": {"source": "system (/usr/lib/libz.dylib via the Xcode/CLT SDK)", "note": "no fetch: nginx'"'"'s own default probe already succeeds against the SDK"}}' \
+	printf '{"openssl": {"version": "%s", "linkage": "static"}, "pcre2": {"version": "%s", "sha256": "%s", "sha256_on_disk": "%s", "release_date": "%s", "last_checked": "%s", "verified": "gpg+sha256", "signing_key_fingerprint": "%s", "usage": "header only (src/pcre2.h.generic); linked against the system /usr/lib/libpcre2-8.dylib, never compiled or shipped"}, "zlib": {"source": "system (/usr/lib/libz.dylib via the Xcode/CLT SDK)", "note": "no fetch: nginx'"'"'s own default probe already succeeds against the SDK"}}' \
 		"$RECIPE_OPENSSL_VERSION" \
 		"$RECIPE_PCRE2_VERSION" "$RECIPE_PCRE2_SHA256" "${pcre2_actual:-unknown}" \
-		"$RECIPE_PCRE2_UPSTREAM_RELEASE_DATE" "$RECIPE_PCRE2_SIGNING_KEY_FPR"
+		"$RECIPE_PCRE2_UPSTREAM_RELEASE_DATE" "$RECIPE_PCRE2_LAST_CHECKED" "$RECIPE_PCRE2_SIGNING_KEY_FPR"
 }

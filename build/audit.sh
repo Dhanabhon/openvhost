@@ -343,6 +343,14 @@ if [ "$SERVER_BIN_SET" -eq 1 ]; then
 	RECIPE_SERVER_BIN="$SERVER_BIN_ARG"
 fi
 
+# No package can legitimately require zero directories under its root; an
+# empty RECIPE_REQUIRED_LAYOUT is a mistake in the recipe, not a declaration.
+# Refused here, before any check runs, for the same reason a floor is refused
+# where check 7's allowances are read below: a malformed declaration is a
+# question about the recipe, not a verdict on the artifact.
+[ "${#RECIPE_REQUIRED_LAYOUT[@]}" -gt 0 ] ||
+	die "RECIPE_REQUIRED_LAYOUT is empty; no package can legitimately require zero directories under its root. Name at least one, or leave the variable unset to keep the default (bin share)."
+
 say "auditing $TARGET"
 say ""
 
@@ -367,17 +375,24 @@ if [ -n "$TARBALL" ]; then
 	fi
 fi
 
+layout_required_note=""
 for want in ${RECIPE_REQUIRED_LAYOUT[@]+"${RECIPE_REQUIRED_LAYOUT[@]}"}; do
 	if [ ! -d "$TREE/$want" ]; then
 		printf 'missing directory: %s/\n' "$want" >>"$layout_problems"
 	fi
+	# Printed whether or not the check passes, same rule check 7's allowances
+	# already follow: an allowance (or here, a requirement) nobody can see is
+	# how a later reader cannot tell the check ran for real.
+	layout_required_note="$layout_required_note${layout_required_note:+, }$want"
 done
 
 if [ -s "$layout_problems" ]; then
 	check_fail "the tree is not a valid package root"
 	report_lines "$layout_problems"
 else
-	check_pass "$SINGLE_ROOT_NOTE"
+	layout_pass_note="required: $layout_required_note"
+	if [ -n "$SINGLE_ROOT_NOTE" ]; then layout_pass_note="$SINGLE_ROOT_NOTE; $layout_pass_note"; fi
+	check_pass "$layout_pass_note"
 fi
 
 # ------------------------------------------------------------ Mach-O inventory --
@@ -717,10 +732,22 @@ elif [ -n "$RECIPE_SERVER_BIN" ]; then
 			# restarted, read back" is a database's probe, and printing it for
 			# every package would be a lie about whatever check 6 actually did
 			# for a package that is not one (D4,
-			# docs/superpowers/specs/2026-08-06-p2-nginx-recipe-design.md). The
-			# probe already prints its own one-line summary as the last thing
-			# it does before returning success; that line IS the note.
-			service_note="$(tail -n 1 "$probe_log")"
+			# docs/superpowers/specs/2026-08-06-p2-nginx-recipe-design.md).
+			#
+			# The FIRST line beginning with "PROBE-SUMMARY: " is the note, with
+			# the prefix stripped — not simply the log's last line. A probe that
+			# is careful to send everything after its summary to /dev/null (as
+			# recipes/nginx.sh's is) makes "last line" safe today, but a less
+			# careful probe would publish a stray warning as the note instead of
+			# what the recipe actually proved; a marker line cannot be displaced
+			# by output that comes after it. A probe with no marked line falls
+			# back to the log's own last line — today's behaviour, unchanged —
+			# which is what recipes/mariadb.sh's probe still gets, since it
+			# predates the marker and is not touched here.
+			service_note="$(LC_ALL=C awk -v p='PROBE-SUMMARY: ' \
+				'index($0, p) == 1 { print substr($0, length(p) + 1); found = 1; exit 0 }
+				 END { if (!found) exit 1 }' "$probe_log")" ||
+				service_note="$(tail -n 1 "$probe_log")"
 			[ -n "$service_note" ] || service_note="the probe passed but printed nothing"
 		else
 			service_state="fail"

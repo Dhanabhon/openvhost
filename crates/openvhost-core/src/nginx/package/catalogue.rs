@@ -448,12 +448,19 @@ mod tests {
     }
 
     /// Spec §14's tripwire lives in two files — this catalogue and the recipe
-    /// that produced the bytes — and two records of one fact drift. Reading the
-    /// recipe makes that drift a test failure instead of a discrepancy nobody
-    /// notices during a CVE response.
+    /// that produced the bytes — and records of the same facts can drift
+    /// silently. Reading the recipe makes that drift a test failure instead
+    /// of a discrepancy nobody notices during a CVE response. Covers both
+    /// tripwire dates and the signing key fingerprint (see this module's
+    /// PROVENANCE note) — the fingerprint matters more than either date, and
+    /// until now nothing checked it against the recipe that actually
+    /// verified a signature by it.
     #[test]
     fn the_tripwire_dates_agree_with_the_recipe_that_built_the_bytes() {
         let e = &NGINX_PACKAGES[0];
+        // nginx's release-signing key primary fingerprint, restated here so it
+        // can be checked rather than merely stated in the PROVENANCE prose above.
+        const SIGNING_KEY_FPR: &str = "43387825DDB1BB97EC36BA5D007C8D7C15D87369";
         for (field, want) in [
             (
                 "RECIPE_UPSTREAM_RELEASE_DATE",
@@ -465,6 +472,10 @@ mod tests {
             (
                 "RECIPE_LAST_CHECKED",
                 format!("RECIPE_LAST_CHECKED=\"{}\"", e.last_checked_on),
+            ),
+            (
+                "RECIPE_SIGNING_KEY_FPR",
+                format!("RECIPE_SIGNING_KEY_FPR=\"{SIGNING_KEY_FPR}\""),
             ),
         ] {
             assert!(
