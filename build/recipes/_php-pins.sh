@@ -166,7 +166,6 @@ PHP_PINS_LIBS=(
 	"bzip2 1.0.8 ab5a03176ee106d3f0fa90e381da478ddae405918153cca248e682cd0c4a2269 bzip2-1.0.8.tar.gz https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz"
 	"curl 8.21.0 aa1b66a70eace83dc624508745646c08ae561de512ab403adffb93ac87fc72e6 curl-8.21.0.tar.xz https://github.com/curl/curl/releases/download/curl-8_21_0/curl-8.21.0.tar.xz"
 	"ext-zip 1.22.8 9fab1f8653d40249bd433ad2c3ca02431f9a5ab06d50f988c8ec53fc6a846eef ext-zip.tgz https://pecl.php.net/get/zip-1.22.8.tgz"
-	"frankenphp 1.12.6 832b4ab4fff0c53d18d18c4a190ee6afb8cb6f35988d56adb70746ffaebdf3d0 php-frankenphp-caddy-v1.12.6-0-g4397463.tar.gz https://api.github.com/repos/php/frankenphp/tarball/v1.12.6"
 	"freetype 2.14.3 1cc149d9dce64e02f92713a777588d0551a8334d63c3d3e73e955269dc57a89a freetype-freetype-VER-2-14-3-0-g0a0221a.tar.gz https://api.github.com/repos/freetype/freetype/tarball/refs/tags/VER-2-14-3"
 	"gettext 1.0 71132a3fb71e68245b8f2ac4e9e97137d3e5c02f415636eb508ae607bc01add7 gettext-1.0.tar.xz https://ftp.gnu.org/pub/gnu/gettext/gettext-1.0.tar.xz"
 	"gmp 6.3.0 a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898 gmp-6.3.0.tar.xz https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz"
@@ -188,13 +187,10 @@ PHP_PINS_LIBS=(
 	"libzip 1.11.4 8a247f57d1e3e6f6d11413b12a6f28a9d388de110adc0ec608d893180ed7097b libzip-1.11.4.tar.xz https://github.com/nih-at/libzip/releases/download/v1.11.4/libzip-1.11.4.tar.xz"
 	"ncurses 6.6 355b4cbbed880b0381a04c46617b7656e362585d52e9cf84a67e2009b749ff11 ncurses-6.6.tar.gz https://ftp.gnu.org/pub/gnu/ncurses/ncurses-6.6.tar.gz"
 	"nghttp2 1.70.0 e05cb1388eaca3830aded4ccf20044b6e1ac1a61411dcca11b0437c4285c8bc2 nghttp2-1.70.0.tar.xz https://github.com/nghttp2/nghttp2/releases/download/v1.70.0/nghttp2-1.70.0.tar.xz"
-	"nghttp3 1.18.0 aad782c23d3f01bd4bb52c8bac7a553b631ef8115fd1612703df6183449fef19 nghttp3-1.18.0.tar.xz https://github.com/ngtcp2/nghttp3/releases/download/v1.18.0/nghttp3-1.18.0.tar.xz"
-	"ngtcp2 1.25.0 2a34d2484ba17847a5d11965704e9dd0fac4c6d8efc75ffe1ec7de66d8c6b6fb ngtcp2-1.25.0.tar.xz https://github.com/ngtcp2/ngtcp2/releases/download/v1.25.0/ngtcp2-1.25.0.tar.xz"
 	"openssl 3.6.3 243a86649cf6f23eeb6a2ff2456e09e5d77dd9018a54d3d96b0c6bdd6ba6c7f1 openssl-3.6.3.tar.gz https://github.com/openssl/openssl/releases/download/openssl-3.6.3/openssl-3.6.3.tar.gz"
 	"postgresql 18.4 f519178b848b54df90f38bafcf4d13b3547e0e896e4851a7f7acc104f52105d1 postgres-postgres-REL_18_4-0-gf5cc817.tar.gz https://api.github.com/repos/postgres/postgres/tarball/refs/tags/REL_18_4"
 	"sqlite 3.45.2 bc9067442eedf3dd39989b5c5cfbfff37ae66cc9c99274e0c3052dc4d4a8f6ae sqlite-autoconf-3450200.tar.gz https://www.sqlite.org/2024/sqlite-autoconf-3450200.tar.gz"
 	"tidy 5.8.0 85fe03682c870b1c83d4b22e9165333fd8adb5474ac469fba8da13e77a4caa33 htacg-tidy-html5-5.8.0-0-g1ca3747.tar.gz https://api.github.com/repos/htacg/tidy-html5/tarball/5.8.0"
-	"watcher 0.14.5 7098217c78e6deb6ab92bc7b469e3d016ae82185bb2ff6cb2b7531ae4ef34e43 e-dant-watcher-release-0.14.5-0-g06f84a1.tar.gz https://api.github.com/repos/e-dant/watcher/tarball/0.14.5"
 	"xdebug 3.5.3 781cf03aee443c317c20d0299fd298d2d8ac9394cfa22b912a61d02464941a55 xdebug_xdebug-3.5.3.zip https://api.github.com/repos/xdebug/xdebug/zipball/127bbcb980400752221cfaa54bdc1420e6ef3c12"
 	"xz 5.8.3 fff1ffcf2b0da84d308a14de513a1aa23d4e9aa3464d17e64b9714bfdd0bbfb6 xz-5.8.3.tar.xz https://github.com/tukaani-project/xz/releases/download/v5.8.3/xz-5.8.3.tar.xz"
 	"zlib 1.3.2 bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16 zlib-1.3.2.tar.gz https://github.com/madler/zlib/releases/download/v1.3.2/zlib-1.3.2.tar.gz"
@@ -208,10 +204,37 @@ PHP_PINS_LIBS=(
 # because it also fixes every submodule.
 #
 # `micro` is the phpmicro SAPI. Nothing in this app wants it: we build
-# php-fpm. It is here only because spc's own graph makes the `php` pseudo-lib
+# php-fpm. It is here because spc's own graph makes the `php` pseudo-lib
 # hard-depend on `micro` and `frankenphp` (config/lib.json), so the closure
 # drags them in regardless of target. Upstream tracks `master` — an unpinned
-# branch of a third party's fork of a PHP SAPI, cloned --recursive.
+# branch of a third party's fork of a PHP SAPI.
+#
+# MEASURED, because "in the closure" and "actually needed" are not the same
+# question and task 2a could not separate them:
+#
+#   micro       REQUIRED. spc extracts it unconditionally for any PHP >= 8.0,
+#               whatever the SAPI target — BuilderBase::proveExts() calls
+#               SourceManager::initSource(sources: ['micro']) with no target
+#               test at all, and BuildPHPCommand always calls proveExts. A
+#               --build-fpm build that lacks it dies before it compiles
+#               anything. Kept, and it stays a git pin: a commit fixes the
+#               tree more tightly than a tarball digest and phpmicro has no
+#               submodules to complicate that (checked).
+#   frankenphp  DEAD, deleted from PHP_PINS_LIBS. Its source is only ever
+#               extracted inside the FrankenPHP SAPI build
+#               (UnixBuilderBase::processFrankenphpApp), which needs
+#               --build-frankenphp, ZTS and a Go toolchain and which this
+#               recipe never asks for. The LIBRARY stays in spc's resolved
+#               closure — nothing can remove a hard lib-depend — but its
+#               `type: target` makes proveLibs() skip instantiating it and
+#               LicenseDumper skip reading it, so no code path ever asks
+#               where its bytes are. Proven by building without the pin.
+#   watcher     DEAD, deleted from PHP_PINS_LIBS. It only entered the closure
+#               through spc's `--with-suggested-libs`, which recipes/php.sh
+#               does not use (it passes an explicit --with-libs so that
+#               libaom/libavif stay excluded), and the only thing that
+#               consumes it is the FrankenPHP Go build's `-tags=...nowatcher`
+#               switch. Proven by building without the pin.
 #
 # Fields: <spc-source-name> <commit> <url>
 PHP_PINS_GIT=(
@@ -231,10 +254,20 @@ PHP_PINS_EXCLUDED=(
 	"unixodbc - ext/odbc + ext/pdo_odbc are a generic DB bridge. The app ships MySQL and MariaDB, and pdo_pgsql/pdo_sqlite cover the rest. ServBay omits both."
 	"qdbm - ext/dba is Berkeley-DB-style key/value storage, effectively unused in modern PHP. ServBay omits it."
 	"libffi - ext/FFI loads arbitrary dylibs by path at runtime. In a STATIC php-fpm launched with -n it is the sharpest foot-gun in the catalogue, and it buys a local dev environment nothing. ServBay omits it. This exclusion is a security call, not a cost call."
+	"ngtcp2 1.25.0 curl's HTTP/3. Removed 2026-08-07 because it does not BUILD on macOS under spc 2.8.5, not because it was unwanted — recipes/php.sh's _PHP_SPC_LIBS carries the full reproduction. In one line: spc hands ngtcp2's configure OPENSSL_LIBS as absolute .a paths, libtool on macOS then treats each as a convenience archive and emits a 96-byte (empty) libngtcp2_crypto_ossl.a, and php fails to link with 15 undefined _ngtcp2_crypto_ossl_* symbols. Re-running the same make with libngtcp2_crypto_ossl_la_LIBADD= produces a correct 49 KB archive, which isolates the cause. Restoring HTTP/3 means carrying a patch against ngtcp2's Makefile.in."
+	"nghttp3 1.18.0 the HTTP/3 framing layer; useful only alongside ngtcp2, so it leaves with it."
 )
 
-# The one genuine capability gap against the Homebrew baseline, with no spc
-# source to pin even if we wanted it: ext/pdo_dblib (Microsoft SQL Server via
-# FreeTDS) is absent from spc's catalogue entirely. Homebrew's php formula has
-# it. Nothing in OpenVHost uses it.
-PHP_PINS_KNOWN_GAPS="pdo_dblib"
+# Capability gaps against the Homebrew-php baseline. Recorded here because
+# `brew install php@X.Y` is what this package replaces, so a gap is something a
+# user loses by switching, not merely something we did not build.
+#
+#   pdo_dblib  Microsoft SQL Server via FreeTDS. Absent from spc's catalogue
+#              entirely, so there is no source to pin even if we wanted one.
+#              Homebrew's php formula has it. Nothing in OpenVHost uses it.
+#   http3      curl's HTTP/3, via ngtcp2 + nghttp3. Homebrew's php DOES have
+#              it (curl_version()'s feature_list carries HTTP3, checked
+#              2026-08-07). Ours does not, for the upstream build reason in
+#              PHP_PINS_EXCLUDED above. curl negotiates down to HTTP/2 on its
+#              own, so the failure mode is slower, not broken.
+PHP_PINS_KNOWN_GAPS="pdo_dblib,http3"
