@@ -470,11 +470,12 @@ bp_gpg() {
 	"$(bp_tool gpg)" --batch --no-tty --quiet --homedir "$(bp_gnupg_home)" "$@"
 }
 
-# Import every candidate key whose PRIMARY fingerprint is <fpr>, from the
-# URL(s) given after <label>. Only a PRIMARY key in the fetched file carrying
-# that fingerprint is imported — verification insists on the same
+# Import the fetched file once it is confirmed to contain a PRIMARY key with
+# fingerprint <fpr>, from the URL(s) given after <label>. `gpg --import` does
+# not filter — every key in the file lands in the keyring, not just the one
+# matching <fpr> — but that is harmless: verification insists on the same
 # fingerprint, so an extra key riding along in the file could not vouch for
-# anything, but there is no reason to let one into the keyring either.
+# anything, and there is no reason to keep one out of the keyring either.
 #
 # <label> distinguishes concurrent imports into the same keyring (a recipe
 # verifying its own release plus a dependency's, say PCRE2's) in the

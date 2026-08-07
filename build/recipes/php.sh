@@ -196,10 +196,15 @@ RECIPE_REQUIRED_LAYOUT=(bin modules)
 # the socket it was handed is NULL. No configure flag reaches it. So the
 # allowance below is deliberately NOT the promise "nothing resolves this" —
 # it is the narrower, true statement that after this build both ini defaults
-# are non-empty, so the only route left is a script that first blanks
-# mysqli.default_socket or pdo_mysql.default_socket (both PHP_INI_ALL) and
-# then connects to 'localhost'. Before the flag, every such connection used
-# it; after it, none do by default.
+# are non-empty AND neither is reachable from a script. MEASURED on the built
+# binary: `mysqli.default_socket` is PHP_INI_ALL, but its updater
+# (OnUpdateStringUnempty, Zend/zend_ini.c) refuses an empty value —
+# `ini_set('mysqli.default_socket', '')` returns false and the path is left
+# unchanged. `pdo_mysql.default_socket` is PHP_INI_SYSTEM, not PHP_INI_ALL as
+# this comment once said, so a script cannot ini_set() it at all — the same
+# call on it returns false before ever reaching a value check. So after
+# --with-mysql-sock there is no in-process route to the /tmp fallback,
+# period, not merely a narrowed one.
 #
 # The rest split into three kinds, none of which php-fpm can reach on the
 # app's own path:
@@ -208,25 +213,40 @@ RECIPE_REQUIRED_LAYOUT=(bin modules)
 #     ext/fileinfo's compiled-in libmagic database (php-src/ext/fileinfo/
 #     data_file.c) as part of a magic RULE describing what a Wireshark trace
 #     file looks like. Nothing ever opens it.
-#   * mkstemp(3) templates reached only by `php -a`. libedit writes the
-#     interactive shell's history through /tmp/.historyXXXXXX and
-#     /tmp/histedit.XXXXXXXXXX (libedit/src/vi.c). O_EXCL on a random name is
-#     the safe pattern for a 1777 directory, and php-fpm has no interactive
-#     shell.
-#   * Write targets behind an ini directive this app never sets, and cannot
-#     set: /tmp/mysqlnd.trace needs mysqlnd.debug, and /tmp/jit- and /tmp/perf-
-#     (opcache's perf/JIT dump prefixes) need opcache.jit_debug's perf bits.
-#     All three are PHP_INI_SYSTEM, php-fpm runs with -n and no php.ini (D6),
-#     and a script cannot ini_set() its way to them.
-#
-# /tmp/tkt is the odd one out and is called out rather than lumped in: it is
-# krb5's FILE credential-cache root (krb5/src/lib/krb5/ccache/cc_file.c),
-# which krb5 READS, and a planted ticket cache is a real if narrow concern.
-# It is allowed because it is the system-wide Kerberos convention that macOS's
-# own Kerberos.framework already follows on the same machine — changing it
-# here would make our krb5 disagree with every other one on the box without
-# closing anything — and because the only route to it from this artifact is
-# curl's SPNEGO/GSSAPI, which nothing in OpenVHost uses.
+#   * mkstemp(3) templates, reached only outside php-fpm's own request path.
+#     libedit writes the interactive shell's history through
+#     /tmp/.historyXXXXXX and /tmp/histedit.XXXXXXXXXX (libedit/src/vi.c),
+#     reached only by `php -a`. /tmp/tkt is the same shape, reached only by
+#     curl's SPNEGO/GSSAPI (which nothing in OpenVHost uses): MEASURED on the
+#     built binary, the string sits immediately after the format "%sXXXXXX"
+#     in strings(1) output, and krb5's source confirms why — it is TKT_ROOT
+#     (krb5/src/lib/krb5/ccache/cc_file.c), used only by fcc_generate_new()
+#     to build a fresh, uniquely-named ticket-cache filename via
+#     snprintf(scratch, sizeof(scratch), "%sXXXXXX", TKT_ROOT) immediately
+#     followed by mkstemp(scratch) — not a path krb5 reads. It is not even
+#     krb5's default cache on this platform: MEASURED (strings(1) plus
+#     krb5's own configure.ac), this build's compiled-in DEFCCNAME is "API:"
+#     — macOS's Kerberos.framework GSSCred collection (`com.apple.GSSCred`
+#     appears alongside it), not a FILE: path at all — so /tmp/tkt has no
+#     role in the default-cache lookup either. O_EXCL on a random name is the
+#     safe pattern for a 1777 directory in all three cases, and php-fpm has
+#     no interactive shell.
+#   * Write targets behind an ini directive this app never sets — and two
+#     different guards keep a script from setting one at runtime either.
+#     /tmp/mysqlnd.trace needs mysqlnd.debug, which MEASURED on the built
+#     binary is PHP_INI_SYSTEM (access level 4): a script cannot ini_set() it
+#     at all. /tmp/jit- and /tmp/perf- (opcache's JIT disassembly/perf-map
+#     dump prefixes) need opcache.jit_debug's perf bits, and MEASURED
+#     opcache.jit_debug and opcache.jit are actually PHP_INI_ALL (access
+#     level 7), not PHP_INI_SYSTEM as this comment once said — a script CAN
+#     call ini_set() on them. What closes the route is opcache's own updater:
+#     zend_jit_debug_config() (ext/opcache/jit/zend_jit.c) refuses to touch a
+#     ZEND_JIT_DEBUG_PERSISTENT bit outside ZEND_INI_STAGE_STARTUP, so
+#     `ini_set('opcache.jit_debug', …)` returns false with "Some
+#     opcache.jit_debug bits cannot be changed after startup" (MEASURED), and
+#     no /tmp/perf-*.map appears. php-fpm still runs with -n and no php.ini
+#     (D6), but for jit_debug/jit the ini access level was never what stood
+#     between a script and these paths — the stage guard is.
 RECIPE_ALLOWED_WRITABLE_PATHS=(
 	/tmp/mysql.sock
 	/tmp/wireshark.TRC000
@@ -829,12 +849,30 @@ recipe_fetch() {
 	# that moved out from under the pins is exactly the failure D4 names —
 	# catching it here means it fails loudly before any network use, not as
 	# a confusing `spc build` error partway through task 2c.
-	local spc_dir spc_head
+	local spc_dir spc_head spc_dirty
 	spc_dir="$(_php_spc_dir)"
 	spc_head="$(git -C "$spc_dir" rev-parse HEAD 2>/dev/null)" ||
 		bp_die "could not read the HEAD commit of the spc checkout at $spc_dir"
 	[ "$spc_head" = "$PHP_PINS_SPC_COMMIT" ] ||
 		bp_die "_php-pins.sh was derived from spc $PHP_PINS_SPC_TAG ($PHP_PINS_SPC_COMMIT); the checkout at $spc_dir is $spc_head. Regenerate the pins with _php-pins-refresh.sh or check out the pinned tag."
+	# A commit pin says nothing about a file edited after checkout, and
+	# _php_prepare_spc_copy copies the spc checkout's WORKTREE, not its
+	# objects — the exact gap recipe_verify_source's pinned-git-source check
+	# closes below (~L911) for phpmicro, for the exact same reason. Reused
+	# here for the anchor itself, which that check does not reach.
+	#
+	# vendor/ is NOT covered by this: spc gitignores its own composer-managed
+	# tooling directory (`/vendor/**`), so `git status --porcelain` cannot see
+	# an edit inside it, and _php_prepare_spc_copy's exclude list does not
+	# drop vendor/ from the copy either — it is carried into the private spc
+	# working copy as-is. That tree is trusted-by-operator, the same way
+	# OPENVHOST_SPC_DIR's own provenance is: nothing here pins or re-verifies
+	# its bytes, and D1's guarantee is scoped to the ~40 sources spc compiles
+	# INTO the artifact, not to the Composer-managed PHP tooling that runs
+	# `bin/spc` itself.
+	spc_dirty="$(git -C "$spc_dir" status --porcelain 2>/dev/null)"
+	[ -z "$spc_dirty" ] ||
+		bp_die "the spc checkout at $spc_dir has local modifications; refusing to build from it"
 
 	bp_download "$RECIPE_SOURCE_URL" "$(_php_src_tarball)"
 	bp_download "$RECIPE_SIGNATURE_URL" "$(_php_src_signature)"
