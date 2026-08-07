@@ -57,10 +57,10 @@ source — rather than by a late `match`. That is the better shape (the value is
 re-decided at every use), so the count is accepted as-is and **no `match` is manufactured to
 raise it**.
 
-What that shape leaves unguarded is ordering, which §7 calls load-bearing: it lives in statement
-order inside the merge, and nothing forces a future third source to declare where it ranks. A
-rank function would encode it, but at two variants that is an abstraction ahead of its need. The
-guard is a **test that pins the contract by name** (§8.7).
+The ordering worry that first appeared here turned out not to exist: merge order is neutralised
+by a pre-existing `sort_by(major)`, so there is no statement-order contract for a third source to
+get wrong. See §7. What a third source *would* have to get right is the per-major precedence,
+which is one `any(|ours| ours.major == rt.major)` check in one place.
 
 ## 4. D2 — Packaged wins per major; brew's own preferences still govern the brew pass
 
@@ -107,12 +107,27 @@ installer can produce, where a broken keg is someone else's doing.
 
 ## 7. D5 — Ordering is part of the contract
 
-"The first entry is the catch-all's runtime" is a live property of the returned `Vec`, relied
-on downstream. Packaged-first changes which runtime that is on a machine that has both.
+"The first entry is the catch-all's runtime" is a live property of the returned `Vec`, relied on
+downstream: `render_set` takes `input.runtimes.php.first()` as the default upstream
+(`site/apply/mod.rs:164`).
 
-**That is the intended behaviour** — the catch-all should serve from the runtime we can name —
-but it is a user-visible change on exactly one machine shape, and it must be stated and tested
-rather than discovered.
+**This section's first draft was wrong and T2 caught it by writing the test.** It claimed
+packaged-first changes which runtime the catch-all uses. It does not. `discover_php` ends with
+`runtimes.sort_by(major)`, so **merge order is neutralised** — and that sort is **pre-existing**,
+already in the brew-only walk on `main` before this slice. The catch-all has always been the
+**lowest major installed**, and still is.
+
+So the ordering contract this slice must hold is narrower than drafted: **packaged wins within a
+major**, which is D2, and which T1 already pins by name in
+`a_packaged_runtime_beats_a_homebrew_one_for_the_same_major` and
+`the_first_entry_is_the_lowest_major_and_is_the_packaged_one_when_both_have_it`. Swapping the two
+merge steps fails both. No new guard is needed and none is added.
+
+**Separate, pre-existing, and not this slice's to decide:** *why* is the catch-all the lowest
+major? `sort_by(major)` reads like a stable **display** order that `.first()` then borrows as a
+**runtime selection** — two different jobs on one call. Today, brew 8.1 alongside brew 8.3 gives
+the catch-all 8.1, the oldest. 5B applies that same rule to a larger set rather than changing it,
+so it is out of scope here, but it is a real product question and it is recorded in §10.
 
 ## 8. What this slice must prove
 
@@ -127,10 +142,10 @@ rather than discovered.
 5. A packaged tree that cannot be identified is reported unidentified, not silently absent.
 6. **Nothing user-visible changes on a machine with no package tree.** Sites, apply, per-site
    PHP versions and the Languages page behave exactly as before.
-7. **Ordering is pinned by name.** With a packaged 8.4 and a Homebrew 8.3 — no collision, so
-   both survive — the packaged entry ranks **first**, because §7 makes the first entry the
-   catch-all's runtime. This is the guard that replaces the rank function §3 declines to build,
-   so it must fail if the two merge steps are swapped.
+7. **Packaged wins within a major, pinned by name** — see §7, which corrects what this item
+   said in the first draft. Swapping the two merge steps must fail
+   `a_packaged_runtime_beats_a_homebrew_one_for_the_same_major` and
+   `the_first_entry_is_the_lowest_major_and_is_the_packaged_one_when_both_have_it`. It does.
 
 ## 9. Out of scope
 
@@ -138,3 +153,13 @@ The Languages page and its source badge (5C) · routing Install to `openvhost-pk
 uninstall, the first target whose plan depends on runtime state (5D) · retiring the brew paths
 (slice 7) · the `_pid_gone`/`_free_port` extraction recorded against the fifth recipe ·
 `InstallLedger` still living under `mysql/`.
+
+**Recorded here because this slice surfaced them, not because it fixes them:**
+
+- **The catch-all serves the lowest installed major** (§7). Probably not what anyone wants, and
+  it is a `sort_by` meant for display being reused as a selection. Pre-existing; needs an owner
+  decision about what the default *should* be (newest? explicitly chosen? per-project?).
+- **A symlinked version directory defeats the direct-child check**, identically in PHP, nginx,
+  MySQL and MariaDB. T1 pinned it here as an assertion about today's behaviour, with a comment
+  saying the test must be rewritten when it is closed. The fix belongs in the shared resolver
+  the four engines still do not have.
