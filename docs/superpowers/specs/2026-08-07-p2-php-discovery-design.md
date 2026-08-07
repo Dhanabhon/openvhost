@@ -1,0 +1,105 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+
+# PHP discovery — packaged first, Homebrew as fallback (off-Homebrew slice 5B)
+
+**Status:** design, ready to plan.
+**Date:** 2026-08-07.
+**Follows:** 5A, which builds PHP 8.4.24 into our own package tree and pins it. The app can
+install a PHP it never looks for.
+
+## 1. Goal and the boundary
+
+Make the app **find** a packaged PHP and prefer it, per major, with Homebrew as fallback.
+
+**Out:** the Languages page (5C), routing Install to our package (5C), uninstall (5D). **The
+release is still deferred**, so on a real machine today discovery finds no packaged PHP and
+falls back exactly as it does now. This slice is invisible until a package exists, and it is
+provable in full against a hand-built tree.
+
+## 2. Measured on `72f5796`
+
+| Fact | Consequence |
+|---|---|
+| `PhpRuntime { major, fpm_bin }` (`site/apply/mod.rs:41`) carries **no source** | The field to add is one, and nginx and MySQL both already have its shape |
+| `discover_installed_php` is called at `stack.rs:810` and feeds `InstalledRuntimes` at `:877` | The seam is one call, like nginx's |
+| `discover.rs` is brew-shaped throughout: `BREW_PREFIXES`, `FPM_REL`, `resolve_keg`, `brew_formula(major)` | There is no packaged half to extend — it is new code |
+| **`mysql/discover.rs:368` says its merge rules "mirror `crate::discover_php_in` exactly"** | PHP's rules are the original; MySQL is the copy that already grew a packaged pass. `mysql/discover.rs:356-363` is the template |
+| PHP is a `Vec`, ordered, and "the first entry is the catch-all's runtime" | Merge order is **semantically load-bearing**, unlike nginx's single `Option` |
+| `Discovery<PhpRuntime>` reports unidentified candidates rather than dropping them, so an empty `runtimes` means "nothing installed", never "I could not tell" | That contract must survive the packaged pass |
+
+## 3. D1 — `PhpRuntimeSource`, and the version asymmetry used from birth
+
+`Packaged { version }` and `Homebrew`, matched **exhaustively, never through a wildcard**.
+
+nginx declared this asymmetry in 4B and nothing consumed it until 4C had to retrofit the
+consumer — the audit's words were that the enum was "write-only in production". **Do not repeat
+that here.** A packaged PHP's exact version comes for free from the catalogue and the directory
+name; only a Homebrew one needs `resolve_keg` or a `php-fpm -v` probe. Wire the consumer in
+this slice, not the next.
+
+## 4. D2 — Packaged wins per major; brew's own preferences still govern the brew pass
+
+Mirror `mysql/discover.rs:356-363`: run the packaged pass first, then push a brew runtime only
+when its major is not already present.
+
+**The two documented brew preferences keep applying, unchanged, *within* the brew pass** —
+earlier prefix wins (Apple Silicon before Rosetta), and a versioned path beats the `php` alias
+within the same prefix, with the first taking precedence because "a stale alias path is
+cosmetic, but running the wrong architecture is not." The packaged pass sits **in front of**
+that logic; it does not replace or reorder it.
+
+Why packaged wins: it is the one we built, pinned, verified and can name the exact version of.
+A brew keg of the same major is a runtime we know less about, and the migration's whole
+direction is away from it.
+
+## 5. D3 — Enumerate every packaged series, because PHP is not nginx
+
+`packaged_nginx_runtime` resolves **one** hardcoded series. PHP must walk `packages/php/*/`
+and resolve each series' `current` — multiple majors installed side by side is this app's
+headline feature.
+
+Copy `packaged_mariadb_runtime`'s discipline for each one: resolve through `PackagesRoot`'s
+facade rather than spelling `join("current")` by hand, keep the structural check that the
+resolved version directory is a **direct child** of the series directory, and record the
+**concrete version path**, never `current`. Spawning through the symlink lets a later swap
+silently change which binary a restart brings up, and it cost a full misdiagnosis in the MySQL
+slice.
+
+## 6. D4 — `Discovery`'s honesty contract survives
+
+A packaged tree that exists but cannot be identified — a missing `sbin/php-fpm`, a `current`
+pointing nowhere — is reported as **unidentified**, not dropped. That is what keeps "empty
+`runtimes`" meaning "nothing is installed".
+
+This matters more for packaged than for brew: a half-installed package tree is a state our own
+installer can produce, where a broken keg is someone else's doing.
+
+## 7. D5 — Ordering is part of the contract
+
+"The first entry is the catch-all's runtime" is a live property of the returned `Vec`, relied
+on downstream. Packaged-first changes which runtime that is on a machine that has both.
+
+**That is the intended behaviour** — the catch-all should serve from the runtime we can name —
+but it is a user-visible change on exactly one machine shape, and it must be stated and tested
+rather than discovered.
+
+## 8. What this slice must prove
+
+1. With a packaged PHP present, discovery resolves it, records `Packaged { version }`, and
+   hands out a **concrete version path** — never through `current`, proven by swapping the link
+   under a resolved runtime.
+2. **The version is taken from the tree, with no `php-fpm` spawned** for a packaged runtime.
+3. With both a packaged and a brew PHP of the **same major**, packaged wins and brew's entry is
+   dropped — not duplicated, not appended.
+4. With brew majors the package tree does not have, both appear, and **brew's two preferences
+   still hold** among the brew entries.
+5. A packaged tree that cannot be identified is reported unidentified, not silently absent.
+6. **Nothing user-visible changes on a machine with no package tree.** Sites, apply, per-site
+   PHP versions and the Languages page behave exactly as before.
+
+## 9. Out of scope
+
+The Languages page and its source badge (5C) · routing Install to `openvhost-pkg` (5C) ·
+uninstall, the first target whose plan depends on runtime state (5D) · retiring the brew paths
+(slice 7) · the `_pid_gone`/`_free_port` extraction recorded against the fifth recipe ·
+`InstallLedger` still living under `mysql/`.
