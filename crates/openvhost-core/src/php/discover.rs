@@ -72,10 +72,24 @@ pub enum PhpRuntimeSource {
     ///
     /// The exact version comes for free (design D1): we asked the catalogue
     /// for it, and the tree records it as a directory name, so nothing has to
-    /// execute `php-fpm` to find out. That is not an optimisation — a freshly
-    /// extracted binary's FIRST execution stalls ~11.5 s under macOS's
-    /// Gatekeeper scan, past `openvhost_conf::PROBE_TIMEOUT`'s 5 s bound,
-    /// forever.
+    /// execute `php-fpm` to find out.
+    ///
+    /// The first-execution cost that avoids is real, but **bounded, and much
+    /// smaller than this comment first claimed**. Measured on this project's
+    /// own 5A artifact (`/opt/openvhost-build/php-8.4.24`, copied to a fresh
+    /// inode): first `bin/php-fpm -v` **0.79 s**, every one after **0.01 s** —
+    /// comfortably inside `openvhost_conf::PROBE_TIMEOUT`'s 5 s bound, so a
+    /// probe here would answer slowly rather than never. The ~11.5 s figure
+    /// quoted elsewhere in this file and in [`crate::keg`] is **Homebrew's**
+    /// cost, correctly measured there, and it does not transfer to a binary we
+    /// extracted ourselves;
+    /// `docs/superpowers/plans/2026-08-01-p1-pkg-extractor.md` is where that
+    /// was first corrected (~1.9 s once per machine for the notarization
+    /// lookup, plus ~750 ms per fresh inode).
+    ///
+    /// The decision stands on the cheaper argument: the version is already
+    /// written down, so executing anything to re-learn it is work with a
+    /// failure mode and no answer we did not already have.
     Packaged {
         /// The exact upstream release, e.g. `"8.4.24"` — the version directory
         /// this major's `current` link selects.
@@ -291,12 +305,28 @@ fn discover_packaged(root: &PackagesRoot) -> Discovery<PhpRuntime> {
 /// desktop app's startup and rescan seams moved across, the Homebrew half is
 /// private and there is no longer any way to ask for it.
 ///
-/// **Ordering is part of the contract** (design D5). The result is sorted by
-/// major, so "the first entry is the catch-all's runtime" still names the
-/// lowest major — but on a machine that has both sources for that major, the
-/// entry is now the packaged one, so the catch-all serves from the runtime we
-/// can name. That is intended, and it is the one user-visible behaviour change
-/// this walk makes.
+/// **Ordering is part of the contract** (design D5), and it is worth stating
+/// exactly: the result is sorted by major as a **byte-lexicographic `String`
+/// compare**, not a numeric one. While every component is a single digit the
+/// two orders coincide and "the first entry is the catch-all's runtime" does
+/// name the lowest major; they diverge the moment one is not. With `8.9`,
+/// `8.10` and `10.0` installed the order is `["10.0", "8.10", "8.9"]` and the
+/// catch-all gets `10.0`. That is not hypothetical housekeeping: the packaged
+/// walk deliberately does NOT catalogue-gate what it discovers (a packaged 8.1
+/// a later build stopped offering must still be found), so the set of majors
+/// reaching this sort is open-ended in a way [`CATALOGUE`](super::CATALOGUE)
+/// is not.
+///
+/// The ordering is left exactly as it is on purpose. Changing it would move
+/// both the display order and the catch-all selection, and *which* runtime the
+/// catch-all should serve is a separate, pre-existing product question already
+/// recorded for an owner decision (design doc §10) — this walk applies the
+/// existing rule to a larger set rather than redefining it.
+///
+/// What packaged-first DOES change is which entry occupies a given major's
+/// slot: on a machine that has both sources for a major, that entry is now the
+/// packaged one, so the catch-all serves from a runtime we can name. That is
+/// intended, and it is the one user-visible behaviour change this walk makes.
 ///
 /// `packages` is minted from a resolved home ([`PackagesRoot::from_home`]),
 /// never from user input. `unidentified` carries candidates from both sources,
@@ -1349,6 +1379,14 @@ mod tests {
         // for the lowest major, the entry in that slot is now ours. That is
         // the intended, user-visible change, and it is stated here rather than
         // discovered.
+        //
+        // "Lowest major" in this test's NAME is true of `8.3` vs `8.5` and of
+        // every catalogued pair, because the sort is a byte-lexicographic
+        // `String` compare and those agree while the components are single
+        // digits. They do not agree in general — `["10.0", "8.10", "8.9"]` is
+        // the sorted order — and `discover_php`'s own doc comment states the
+        // rule precisely. Deliberately not "fixed" here: the ordering is
+        // pre-existing and out of this slice's scope (design doc §10).
         let home = tempfile::tempdir().unwrap();
         let root = PackagesRoot::from_home(home.path());
         install_fake_package(&root, "8.3", "8.3.99", "8.3.99 fpm\n");
@@ -1432,10 +1470,25 @@ mod tests {
         // itself a symlink therefore passes every guard and hands back a path
         // that looks in-tree and resolves out of it.
         //
-        // Severity is bounded by who can produce the state: planting that
+        // **The gap is one level wider than this test exercises, and the fix
+        // must be specified against the wider case.** The SERIES directory
+        // works too, and it defeats the obvious repair. Measured:
+        //
+        //     packages/php/8.4 -> /elsewhere     (the series dir is the link)
+        //     /elsewhere/current -> 9.9.9
+        //     => resolves to /elsewhere/9.9.9/bin/php-fpm
+        //
+        // Canonicalising the version directory and re-checking `parent()`
+        // closes the case below and NOT that one: both sides canonicalise into
+        // `/elsewhere`, so `canon(dir).parent() == canon(major_dir)` is `true`
+        // and the escape survives. The fix that closes both is to **confine
+        // the canonicalised path under the canonicalised packages root**
+        // (`canon(dir).starts_with(canon(root))`), which answers `false` here.
+        //
+        // Severity is bounded by who can produce the state: planting either
         // symlink requires write access to `<home>/packages`, which is already
-        // the user's own account. Closing it means canonicalising, which
-        // belongs in one place for all four engines rather than four.
+        // the user's own account. Closing it belongs in one place for all four
+        // engines rather than four.
         //
         // This test is deliberately worded as an assertion about TODAY'S
         // behaviour. When the gap is closed, it must be rewritten, and that is

@@ -115,7 +115,18 @@ downstream: `render_set` takes `input.runtimes.php.first()` as the default upstr
 packaged-first changes which runtime the catch-all uses. It does not. `discover_php` ends with
 `runtimes.sort_by(major)`, so **merge order is neutralised** — and that sort is **pre-existing**,
 already in the brew-only walk on `main` before this slice. The catch-all has always been the
-**lowest major installed**, and still is.
+first entry of that sort, and still is.
+
+**And that sort is a byte-lexicographic `String` compare, not a numeric one — corrected here
+after the audit measured it.** "The lowest major" is what it produces only while every component
+is a single digit, which is true of everything `CATALOGUE` offers today. It is not true in
+general: with `8.9`, `8.10` and `10.0` installed the order is `["10.0", "8.10", "8.9"]` and the
+catch-all gets `10.0`. Latent rather than theoretical, because the packaged walk deliberately does
+**not** catalogue-gate what it discovers — a packaged 8.1 a later build stopped offering must
+still be found — so the set of majors reaching the sort is open-ended in a way the catalogue is
+not. **Not changed here:** reordering would move both display order and catch-all selection, and
+*which* runtime the catch-all should serve is the pre-existing product question recorded in §10.
+This slice states the rule accurately rather than redefining it.
 
 So the ordering contract this slice must hold is narrower than drafted: **packaged wins within a
 major**, which is D2, and which T1 already pins by name in
@@ -154,12 +165,33 @@ uninstall, the first target whose plan depends on runtime state (5D) · retiring
 (slice 7) · the `_pid_gone`/`_free_port` extraction recorded against the fifth recipe ·
 `InstallLedger` still living under `mysql/`.
 
-**Recorded here because this slice surfaced them, not because it fixes them:**
+## 10. Recorded, not fixed
 
-- **The catch-all serves the lowest installed major** (§7). Probably not what anyone wants, and
-  it is a `sort_by` meant for display being reused as a selection. Pre-existing; needs an owner
-  decision about what the default *should* be (newest? explicitly chosen? per-project?).
-- **A symlinked version directory defeats the direct-child check**, identically in PHP, nginx,
-  MySQL and MariaDB. T1 pinned it here as an assertion about today's behaviour, with a comment
-  saying the test must be rewritten when it is closed. The fix belongs in the shared resolver
-  the four engines still do not have.
+Surfaced by this slice, deliberately left alone by it. §7 and `php/discover.rs` both point here.
+
+- **The catch-all serves the first entry of a `sort_by(major)` that compares majors as strings**
+  (§7). Two problems stacked on one call: a sort meant for *display* is being reused as a
+  *selection*, and the compare is byte-lexicographic, so "first" means "lowest major" only while
+  every component is a single digit (`["10.0", "8.10", "8.9"]` is the sorted order otherwise).
+  Both halves are pre-existing. Needs an owner decision about what the default *should* be —
+  newest? explicitly chosen? per-project? — before touching the ordering, because changing it
+  moves display and selection together.
+- **A symlink defeats the direct-child check**, identically in PHP, nginx, MySQL and MariaDB. T1
+  pinned the version-directory case here as an assertion about today's behaviour, with a comment
+  saying the test must be rewritten when it is closed.
+
+  **The audit widened it by one level, and that changes what the fix must be.** The *series*
+  directory works as the symlink too:
+
+  ```text
+  packages/php/8.4 -> /elsewhere        (symlink)
+  /elsewhere/current -> 9.9.9
+  => resolves to /elsewhere/9.9.9/bin/php-fpm
+  ```
+
+  Reproduced live. Canonicalising the version directory and re-checking `parent()` closes the
+  narrow case and **leaves this one open** — both sides canonicalise into `/elsewhere`, so the
+  parent check answers `true` and the escape survives. Specify the fix as **confine the
+  canonicalised path under the canonicalised packages root**
+  (`canon(dir).starts_with(canon(packages_root))`), which answers `false` on the case above. It
+  belongs in the shared resolver the four engines still do not have.
