@@ -34,8 +34,15 @@ provable in full against a hand-built tree.
 nginx declared this asymmetry in 4B and nothing consumed it until 4C had to retrofit the
 consumer — the audit's words were that the enum was "write-only in production". **Do not repeat
 that here.** A packaged PHP's exact version comes for free from the catalogue and the directory
-name; only a Homebrew one needs `resolve_keg` or a `php-fpm -v` probe. Wire the consumer in
-this slice, not the next.
+name; only a Homebrew one needs `resolve_keg` or a `php-fpm -v` probe.
+
+To be exact about what "consuming it" means here, because §9 excludes the Languages page: the
+**operative fork lands in discovery itself** — the packaged arm reads the version from the tree
+and **spawns nothing**, the Homebrew arm probes. That is a behavioural branch in this slice's
+own code, not a badge. The UI that *displays* the distinction is 5C. The test for whether this
+slice earned the enum is 4C's: **a throwaway third variant must break compilation at more sites
+than it did before**, and at least one of them must be a real behavioural fork rather than
+plumbing.
 
 ## 4. D2 — Packaged wins per major; brew's own preferences still govern the brew pass
 
