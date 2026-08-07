@@ -17,6 +17,7 @@ use openvhost_proc::SpawnSpec;
 use super::BREW_PREFIXES;
 use crate::brew_cmd::{BrewVerb, brew_spec};
 use crate::error::CoreError;
+use crate::site::model::PHP_VERSION_MAX_LEN;
 
 /// The versions this build offers. Hand-maintained: asking `brew` would mean
 /// spawning a process on a path that has to stay cheap, and a stale entry
@@ -37,6 +38,50 @@ fn not_cataloged_error(version: &str) -> CoreError {
     }
 }
 
+/// Digits, one dot, digits — nothing else, and at most
+/// [`PHP_VERSION_MAX_LEN`] bytes. [`PhpMajor::parse`]'s layer-1 check, lifted
+/// out of it so the packaged-tree walk in [`crate::php::discover`] can apply
+/// the identical rule to a directory name without a second hand-rolled copy
+/// drifting from this one.
+///
+/// **The length bound, and why it is the same constant.** Digits-and-a-dot
+/// alone accepts `8.` followed by 120 more digits, and the walk feeds this
+/// predicate a name read off the disk. That name becomes `PhpRuntime.major`,
+/// which becomes a service id and a php-fpm socket filename — so the walk's
+/// own comment about "keeping a surprising directory name out of the major
+/// component" is only fully true with a bound on it.
+/// [`crate::site::model::PhpVersion::parse`] already applies exactly this
+/// bound to the value arriving from the UI; reusing the constant rather than
+/// picking a second number is what keeps the two ingress points from
+/// disagreeing about the same field.
+///
+/// Every downstream consumer was checked to degrade safely without it, so this
+/// is hygiene rather than a hole being closed — but an unbounded component in
+/// a path we later join and spawn from is not a property worth leaving to the
+/// goodwill of every future consumer.
+///
+/// **A predicate, deliberately not a constructor.** `MysqlMajor` grew a
+/// discovery-only `from_probe`, and this module's own [`cataloged`] guard
+/// exists because that opened a path to `brew`'s argv that never passed
+/// `parse`. Exposing the shape TEST widens nothing: it mints no [`PhpMajor`],
+/// so there is still exactly one production constructor and it is still
+/// catalogue-gated.
+pub(super) fn is_major_minor_shape(s: &str) -> bool {
+    if s.len() > PHP_VERSION_MAX_LEN {
+        return false;
+    }
+    let mut parts = s.split('.');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(a), Some(b), None) => {
+            !a.is_empty()
+                && !b.is_empty()
+                && a.bytes().all(|c| c.is_ascii_digit())
+                && b.bytes().all(|c| c.is_ascii_digit())
+        }
+        _ => false,
+    }
+}
+
 /// A PHP `major.minor` this build offers. Parsing enforces the shape;
 /// membership of [`CATALOGUE`] enforces the policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,17 +90,7 @@ pub struct PhpMajor(String);
 impl PhpMajor {
     pub fn parse(s: &str) -> Result<Self, CoreError> {
         // Layer 1: shape. Digits, one dot, digits — nothing else.
-        let mut parts = s.split('.');
-        let ok = match (parts.next(), parts.next(), parts.next()) {
-            (Some(a), Some(b), None) => {
-                !a.is_empty()
-                    && !b.is_empty()
-                    && a.bytes().all(|c| c.is_ascii_digit())
-                    && b.bytes().all(|c| c.is_ascii_digit())
-            }
-            _ => false,
-        };
-        if !ok {
+        if !is_major_minor_shape(s) {
             return Err(CoreError::Validation {
                 field: "php_version",
                 reason: format!("{s:?} is not a major.minor version"),
@@ -185,6 +220,44 @@ mod tests {
         ] {
             assert!(PhpMajor::parse(bad).is_err(), "accepted {bad:?}");
         }
+    }
+
+    #[test]
+    fn the_shape_predicate_bounds_the_length_it_will_accept() {
+        // Audit LOW-2. Without the bound, `8.` followed by 120 digits is a
+        // "major.minor" as far as this predicate is concerned — and the
+        // packaged walk hands it directory names read off the disk, which then
+        // become a service id and a socket filename.
+        //
+        // The boundary is pinned on BOTH sides, because a bound tested only
+        // from the rejecting side passes just as well when it is off by one.
+        let at_limit = format!("8.{}", "9".repeat(PHP_VERSION_MAX_LEN - 2));
+        assert_eq!(at_limit.len(), PHP_VERSION_MAX_LEN);
+        assert!(
+            is_major_minor_shape(&at_limit),
+            "the bound must not reject a value AT the limit: {at_limit:?}"
+        );
+
+        let one_over = format!("8.{}", "9".repeat(PHP_VERSION_MAX_LEN - 1));
+        assert_eq!(one_over.len(), PHP_VERSION_MAX_LEN + 1);
+        assert!(
+            !is_major_minor_shape(&one_over),
+            "accepted a value one byte over the limit: {one_over:?}"
+        );
+
+        // The auditor's own example, well clear of the boundary.
+        assert!(!is_major_minor_shape(&format!("8.{}", "1".repeat(120))));
+    }
+
+    #[test]
+    fn the_length_bound_is_the_same_one_the_ui_ingress_applies() {
+        // ONE constant, two entry points. A value this long is refused whether
+        // it arrives as a `PhpVersion` from the UI or as a directory name from
+        // the packaged walk — if these ever disagree, one of them is admitting
+        // a major the other would have refused for the identical field.
+        let one_over = format!("8.{}", "9".repeat(PHP_VERSION_MAX_LEN - 1));
+        assert!(!is_major_minor_shape(&one_over));
+        assert!(crate::site::model::PhpVersion::parse(&one_over).is_err());
     }
 
     #[test]
@@ -409,37 +482,43 @@ mod tests {
     }
 
     #[test]
-    fn the_inherited_ambient_path_never_appears_in_the_composed_value() {
+    fn the_composed_path_is_a_fixed_baseline_and_not_the_processs_ambient_one() {
         // The composed PATH must come from a fixed baseline, never the
         // process's own ambient PATH: a ServBay install shadows `php-fpm`/
         // `nginx` on that ambient value (see `discover.rs`), and brew's
         // children (git, curl, tar) would inherit the same shadowing if the
-        // parent's PATH were appended. Set a PATH with an unmistakable
-        // marker directory and assert it never reaches the child's env —
-        // restoring the previous value afterwards so this test cannot leak
-        // into any other test in the same process.
-        const MARKER: &str = "/tmp/openvhost-hostile-shadow-dir-marker";
-        let previous = std::env::var_os("PATH");
-        // SAFETY: no other thread in this test binary reads/writes PATH
-        // concurrently with this single-threaded set/restore pair.
-        unsafe {
-            std::env::set_var("PATH", format!("{MARKER}:/usr/bin"));
-        }
-
+        // parent's PATH were appended.
+        //
+        // **Pinned by the whole string, not by planting a marker in the
+        // process's own PATH.** `brew_cmd::brew_spec` reads no environment
+        // variable at all — the baseline is a literal in that function — so
+        // there is nothing an in-process mutation could influence, and the
+        // equality below already refuses every way an ambient value could get
+        // in: prepended, appended or substituted. A marker check is strictly
+        // weaker than this and cost process-global state to run.
+        //
+        // WHAT WAS HERE BEFORE, because the reason matters more than the
+        // diff: this test called `std::env::set_var("PATH", …)` under a
+        // SAFETY comment asserting "no other thread in this test binary
+        // reads/writes PATH concurrently". **That was false.** The default
+        // harness runs tests on many threads; `mysql::brew` carried a
+        // byte-identical copy of this test in the same binary; and `setenv(3)`
+        // is not thread-safe against *any* concurrent `getenv`, including the
+        // ones libc and `std::process::Command` make on behalf of unrelated
+        // tests in this crate that spawn children. The exchange was
+        // undefined behaviour for a check the assertion below subsumes.
+        //
+        // Residual, stated rather than papered over: an append made
+        // *conditional* on a non-empty ambient PATH would satisfy this
+        // equality in a process whose PATH happened to be empty. Closing that
+        // would mean varying the environment, which is the hazard just
+        // removed — and it cannot arise without an env read appearing in
+        // `brew_cmd`, where there is none and the module doc says so.
         let spec = brew_install_spec(
             std::path::Path::new("/opt/homebrew/bin/brew"),
             &PhpMajor::parse("8.3").unwrap(),
         )
         .unwrap();
-
-        // SAFETY: restoring the pre-test value before any assertion can panic
-        // and skip it.
-        unsafe {
-            match &previous {
-                Some(v) => std::env::set_var("PATH", v),
-                None => std::env::remove_var("PATH"),
-            }
-        }
 
         let path = spec
             .env
@@ -447,10 +526,6 @@ mod tests {
             .find(|(k, _)| k == "PATH")
             .map(|(_, v)| v.to_string_lossy().into_owned())
             .expect("PATH must be set explicitly");
-        assert!(
-            !path.contains(MARKER),
-            "the inherited ambient PATH leaked into the composed value: {path}"
-        );
         assert_eq!(path, "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin");
     }
 

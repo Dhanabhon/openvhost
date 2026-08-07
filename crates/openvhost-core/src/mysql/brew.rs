@@ -415,35 +415,25 @@ mod tests {
     }
 
     #[test]
-    fn the_inherited_ambient_path_never_appears_in_the_composed_value() {
-        // Mirrors php/brew.rs's identical test. The function under test never
-        // reads $PATH — it composes one purely from `brew`'s own parent plus a
-        // fixed suffix — so this assertion cannot be affected by a concurrently
-        // running sibling test mutating the same process-global env var; only
-        // the restore-previous bookkeeping shares that (harmless, since nothing
-        // else in this crate reads PATH from env) narrow window.
-        const MARKER: &str = "/tmp/openvhost-hostile-shadow-dir-marker-mysql";
-        let previous = std::env::var_os("PATH");
-        // SAFETY: no other thread in this test binary reads/writes PATH
-        // concurrently with this single-threaded set/restore pair.
-        unsafe {
-            std::env::set_var("PATH", format!("{MARKER}:/usr/bin"));
-        }
-
+    fn the_composed_path_is_a_fixed_baseline_and_not_the_processs_ambient_one() {
+        // Mirrors `php::brew`'s identical test — see it for the full reason
+        // this no longer mutates the process environment. In short: the
+        // function under test never reads $PATH (it composes one purely from
+        // `brew`'s own parent plus a fixed suffix, in `brew_cmd::brew_spec`),
+        // so pinning the whole composed string is the entire proof, and the
+        // `set_var`/restore pair this test used to run was undefined behaviour
+        // bought for nothing.
+        //
+        // The old comment here claimed the mutation shared only a "narrow
+        // window" with anything else. Measured: a concurrent reader in the
+        // same process observes the hostile value in ~99.98% of reads, because
+        // the restore happens after the call under test rather than
+        // immediately. It was not narrow.
         let spec = mysql_brew_install_spec(
             std::path::Path::new("/opt/homebrew/bin/brew"),
             &MysqlMajor::parse("8.4").unwrap(),
         )
         .unwrap();
-
-        // SAFETY: restoring the pre-test value before any assertion can panic
-        // and skip it.
-        unsafe {
-            match &previous {
-                Some(v) => std::env::set_var("PATH", v),
-                None => std::env::remove_var("PATH"),
-            }
-        }
 
         let path = spec
             .env
@@ -451,10 +441,6 @@ mod tests {
             .find(|(k, _)| k == "PATH")
             .map(|(_, v)| v.to_string_lossy().into_owned())
             .expect("PATH must be set explicitly");
-        assert!(
-            !path.contains(MARKER),
-            "the inherited ambient PATH leaked into the composed value: {path}"
-        );
         assert_eq!(path, "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin");
     }
 

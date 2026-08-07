@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use openvhost_conf::WebServerSettings;
 
+use crate::php::PhpRuntimeSource;
 use crate::site::model::{Docroot, Domain, PhpVersion, Site, SiteId, SiteName, WebServer};
 
 use super::{ApplyInput, InstalledRuntimes, PhpRuntime};
@@ -35,6 +36,11 @@ pub(crate) fn runtimes(majors: &[&str]) -> InstalledRuntimes {
             .map(|m| PhpRuntime {
                 major: (*m).to_string(),
                 fpm_bin: PathBuf::from(format!("/opt/homebrew/opt/php@{m}/sbin/php-fpm")),
+                // The path above is a brew keg's, so this is the truthful
+                // value and not a placeholder: every test that consumed this
+                // fixture before the field existed keeps describing the exact
+                // machine it described then.
+                source: PhpRuntimeSource::Homebrew,
             })
             .collect(),
     }

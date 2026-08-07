@@ -1899,9 +1899,18 @@ fn php_rows(
     rows
 }
 
-/// Probe every known Homebrew prefix for installed PHP runtimes.
+/// Scan BOTH PHP install sources — OpenVHost's own `<home>/packages/php/`
+/// tree and every known Homebrew prefix (PHP-discovery design D2).
 ///
-/// `openvhost_core::discover_php_in` takes a SYNCHRONOUS probe closure, but
+/// `home` is what makes the packaged tree visible; the [`PackagesRoot`] is
+/// minted from it and from nothing a caller supplies. This is the exact
+/// parameter, and the exact reason, `discover_all_mysql` below already has: a
+/// rescan that read only Homebrew would make a freshly installed packaged
+/// runtime vanish from the Languages page the moment the user pressed Check
+/// again — and, worse, would disagree with what startup found, which is the
+/// C2 class of bug (`stack.rs`) all over again.
+///
+/// `openvhost_core::discover_php` takes a SYNCHRONOUS probe closure, but
 /// `openvhost_conf::probe_php_fpm_version` is async. Resolved by running the
 /// whole directory walk on `spawn_blocking` and calling the async prober via
 /// `Handle::block_on` from INSIDE that blocking closure: `spawn_blocking`
@@ -1910,20 +1919,25 @@ fn php_rows(
 /// runtime the way calling `block_on` directly inside an async command would.
 ///
 /// The other option the task allowed — pre-building a `path -> version` map
-/// by probing candidates asynchronously first, then handing `discover_php_in`
-/// a closure that only reads that map — was passed over because the set of
-/// candidate paths is exactly what `discover_php_in`'s own (private)
-/// directory walk already computes. Re-deriving that candidate list here
-/// first would duplicate discovery logic that already exists and is already
-/// tested, which is the kind of copy-paste drift the project's own
-/// coding-style rules warn against; this approach reuses `discover_php_in`
-/// untouched instead.
-async fn discover_all_php()
--> Result<openvhost_core::Discovery<openvhost_core::PhpRuntime>, IpcError> {
-    tauri::async_runtime::spawn_blocking(|| {
+/// by probing candidates asynchronously first, then handing the walk a closure
+/// that only reads that map — was passed over because the set of candidate
+/// paths is exactly what the walk's own (private) directory traversal already
+/// computes. Re-deriving that candidate list here first would duplicate
+/// discovery logic that already exists and is already tested, which is the
+/// kind of copy-paste drift the project's own coding-style rules warn against;
+/// this approach reuses the walk untouched instead.
+///
+/// The packaged half spawns nothing at all (design D1: its version is a
+/// directory name chosen at install time), so this bridge is only ever paid
+/// for the Homebrew candidates.
+async fn discover_all_php(
+    home: &Path,
+) -> Result<openvhost_core::Discovery<openvhost_core::PhpRuntime>, IpcError> {
+    let packages = openvhost_core::PackagesRoot::from_home(home);
+    tauri::async_runtime::spawn_blocking(move || {
         let handle = tokio::runtime::Handle::current();
         let prefixes: Vec<&Path> = brew_prefixes();
-        openvhost_core::discover_php_in(&prefixes, &|bin| {
+        openvhost_core::discover_php(&packages, &prefixes, &|bin| {
             handle.block_on(openvhost_conf::probe_php_fpm_version(bin))
         })
     })
@@ -2073,7 +2087,11 @@ pub(crate) async fn rescan_into_state(
     paths: &StackPaths,
     seed: Option<openvhost_core::PhpRuntime>,
 ) -> Result<openvhost_core::Discovery<openvhost_core::PhpRuntime>, IpcError> {
-    let discovered = seeded_php(discover_all_php().await?, seed);
+    // `paths.home` — the resolved home `macos_stack` built these paths from,
+    // never a caller-supplied path — is what makes OpenVHost's own package
+    // tree visible to a rescan, so a rescan and a cold start see the same
+    // machine (PHP-discovery design D2).
+    let discovered = seeded_php(discover_all_php(&paths.home).await?, seed);
     report_unidentified("PHP", &discovered.unidentified);
     reconcile_php(runtimes, sup, paths, discovered)
 }
@@ -2787,9 +2805,17 @@ mod php_ipc_tests {
 
     #[test]
     fn every_catalogue_entry_is_listed_with_its_installed_state() {
+        // `PhpRuntime.source` arrived with PHP discovery (off-Homebrew slice
+        // 5B). Every fixture in this file already described a Homebrew keg —
+        // a `…/opt/php@<major>/sbin/php-fpm` path, or a synthetic stand-in
+        // for one — so `Homebrew` is the TRUTHFUL value here rather than a
+        // placeholder, and no test's meaning changes: nothing below reads the
+        // field. The packaged variant enters this file when the Languages
+        // page learns to display the distinction (5C).
         let installed = vec![openvhost_core::PhpRuntime {
             major: "8.3".into(),
             fpm_bin: PathBuf::from("/opt/homebrew/opt/php@8.3/sbin/php-fpm"),
+            source: openvhost_core::PhpRuntimeSource::Homebrew,
         }];
         let rows = php_rows(Path::new("/tmp/ovh"), &installed, &[("8.3", "8.3.14")]);
         assert_eq!(rows.len(), openvhost_core::CATALOGUE.len());
@@ -2819,6 +2845,7 @@ mod php_ipc_tests {
         let installed = vec![openvhost_core::PhpRuntime {
             major: "8.3".into(),
             fpm_bin: PathBuf::from("/opt/homebrew/opt/php@8.3/sbin/php-fpm"),
+            source: openvhost_core::PhpRuntimeSource::Homebrew,
         }];
         let rows = php_rows(Path::new("/tmp/ovh"), &installed, &[]);
         let three = rows.iter().find(|r| r.major == "8.3").unwrap();
@@ -2939,6 +2966,7 @@ mod php_ipc_tests {
         let rt = |major: &str| openvhost_core::PhpRuntime {
             major: major.to_string(),
             fpm_bin: home.path().join(format!("php-fpm-{major}")),
+            source: openvhost_core::PhpRuntimeSource::Homebrew,
         };
 
         // Before: 8.3 installed and registered.
@@ -2967,6 +2995,151 @@ mod php_ipc_tests {
             .map(|r| r.major.clone())
             .collect();
         assert_eq!(listed, vec!["8.4".to_string()]);
+    }
+
+    // ---- the RESCAN seam reads the package tree (D2) ---------------------
+    //
+    // The symmetrical twin of `stack.rs`'s startup-seam pair, and the reason
+    // it has to exist separately: `openvhost-core` owns the merge rules and
+    // tests them thoroughly, `stack.rs` proves STARTUP reads
+    // `<home>/packages/php/`, and neither of those says anything about the
+    // OTHER seam. `rescan_into_state` hands `paths.home` to `discover_all_php`,
+    // which mints the `PackagesRoot` from it and from nothing else. A refactor
+    // that gave that call site a stale or empty home would compile, pass every
+    // other test in the workspace, and make a freshly installed packaged
+    // runtime vanish from the Languages page the moment the user pressed Check
+    // again — while startup still listed it. That disagreement between two
+    // views of the same machine is the C2 class of bug exactly.
+    //
+    // Driven through `rescan_into_state` rather than `discover_all_php`
+    // directly, because the argument under test is the one the RESCAN supplies,
+    // not one a test supplies. The sibling tests above avoid `rescan_into_state`
+    // because it probes the developer's own Homebrew and asserts nothing
+    // reproducible; that reasoning still holds for them, and these two work
+    // around it by asserting only about the packaged entry — which is
+    // machine-independent, because packaged wins per major, so whatever brew
+    // contributes can neither remove our entry nor outrank it.
+
+    /// `<home>/packages/php/<major>/<version>/bin/php-fpm` plus a relative
+    /// `current` symlink, exactly as `openvhost-pkg` leaves it. Mirrors
+    /// `stack.rs`'s `install_fake_php_package` + `point_current`, including
+    /// `bin/` rather than brew's `sbin/` — the packaged walk refuses the brew
+    /// shape, so a fixture written the other way would prove the wrong thing.
+    #[cfg(unix)]
+    fn install_fake_php_package(home: &Path, major: &str, version: &str, body: &str) {
+        let root = openvhost_core::PackagesRoot::from_home(home);
+        let bin = root
+            .package_dir(openvhost_core::PHP_PACKAGE_NAME, major, version)
+            .join("bin");
+        std::fs::create_dir_all(&bin).expect("mkdir package bin");
+        std::fs::write(bin.join("php-fpm"), body.as_bytes()).expect("write fake php-fpm");
+        let link = root.current_link(openvhost_core::PHP_PACKAGE_NAME, major);
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(PathBuf::from(version), &link).expect("symlink current");
+    }
+
+    #[cfg(unix)]
+    fn rescan_paths(home: &Path) -> StackPaths {
+        StackPaths {
+            home: home.to_path_buf(),
+            nginx_bin: Some(home.join("nginx")),
+            nginx_conf: home.join("nginx.conf"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rescan_reads_the_package_tree_of_the_home_it_was_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        // A version string no Homebrew keg can produce, so "this came from the
+        // fixture" is not an inference.
+        install_fake_php_package(home, "8.4", "8.4.24", "8.4.24 fpm\n");
+
+        let runtimes = RwLock::new(None);
+        let sup = Supervisor::new(openvhost_proc::default_driver());
+        let found = rescan_into_state(&runtimes, &sup, &rescan_paths(home), None)
+            .await
+            .unwrap();
+
+        let ours: Vec<_> = found
+            .runtimes
+            .iter()
+            .filter(|r| r.fpm_bin.starts_with(home))
+            .collect();
+        assert_eq!(ours.len(), 1, "got {:?}", found.runtimes);
+        assert_eq!(ours[0].major, "8.4");
+        assert_eq!(
+            ours[0].source,
+            openvhost_core::PhpRuntimeSource::Packaged {
+                version: "8.4.24".to_string()
+            },
+            "the rescan must report where the runtime came from"
+        );
+        // D3 at this seam too: the concrete version directory, never `current`.
+        assert!(
+            !ours[0]
+                .fpm_bin
+                .components()
+                .any(|c| c.as_os_str() == "current"),
+            "the rescan handed out a path through the current link: {:?}",
+            ours[0].fpm_bin
+        );
+
+        // The reconcile half ran on it: a supervisor row exists for the major,
+        // and the spec it would spawn is the packaged binary — not a brew one.
+        let row = sup
+            .snapshot()
+            .into_iter()
+            .find(|s| s.id == "php-fpm-8.4")
+            .expect("the packaged major must be registered");
+        assert_eq!(row.id, "php-fpm-8.4");
+        let listed = runtimes.read().unwrap().clone().unwrap().php;
+        assert!(
+            listed
+                .iter()
+                .any(|r| r.fpm_bin == ours[0].fpm_bin && r.major == "8.4"),
+            "the managed runtime list does not carry the packaged entry: {listed:?}"
+        );
+    }
+
+    /// The other half of the same claim, and what makes the test above about
+    /// the ARGUMENT rather than about this machine: the identical call against
+    /// a home with no package tree reports nothing packaged. Without it, a
+    /// `discover_all_php` that ignored its `home` and read some ambient
+    /// location would still have to fail — but only if that ambient location
+    /// happened to be empty, which is not something a test should rely on.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_same_rescan_against_a_home_with_no_package_tree_finds_nothing_packaged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        assert!(
+            !openvhost_core::PackagesRoot::from_home(home)
+                .as_path()
+                .exists(),
+            "this test's whole point is a home with no package tree"
+        );
+
+        let runtimes = RwLock::new(None);
+        let sup = Supervisor::new(openvhost_proc::default_driver());
+        let found = rescan_into_state(&runtimes, &sup, &rescan_paths(home), None)
+            .await
+            .unwrap();
+
+        assert!(
+            found
+                .runtimes
+                .iter()
+                .all(|r| r.source == openvhost_core::PhpRuntimeSource::Homebrew),
+            "a packaged runtime appeared from somewhere other than this home: {:?}",
+            found.runtimes
+        );
+        assert!(
+            !found.runtimes.iter().any(|r| r.fpm_bin.starts_with(home)),
+            "a runtime was reported under an empty home: {:?}",
+            found.runtimes
+        );
     }
 
     // ---- the install seed (fix R2, part 1) -------------------------------
@@ -3005,6 +3178,7 @@ mod php_ipc_tests {
         let seed = openvhost_core::PhpRuntime {
             major: "8.4".to_string(),
             fpm_bin: candidate.join("sbin/php-fpm"),
+            source: openvhost_core::PhpRuntimeSource::Homebrew,
         };
 
         let reconciled = reconcile_php(
@@ -3047,6 +3221,7 @@ mod php_ipc_tests {
             runtimes: vec![openvhost_core::PhpRuntime {
                 major: "8.4".to_string(),
                 fpm_bin: PathBuf::from("/opt/homebrew/opt/php@8.4/sbin/php-fpm"),
+                source: openvhost_core::PhpRuntimeSource::Homebrew,
             }],
             unidentified: vec![],
         };
@@ -3055,6 +3230,7 @@ mod php_ipc_tests {
             Some(openvhost_core::PhpRuntime {
                 major: "8.4".to_string(),
                 fpm_bin: PathBuf::from("/usr/local/opt/php@8.4/sbin/php-fpm"),
+                source: openvhost_core::PhpRuntimeSource::Homebrew,
             }),
         );
         assert_eq!(seeded.runtimes.len(), 1, "got {seeded:?}");
@@ -3071,6 +3247,7 @@ mod php_ipc_tests {
             runtimes: vec![openvhost_core::PhpRuntime {
                 major: "8.4".to_string(),
                 fpm_bin: PathBuf::from("/opt/homebrew/opt/php@8.4/sbin/php-fpm"),
+                source: openvhost_core::PhpRuntimeSource::Homebrew,
             }],
             unidentified: vec![PathBuf::from("/opt/homebrew/opt/php@8.1")],
         };
@@ -3140,6 +3317,7 @@ mod php_ipc_tests {
             &openvhost_core::PhpRuntime {
                 major: "8.3".into(),
                 fpm_bin: PathBuf::from("/nonexistent/php-fpm"),
+                source: openvhost_core::PhpRuntimeSource::Homebrew,
             },
         ));
         assert_eq!(sup.snapshot().len(), 1);
@@ -3216,6 +3394,7 @@ mod php_ipc_tests {
         let installed = vec![openvhost_core::PhpRuntime {
             major: "7.4".into(),
             fpm_bin: PathBuf::from("/opt/homebrew/opt/php@7.4/sbin/php-fpm"),
+            source: openvhost_core::PhpRuntimeSource::Homebrew,
         }];
         let rows = php_rows(Path::new("/tmp/ovh"), &installed, &[("7.4", "7.4.33")]);
         assert!(rows.iter().any(|r| r.major == "7.4" && r.installed));
@@ -3234,6 +3413,7 @@ mod php_ipc_tests {
         let installed = vec![openvhost_core::PhpRuntime {
             major: "7.4".into(),
             fpm_bin: PathBuf::from("/opt/homebrew/opt/php@7.4/sbin/php-fpm"),
+            source: openvhost_core::PhpRuntimeSource::Homebrew,
         }];
         let rows = php_rows(Path::new("/tmp/ovh"), &installed, &[]);
         let hand_installed = rows.iter().find(|r| r.major == "7.4").unwrap();
@@ -8375,6 +8555,7 @@ mod apply_ipc_tests {
             php: vec![openvhost_core::PhpRuntime {
                 major: "8.3".into(),
                 fpm_bin: PathBuf::from("/opt/homebrew/opt/php@8.3/sbin/php-fpm"),
+                source: openvhost_core::PhpRuntimeSource::Homebrew,
             }],
         });
         let seen = state.read().unwrap().clone().unwrap();
@@ -8554,7 +8735,7 @@ mod list_web_servers_tests {
     /// test is therefore hermetic in the sense of not touching any binary
     /// ITSELF, but its discriminating power against a REINTRODUCED hardcoded
     /// fallback is machine-dependent. `list_web_servers` has no injectable
-    /// prober seam (unlike `discover_php_in`'s closure parameter) that would
+    /// prober seam (unlike `discover_php`'s closure parameter) that would
     /// let a fake binary stand in regardless of machine state.
     #[tokio::test]
     async fn list_web_servers_reports_no_binary_and_no_version_when_none_was_found() {
@@ -10265,6 +10446,7 @@ mod log_ipc_tests {
             php: vec![openvhost_core::PhpRuntime {
                 major: "8.3".into(),
                 fpm_bin: home.path().join("php-fpm"),
+                source: openvhost_core::PhpRuntimeSource::Homebrew,
             }],
         })));
         let sup = Arc::new(Supervisor::new(openvhost_proc::default_driver()));

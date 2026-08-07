@@ -365,7 +365,7 @@ pub fn discover_mysql(
     found
 }
 
-/// Merge rules mirror `crate::discover_php_in` exactly, with one addition:
+/// Merge rules mirror `crate::php::discover::discover_php_in` exactly, with one addition:
 /// a formula directory is only a candidate when ALL THREE of `bin/mysqld`,
 /// `bin/mysql` and `bin/mysqladmin` exist as files (see `MYSQLD_REL` and
 /// friends). Two preferences apply when merging, and they can disagree:
@@ -379,12 +379,12 @@ pub fn discover_mysql(
 ///    formula, while `mysql@8.4` keeps pointing at 8.4.
 ///
 /// Preference 1 takes precedence over preference 2, for the identical
-/// reason `discover_php_in` documents: a stale alias path is cosmetic
+/// reason `crate::php::discover::discover_php_in` documents: a stale alias path is cosmetic
 /// (discovery reruns on every rescan), but running the wrong architecture is
 /// not.
 ///
 /// The probe closure receives the `mysqld` path and returns the version
-/// string, exactly like `discover_php_in`'s probe does for `php-fpm`.
+/// string, exactly like `crate::php::discover::discover_php_in`'s probe does for `php-fpm`.
 /// Production code supplies a bounded `mysqld --version` probe (mirroring
 /// `openvhost_conf::probe_php_fpm_version`); tests supply a tempdir-backed
 /// fake — this crate spawns no process here. It is consulted only when

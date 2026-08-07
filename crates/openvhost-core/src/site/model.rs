@@ -16,7 +16,15 @@ use crate::error::CoreError;
 /// with digit-only components, and no PHP release has ever carried a
 /// three-digit major or minor — 8 bytes still admits `999.999` while keeping
 /// the value obviously bounded before it reaches a php-fpm pool name.
-const PHP_VERSION_MAX_LEN: usize = 8;
+///
+/// `pub(crate)` so the discovery-side shape predicate
+/// ([`crate::php::brew::is_major_minor_shape`]) applies the identical bound to
+/// a directory name it finds on disk. One constant, two entry points: a value
+/// that becomes a `PhpRuntime.major` reaches a service id and a socket
+/// filename whether it arrived through `PhpVersion::parse` or through the
+/// packaged walk, and the two must not disagree about how long that is allowed
+/// to be.
+pub(crate) const PHP_VERSION_MAX_LEN: usize = 8;
 
 /// Longest `Docroot` we accept, in bytes. macOS caps a pathname at `PATH_MAX`
 /// (1024) *including* the terminating NUL, so 1023 bytes is the longest path
