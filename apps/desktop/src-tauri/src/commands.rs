@@ -1341,6 +1341,21 @@ pub async fn list_web_servers(
     nginx_source: tauri::State<'_, Option<openvhost_core::nginx::NginxRuntimeSource>>,
 ) -> Result<Vec<WebServerDto>, IpcError> {
     let p = stack_paths(&paths)?;
+    // `nginx_bin` and `nginx_source` are two projections of the ONE
+    // `Option<NginxRuntime>` that `macos_stack` resolved, and this is the only
+    // place both are read together. Nothing structural keeps them in step —
+    // "one fact, two managed projections" is the shape `StackPaths.nginx_bin`
+    // and `InstalledRuntimes.nginx_bin` already have, so this is a convention
+    // here, not a type. That is fine while both are written once at startup
+    // and never rescanned; it stops being fine the day nginx gains an install
+    // or rescan flow that updates one side. Assert now, in dev and test, so
+    // that day announces itself instead of rendering a row that reports a
+    // source for a binary it does not have (branch review, 4C, MEDIUM).
+    debug_assert_eq!(
+        p.nginx_bin.is_some(),
+        nginx_source.inner().is_some(),
+        "nginx_bin and nginx_source disagree — both come from one discovery at startup"
+    );
     let err_log = openvhost_core::LogPaths::new(&p.home).nginx_error();
     // Nginx source design D2: a packaged nginx's version comes for free from
     // the tree discovery already resolved — no process runs to learn it.
