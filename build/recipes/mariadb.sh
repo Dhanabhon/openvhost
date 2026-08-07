@@ -113,10 +113,10 @@ RECIPE_PCRE2_UPSTREAM_RELEASE_DATE="2025-02-05"
 #   keyserver.ubuntu.com  -> A95536204A3BB489715231282A98E77EB6F24CA8
 #
 # The PRIMARY is pinned, not the subkey that made the signature, which is why
-# _mariadb_verify_signature reads the last field of VALIDSIG rather than the
-# first. A maintainer may rotate a signing subkey between releases without the
-# identity changing; pinning the subkey would turn that into a build failure
-# indistinguishable from an attack.
+# build.sh's bp_gpg_verify_signature reads the last field of VALIDSIG rather
+# than the first. A maintainer may rotate a signing subkey between releases
+# without the identity changing; pinning the subkey would turn that into a
+# build failure indistinguishable from an attack.
 RECIPE_PCRE2_SIGNING_KEY_FPR="A95536204A3BB489715231282A98E77EB6F24CA8"
 RECIPE_PCRE2_SIGNING_KEY_URLS=(
 	"https://keys.openpgp.org/vks/v1/by-fingerprint/A95536204A3BB489715231282A98E77EB6F24CA8"
@@ -252,7 +252,6 @@ RECIPE_BISON_VERSION=""
 
 # ------------------------------------------------------------------ helpers --
 
-_mariadb_gnupg_home() { printf '%s/gnupg\n' "$BUILD_WORK"; }
 _mariadb_tarball() { printf '%s/mariadb-%s.tar.gz\n' "$BUILD_DOWNLOADS" "$RECIPE_VERSION"; }
 _mariadb_signature() { printf '%s.asc\n' "$(_mariadb_tarball)"; }
 _mariadb_openssl_prefix() { bp_dep_prefix openssl "$RECIPE_OPENSSL_VERSION"; }
@@ -262,10 +261,6 @@ _mariadb_openssl_prefix() { bp_dep_prefix openssl "$RECIPE_OPENSSL_VERSION"; }
 _mariadb_pcre2_archive() { printf '%s/pcre2-%s.zip\n' "$BUILD_DOWNLOADS" "$RECIPE_PCRE2_VERSION"; }
 _mariadb_pcre2_signature() { printf '%s.sig\n' "$(_mariadb_pcre2_archive)"; }
 _mariadb_fmt_archive() { printf '%s/fmt-%s.zip\n' "$BUILD_DOWNLOADS" "$RECIPE_FMT_VERSION"; }
-
-_mariadb_gpg() {
-	"$(bp_tool gpg)" --batch --no-tty --quiet --homedir "$(_mariadb_gnupg_home)" "$@"
-}
 
 # Take the network away from one command. cmake's file(DOWNLOAD) — which is what
 # every ExternalProject download step ends up in — is libcurl, and libcurl honours
@@ -283,75 +278,6 @@ _mariadb_no_network() {
 		ALL_PROXY="http://127.0.0.1:9" FTP_PROXY="http://127.0.0.1:9" \
 		no_proxy="" NO_PROXY="" \
 		"$@"
-}
-
-# Import every candidate key whose PRIMARY fingerprint is $1, from the URLs given
-# after the label. The fingerprint is the trust anchor, so key material may come
-# from any host: a substituted key cannot produce it. What the fetch has to get
-# right is freshness, not authenticity — expiry and revocation only travel with
-# the key — which is why no candidate is ever reused from a previous run.
-_mariadb_import_key() {
-	local fpr="$1" label="$2"
-	shift 2
-	local index=0 url dest imported=0 primary
-	for url in "$@"; do
-		index=$((index + 1))
-		dest="$BUILD_DOWNLOADS/signing-key-$label-$index.asc"
-		rm -f -- "$dest"
-		if ! bp_download "$url" "$dest" >/dev/null 2>&1; then
-			bp_log "signing key not available from $url"
-			continue
-		fi
-		# Import only if a PRIMARY key in the file carries the pinned fingerprint.
-		# Verification below insists on that same fingerprint, so an extra key
-		# riding along could not vouch for anything — but there is no reason to let
-		# one into the keyring either.
-		primary="$(_mariadb_gpg --show-keys --with-colons "$dest" 2>/dev/null |
-			awk -F: '$1 == "pub" { want = 1; next } $1 == "fpr" && want { print $10; want = 0 }' |
-			grep -Fx "$fpr" || true)"
-		if [ -z "$primary" ]; then
-			bp_log "ignoring key from $url: no primary key with fingerprint $fpr"
-			continue
-		fi
-		_mariadb_gpg --import "$dest" >/dev/null 2>&1 || continue
-		imported=$((imported + 1))
-		bp_log "imported signing key $fpr from $url"
-	done
-	[ "$imported" -gt 0 ] ||
-		bp_die "no host served a key with fingerprint $fpr; cannot verify provenance"
-}
-
-# Insist on a good signature over <file> by the primary key <fpr>.
-#
-# gpg --verify exits 0 on an EXPIRED signing key — measured on 2026-08-02 against
-# OpenSSL's, whose keyserver copy had lapsed — so the exit status proves nothing
-# and the machine-readable status is read instead.
-#
-# The fingerprint compared is the LAST field of VALIDSIG, which is the primary
-# key; the first field is whichever subkey actually made the signature. MariaDB
-# signs with its primary and PCRE2 signs with a subkey, so the primary is the only
-# stable thing to pin — see RECIPE_PCRE2_SIGNING_KEY_FPR.
-_mariadb_verify_signature() {
-	local file="$1" sig="$2" fpr="$3" what status errors bad
-	what="$(basename -- "$file")"
-	status="$BUILD_WORK/gpg-status-$what.txt"
-	errors="$BUILD_WORK/gpg-stderr-$what.txt"
-
-	_mariadb_gpg --status-fd 1 --verify "$sig" "$file" >"$status" 2>"$errors" || true
-
-	awk -v fpr="$fpr" \
-		'$1 == "[GNUPG:]" && $2 == "VALIDSIG" && $NF == fpr { found = 1 }
-		 END { exit found ? 0 : 1 }' "$status" ||
-		bp_die "no valid signature by $fpr over $what; gpg said: $(tr '\n' ' ' <"$errors")"
-	for bad in EXPKEYSIG REVKEYSIG BADSIG ERRSIG EXPSIG; do
-		# An `if`, not `grep ... && bp_die`: under set -e the AND-list's failure
-		# becomes the loop's exit status, and a loop that "fails" because nothing
-		# was wrong would abort the build on the happy path.
-		if grep -q "^\[GNUPG:\] $bad " "$status"; then
-			bp_die "signature over $what is $bad; refusing to build from it"
-		fi
-	done
-	bp_log "GPG: good signature by $fpr over $what"
 }
 
 # Put a verified archive where MariaDB's ExternalProject step will look, and prove
@@ -446,25 +372,23 @@ recipe_fetch() {
 	bp_download "$RECIPE_PCRE2_SIGNATURE_URL" "$(_mariadb_pcre2_signature)"
 	bp_download "$RECIPE_FMT_URL" "$(_mariadb_fmt_archive)"
 
-	bp_rm_tree "$(_mariadb_gnupg_home)"
-	mkdir -p "$(_mariadb_gnupg_home)"
-	chmod 700 "$(_mariadb_gnupg_home)"
+	bp_gpg_init_home
 	# One keyring for both. Each verification names the fingerprint it demands, so
 	# a key in here can only vouch for the release it actually signed.
-	_mariadb_import_key "$RECIPE_SIGNING_KEY_FPR" mariadb \
+	bp_gpg_import_key "$RECIPE_SIGNING_KEY_FPR" mariadb \
 		${RECIPE_SIGNING_KEY_URLS[@]+"${RECIPE_SIGNING_KEY_URLS[@]}"}
-	_mariadb_import_key "$RECIPE_PCRE2_SIGNING_KEY_FPR" pcre2 \
+	bp_gpg_import_key "$RECIPE_PCRE2_SIGNING_KEY_FPR" pcre2 \
 		${RECIPE_PCRE2_SIGNING_KEY_URLS[@]+"${RECIPE_PCRE2_SIGNING_KEY_URLS[@]}"}
 }
 
 recipe_verify_source() {
 	# The signature says who produced these bytes; the pinned digest says they
 	# are the same bytes we reviewed. Both, in that order.
-	_mariadb_verify_signature "$(_mariadb_tarball)" "$(_mariadb_signature)" \
+	bp_gpg_verify_signature "$(_mariadb_tarball)" "$(_mariadb_signature)" \
 		"$RECIPE_SIGNING_KEY_FPR"
 	bp_verify_sha256 "$(_mariadb_tarball)" "$RECIPE_SOURCE_SHA256"
 
-	_mariadb_verify_signature "$(_mariadb_pcre2_archive)" "$(_mariadb_pcre2_signature)" \
+	bp_gpg_verify_signature "$(_mariadb_pcre2_archive)" "$(_mariadb_pcre2_signature)" \
 		"$RECIPE_PCRE2_SIGNING_KEY_FPR"
 	bp_verify_sha256 "$(_mariadb_pcre2_archive)" "$RECIPE_PCRE2_SHA256"
 

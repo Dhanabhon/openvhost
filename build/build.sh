@@ -432,6 +432,109 @@ bp_verify_sha256() {
 	bp_log "sha256 verified: $(basename -- "$file")"
 }
 
+# --------------------------------------------------- GPG import-and-verify ---
+#
+# Written three times before this extraction (openssl.sh, mariadb.sh,
+# nginx.sh), identical down to the awk that reads the primary fingerprint out
+# of `--show-keys --with-colons`. Package-agnostic from the start; only now
+# shared.
+#
+# `gpg --verify` exits 0 on an EXPIRED signing key — measured 2026-08-02
+# against OpenSSL's, whose keyserver copy had lapsed — so
+# bp_gpg_verify_signature never trusts that exit status; --status-fd is
+# parsed instead. The fingerprint compared is the LAST field of VALIDSIG (the
+# signature's PRIMARY key), never the first (whichever subkey actually made
+# the signature): MariaDB and nginx both sign directly with their primary
+# key, but PCRE2 — a dependency of both — signs with a subkey, so the primary
+# is the only stable thing to pin.
+#
+# Key material may come from any host, because the fingerprint is the trust
+# anchor and a substituted key cannot produce it — but freshness (expiry,
+# revocation) only travels with the key, which is why bp_gpg_import_key never
+# reuses a candidate from a previous run. The keyring itself lives in one
+# fresh, mode-700 homedir per build, under $BUILD_WORK, and bp_gpg always
+# passes --homedir explicitly so no ambient GNUPGHOME or ~/.gnupg/gpg.conf can
+# steer it.
+
+bp_gnupg_home() { printf '%s/gnupg\n' "$BUILD_WORK"; }
+
+bp_gpg_init_home() {
+	local home
+	home="$(bp_gnupg_home)"
+	bp_rm_tree "$home"
+	mkdir -p "$home"
+	chmod 700 "$home"
+}
+
+bp_gpg() {
+	"$(bp_tool gpg)" --batch --no-tty --quiet --homedir "$(bp_gnupg_home)" "$@"
+}
+
+# Import the fetched file once it is confirmed to contain a PRIMARY key with
+# fingerprint <fpr>, from the URL(s) given after <label>. `gpg --import` does
+# not filter — every key in the file lands in the keyring, not just the one
+# matching <fpr> — but that is harmless: verification insists on the same
+# fingerprint, so an extra key riding along in the file could not vouch for
+# anything, and there is no reason to keep one out of the keyring either.
+#
+# <label> distinguishes concurrent imports into the same keyring (a recipe
+# verifying its own release plus a dependency's, say PCRE2's) in the
+# downloaded file's name; a recipe importing only one key may pass "".
+bp_gpg_import_key() {
+	local fpr="$1" label="$2"
+	shift 2
+	local index=0 url dest imported=0 primary
+	for url in "$@"; do
+		index=$((index + 1))
+		dest="$BUILD_DOWNLOADS/signing-key${label:+-$label}-$index.asc"
+		rm -f -- "$dest"
+		# Never reused from a previous run: a stale mirror copy is precisely the
+		# failure mode this list exists to route around.
+		if ! bp_download "$url" "$dest" >/dev/null 2>&1; then
+			bp_log "signing key not available from $url"
+			continue
+		fi
+		primary="$(bp_gpg --show-keys --with-colons "$dest" 2>/dev/null |
+			awk -F: '$1 == "pub" { want = 1; next } $1 == "fpr" && want { print $10; want = 0 }' |
+			grep -Fx "$fpr" || true)"
+		if [ -z "$primary" ]; then
+			bp_log "ignoring key from $url: no primary key with fingerprint $fpr"
+			continue
+		fi
+		bp_gpg --import "$dest" >/dev/null 2>&1 || continue
+		imported=$((imported + 1))
+		bp_log "imported signing key $fpr from $url"
+	done
+	[ "$imported" -gt 0 ] ||
+		bp_die "no host served a key with fingerprint $fpr; cannot verify provenance"
+}
+
+# Insist on a good signature over <file> by the primary key <fpr>. See the
+# block comment above for why the exit status is ignored and why the
+# fingerprint compared is VALIDSIG's last field rather than its first.
+bp_gpg_verify_signature() {
+	local file="$1" sig="$2" fpr="$3" what status errors bad
+	what="$(basename -- "$file")"
+	status="$BUILD_WORK/gpg-status-$what.txt"
+	errors="$BUILD_WORK/gpg-stderr-$what.txt"
+
+	bp_gpg --status-fd 1 --verify "$sig" "$file" >"$status" 2>"$errors" || true
+
+	awk -v fpr="$fpr" \
+		'$1 == "[GNUPG:]" && $2 == "VALIDSIG" && $NF == fpr { found = 1 }
+		 END { exit found ? 0 : 1 }' "$status" ||
+		bp_die "no valid signature by $fpr over $what; gpg said: $(tr '\n' ' ' <"$errors")"
+	for bad in EXPKEYSIG REVKEYSIG BADSIG ERRSIG EXPSIG; do
+		# An `if`, not `grep ... && bp_die`: under set -e the AND-list's failure
+		# becomes the loop's exit status, and a loop that "fails" because nothing
+		# was wrong would abort the build on the happy path.
+		if grep -q "^\[GNUPG:\] $bad " "$status"; then
+			bp_die "signature over $what is $bad; refusing to build from it"
+		fi
+	done
+	bp_log "GPG: good signature by $fpr over $what"
+}
+
 # Record a configure flag so it reaches the build manifest (§7). Intent that is
 # not recorded is not auditable.
 bp_record_flags() {

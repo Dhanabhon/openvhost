@@ -183,83 +183,16 @@ RECIPE_REQUIRED_LAYOUT=(bin)
 
 # ------------------------------------------------------------------ helpers --
 
-_nginx_gnupg_home() { printf '%s/gnupg\n' "$BUILD_WORK"; }
 _nginx_tarball() { printf '%s/nginx-%s.tar.gz\n' "$BUILD_DOWNLOADS" "$RECIPE_VERSION"; }
 _nginx_signature() { printf '%s.asc\n' "$(_nginx_tarball)"; }
 _nginx_pcre2_archive() { printf '%s/pcre2-%s.zip\n' "$BUILD_DOWNLOADS" "$RECIPE_PCRE2_VERSION"; }
 _nginx_pcre2_signature() { printf '%s.sig\n' "$(_nginx_pcre2_archive)"; }
 # Sibling of $BUILD_DOWNLOADS/$BUILD_SRC/$BUILD_OBJ under $BUILD_WORK — same
-# pattern recipes/mariadb.sh uses for its gnupg home, not one of the three
-# names the interface calls out by name but equally scratch (README.md
+# pattern build.sh's bp_gnupg_home uses for the gnupg home, not one of the
+# three names the interface calls out by name but equally scratch (README.md
 # "Paths a recipe may write to").
 _nginx_pcre2_header_dir() { printf '%s/pcre2-include\n' "$BUILD_WORK"; }
 _nginx_openssl_prefix() { bp_dep_prefix openssl "$RECIPE_OPENSSL_VERSION"; }
-
-_nginx_gpg() {
-	"$(bp_tool gpg)" --batch --no-tty --quiet --homedir "$(_nginx_gnupg_home)" "$@"
-}
-
-# Import every candidate key whose PRIMARY fingerprint is $1, from the URLs
-# given after the label. Identical shape to recipes/mariadb.sh's
-# _mariadb_import_key — the fingerprint is the trust anchor so key MATERIAL
-# may come from anywhere, but freshness (expiry, revocation) only travels
-# with the key, which is why nothing is ever reused from a previous run.
-_nginx_import_key() {
-	local fpr="$1" label="$2"
-	shift 2
-	local index=0 url dest imported=0 primary
-	for url in "$@"; do
-		index=$((index + 1))
-		dest="$BUILD_DOWNLOADS/signing-key-$label-$index.asc"
-		rm -f -- "$dest"
-		if ! bp_download "$url" "$dest" >/dev/null 2>&1; then
-			bp_log "signing key not available from $url"
-			continue
-		fi
-		primary="$(_nginx_gpg --show-keys --with-colons "$dest" 2>/dev/null |
-			awk -F: '$1 == "pub" { want = 1; next } $1 == "fpr" && want { print $10; want = 0 }' |
-			grep -Fx "$fpr" || true)"
-		if [ -z "$primary" ]; then
-			bp_log "ignoring key from $url: no primary key with fingerprint $fpr"
-			continue
-		fi
-		_nginx_gpg --import "$dest" >/dev/null 2>&1 || continue
-		imported=$((imported + 1))
-		bp_log "imported signing key $fpr from $url"
-	done
-	[ "$imported" -gt 0 ] ||
-		bp_die "no host served a key with fingerprint $fpr; cannot verify provenance"
-}
-
-# Insist on a good signature over <file> by the primary key <fpr>.
-#
-# gpg --verify exits 0 on an EXPIRED signing key (measured 2026-08-02 against
-# OpenSSL's) so the exit status proves nothing here either; the
-# machine-readable status is read instead, exactly as recipes/mariadb.sh and
-# recipes/openssl.sh already do. Neither key pinned in this file expires, but
-# the check does not get to assume that of itself.
-_nginx_verify_signature() {
-	local file="$1" sig="$2" fpr="$3" what status errors bad
-	what="$(basename -- "$file")"
-	status="$BUILD_WORK/gpg-status-$what.txt"
-	errors="$BUILD_WORK/gpg-stderr-$what.txt"
-
-	_nginx_gpg --status-fd 1 --verify "$sig" "$file" >"$status" 2>"$errors" || true
-
-	awk -v fpr="$fpr" \
-		'$1 == "[GNUPG:]" && $2 == "VALIDSIG" && $NF == fpr { found = 1 }
-		 END { exit found ? 0 : 1 }' "$status" ||
-		bp_die "no valid signature by $fpr over $what; gpg said: $(tr '\n' ' ' <"$errors")"
-	for bad in EXPKEYSIG REVKEYSIG BADSIG ERRSIG EXPSIG; do
-		# An `if`, not `grep ... && bp_die`: under set -e the AND-list's failure
-		# becomes the loop's exit status, and a loop that "fails" because
-		# nothing was wrong would abort the build on the happy path.
-		if grep -q "^\[GNUPG:\] $bad " "$status"; then
-			bp_die "signature over $what is $bad; refusing to build from it"
-		fi
-	done
-	bp_log "GPG: good signature by $fpr over $what"
-}
 
 # ------------------------------------------------------------------- stages --
 
@@ -278,23 +211,21 @@ recipe_fetch() {
 	bp_download "$RECIPE_PCRE2_URL" "$(_nginx_pcre2_archive)"
 	bp_download "$RECIPE_PCRE2_SIGNATURE_URL" "$(_nginx_pcre2_signature)"
 
-	bp_rm_tree "$(_nginx_gnupg_home)"
-	mkdir -p "$(_nginx_gnupg_home)"
-	chmod 700 "$(_nginx_gnupg_home)"
+	bp_gpg_init_home
 	# One keyring for both keys. Each verification names the fingerprint it
 	# demands, so a key in here can only vouch for the release it actually
 	# signed.
-	_nginx_import_key "$RECIPE_SIGNING_KEY_FPR" nginx \
+	bp_gpg_import_key "$RECIPE_SIGNING_KEY_FPR" nginx \
 		${RECIPE_SIGNING_KEY_URLS[@]+"${RECIPE_SIGNING_KEY_URLS[@]}"}
-	_nginx_import_key "$RECIPE_PCRE2_SIGNING_KEY_FPR" pcre2 \
+	bp_gpg_import_key "$RECIPE_PCRE2_SIGNING_KEY_FPR" pcre2 \
 		${RECIPE_PCRE2_SIGNING_KEY_URLS[@]+"${RECIPE_PCRE2_SIGNING_KEY_URLS[@]}"}
 }
 
 recipe_verify_source() {
-	_nginx_verify_signature "$(_nginx_tarball)" "$(_nginx_signature)" "$RECIPE_SIGNING_KEY_FPR"
+	bp_gpg_verify_signature "$(_nginx_tarball)" "$(_nginx_signature)" "$RECIPE_SIGNING_KEY_FPR"
 	bp_verify_sha256 "$(_nginx_tarball)" "$RECIPE_SOURCE_SHA256"
 
-	_nginx_verify_signature "$(_nginx_pcre2_archive)" "$(_nginx_pcre2_signature)" \
+	bp_gpg_verify_signature "$(_nginx_pcre2_archive)" "$(_nginx_pcre2_signature)" \
 		"$RECIPE_PCRE2_SIGNING_KEY_FPR"
 	bp_verify_sha256 "$(_nginx_pcre2_archive)" "$RECIPE_PCRE2_SHA256"
 }

@@ -76,13 +76,8 @@ RECIPE_SERVER_BIN=""
 # ------------------------------------------------------------------ helpers --
 
 # Every path below is derived from $BUILD_WORK, which build.sh owns.
-_openssl_gnupg_home() { printf '%s/gnupg\n' "$BUILD_WORK"; }
 _openssl_tarball() { printf '%s/openssl-%s.tar.gz\n' "$BUILD_DOWNLOADS" "$RECIPE_VERSION"; }
 _openssl_signature() { printf '%s.asc\n' "$(_openssl_tarball)"; }
-
-_openssl_gpg() {
-	"$(bp_tool gpg)" --batch --no-tty --quiet --homedir "$(_openssl_gnupg_home)" "$@"
-}
 
 # ------------------------------------------------------------------- stages --
 
@@ -101,62 +96,15 @@ recipe_fetch() {
 	bp_download "$RECIPE_SOURCE_URL" "$(_openssl_tarball)"
 	bp_download "$RECIPE_SIGNATURE_URL" "$(_openssl_signature)"
 
-	local index=0 url dest imported=0 primary
-	bp_rm_tree "$(_openssl_gnupg_home)"
-	mkdir -p "$(_openssl_gnupg_home)"
-	chmod 700 "$(_openssl_gnupg_home)"
-	for url in ${RECIPE_SIGNING_KEY_URLS[@]+"${RECIPE_SIGNING_KEY_URLS[@]}"}; do
-		index=$((index + 1))
-		dest="$BUILD_DOWNLOADS/signing-key-$index.asc"
-		rm -f -- "$dest"
-		# Never reused from a previous run: a stale mirror copy is precisely the
-		# failure mode this list exists to route around.
-		if ! bp_download "$url" "$dest" >/dev/null 2>&1; then
-			bp_log "signing key not available from $url"
-			continue
-		fi
-		# Import only if a PRIMARY key in the file carries the pinned fingerprint.
-		# Verification below insists on VALIDSIG for that same fingerprint, so an
-		# extra key riding along in the file cannot vouch for anything — but there
-		# is no reason to let one into the keyring either.
-		primary="$(_openssl_gpg --show-keys --with-colons "$dest" 2>/dev/null |
-			awk -F: '$1 == "pub" { want = 1; next } $1 == "fpr" && want { print $10; want = 0 }' |
-			grep -Fx "$RECIPE_SIGNING_KEY_FPR" || true)"
-		if [ -z "$primary" ]; then
-			bp_log "ignoring key from $url: no primary key with fingerprint $RECIPE_SIGNING_KEY_FPR"
-			continue
-		fi
-		_openssl_gpg --import "$dest" >/dev/null 2>&1 || continue
-		imported=$((imported + 1))
-		bp_log "imported signing key $RECIPE_SIGNING_KEY_FPR from $url"
-	done
-	[ "$imported" -gt 0 ] ||
-		bp_die "no host served a key with fingerprint $RECIPE_SIGNING_KEY_FPR; cannot verify provenance"
+	bp_gpg_init_home
+	bp_gpg_import_key "$RECIPE_SIGNING_KEY_FPR" "" \
+		${RECIPE_SIGNING_KEY_URLS[@]+"${RECIPE_SIGNING_KEY_URLS[@]}"}
 }
 
 recipe_verify_source() {
-	local status="$BUILD_WORK/gpg-status.txt" errors="$BUILD_WORK/gpg-stderr.txt" bad
-
 	# The signature first: it is the statement about who produced these bytes.
 	# The pinned digest that follows says they are the same bytes we reviewed.
-	# gpg --verify exits 0 on an EXPIRED key — measured on 2026-08-02 — so the
-	# exit status is worth nothing here and the machine-readable status is read
-	# instead.
-	_openssl_gpg --status-fd 1 --verify "$(_openssl_signature)" "$(_openssl_tarball)" \
-		>"$status" 2>"$errors" || true
-
-	grep -q "^\[GNUPG:\] VALIDSIG $RECIPE_SIGNING_KEY_FPR " "$status" ||
-		bp_die "no valid signature by $RECIPE_SIGNING_KEY_FPR over $(basename -- "$(_openssl_tarball)"); gpg said: $(tr '\n' ' ' <"$errors")"
-	for bad in EXPKEYSIG REVKEYSIG BADSIG ERRSIG EXPSIG; do
-		# An `if`, not `grep ... && bp_die`: under set -e the AND-list's failure
-		# becomes the loop's exit status, and a loop that "fails" because nothing
-		# was wrong would abort the build on the happy path.
-		if grep -q "^\[GNUPG:\] $bad " "$status"; then
-			bp_die "signature over $(basename -- "$(_openssl_tarball)") is $bad — see RECIPE_SIGNING_KEY_EXPIRY ($RECIPE_SIGNING_KEY_EXPIRY) and refresh the key"
-		fi
-	done
-	bp_log "GPG: good signature by $RECIPE_SIGNING_KEY_FPR"
-
+	bp_gpg_verify_signature "$(_openssl_tarball)" "$(_openssl_signature)" "$RECIPE_SIGNING_KEY_FPR"
 	bp_verify_sha256 "$(_openssl_tarball)" "$RECIPE_SOURCE_SHA256"
 }
 
