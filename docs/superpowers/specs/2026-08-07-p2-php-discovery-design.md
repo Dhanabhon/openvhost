@@ -44,6 +44,24 @@ slice earned the enum is 4C's: **a throwaway third variant must break compilatio
 than it did before**, and at least one of them must be a real behavioural fork rather than
 plumbing.
 
+**Measured in T1, and the bar above was set wrong — recorded rather than quietly moved.** The
+throwaway variant breaks **2 sites**, both `PhpRuntimeSource`'s own accessors; **neither is a
+behavioural fork**. The calibration that decides it: `MysqlRuntimeSource` also breaks at 2
+*after its full UI slice*, and `NginxRuntimeSource` reaches 3 only because **4C** — a consumer
+slice — added an install-path fork. So 2 is the normal count for a discovery-only slice here,
+and §3 was comparing 5B against a slice one stage further along.
+
+Substantively the asymmetry *is* consumed: making the packaged runtime report `Homebrew` fails
+four tests. It is enforced **at construction** — two resolver functions, each producing one
+source — rather than by a late `match`. That is the better shape (the value is parsed once, not
+re-decided at every use), so the count is accepted as-is and **no `match` is manufactured to
+raise it**.
+
+What that shape leaves unguarded is ordering, which §7 calls load-bearing: it lives in statement
+order inside the merge, and nothing forces a future third source to declare where it ranks. A
+rank function would encode it, but at two variants that is an abstraction ahead of its need. The
+guard is a **test that pins the contract by name** (§8.7).
+
 ## 4. D2 — Packaged wins per major; brew's own preferences still govern the brew pass
 
 Mirror `mysql/discover.rs:356-363`: run the packaged pass first, then push a brew runtime only
@@ -74,9 +92,15 @@ slice.
 
 ## 6. D4 — `Discovery`'s honesty contract survives
 
-A packaged tree that exists but cannot be identified — a missing `sbin/php-fpm`, a `current`
+A packaged tree that exists but cannot be identified — a missing `bin/php-fpm`, a `current`
 pointing nowhere — is reported as **unidentified**, not dropped. That is what keeps "empty
 `runtimes`" meaning "nothing is installed".
+
+**`bin/php-fpm`, not `sbin/php-fpm`** — this section said `sbin` in the first draft, which was
+wrong. The recipe is authoritative (`RECIPE_SERVER_BIN="bin/php-fpm"`,
+`RECIPE_REQUIRED_LAYOUT=(bin modules)`) and 5A's catalogue already asserts it. `sbin` is
+Homebrew's layout, so the packaged walk must **refuse** a tree shaped that way rather than
+quietly accept either.
 
 This matters more for packaged than for brew: a half-installed package tree is a state our own
 installer can produce, where a broken keg is someone else's doing.
@@ -103,6 +127,10 @@ rather than discovered.
 5. A packaged tree that cannot be identified is reported unidentified, not silently absent.
 6. **Nothing user-visible changes on a machine with no package tree.** Sites, apply, per-site
    PHP versions and the Languages page behave exactly as before.
+7. **Ordering is pinned by name.** With a packaged 8.4 and a Homebrew 8.3 — no collision, so
+   both survive — the packaged entry ranks **first**, because §7 makes the first entry the
+   catch-all's runtime. This is the guard that replaces the rank function §3 declines to build,
+   so it must fail if the two merge steps are swapped.
 
 ## 9. Out of scope
 
