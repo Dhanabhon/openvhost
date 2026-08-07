@@ -30,6 +30,8 @@ use openvhost_core::nginx::{NginxRuntime, NginxRuntimeSource, discover_nginx, ng
 // Re-exported by `openvhost-core` so this crate needs no direct `openvhost-pkg`
 // dependency. Minted only from a resolved home — never from IPC input.
 use openvhost_core::PackagesRoot;
+#[cfg(all(test, target_os = "macos"))]
+use openvhost_core::PhpRuntimeSource;
 use openvhost_core::{InstalledRuntimes, PhpRuntime};
 use openvhost_proc::{DEFAULT_GRACE, ReadinessProbe, ServiceSpec, SpawnSpec};
 
@@ -947,9 +949,15 @@ mod tests {
     fn php_fpm_spec_ensures_the_log_directory_exists() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tmp.path();
+        // `PhpRuntime.source` arrived with PHP discovery (off-Homebrew slice
+        // 5B). Every fixture in this module already described a Homebrew keg,
+        // so `Homebrew` is the truthful value rather than a placeholder, and
+        // no test's meaning changes: nothing here reads the field. The startup
+        // seam that begins producing `Packaged` is the next task in the slice.
         let rt = PhpRuntime {
             major: "8.4".to_string(),
             fpm_bin: PathBuf::from("/opt/homebrew/opt/php@8.4/sbin/php-fpm"),
+            source: PhpRuntimeSource::Homebrew,
         };
         let dir = openvhost_core::LogPaths::new(home)
             .php_fpm_error(&openvhost_core::PhpVersion::parse("8.4").expect("valid major"))
@@ -986,6 +994,7 @@ mod tests {
         let rt = PhpRuntime {
             major: "8.4".to_string(),
             fpm_bin: PathBuf::from("/opt/homebrew/opt/php@8.4/sbin/php-fpm"),
+            source: PhpRuntimeSource::Homebrew,
         };
         let dir = openvhost_core::LogPaths::new(home)
             .php_fpm_error(&openvhost_core::PhpVersion::parse("8.4").expect("valid major"))
@@ -1040,6 +1049,7 @@ mod tests {
             &PhpRuntime {
                 major: "8.4".to_string(),
                 fpm_bin: PathBuf::from("/opt/homebrew/opt/php@8.4/sbin/php-fpm"),
+                source: PhpRuntimeSource::Homebrew,
             },
         );
         // The literal, not just the round trip: a service id is a user-facing

@@ -89,8 +89,8 @@ use openvhost_core::platform::macos::demo_stack::{find_brew_binaries, provision_
 use openvhost_core::site::apply::LISTEN_PORT;
 use openvhost_core::{
     ApplyInput, Docroot, Domain, InstalledRuntimes, LogLimits, LogPaths, LogQuery, NginxValidator,
-    PhpRuntime, PhpVersion, Site, SiteId, SiteName, WebServer, apply, nginx_prefix_dir,
-    nginx_spawn_argv, plan, read_window,
+    PhpRuntime, PhpRuntimeSource, PhpVersion, Site, SiteId, SiteName, WebServer, apply,
+    nginx_prefix_dir, nginx_spawn_argv, plan, read_window,
 };
 
 // ---------------------------------------------------------------------------
@@ -289,6 +289,10 @@ async fn per_site_logs_capture_the_real_request_and_the_fatal() {
             php: vec![PhpRuntime {
                 major: major.clone(),
                 fpm_bin: brew.php_fpm.clone(),
+                // `find_brew_binaries` is where `brew.php_fpm` came from, so
+                // this states the truth about this fixture rather than filling
+                // a field: the test proves exactly what it proved before.
+                source: PhpRuntimeSource::Homebrew,
             }],
         },
         // The defaults, deliberately — same reasoning as `site_apply_e2e.rs`:

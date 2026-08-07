@@ -20,7 +20,8 @@ use openvhost_core::platform::macos::demo_stack::{find_brew_binaries, provision_
 use openvhost_core::site::apply::LISTEN_PORT;
 use openvhost_core::{
     ApplyInput, Docroot, Domain, InstalledRuntimes, LogPaths, NginxValidator, PhpRuntime,
-    PhpVersion, Site, SiteId, SiteName, WebServer, apply, nginx_prefix_dir, nginx_spawn_argv, plan,
+    PhpRuntimeSource, PhpVersion, Site, SiteId, SiteName, WebServer, apply, nginx_prefix_dir,
+    nginx_spawn_argv, plan,
 };
 
 /// Both nginx (`worker_processes 1`) and php-fpm (`pm = ondemand`) fork
@@ -167,6 +168,10 @@ async fn site_apply_serves_a_real_site_end_to_end() {
             php: vec![PhpRuntime {
                 major: major.clone(),
                 fpm_bin: brew.php_fpm.clone(),
+                // `find_brew_binaries` is where `brew.php_fpm` came from, so
+                // this states the truth about this fixture rather than filling
+                // a field: the test proves exactly what it proved before.
+                source: PhpRuntimeSource::Homebrew,
             }],
         },
         // The defaults, deliberately: this test proves the pipeline serves a

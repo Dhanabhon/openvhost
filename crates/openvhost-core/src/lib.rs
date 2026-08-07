@@ -105,6 +105,11 @@ pub use openvhost_pkg::{ArchiveFormat, InstalledPackage, PackagesRoot, PkgError,
 /// is inspectable (and testable) without exposing an install a user could
 /// trigger into a 404.
 ///
+/// `discover_php`/`PhpRuntimeSource` (off-Homebrew slice 5B) need no such
+/// gate, exactly like nginx's discovery surface above: they only ever READ the
+/// package tree and a Homebrew prefix, so they are safe to call whether or not
+/// a packaged PHP has ever been published.
+///
 /// **`Availability` is deliberately absent from this list**, the same as
 /// [`nginx::Availability`]: [`mariadb::Availability`] already holds the
 /// `Availability` name at the crate root, and PHP's copy is a distinct type
@@ -112,9 +117,9 @@ pub use openvhost_pkg::{ArchiveFormat, InstalledPackage, PackagesRoot, PkgError,
 /// not shared). It stays reachable at `php::Availability`.
 pub use php::{
     BREW_PREFIXES, CATALOGUE, PHP_PACKAGE_NAME, PHP_PACKAGES, PHP_WARMUP_BINARY, PhpMajor,
-    PhpPackage, PhpPackageInstall, brew_formula, brew_install_spec, brew_uninstall_spec,
-    discover_php_in, find_brew, install_php_package, php_package_for_host, php_package_for_target,
-    php_runtime_for_major,
+    PhpPackage, PhpPackageInstall, PhpRuntimeSource, brew_formula, brew_install_spec,
+    brew_uninstall_spec, discover_php, discover_php_in, find_brew, install_php_package,
+    php_package_for_host, php_package_for_target, php_runtime_for_major,
 };
 pub use settings_repo::{SqliteWebServerSettings, WebServerSettingsRepository};
 pub use site::apply::{

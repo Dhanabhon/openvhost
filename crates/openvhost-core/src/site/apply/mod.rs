@@ -22,6 +22,7 @@ pub use error::{ApplyError, RollbackReport};
 pub use plan::{ApplyPlan, ChangeKind, FileChange, plan};
 
 use crate::CoreError;
+use crate::php::PhpRuntimeSource;
 use crate::site::model::{Site, SiteId, WebServer};
 
 /// Darwin's `sun_path` is 104 bytes including the NUL. php-fpm does not reject
@@ -37,10 +38,23 @@ pub fn listen_addr() -> SocketAddr {
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, LISTEN_PORT))
 }
 
+/// One discovered PHP installation: the `major.minor` it provides, the
+/// `php-fpm` this app supervises, and where those binaries came from.
+///
+/// **The path is always concrete** (PHP-discovery design D3, mirroring
+/// [`crate::nginx::NginxRuntime`] and [`crate::mysql::MysqlRuntime`]). For a
+/// packaged runtime it names `packages/php/<major>/<version>/bin/php-fpm`,
+/// never `packages/php/<major>/current/bin/php-fpm`: a supervised child is
+/// spawned from whatever is recorded here, and spawning *through* the link
+/// would mean a later `current` swap silently changed which binary a restart
+/// brings up, with the running process and the one the UI describes diverging
+/// and nothing in between to notice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhpRuntime {
     pub major: String,
     pub fpm_bin: PathBuf,
+    /// Which install produced [`Self::fpm_bin`] — see [`PhpRuntimeSource`].
+    pub source: PhpRuntimeSource,
 }
 
 /// What is installed on this machine. Passed in as data rather than probed

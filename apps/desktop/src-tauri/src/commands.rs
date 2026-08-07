@@ -2787,9 +2787,17 @@ mod php_ipc_tests {
 
     #[test]
     fn every_catalogue_entry_is_listed_with_its_installed_state() {
+        // `PhpRuntime.source` arrived with PHP discovery (off-Homebrew slice
+        // 5B). Every fixture in this file already described a Homebrew keg —
+        // a `…/opt/php@<major>/sbin/php-fpm` path, or a synthetic stand-in
+        // for one — so `Homebrew` is the TRUTHFUL value here rather than a
+        // placeholder, and no test's meaning changes: nothing below reads the
+        // field. The packaged variant enters this file when the Languages
+        // page learns to display the distinction (5C).
         let installed = vec![openvhost_core::PhpRuntime {
             major: "8.3".into(),
             fpm_bin: PathBuf::from("/opt/homebrew/opt/php@8.3/sbin/php-fpm"),
+            source: openvhost_core::PhpRuntimeSource::Homebrew,
         }];
         let rows = php_rows(Path::new("/tmp/ovh"), &installed, &[("8.3", "8.3.14")]);
         assert_eq!(rows.len(), openvhost_core::CATALOGUE.len());
@@ -2819,6 +2827,7 @@ mod php_ipc_tests {
         let installed = vec![openvhost_core::PhpRuntime {
             major: "8.3".into(),
             fpm_bin: PathBuf::from("/opt/homebrew/opt/php@8.3/sbin/php-fpm"),
+            source: openvhost_core::PhpRuntimeSource::Homebrew,
         }];
         let rows = php_rows(Path::new("/tmp/ovh"), &installed, &[]);
         let three = rows.iter().find(|r| r.major == "8.3").unwrap();
@@ -2939,6 +2948,7 @@ mod php_ipc_tests {
         let rt = |major: &str| openvhost_core::PhpRuntime {
             major: major.to_string(),
             fpm_bin: home.path().join(format!("php-fpm-{major}")),
+            source: openvhost_core::PhpRuntimeSource::Homebrew,
         };
 
         // Before: 8.3 installed and registered.
@@ -3005,6 +3015,7 @@ mod php_ipc_tests {
         let seed = openvhost_core::PhpRuntime {
             major: "8.4".to_string(),
             fpm_bin: candidate.join("sbin/php-fpm"),
+            source: openvhost_core::PhpRuntimeSource::Homebrew,
         };
 
         let reconciled = reconcile_php(
@@ -3047,6 +3058,7 @@ mod php_ipc_tests {
             runtimes: vec![openvhost_core::PhpRuntime {
                 major: "8.4".to_string(),
                 fpm_bin: PathBuf::from("/opt/homebrew/opt/php@8.4/sbin/php-fpm"),
+                source: openvhost_core::PhpRuntimeSource::Homebrew,
             }],
             unidentified: vec![],
         };
@@ -3055,6 +3067,7 @@ mod php_ipc_tests {
             Some(openvhost_core::PhpRuntime {
                 major: "8.4".to_string(),
                 fpm_bin: PathBuf::from("/usr/local/opt/php@8.4/sbin/php-fpm"),
+                source: openvhost_core::PhpRuntimeSource::Homebrew,
             }),
         );
         assert_eq!(seeded.runtimes.len(), 1, "got {seeded:?}");
@@ -3071,6 +3084,7 @@ mod php_ipc_tests {
             runtimes: vec![openvhost_core::PhpRuntime {
                 major: "8.4".to_string(),
                 fpm_bin: PathBuf::from("/opt/homebrew/opt/php@8.4/sbin/php-fpm"),
+                source: openvhost_core::PhpRuntimeSource::Homebrew,
             }],
             unidentified: vec![PathBuf::from("/opt/homebrew/opt/php@8.1")],
         };
@@ -3140,6 +3154,7 @@ mod php_ipc_tests {
             &openvhost_core::PhpRuntime {
                 major: "8.3".into(),
                 fpm_bin: PathBuf::from("/nonexistent/php-fpm"),
+                source: openvhost_core::PhpRuntimeSource::Homebrew,
             },
         ));
         assert_eq!(sup.snapshot().len(), 1);
@@ -3216,6 +3231,7 @@ mod php_ipc_tests {
         let installed = vec![openvhost_core::PhpRuntime {
             major: "7.4".into(),
             fpm_bin: PathBuf::from("/opt/homebrew/opt/php@7.4/sbin/php-fpm"),
+            source: openvhost_core::PhpRuntimeSource::Homebrew,
         }];
         let rows = php_rows(Path::new("/tmp/ovh"), &installed, &[("7.4", "7.4.33")]);
         assert!(rows.iter().any(|r| r.major == "7.4" && r.installed));
@@ -3234,6 +3250,7 @@ mod php_ipc_tests {
         let installed = vec![openvhost_core::PhpRuntime {
             major: "7.4".into(),
             fpm_bin: PathBuf::from("/opt/homebrew/opt/php@7.4/sbin/php-fpm"),
+            source: openvhost_core::PhpRuntimeSource::Homebrew,
         }];
         let rows = php_rows(Path::new("/tmp/ovh"), &installed, &[]);
         let hand_installed = rows.iter().find(|r| r.major == "7.4").unwrap();
@@ -8375,6 +8392,7 @@ mod apply_ipc_tests {
             php: vec![openvhost_core::PhpRuntime {
                 major: "8.3".into(),
                 fpm_bin: PathBuf::from("/opt/homebrew/opt/php@8.3/sbin/php-fpm"),
+                source: openvhost_core::PhpRuntimeSource::Homebrew,
             }],
         });
         let seen = state.read().unwrap().clone().unwrap();
@@ -10265,6 +10283,7 @@ mod log_ipc_tests {
             php: vec![openvhost_core::PhpRuntime {
                 major: "8.3".into(),
                 fpm_bin: home.path().join("php-fpm"),
+                source: openvhost_core::PhpRuntimeSource::Homebrew,
             }],
         })));
         let sup = Arc::new(Supervisor::new(openvhost_proc::default_driver()));

@@ -37,6 +37,30 @@ fn not_cataloged_error(version: &str) -> CoreError {
     }
 }
 
+/// Digits, one dot, digits — nothing else. [`PhpMajor::parse`]'s layer-1
+/// check, lifted out of it so the packaged-tree walk in
+/// [`crate::php::discover`] can apply the identical rule to a directory name
+/// without a second hand-rolled copy drifting from this one.
+///
+/// **A predicate, deliberately not a constructor.** `MysqlMajor` grew a
+/// discovery-only `from_probe`, and this module's own [`cataloged`] guard
+/// exists because that opened a path to `brew`'s argv that never passed
+/// `parse`. Exposing the shape TEST widens nothing: it mints no [`PhpMajor`],
+/// so there is still exactly one production constructor and it is still
+/// catalogue-gated.
+pub(super) fn is_major_minor_shape(s: &str) -> bool {
+    let mut parts = s.split('.');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(a), Some(b), None) => {
+            !a.is_empty()
+                && !b.is_empty()
+                && a.bytes().all(|c| c.is_ascii_digit())
+                && b.bytes().all(|c| c.is_ascii_digit())
+        }
+        _ => false,
+    }
+}
+
 /// A PHP `major.minor` this build offers. Parsing enforces the shape;
 /// membership of [`CATALOGUE`] enforces the policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,17 +69,7 @@ pub struct PhpMajor(String);
 impl PhpMajor {
     pub fn parse(s: &str) -> Result<Self, CoreError> {
         // Layer 1: shape. Digits, one dot, digits — nothing else.
-        let mut parts = s.split('.');
-        let ok = match (parts.next(), parts.next(), parts.next()) {
-            (Some(a), Some(b), None) => {
-                !a.is_empty()
-                    && !b.is_empty()
-                    && a.bytes().all(|c| c.is_ascii_digit())
-                    && b.bytes().all(|c| c.is_ascii_digit())
-            }
-            _ => false,
-        };
-        if !ok {
+        if !is_major_minor_shape(s) {
             return Err(CoreError::Validation {
                 field: "php_version",
                 reason: format!("{s:?} is not a major.minor version"),
