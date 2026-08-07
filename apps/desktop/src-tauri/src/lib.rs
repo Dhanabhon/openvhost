@@ -375,7 +375,7 @@ pub fn run() {
                             #[cfg(debug_assertions)]
                             supervisor.register(demo_ticker_spec());
                             #[cfg(target_os = "macos")]
-                            let (stack_paths, stack_runtimes, mysql_runtimes, mariadb_runtimes) = {
+                            let (stack_paths, stack_runtimes, mysql_runtimes, mariadb_runtimes, nginx_source) = {
                                 let stack = stack::macos_stack();
                                 for spec in stack.specs {
                                     supervisor.register(spec);
@@ -385,6 +385,7 @@ pub fn run() {
                                     stack.runtimes,
                                     stack.mysql_runtimes,
                                     stack.mariadb_runtimes,
+                                    stack.nginx_source,
                                 )
                             };
                             // No stack builder for this target yet, so `None` is the
@@ -392,12 +393,13 @@ pub fn run() {
                             // simply nothing to point the Web Server page at. See
                             // `commands::stack_paths` for the message that renders.
                             #[cfg(not(target_os = "macos"))]
-                            let (stack_paths, stack_runtimes, mysql_runtimes, mariadb_runtimes): (
+                            let (stack_paths, stack_runtimes, mysql_runtimes, mariadb_runtimes, nginx_source): (
                                 Option<stack::StackPaths>,
                                 Option<openvhost_core::InstalledRuntimes>,
                                 Option<Vec<openvhost_core::mysql::MysqlRuntime>>,
                                 Option<Vec<openvhost_core::mariadb::MariadbRuntime>>,
-                            ) = (None, None, None, None);
+                                Option<openvhost_core::nginx::NginxRuntimeSource>,
+                            ) = (None, None, None, None, None);
                             // Manage the Option ITSELF, unconditionally. Tauri implements
                             // `CommandArg` only for `State<'r, T>` — there is no impl for
                             // `Option<State<'r, T>>` — so a command cannot take an
@@ -412,6 +414,16 @@ pub fn run() {
                             // early, the real value later" split would silently pin every
                             // user to `None`.
                             app.manage(stack_paths);
+                            // Nginx source design D2: managed the same "bare `Option`,
+                            // exactly once" shape as `stack_paths` above rather than the
+                            // `RwLock`-wrapped shape the three lists below use — nothing in
+                            // this slice rescans or reinstalls nginx after launch, so unlike
+                            // those three there is no later writer to guard against.
+                            // `list_web_servers` reads this instead of re-discovering, for
+                            // the same reason `stack_paths` itself exists: a fresh walk could
+                            // disagree with the binary the supervisor actually registered if
+                            // `current` moved after launch.
+                            app.manage(nginx_source);
                             // Same `Option<T>`-managed-unconditionally shape as `stack_paths`
                             // above, for the same reason: `Manager::manage` never overwrites,
                             // so every arm must yield a value rather than some arms skipping

@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, expect, it } from 'vitest';
-import { statusFor, hotReloadLabel, startStopFor, stoppedPoolsFor } from './webservers.derive';
-import type { ServiceStatus, SiteDto } from '$lib/ipc';
+import {
+	statusFor,
+	hotReloadLabel,
+	nginxSourceBadge,
+	startStopFor,
+	stoppedPoolsFor
+} from './webservers.derive';
+import type { NginxRuntimeSourceDto, ServiceStatus, SiteDto } from '$lib/ipc';
 // NOTE: `ServiceState` is NOT exported from `$lib/ipc` (only `ServiceStateEvent`
 // and `ServiceStatus`), and `StatusPill` takes `kind: StateKind` rather than a
 // state object — so `statusFor` returns the kind STRING, indexed off the
@@ -155,5 +161,42 @@ describe('stoppedPoolsFor', () => {
 			'8.3',
 			'8.4'
 		]);
+	});
+});
+
+// Nginx source design D1/D2/D3. Mirrors `mysql-install.derive.test.ts`'s
+// `mysqlSourceBadge` block exactly — same three claims, same shape — since
+// the two functions answer the identical question for a differently-shaped
+// row.
+describe('nginxSourceBadge', () => {
+	const packaged: NginxRuntimeSourceDto = { kind: 'packaged', version: '1.30.4' };
+	const homebrew: NginxRuntimeSourceDto = { kind: 'homebrew' };
+
+	it('shows nothing when no nginx was found', () => {
+		expect(nginxSourceBadge(null)).toBeNull();
+	});
+
+	it('labels the two sources distinctly, so a migration is legible', () => {
+		const a = nginxSourceBadge(packaged);
+		const b = nginxSourceBadge(homebrew);
+		expect(a).not.toBeNull();
+		expect(b).not.toBeNull();
+		expect(a?.label).not.toBe(b?.label);
+		expect(a?.title).not.toBe(b?.title);
+	});
+
+	it('shows the exact version for a runtime OpenVHost installed', () => {
+		expect(nginxSourceBadge(packaged)?.label).toBe('OpenVHost 1.30.4');
+	});
+
+	// The lie this rules out: printing a made-up patch release for a binary
+	// nobody probed. nginx has no `--version` flag, only `-v` — finding out
+	// means executing the binary, which design D2 exists to avoid on the
+	// packaged path — so the badge carries no number at all.
+	it('invents no version for a Homebrew runtime — its label carries no digits', () => {
+		const badge = nginxSourceBadge(homebrew);
+		expect(badge?.label).toBe('Homebrew');
+		expect(badge?.label).not.toMatch(/\d/);
+		expect(badge?.title).toMatch(/will not guess|which this badge/i);
 	});
 });

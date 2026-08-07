@@ -2,7 +2,7 @@
 <script lang="ts">
 	import type { ServiceStatus, ValidationReportDto, WebServerDto } from '$lib/ipc';
 	import { WEB_SERVERS, type WebServerKind } from '$lib/sites.derive';
-	import { hotReloadLabel, startStopFor } from '$lib/webservers.derive';
+	import { hotReloadLabel, nginxSourceBadge, startStopFor } from '$lib/webservers.derive';
 	import Button from './Button.svelte';
 	import StatusPill from './StatusPill.svelte';
 	import WebServerIcon from './WebServerIcon.svelte';
@@ -52,6 +52,10 @@
 			: startStopFor(statusKind, server.configExists)
 	);
 
+	/** Which install put this binary here (nginx source design D1) — `null`
+	 *  for the Apache row and whenever no nginx was found. */
+	const sourceBadge = $derived(nginxSourceBadge(server.source));
+
 	/** Shown for any fact the backend could not fill in — never an empty gap the
 	 * reader cannot interpret. Reachable for `version` whenever the probe fails;
 	 * reachable for the paths only if a supported brand ever has none resolved,
@@ -100,6 +104,18 @@
 		<h3 class="primary">
 			{#if brand}<WebServerIcon server={brand} />{/if}
 			{server.displayName}
+			<!-- WHICH INSTALL this binary came from (design D1). Absent for
+			     Apache and whenever no nginx was found. Kept inside the same
+			     heading MySQL's row uses for its own badge (design D3: provenance
+			     lives with the name, never beside the status pill, so it cannot
+			     read as a second status). -->
+			{#if sourceBadge}
+				<span
+					class="badge source source-{server.source?.kind}"
+					title={sourceBadge.title}
+					data-testid="ws-source-{server.id}">{sourceBadge.label}</span
+				>
+			{/if}
 		</h3>
 		{#if statusKind}
 			<StatusPill kind={statusKind} testId="ws-pill-{server.id}" />
@@ -317,10 +333,46 @@
 	}
 	.ws-head .primary {
 		display: inline-flex;
+		/* Wraps since the source badge landed: at a narrow panel this heading can
+		   hold an icon, "nginx" and "OpenVHost 1.30.4" together, which on one
+		   nowrap line would push the row's status pill and actions off-screen —
+		   the same failure MysqlRow.svelte's identical comment documents fixing
+		   once already. */
+		flex-wrap: wrap;
 		align-items: center;
 		gap: 8px;
 		font-size: var(--vh-text-body);
 		font-weight: 600;
+		min-width: 0;
+	}
+	/* Provenance, not status (design D3): a quiet outline chip that reads as
+	   metadata beside the name rather than competing with the StatusPill in
+	   this row's head. Same recipe as MysqlRow.svelte's identical badge —
+	   matched deliberately rather than reinvented one page over. */
+	.badge {
+		display: inline-flex;
+		align-items: center;
+		flex-shrink: 0;
+		white-space: nowrap;
+		padding: 1px 8px;
+		border-radius: var(--vh-radius-pill);
+		font-size: var(--vh-text-caption);
+		font-weight: 600;
+		color: var(--vh-text-2);
+		background: var(--vh-surface-2);
+		border: 1px solid var(--vh-border);
+	}
+	.badge.source {
+		font-weight: 500;
+		letter-spacing: 0.01em;
+	}
+	/* The packaged chip borrows the link accent to say "this one is ours" —
+	   `--vh-link` is brand-700, the same token MysqlRow.svelte's identical
+	   chip uses. Homebrew keeps the neutral `.badge` base above. */
+	.badge.source-packaged {
+		color: var(--vh-link);
+		border-color: color-mix(in oklab, var(--vh-link) 35%, transparent);
+		background: color-mix(in oklab, var(--vh-link) 8%, transparent);
 	}
 	.grow {
 		flex: 1;

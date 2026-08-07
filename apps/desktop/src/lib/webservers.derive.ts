@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import type { ServiceStatus, SiteDto } from '$lib/ipc';
+import type { NginxRuntimeSourceDto, ServiceStatus, SiteDto } from '$lib/ipc';
 
 /**
  * The supervised state-kind a row shows, or `null` when the row has no
@@ -25,6 +25,51 @@ export function statusFor(
 
 export function hotReloadLabel(supportsHotReload: boolean): string {
 	return supportsHotReload ? 'Supported' : 'Not supported';
+}
+
+/**
+ * The small provenance badge beside nginx's name on the Web Server page —
+ * which install put that binary there (nginx source design D1).
+ *
+ * Mirrors `mysqlSourceBadge` (`mysql-install.derive.ts`) exactly rather than
+ * inventing a second visual language for the same idea one page over (design
+ * D3): source is provenance, not health, and must not be styled as a second
+ * status — a green "Packaged" badge next to a red "Failed" pill would read
+ * as a contradiction rather than two facts. `null` covers BOTH "no nginx was
+ * found" and the Apache row, which has no runtime at all — `server.supported`
+ * already tells those two apart for any caller that cares, so this function
+ * adds no second discriminator.
+ *
+ * A Homebrew badge shows **no version at all**. nginx has no `--version`
+ * flag, only `-v`, and finding out means executing the binary — the exact
+ * cost design D2 exists to remove from the packaged path, where the version
+ * is read off the tree instead. The row's own "Version" fact already reports
+ * whatever WAS learned; this badge only ever adds provenance, never a guess.
+ */
+export function nginxSourceBadge(
+	source: NginxRuntimeSourceDto | null
+): { label: string; title: string } | null {
+	if (source === null) return null;
+	switch (source.kind) {
+		case 'packaged':
+			return {
+				label: `OpenVHost ${source.version}`,
+				title:
+					`Installed by OpenVHost from its own nginx build, checksum-verified. Exact version ` +
+					`${source.version}, read from the package tree — never probed.`
+			};
+		case 'homebrew':
+			return {
+				label: 'Homebrew',
+				title:
+					'Installed by Homebrew, not by OpenVHost. nginx has no --version flag, so its exact ' +
+					"patch release is only known by asking the binary itself, which this badge won't guess."
+			};
+		default: {
+			const unreachable: never = source;
+			return unreachable;
+		}
+	}
 }
 
 /** The reason a Start button is disabled. Spec §4 fixes this string; the form

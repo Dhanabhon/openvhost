@@ -1145,6 +1145,41 @@ impl WebServerBrand {
     }
 }
 
+/// Where a listed nginx runtime's binary came from — the wire copy of
+/// `openvhost_core::nginx::NginxRuntimeSource` (nginx source design D1).
+///
+/// Transcribed from `MysqlRuntimeSourceDto` (`mysql_pkg.rs`) rather than
+/// reinvented: the two ask the identical question — "which install put these
+/// bytes here" — and nothing about nginx's answer needs a different shape.
+/// `NginxRuntimeSource::as_str()` stays the one machine-facing spelling for
+/// each source; `the_wire_tag_is_nginx_runtime_source_as_str` below pins this
+/// type's serialized `kind` to it for every variant, so the two cannot drift
+/// into different words for the same fact.
+///
+/// `Homebrew` carries **no version, on purpose** (design D2): nginx has no
+/// `--version` flag, only `-v`, and finding out means executing the
+/// binary — the exact cost design D2 exists to remove from the packaged
+/// path. Reporting the packaged series as though it were Homebrew's exact
+/// patch release would be a lie no caller could detect.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum NginxRuntimeSourceDto {
+    Packaged { version: String },
+    Homebrew,
+}
+
+impl From<&openvhost_core::nginx::NginxRuntimeSource> for NginxRuntimeSourceDto {
+    fn from(s: &openvhost_core::nginx::NginxRuntimeSource) -> Self {
+        use openvhost_core::nginx::NginxRuntimeSource as S;
+        match s {
+            S::Packaged { version } => Self::Packaged {
+                version: version.clone(),
+            },
+            S::Homebrew => Self::Homebrew,
+        }
+    }
+}
+
 /// One row on the Web Server page.
 #[derive(Debug, Clone, serde::Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
@@ -1157,6 +1192,13 @@ pub struct WebServerDto {
     pub service_id: Option<String>,
     pub binary_path: Option<String>,
     pub version: Option<String>,
+    /// Where `binary_path` came from (nginx source design D1) — `None` both
+    /// when no nginx was found on this machine AND for the Apache row, which
+    /// has no runtime at all. The row's own `supported` flag already tells
+    /// those two apart for any consumer that cares; this field carries
+    /// provenance only, and adds no second discriminator for "is there a
+    /// server here".
+    pub source: Option<NginxRuntimeSourceDto>,
     pub supports_hot_reload: bool,
     pub config_path: Option<String>,
     /// Whether a file exists at `config_path` right now — a TRI-STATE, because
@@ -1196,6 +1238,11 @@ impl WebServerDto {
             service_id: None,
             binary_path: None,
             version: None,
+            // No runtime at all, so no provenance to report — see this field's
+            // own doc comment for why `None` here is not confusable with "no
+            // nginx was found": `supported: false` above is what tells the two
+            // apart.
+            source: None,
             supports_hot_reload: false,
             config_path: None,
             // `Some(false)`, not `None`. `None` means "a stat was attempted and
@@ -1266,6 +1313,7 @@ fn web_server_rows(
     p: &StackPaths,
     version: Option<String>,
     config_exists: Option<bool>,
+    source: Option<NginxRuntimeSourceDto>,
 ) -> Vec<WebServerDto> {
     vec![
         WebServerDto {
@@ -1277,6 +1325,7 @@ fn web_server_rows(
             // path this row should invent.
             binary_path: p.nginx_bin.as_ref().map(|b| b.display().to_string()),
             version,
+            source,
             supports_hot_reload: openvhost_conf::NginxAdapter.supports_hot_reload(),
             config_path: Some(p.nginx_conf.display().to_string()),
             config_exists,
@@ -1289,31 +1338,60 @@ fn web_server_rows(
 #[specta::specta]
 pub async fn list_web_servers(
     paths: tauri::State<'_, Option<StackPaths>>,
+    nginx_source: tauri::State<'_, Option<openvhost_core::nginx::NginxRuntimeSource>>,
 ) -> Result<Vec<WebServerDto>, IpcError> {
     let p = stack_paths(&paths)?;
-    // Probing the version SPAWNS `nginx -v`, so merely opening this page starts
-    // a process. Bounded: one short-lived probe, fixed argv, PROBE_TIMEOUT.
-    // `-e` is mandatory on EVERY nginx invocation, `-v` included, so that nothing
-    // this app runs can write into nginx's compiled-in prefix instead of our home
-    // — see `openvhost_conf::probe_nginx_version`'s own doc comment.
+    // `nginx_bin` and `nginx_source` are two projections of the ONE
+    // `Option<NginxRuntime>` that `macos_stack` resolved, and this is the only
+    // place both are read together. Nothing structural keeps them in step —
+    // "one fact, two managed projections" is the shape `StackPaths.nginx_bin`
+    // and `InstalledRuntimes.nginx_bin` already have, so this is a convention
+    // here, not a type. That is fine while both are written once at startup
+    // and never rescanned; it stops being fine the day nginx gains an install
+    // or rescan flow that updates one side. Assert now, in dev and test, so
+    // that day announces itself instead of rendering a row that reports a
+    // source for a binary it does not have (branch review, 4C, MEDIUM).
+    debug_assert_eq!(
+        p.nginx_bin.is_some(),
+        nginx_source.inner().is_some(),
+        "nginx_bin and nginx_source disagree — both come from one discovery at startup"
+    );
     let err_log = openvhost_core::LogPaths::new(&p.home).nginx_error();
-    // Design D3: no binary, no probe — `None` reaches the row honestly rather
-    // than spawning against a path that does not exist.
+    // Nginx source design D2: a packaged nginx's version comes for free from
+    // the tree discovery already resolved — no process runs to learn it.
+    // Probing (which SPAWNS `nginx -v`, so merely opening this page used to
+    // start a process for EVERY source) now happens only for `Homebrew`,
+    // whose exact patch release genuinely cannot be known any other way.
+    // Exhaustive over `NginxRuntimeSource`, no wildcard arm: a third source
+    // must be decided about here rather than silently probed or silently
+    // trusted.
     //
     // `-p`'s target is `nginx_prefix_dir(&p.home)`, never `p.home` itself
     // (4B fix-wave, item 1) — see that function's own doc comment for the
     // credential-exposure finding this closes.
-    let version = match p.nginx_bin.as_deref() {
-        Some(bin) => {
-            openvhost_conf::probe_nginx_version(
-                bin,
-                &err_log,
-                &openvhost_core::nginx_prefix_dir(&p.home),
-            )
-            .await
+    let version = match nginx_source.inner() {
+        Some(openvhost_core::nginx::NginxRuntimeSource::Packaged { version }) => {
+            Some(version.clone())
         }
+        Some(openvhost_core::nginx::NginxRuntimeSource::Homebrew) => match p.nginx_bin.as_deref() {
+            Some(bin) => {
+                openvhost_conf::probe_nginx_version(
+                    bin,
+                    &err_log,
+                    &openvhost_core::nginx_prefix_dir(&p.home),
+                )
+                .await
+            }
+            None => None,
+        },
+        // Design D3: no source, no probe — `None` reaches the row honestly
+        // rather than spawning against a path that does not exist.
         None => None,
     };
+    let source = nginx_source
+        .inner()
+        .as_ref()
+        .map(NginxRuntimeSourceDto::from);
     // `tokio::fs`, not `Path::exists()`: a sync stat pins a tokio WORKER, and an
     // OPENVHOST_HOME on a stalled network mount would take the supervisor event
     // pump down with it — the same hazard `read_web_server_config` documents
@@ -1327,7 +1405,7 @@ pub async fn list_web_servers(
     // tell" — see `WebServerDto::config_exists`'s doc comment for what each one
     // means to the page.
     let config_exists = tokio::fs::try_exists(&p.nginx_conf).await.ok();
-    Ok(web_server_rows(p, version, config_exists))
+    Ok(web_server_rows(p, version, config_exists, source))
 }
 
 #[tauri::command]
@@ -8010,7 +8088,7 @@ mod web_server_ipc_tests {
     #[test]
     fn rows_list_apache_and_report_nginx_from_the_given_paths() {
         let p = sample_paths();
-        let listed = web_server_rows(&p, Some("1.27.3".into()), Some(true));
+        let listed = web_server_rows(&p, Some("1.27.3".into()), Some(true), None);
 
         let nginx = listed
             .iter()
@@ -8151,6 +8229,61 @@ mod web_server_ipc_tests {
             }
             other => panic!("expected Validation, got {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // `NginxRuntimeSourceDto` — the wire tag is `NginxRuntimeSource::as_str()`,
+    // not a second spelling of it (nginx source design D1). Mirrors
+    // `mysql_pkg.rs`'s identical group for `MysqlRuntimeSourceDto`.
+    // ------------------------------------------------------------------
+
+    fn tag_of(value: &impl serde::Serialize) -> String {
+        serde_json::to_value(value).unwrap()["kind"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// The one that stops this DTO drifting: for EVERY source, the wire tag is
+    /// literally what `as_str()` says. The match is exhaustive, so a third
+    /// source has to be added here too.
+    #[test]
+    fn the_wire_tag_is_nginx_runtime_source_as_str() {
+        use openvhost_core::nginx::NginxRuntimeSource;
+        let sources = [
+            NginxRuntimeSource::Packaged {
+                version: "1.30.4".to_string(),
+            },
+            NginxRuntimeSource::Homebrew,
+        ];
+        for source in &sources {
+            let dto = NginxRuntimeSourceDto::from(source);
+            assert_eq!(tag_of(&dto), source.as_str(), "tag drifted for {source:?}");
+        }
+    }
+
+    /// A Homebrew runtime carries NO version over the wire — deliberately, so
+    /// the UI cannot render an invented patch number (design D2).
+    #[test]
+    fn a_homebrew_nginx_carries_no_version_over_the_wire() {
+        let wire = serde_json::to_value(NginxRuntimeSourceDto::from(
+            &openvhost_core::nginx::NginxRuntimeSource::Homebrew,
+        ))
+        .unwrap();
+        assert_eq!(wire.get("version"), None);
+        assert_eq!(wire["kind"], "homebrew");
+    }
+
+    #[test]
+    fn a_packaged_nginx_carries_its_exact_version() {
+        let wire = serde_json::to_value(NginxRuntimeSourceDto::from(
+            &openvhost_core::nginx::NginxRuntimeSource::Packaged {
+                version: "1.30.4".to_string(),
+            },
+        ))
+        .unwrap();
+        assert_eq!(wire["kind"], "packaged");
+        assert_eq!(wire["version"], "1.30.4");
     }
 }
 
@@ -8357,8 +8490,13 @@ mod list_web_servers_tests {
             nginx_bin: Some(bin.clone()),
             nginx_conf: home.path().join("conf/nginx.conf"),
         }));
+        // `Homebrew`, deliberately: this test's whole point is that the probe
+        // RUNS, and design D2 only ever probes a Homebrew source — a
+        // `Packaged` source here would make `list_web_servers` read the
+        // version off `nginx_source` instead and never touch `bin` at all.
+        app.manage(Some(openvhost_core::nginx::NginxRuntimeSource::Homebrew));
 
-        let rows = list_web_servers(app.state()).await.unwrap();
+        let rows = list_web_servers(app.state(), app.state()).await.unwrap();
         let nginx = rows
             .iter()
             .find(|r| r.id == "nginx")
@@ -8429,8 +8567,11 @@ mod list_web_servers_tests {
             nginx_bin: None,
             nginx_conf: home.path().join("conf/nginx.conf"),
         }));
+        // No binary, so no source either — the honest pairing `macos_stack`
+        // itself always produces (nginx source design D2).
+        app.manage(None::<openvhost_core::nginx::NginxRuntimeSource>);
 
-        let rows = list_web_servers(app.state()).await.unwrap();
+        let rows = list_web_servers(app.state(), app.state()).await.unwrap();
         let nginx = rows
             .iter()
             .find(|r| r.id == "nginx")
@@ -8443,6 +8584,124 @@ mod list_web_servers_tests {
         assert_eq!(
             nginx.version, None,
             "design D3: with no binary, list_web_servers must not spawn a probe at all"
+        );
+    }
+
+    /// New coverage alongside the test above rather than an edit to it: with
+    /// no nginx found, the row's new `source` field must read the same
+    /// "nothing to report" way `binary_path`/`version` already do.
+    #[tokio::test]
+    async fn list_web_servers_reports_no_source_when_no_nginx_was_found() {
+        let home = tempfile::tempdir().unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(Some(StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: None,
+            nginx_conf: home.path().join("conf/nginx.conf"),
+        }));
+        app.manage(None::<openvhost_core::nginx::NginxRuntimeSource>);
+
+        let rows = list_web_servers(app.state(), app.state()).await.unwrap();
+        let nginx = rows
+            .iter()
+            .find(|r| r.id == "nginx")
+            .unwrap_or_else(|| panic!("nginx must still be listed, got {rows:?}"));
+        assert_eq!(
+            nginx.source, None,
+            "design D1: no nginx was found, so no source may be invented"
+        );
+    }
+
+    /// Nginx source design D2's central behaviour, and the one this whole
+    /// slice exists to add: a PACKAGED source's version comes from the tree
+    /// discovery already resolved, and `list_web_servers` must not spawn a
+    /// probe to get it.
+    ///
+    /// `fake_nginx`'s own banner ("1.19.0") is DELIBERATELY different from
+    /// the tree version handed to `nginx_source` ("9.9.9") — so a regression
+    /// that still probed would report the WRONG version here, not merely an
+    /// extra one. Non-vacuity (neuter-and-watch-it-fail): temporarily
+    /// changing the `Packaged` arm to call `probe_nginx_version` as well
+    /// (the exact regression this test exists to catch) fails BOTH
+    /// assertions below — `nginx.version` becomes `Some("1.19.0")` and
+    /// `argv.txt` appears — confirming this test would catch the fallback
+    /// design D2 forbids; reverted after confirming.
+    #[tokio::test]
+    async fn a_packaged_source_reports_the_tree_version_and_never_spawns_a_probe() {
+        let home = tempfile::tempdir().unwrap();
+        let argv = home.path().join("argv.txt");
+        // Would leave evidence in `argv` if spawned — the same fixture the
+        // Homebrew-path test below uses, so the two tests differ only in
+        // which source is managed.
+        let bin = fake_nginx(home.path(), &argv, "1.19.0");
+
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(Some(StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: Some(bin),
+            nginx_conf: home.path().join("conf/nginx.conf"),
+        }));
+        app.manage(Some(openvhost_core::nginx::NginxRuntimeSource::Packaged {
+            version: "9.9.9".to_string(),
+        }));
+
+        let rows = list_web_servers(app.state(), app.state()).await.unwrap();
+        let nginx = rows
+            .iter()
+            .find(|r| r.id == "nginx")
+            .unwrap_or_else(|| panic!("nginx must be listed, got {rows:?}"));
+
+        assert_eq!(
+            nginx.version.as_deref(),
+            Some("9.9.9"),
+            "the TREE version must reach the row, not whatever the binary itself claims"
+        );
+        assert_eq!(
+            nginx.source,
+            Some(NginxRuntimeSourceDto::Packaged {
+                version: "9.9.9".to_string()
+            })
+        );
+        assert!(
+            !argv.exists(),
+            "a packaged source must never spawn a version probe, but the fake nginx ran"
+        );
+    }
+
+    /// The contrasting half of the test above: a Homebrew source still has no
+    /// other way to learn its exact patch release, so it IS probed, and the
+    /// probe's own answer is what reaches the row.
+    #[tokio::test]
+    async fn a_homebrew_source_is_probed_and_reports_the_binarys_own_answer() {
+        let home = tempfile::tempdir().unwrap();
+        let argv = home.path().join("argv.txt");
+        let bin = fake_nginx(home.path(), &argv, "1.31.3");
+
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(Some(StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: Some(bin),
+            nginx_conf: home.path().join("conf/nginx.conf"),
+        }));
+        app.manage(Some(openvhost_core::nginx::NginxRuntimeSource::Homebrew));
+
+        let rows = list_web_servers(app.state(), app.state()).await.unwrap();
+        let nginx = rows
+            .iter()
+            .find(|r| r.id == "nginx")
+            .unwrap_or_else(|| panic!("nginx must be listed, got {rows:?}"));
+
+        assert_eq!(nginx.version.as_deref(), Some("1.31.3"));
+        assert_eq!(nginx.source, Some(NginxRuntimeSourceDto::Homebrew));
+        assert!(
+            argv.exists(),
+            "a Homebrew source has no other way to learn its version, so the probe must run"
         );
     }
 
@@ -8459,7 +8718,7 @@ mod list_web_servers_tests {
             nginx_conf: PathBuf::from("/x/.openvhost/config/generated/nginx/nginx.conf"),
         };
 
-        let present = web_server_rows(&p, None, Some(true));
+        let present = web_server_rows(&p, None, Some(true), None);
         let nginx = present
             .iter()
             .find(|r| r.id == "nginx")
@@ -8470,7 +8729,7 @@ mod list_web_servers_tests {
             "Some(true) must reach the nginx row"
         );
 
-        let absent = web_server_rows(&p, None, Some(false));
+        let absent = web_server_rows(&p, None, Some(false), None);
         let nginx = absent
             .iter()
             .find(|r| r.id == "nginx")
@@ -8483,7 +8742,7 @@ mod list_web_servers_tests {
 
         // The unknown case: a stat that could not be performed must reach the
         // row AS `None`, not collapse into `Some(false)` on the way through.
-        let unknown = web_server_rows(&p, None, None);
+        let unknown = web_server_rows(&p, None, None, None);
         let nginx = unknown
             .iter()
             .find(|r| r.id == "nginx")
@@ -8530,10 +8789,16 @@ mod list_web_servers_tests {
             nginx_bin: Some(bin),
             nginx_conf: conf.clone(),
         }));
+        // `nginx_bin` is a real (fake-nginx) path, so the honest pairing is a
+        // known source rather than `None` — nothing under test here asserts
+        // on `version`/`source`, only `config_exists`, so any source would
+        // do; this is the one `macos_stack` would actually have produced
+        // alongside a `Some(nginx_bin)`.
+        app.manage(Some(openvhost_core::nginx::NginxRuntimeSource::Homebrew));
 
         std::fs::create_dir_all(conf.parent().unwrap()).unwrap();
         std::fs::write(&conf, "# placeholder\n").unwrap();
-        let rows = list_web_servers(app.state()).await.unwrap();
+        let rows = list_web_servers(app.state(), app.state()).await.unwrap();
         let nginx = rows
             .iter()
             .find(|r| r.id == "nginx")
@@ -8545,7 +8810,7 @@ mod list_web_servers_tests {
         );
 
         std::fs::remove_file(&conf).unwrap();
-        let rows = list_web_servers(app.state()).await.unwrap();
+        let rows = list_web_servers(app.state(), app.state()).await.unwrap();
         let nginx = rows
             .iter()
             .find(|r| r.id == "nginx")

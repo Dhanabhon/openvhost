@@ -26,7 +26,7 @@ use openvhost_core::mariadb::{
 use openvhost_core::mysql::{
     DatadirState, MysqlRuntime, classify_datadir, mysql_paths, write_generated_config,
 };
-use openvhost_core::nginx::{NginxRuntime, discover_nginx, nginx_spawn_argv};
+use openvhost_core::nginx::{NginxRuntime, NginxRuntimeSource, discover_nginx, nginx_spawn_argv};
 // Re-exported by `openvhost-core` so this crate needs no direct `openvhost-pkg`
 // dependency. Minted only from a resolved home — never from IPC input.
 use openvhost_core::PackagesRoot;
@@ -662,6 +662,15 @@ pub struct MacosStack {
     /// case). `None` under the identical condition the other three are `None`
     /// under.
     pub mariadb_runtimes: Option<Vec<MariadbRuntime>>,
+    /// Where the nginx named by `paths.nginx_bin` came from, discovered at
+    /// the exact same moment (nginx source design D2) — never re-derived
+    /// later. `list_web_servers` reads this instead of re-discovering, for
+    /// the identical reason `paths` itself exists (this struct's own doc
+    /// comment): a fresh walk could disagree with the binary the supervisor
+    /// actually registered if `current` moved after launch. `None` under the
+    /// identical condition the other four fields are `None` under, and also
+    /// whenever discovery found no nginx at all.
+    pub nginx_source: Option<NginxRuntimeSource>,
 }
 
 /// The `nginx` service row for one discovered runtime: id, display name,
@@ -737,6 +746,7 @@ pub fn macos_stack() -> MacosStack {
                 runtimes: None,
                 mysql_runtimes: None,
                 mariadb_runtimes: None,
+                nginx_source: None,
             };
         }
     };
@@ -867,6 +877,7 @@ pub fn macos_stack() -> MacosStack {
         runtimes: Some(InstalledRuntimes { nginx_bin, php }),
         mysql_runtimes: Some(mysql),
         mariadb_runtimes: Some(mariadb),
+        nginx_source: nginx.map(|rt| rt.source),
     }
 }
 
