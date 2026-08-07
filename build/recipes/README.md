@@ -90,6 +90,11 @@ socket has. It must leave no process running when it returns, on either path.
 | `bp_tool <name>` | absolute path of a tool declared in `RECIPE_BUILD_TOOLS`. **Never call a build tool by bare name** — ServBay's `bison` was on `PATH`, could not run at all, and broke the reference build (spec §2). |
 | `bp_download <url> <dest>` | fetch to `<dest>` via a `.part` file, skipping work already done. |
 | `bp_verify_sha256 <file> <sha256>` | abort unless the digest matches. |
+| `bp_gnupg_home` | path of the one gnupg homedir for this build, under `$BUILD_WORK`. |
+| `bp_gpg_init_home` | wipe and recreate `bp_gnupg_home` at mode 700. Call once per build, before any import. |
+| `bp_gpg <args>...` | run gpg with `--batch --no-tty --quiet --homedir "$(bp_gnupg_home)"` — never an ambient `GNUPGHOME` or `gpg.conf`. |
+| `bp_gpg_import_key <fpr> <label> <url>...` | import every candidate key whose PRIMARY fingerprint is `<fpr>`, refetched from every URL every run so revocation and expiry travel. `<label>` disambiguates concurrent imports into the same keyring; pass `""` for a recipe with only one key. |
+| `bp_gpg_verify_signature <file> <sig> <fpr>` | good signature by primary key `<fpr>` over `<file>`, checked via `--status-fd` — never gpg's own exit code, which is 0 even for an expired signing key. Rejects `EXPKEYSIG`/`REVKEYSIG`/`BADSIG`/`ERRSIG`/`EXPSIG`. |
 | `bp_dep_prefix <name> <version>` | where a `RECIPE_DEPENDS` entry was staged. |
 | `bp_ignore_prefix_path` | `RECIPE_IGNORE_PREFIXES` joined for `-DCMAKE_IGNORE_PREFIX_PATH`. |
 | `bp_record_flags <flag>...` | add flags to the manifest's record. |
