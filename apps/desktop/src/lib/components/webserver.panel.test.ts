@@ -20,6 +20,7 @@ const nginx: WebServerDto = {
 	serviceId: 'nginx',
 	binaryPath: '/opt/homebrew/opt/nginx/bin/nginx',
 	version: '1.27.3',
+	source: null,
 	supportsHotReload: true,
 	configPath: '/x/.openvhost/conf/nginx.conf',
 	configExists: true
@@ -31,6 +32,7 @@ const apache: WebServerDto = {
 	serviceId: null,
 	binaryPath: null,
 	version: null,
+	source: null,
 	supportsHotReload: false,
 	configPath: null,
 	configExists: false
@@ -79,6 +81,17 @@ function buttonTag(body: string, testId: string): string {
 		throw new Error(`no <button> with data-testid="${testId}" in:\n${body}`);
 	}
 	return found[0];
+}
+
+/** The inner text of a `<span>` carrying `testId`, so a source-badge assertion is
+ * about THAT element's content rather than about the text appearing anywhere on
+ * the page — mirrors `buttonTag` above for the same reason. */
+function spanText(body: string, testId: string): string {
+	const found = body.match(new RegExp(`<span[^>]*data-testid="${testId}"[^>]*>([^<]*)</span>`));
+	if (found === null) {
+		throw new Error(`no <span> with data-testid="${testId}" in:\n${body}`);
+	}
+	return found[1];
 }
 
 describe('WebServerPanel', () => {
@@ -239,6 +252,43 @@ describe('the status pill', () => {
 	// and a pill that guessed one would be a fabricated claim about the machine.
 	it('renders no pill at all before the first supervisor snapshot arrives', () => {
 		expect(html({ services: [] })).not.toContain('data-testid="ws-pill-');
+	});
+});
+
+// Nginx source design D1/D3: which install put the binary here. Mirrors the
+// status-pill block above in spirit (a fact read straight off the row's own
+// slice), but source is provenance, not health.
+describe('the source badge', () => {
+	it('shows a packaged nginx with its exact version, and gives Apache no badge', () => {
+		const body = html({
+			servers: [{ ...nginx, source: { kind: 'packaged', version: '1.30.4' } }, apache]
+		});
+		expect(spanText(body, 'ws-source-nginx')).toBe('OpenVHost 1.30.4');
+		expect(body).not.toContain('data-testid="ws-source-apache"');
+	});
+
+	// The whole point of design D2: a Homebrew badge must never show a version
+	// nginx cannot back up (it has no `--version` flag to probe cheaply).
+	it('shows Homebrew with no version at all', () => {
+		const body = html({ servers: [{ ...nginx, source: { kind: 'homebrew' } }] });
+		expect(spanText(body, 'ws-source-nginx')).toBe('Homebrew');
+	});
+
+	it('renders no badge at all when no nginx was found', () => {
+		const body = html({ servers: [{ ...nginx, source: null }] });
+		expect(body).not.toContain('data-testid="ws-source-nginx"');
+	});
+
+	// Design D3: the badge is provenance, not a second status, so it must
+	// coexist with a failed pill rather than being swallowed by it or
+	// swallowing it.
+	it('coexists with a failed status pill rather than reading as a contradiction', () => {
+		const body = html({
+			servers: [{ ...nginx, source: { kind: 'packaged', version: '1.30.4' } }],
+			services: [svc('nginx', { kind: 'failed', exit: 1, stderrTail: ['boom'] })]
+		});
+		expect(body).toContain('data-testid="ws-source-nginx"');
+		expect(body).toContain('data-testid="ws-pill-nginx"');
 	});
 });
 

@@ -10,6 +10,7 @@ const nginx: WebServerDto = {
 	serviceId: 'nginx',
 	binaryPath: '/opt/homebrew/opt/nginx/bin/nginx',
 	version: '1.27.3',
+	source: null,
 	supportsHotReload: true,
 	configPath: '/home/.openvhost/conf/nginx.conf',
 	configExists: true

@@ -1236,6 +1236,26 @@ export type MysqlResetOutcomeDto = { kind: "reset" } | { kind: "authFailed"; det
 export type MysqlRuntimeSourceDto = { kind: "packaged"; version: string } | { kind: "homebrew" };
 
 /**
+ *  Where a listed nginx runtime's binary came from — the wire copy of
+ *  `openvhost_core::nginx::NginxRuntimeSource` (nginx source design D1).
+ * 
+ *  Transcribed from `MysqlRuntimeSourceDto` (`mysql_pkg.rs`) rather than
+ *  reinvented: the two ask the identical question — "which install put these
+ *  bytes here" — and nothing about nginx's answer needs a different shape.
+ *  `NginxRuntimeSource::as_str()` stays the one machine-facing spelling for
+ *  each source; `the_wire_tag_is_nginx_runtime_source_as_str` below pins this
+ *  type's serialized `kind` to it for every variant, so the two cannot drift
+ *  into different words for the same fact.
+ * 
+ *  `Homebrew` carries **no version, on purpose** (design D2): nginx has no
+ *  `--version` flag, only `-v`, and finding out means executing the
+ *  binary — the exact cost design D2 exists to remove from the packaged
+ *  path. Reporting the packaged series as though it were Homebrew's exact
+ *  patch release would be a lie no caller could detect.
+ */
+export type NginxRuntimeSourceDto = { kind: "packaged"; version: string } | { kind: "homebrew" };
+
+/**
  *  Which family of package an uninstall targets.
  * 
  *  Exhaustively matched everywhere with **no wildcard arm** — adding a variant
@@ -1507,6 +1527,15 @@ export type WebServerDto = {
 	serviceId: string | null,
 	binaryPath: string | null,
 	version: string | null,
+	/**
+	 *  Where `binary_path` came from (nginx source design D1) — `None` both
+	 *  when no nginx was found on this machine AND for the Apache row, which
+	 *  has no runtime at all. The row's own `supported` flag already tells
+	 *  those two apart for any consumer that cares; this field carries
+	 *  provenance only, and adds no second discriminator for "is there a
+	 *  server here".
+	 */
+	source: NginxRuntimeSourceDto | null,
 	supportsHotReload: boolean,
 	configPath: string | null,
 	/**

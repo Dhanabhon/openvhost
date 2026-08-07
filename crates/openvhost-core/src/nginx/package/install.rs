@@ -182,7 +182,7 @@ mod tests {
     use crate::PackageTarget;
     use crate::db::Db;
     use crate::mysql::{MysqlInstanceRepo, MysqlMajor, generate_root_password};
-    use crate::nginx::NGINX_PACKAGES;
+    use crate::nginx::{NGINX_PACKAGES, NginxRuntimeSource, packaged_nginx_runtime};
 
     // ------------------------------------------------------------------
     // Fixtures.
@@ -799,5 +799,74 @@ mod tests {
         sanctuary
             .assert_untouched(&fx, "after installing the real artifact")
             .await;
+    }
+
+    // ------------------------------------------------------------------
+    // Group 5 — nginx source design D2's central claim: the version the tree
+    // reports (a directory name `current` resolves to — nothing spawned) is
+    // the identical string the binary itself prints when asked. If the two
+    // could ever disagree, the tree would be lying, and D2's whole reason for
+    // skipping the probe on the packaged path goes with it.
+    //
+    // Same gate as the group above: needs the real build artifact, ignored by
+    // default, run with:
+    //
+    //   OPENVHOST_NGINX_TARBALL=$PWD/build/out/nginx-1.30.4-macos-arm64.tar.gz \
+    //     cargo test -p openvhost-core --lib -- --ignored --nocapture \
+    //     the_tree_derived_version_agrees_with_what_the_binary_itself_prints
+    //
+    // Vacuity: the two sides are read through genuinely different mechanisms
+    // — `packaged_nginx_runtime` only ever reads a directory name via
+    // `current`, `probe_nginx_version` spawns `bin/nginx -v` and parses its
+    // stderr banner — so an agreement here is not two calls into the same
+    // code happening to match themselves. Proven by mutation: asserting
+    // against a hardcoded `"1.30.3"` instead of `tree_version` fails against
+    // the real 1.30.4 artifact.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    #[ignore = "needs the real build artifact; set OPENVHOST_NGINX_TARBALL"]
+    async fn the_tree_derived_version_agrees_with_what_the_binary_itself_prints() {
+        let path = std::env::var("OPENVHOST_NGINX_TARBALL")
+            .expect("set OPENVHOST_NGINX_TARBALL to build/out/nginx-1.30.4-macos-arm64.tar.gz");
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let sha = sha_hex(&bytes);
+        assert_eq!(
+            sha, NGINX_PACKAGES[0].sha256,
+            "the artifact at {path} is not the one the catalogue pins"
+        );
+
+        let fx = Fixture::new().await;
+        let entry = entry_for(serve_once(bytes), sha);
+        install_entry(&entry, &fx.root, &fx.ledger, |_| {})
+            .await
+            .unwrap();
+
+        // The tree-derived side: exactly what `list_web_servers` reads,
+        // discovered through the SAME `current` link the install above just
+        // swung — no version argument passed in, nothing re-derived by hand.
+        let rt = packaged_nginx_runtime(&fx.root)
+            .expect("the package just installed must be discoverable through `current`");
+        let tree_version = match &rt.source {
+            NginxRuntimeSource::Packaged { version } => version.clone(),
+            NginxRuntimeSource::Homebrew => {
+                panic!("a freshly installed package must report Packaged, not Homebrew")
+            }
+        };
+
+        // The probed side: the ONLY caller in production allowed to spawn
+        // this binary for its version — see `openvhost_conf::probe_nginx_version`.
+        let err_log = fx.home.join("logs/nginx.error.log");
+        let probed = openvhost_conf::probe_nginx_version(&rt.bin, &err_log, &fx.home)
+            .await
+            .unwrap_or_else(|| {
+                panic!("probe_nginx_version returned None for {}", rt.bin.display())
+            });
+
+        assert_eq!(
+            tree_version, probed,
+            "the tree says {tree_version:?}, the binary itself says {probed:?} — design D2's \
+             whole premise is that these never disagree"
+        );
     }
 }
