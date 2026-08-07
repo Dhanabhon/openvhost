@@ -110,6 +110,11 @@ pub use openvhost_pkg::{ArchiveFormat, InstalledPackage, PackagesRoot, PkgError,
 /// package tree and a Homebrew prefix, so they are safe to call whether or not
 /// a packaged PHP has ever been published.
 ///
+/// **`discover_php` is the only PHP discovery entry point in this list.** The
+/// Homebrew-only walk it used to sit beside is private to `php::discover` now
+/// that the desktop app's startup and rescan seams call this one — a crate
+/// outside `openvhost-core` cannot ask for a walk that sees half the machine.
+///
 /// **`Availability` is deliberately absent from this list**, the same as
 /// [`nginx::Availability`]: [`mariadb::Availability`] already holds the
 /// `Availability` name at the crate root, and PHP's copy is a distinct type
@@ -118,8 +123,8 @@ pub use openvhost_pkg::{ArchiveFormat, InstalledPackage, PackagesRoot, PkgError,
 pub use php::{
     BREW_PREFIXES, CATALOGUE, PHP_PACKAGE_NAME, PHP_PACKAGES, PHP_WARMUP_BINARY, PhpMajor,
     PhpPackage, PhpPackageInstall, PhpRuntimeSource, brew_formula, brew_install_spec,
-    brew_uninstall_spec, discover_php, discover_php_in, find_brew, install_php_package,
-    php_package_for_host, php_package_for_target, php_runtime_for_major,
+    brew_uninstall_spec, discover_php, find_brew, install_php_package, php_package_for_host,
+    php_package_for_target, php_runtime_for_major,
 };
 pub use settings_repo::{SqliteWebServerSettings, WebServerSettingsRepository};
 pub use site::apply::{

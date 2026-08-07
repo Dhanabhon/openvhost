@@ -1899,9 +1899,18 @@ fn php_rows(
     rows
 }
 
-/// Probe every known Homebrew prefix for installed PHP runtimes.
+/// Scan BOTH PHP install sources — OpenVHost's own `<home>/packages/php/`
+/// tree and every known Homebrew prefix (PHP-discovery design D2).
 ///
-/// `openvhost_core::discover_php_in` takes a SYNCHRONOUS probe closure, but
+/// `home` is what makes the packaged tree visible; the [`PackagesRoot`] is
+/// minted from it and from nothing a caller supplies. This is the exact
+/// parameter, and the exact reason, `discover_all_mysql` below already has: a
+/// rescan that read only Homebrew would make a freshly installed packaged
+/// runtime vanish from the Languages page the moment the user pressed Check
+/// again — and, worse, would disagree with what startup found, which is the
+/// C2 class of bug (`stack.rs`) all over again.
+///
+/// `openvhost_core::discover_php` takes a SYNCHRONOUS probe closure, but
 /// `openvhost_conf::probe_php_fpm_version` is async. Resolved by running the
 /// whole directory walk on `spawn_blocking` and calling the async prober via
 /// `Handle::block_on` from INSIDE that blocking closure: `spawn_blocking`
@@ -1910,20 +1919,25 @@ fn php_rows(
 /// runtime the way calling `block_on` directly inside an async command would.
 ///
 /// The other option the task allowed — pre-building a `path -> version` map
-/// by probing candidates asynchronously first, then handing `discover_php_in`
-/// a closure that only reads that map — was passed over because the set of
-/// candidate paths is exactly what `discover_php_in`'s own (private)
-/// directory walk already computes. Re-deriving that candidate list here
-/// first would duplicate discovery logic that already exists and is already
-/// tested, which is the kind of copy-paste drift the project's own
-/// coding-style rules warn against; this approach reuses `discover_php_in`
-/// untouched instead.
-async fn discover_all_php()
--> Result<openvhost_core::Discovery<openvhost_core::PhpRuntime>, IpcError> {
-    tauri::async_runtime::spawn_blocking(|| {
+/// by probing candidates asynchronously first, then handing the walk a closure
+/// that only reads that map — was passed over because the set of candidate
+/// paths is exactly what the walk's own (private) directory traversal already
+/// computes. Re-deriving that candidate list here first would duplicate
+/// discovery logic that already exists and is already tested, which is the
+/// kind of copy-paste drift the project's own coding-style rules warn against;
+/// this approach reuses the walk untouched instead.
+///
+/// The packaged half spawns nothing at all (design D1: its version is a
+/// directory name chosen at install time), so this bridge is only ever paid
+/// for the Homebrew candidates.
+async fn discover_all_php(
+    home: &Path,
+) -> Result<openvhost_core::Discovery<openvhost_core::PhpRuntime>, IpcError> {
+    let packages = openvhost_core::PackagesRoot::from_home(home);
+    tauri::async_runtime::spawn_blocking(move || {
         let handle = tokio::runtime::Handle::current();
         let prefixes: Vec<&Path> = brew_prefixes();
-        openvhost_core::discover_php_in(&prefixes, &|bin| {
+        openvhost_core::discover_php(&packages, &prefixes, &|bin| {
             handle.block_on(openvhost_conf::probe_php_fpm_version(bin))
         })
     })
@@ -2073,7 +2087,11 @@ pub(crate) async fn rescan_into_state(
     paths: &StackPaths,
     seed: Option<openvhost_core::PhpRuntime>,
 ) -> Result<openvhost_core::Discovery<openvhost_core::PhpRuntime>, IpcError> {
-    let discovered = seeded_php(discover_all_php().await?, seed);
+    // `paths.home` — the resolved home `macos_stack` built these paths from,
+    // never a caller-supplied path — is what makes OpenVHost's own package
+    // tree visible to a rescan, so a rescan and a cold start see the same
+    // machine (PHP-discovery design D2).
+    let discovered = seeded_php(discover_all_php(&paths.home).await?, seed);
     report_unidentified("PHP", &discovered.unidentified);
     reconcile_php(runtimes, sup, paths, discovered)
 }
@@ -8572,7 +8590,7 @@ mod list_web_servers_tests {
     /// test is therefore hermetic in the sense of not touching any binary
     /// ITSELF, but its discriminating power against a REINTRODUCED hardcoded
     /// fallback is machine-dependent. `list_web_servers` has no injectable
-    /// prober seam (unlike `discover_php_in`'s closure parameter) that would
+    /// prober seam (unlike `discover_php`'s closure parameter) that would
     /// let a fake binary stand in regardless of machine state.
     #[tokio::test]
     async fn list_web_servers_reports_no_binary_and_no_version_when_none_was_found() {

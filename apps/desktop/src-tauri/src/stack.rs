@@ -562,26 +562,37 @@ pub(crate) fn mariadb_datadir_is_initialized(home: &Path) -> bool {
 }
 
 /// The multi-version PHP walk `macos_stack` performs at startup, factored out
-/// of it so a test can hand it a fake prefix and a fake probe instead of the
-/// machine's real Homebrew installs and a spawned `php-fpm -v`.
+/// of it so a test can hand it a fake home, a fake prefix and a fake probe
+/// instead of the machine's real installs and a spawned `php-fpm -v`.
 ///
-/// This is a thin pass-through to `openvhost_core::discover_php_in`, which
+/// This is a thin pass-through to `openvhost_core::discover_php`, which
 /// already has its own thorough test suite in
 /// `openvhost-core/src/php/discover.rs` — so this function is NOT here to
 /// re-test that walk's merge rules. It exists so the C2 regression test (see
 /// the `tests` module below) pins that `macos_stack` calls the multi-version
-/// walk at all, rather than only being able to exercise `discover_php_in`
-/// again under a different name and never actually proving the startup path
-/// was rewired to use it.
+/// walk at all, rather than only being able to exercise the walk again under
+/// a different name and never actually proving the startup path was rewired
+/// to use it.
+///
+/// `home` is what makes OpenVHost's OWN package tree
+/// (`<home>/packages/php/…`) visible to startup, alongside Homebrew
+/// (PHP-discovery design D2) — exactly the parameter, and exactly the reason,
+/// [`discover_installed_mysql`] below already has. The [`PackagesRoot`] is
+/// minted from the resolved home and from nothing else. Before this argument
+/// existed, startup called the Homebrew HALF of the walk, so a PHP this app
+/// had installed itself was invisible to it; that half is private to
+/// `openvhost-core` now, so the narrower walk is not reachable from here even
+/// by mistake.
 #[cfg(target_os = "macos")]
 fn discover_installed_php(
+    home: &Path,
     prefixes: &[&Path],
     probe: &dyn Fn(&Path) -> Option<String>,
 ) -> Vec<PhpRuntime> {
     // `.runtimes`: startup only needs what was positively identified.
     // `Discovery::unidentified` is reported by the rescan path, which is the
     // one a user can act on (`report_unidentified` in `commands.rs`).
-    openvhost_core::discover_php_in(prefixes, probe).runtimes
+    openvhost_core::discover_php(&PackagesRoot::from_home(home), prefixes, probe).runtimes
 }
 
 /// The MySQL discovery walk `macos_stack` performs at startup, factored out
@@ -765,13 +776,13 @@ pub fn macos_stack() -> MacosStack {
     // to a path that does not exist on that machine, the probe found nothing,
     // and `php` ended up empty — Languages reported every catalogue version
     // as not installed and Sites disabled Save, on a machine with two working
-    // PHP runtimes. `discover_php_in` is the multi-version walk the rest of
+    // PHP runtimes. `discover_php` is the multi-version walk the rest of
     // this slice (`rescan_php_runtimes`, `install_php`) already uses; it now
     // runs at startup too, so cold start and a live rescan see the same
     // runtimes through the same code, rather than startup alone using a
     // narrower single-binary probe.
     //
-    // `discover_php_in` wants a SYNCHRONOUS probe closure, but
+    // `discover_php` wants a SYNCHRONOUS probe closure, but
     // `openvhost_conf::probe_php_fpm_version` is async. `commands.rs`'s
     // `discover_all_php` (the rescan/install path) resolves that with
     // `spawn_blocking` + `Handle::block_on` because it runs INSIDE an async
@@ -809,9 +820,27 @@ pub fn macos_stack() -> MacosStack {
     }
     let nginx_bin: Option<PathBuf> = nginx.as_ref().map(|rt| rt.bin.clone());
 
-    let php: Vec<PhpRuntime> = discover_installed_php(&prefixes, &|bin| {
+    // `&home` is the PHP-discovery seam (design D2): startup reads OpenVHost's
+    // own package tree as well as Homebrew, so a PHP this app installed is
+    // visible from cold start and not only after a rescan.
+    let php: Vec<PhpRuntime> = discover_installed_php(&home, &prefixes, &|bin| {
         tauri::async_runtime::block_on(openvhost_conf::probe_php_fpm_version(bin))
     });
+    // The PHP counterpart of the nginx line above, and the same audit finding
+    // it answers (L2): without it, `PhpRuntimeSource` would be read by nothing
+    // in production, and a user carrying both a packaged and a Homebrew PHP for
+    // one major would have no way at all to learn which php-fpm is actually
+    // supervising their sites. One line per runtime, at startup, in the app's
+    // own log. The Languages page's own badge is a later slice (5C); this is
+    // not it, and nothing here crosses the IPC boundary.
+    for rt in &php {
+        eprintln!(
+            "stack: php-fpm {} resolved to {} ({})",
+            rt.major,
+            rt.fpm_bin.display(),
+            rt.source.as_str()
+        );
+    }
 
     // Same "spawn the version probe exactly once, at startup" discipline as
     // PHP above, and the identical sync-closure-over-async-probe bridge
@@ -1126,9 +1155,22 @@ mod tests {
     /// which does not exist on this machine either), so it found nothing and
     /// `php` came back empty. Pin that the startup discovery now finds BOTH
     /// majors — with no unversioned `php` alias present at all.
+    ///
+    /// The `home` argument arrived with the packaged walk (PHP-discovery
+    /// design D2) and is deliberately a home with NO package tree, so what
+    /// this test proves is unchanged: it is still exactly the Homebrew-only
+    /// machine C2 was reported on, and it is simultaneously spec §8.6 at this
+    /// seam — on a machine with no packages directory, startup discovery
+    /// answers precisely as it did before.
     #[test]
     fn startup_discovery_finds_multiple_majors_without_an_unversioned_php_formula() {
         let dir = tempfile::tempdir().expect("tempdir");
+        // A home, separate from the brew prefix above, with nothing in it.
+        let home = tempfile::tempdir().expect("tempdir");
+        assert!(
+            !PackagesRoot::from_home(home.path()).as_path().exists(),
+            "this test's whole point is a machine with no package tree"
+        );
         for formula in ["php@8.1", "php@8.3"] {
             let bin = dir.path().join("opt").join(formula).join("sbin/php-fpm");
             std::fs::create_dir_all(bin.parent().expect("parent")).expect("mkdir");
@@ -1149,9 +1191,133 @@ mod tests {
             }
         };
 
-        let found = discover_installed_php(&[dir.path()], &probe);
+        let found = discover_installed_php(home.path(), &[dir.path()], &probe);
         let majors: Vec<&str> = found.iter().map(|r| r.major.as_str()).collect();
         assert_eq!(majors, vec!["8.1", "8.3"], "got {found:?}");
+        assert!(
+            found
+                .iter()
+                .all(|r| r.source == openvhost_core::PhpRuntimeSource::Homebrew),
+            "with no package tree every runtime must still come from Homebrew: {found:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // PHP-discovery design D2/D3 — the seam between discovery and the spec
+    // the supervisor actually spawns. Deliberately the same two tests, in the
+    // same order, as the MySQL pair further down this module: the two engines
+    // reach this seam through different functions but make the identical
+    // promise, and a reader comparing them should find nothing to reconcile.
+    //
+    // `openvhost-core` owns the merge rules and tests them thoroughly. What is
+    // provable ONLY here is that STARTUP reads the packaged tree at all — T1
+    // built the walk but nothing called it — and that the concrete path core
+    // resolved survives into `ServiceSpec::spawn.program`, the value a child is
+    // really spawned from.
+    // ------------------------------------------------------------------
+
+    /// Lay down `<home>/packages/php/<major>/<version>/bin/php-fpm` with its
+    /// body set to `body`, exactly as an install leaves it.
+    ///
+    /// `bin/php-fpm`, which is what `build/recipes/php.sh` produces, and
+    /// deliberately NOT brew's `sbin/php-fpm` — reusing brew's spelling here
+    /// would make this fixture describe a layout our own installer never
+    /// writes, and the test would then pass or fail for the wrong reason.
+    /// The body is what lets a test tell one version's binary from another's
+    /// by CONTENT rather than by the path it was reached through.
+    #[cfg(unix)]
+    fn install_fake_php_package(home: &Path, major: &str, version: &str, body: &str) {
+        let bin = PackagesRoot::from_home(home)
+            .package_dir(openvhost_core::PHP_PACKAGE_NAME, major, version)
+            .join("bin");
+        std::fs::create_dir_all(&bin).expect("mkdir package bin");
+        std::fs::write(bin.join("php-fpm"), body.as_bytes()).expect("write fake php-fpm");
+    }
+
+    /// D2, at the startup seam, and the substance of this task: before it,
+    /// `macos_stack` called the Homebrew HALF of the walk, so a PHP this app
+    /// had installed itself was invisible from cold start.
+    ///
+    /// Deliberately run with NO brew prefixes and a probe that panics if
+    /// consulted — so the only way this can pass is by reading
+    /// `<home>/packages/`, it cannot pass by falling through to a keg on the
+    /// machine running the test, and it doubles as the seam's own copy of
+    /// design D1 (the packaged arm spawns nothing).
+    #[cfg(unix)]
+    #[test]
+    fn startup_discovery_finds_a_packaged_php_with_no_homebrew_at_all() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        install_fake_php_package(home, "8.4", "8.4.24", "8.4.24 fpm\n");
+        point_current(home, openvhost_core::PHP_PACKAGE_NAME, "8.4", "8.4.24");
+
+        let found = discover_installed_php(home, &[], &|_| {
+            panic!("startup must not probe a packaged runtime for its version")
+        });
+        assert_eq!(found.len(), 1, "got {found:?}");
+        assert_eq!(found[0].major, "8.4");
+        assert_eq!(
+            found[0].source,
+            openvhost_core::PhpRuntimeSource::Packaged {
+                version: "8.4.24".to_string()
+            },
+            "the row must be able to say where it came from"
+        );
+    }
+
+    /// D3, at the seam that matters: the path a supervised php-fpm is spawned
+    /// from is the concrete version directory, and a later `current` swap does
+    /// not reach back and change which binary a restart brings up.
+    ///
+    /// Asserting only that the path *looks* concrete would pass against a
+    /// `current` link that happens to resolve, so the swap is the load-bearing
+    /// half — exactly as it is for MySQL, where spawning through the link cost
+    /// a full misdiagnosis. The registered `ServiceSpec` is the record:
+    /// `openvhost-proc` spawns `spawn.program` verbatim, and a re-`Start`
+    /// re-uses the stored spec.
+    #[cfg(unix)]
+    #[test]
+    fn a_packaged_php_spec_spawns_a_concrete_version_and_survives_a_current_swap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        install_fake_php_package(home, "8.4", "8.4.23", "8.4.23 fpm\n");
+        install_fake_php_package(home, "8.4", "8.4.24", "8.4.24 fpm\n");
+        point_current(home, openvhost_core::PHP_PACKAGE_NAME, "8.4", "8.4.24");
+
+        let found = discover_installed_php(home, &[], &|_| None);
+        assert_eq!(found.len(), 1, "got {found:?}");
+        let spec = php_fpm_spec(home, &found[0]);
+
+        assert!(
+            spec.spawn
+                .program
+                .starts_with(PackagesRoot::from_home(home).package_dir(
+                    openvhost_core::PHP_PACKAGE_NAME,
+                    "8.4",
+                    "8.4.24"
+                )),
+            "the supervisor would spawn {:?}, which is not the concrete version directory",
+            spec.spawn.program
+        );
+        assert!(
+            !spec
+                .spawn
+                .program
+                .components()
+                .any(|c| c.as_os_str() == "current"),
+            "the supervisor would spawn through the current link: {:?}",
+            spec.spawn.program
+        );
+
+        // A `current` swap is a legitimate operation (a future upgrade flow
+        // does exactly this). It must not silently change which binary the
+        // already-registered spec starts.
+        point_current(home, openvhost_core::PHP_PACKAGE_NAME, "8.4", "8.4.23");
+        assert_eq!(
+            std::fs::read(&spec.spawn.program).expect("read the spawned binary"),
+            b"8.4.24 fpm\n",
+            "a current swap changed the runtime an already-registered spec spawns"
+        );
     }
 
     /// Review fix wave, minor 3: a crash or force-quit mid-init leaves an

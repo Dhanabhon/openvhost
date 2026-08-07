@@ -279,11 +279,17 @@ fn discover_packaged(root: &PackagesRoot) -> Discovery<PhpRuntime> {
 /// the migration room to be incremental instead of stranding the user who has
 /// a working `brew install php@8.4` today.
 ///
-/// **The packaged pass sits in FRONT of [`discover_php_in`], and changes
+/// **The packaged pass sits in FRONT of `discover_php_in`, and changes
 /// nothing inside it.** Brew's two documented preferences — earlier prefix
 /// wins, versioned path beats the `php` alias within one prefix — still govern
 /// the brew pass exactly as before; this function only refuses to append a
 /// brew runtime for a major we already have.
+///
+/// The two walks are combined here rather than exposed separately, exactly as
+/// [`crate::mysql::discover_mysql`] combines its own: a caller that could see
+/// only half the machine is the bug this signature prevents, and since the
+/// desktop app's startup and rescan seams moved across, the Homebrew half is
+/// private and there is no longer any way to ask for it.
 ///
 /// **Ordering is part of the contract** (design D5). The result is sorted by
 /// major, so "the first entry is the catch-all's runtime" still names the
@@ -332,12 +338,15 @@ pub fn discover_php(
 /// be established is reported as UNIDENTIFIED rather than dropped, so an empty
 /// `runtimes` still means "nothing is installed" and never "I could not tell".
 ///
-/// **This is the Homebrew HALF of the machine.** [`discover_php`] is the entry
-/// point that reads both install sources; a caller that uses this directly
-/// cannot see OpenVHost's own package tree. It stays public only until the
-/// desktop app's startup and rescan seams move across (`stack.rs`,
-/// `commands.rs`), which is the next task in this slice.
-pub fn discover_php_in(
+/// **This is the Homebrew HALF of the machine, and it is private.**
+/// [`discover_php`] is the entry point that reads both install sources; a
+/// caller that used this directly could not see OpenVHost's own package tree.
+/// It was `pub` for exactly as long as the desktop app's startup and rescan
+/// seams called it (`stack.rs`, `commands.rs`); both moved across to
+/// [`discover_php`], so the half-blind walk is now unreachable from outside
+/// this module — a compiler guarantee rather than a convention, matching
+/// `crate::mysql::discover_brew` and `crate::nginx::brew_nginx_runtime`.
+fn discover_php_in(
     prefixes: &[&Path],
     probe: &dyn Fn(&Path) -> Option<String>,
 ) -> Discovery<PhpRuntime> {
