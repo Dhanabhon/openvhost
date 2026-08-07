@@ -98,9 +98,23 @@ pub use nginx::{
 /// hash: [`PackagesRoot`] is minted from a resolved home, and
 /// [`install_mysql_package`] takes a [`MysqlMajor`].
 pub use openvhost_pkg::{ArchiveFormat, InstalledPackage, PackagesRoot, PkgError, Progress};
+/// PHP's package-tree install surface, alongside its existing Homebrew
+/// surface. Nothing here is wired to a Tauri command, a CLI subcommand or a
+/// UI control, and the install path may not be until the owner publishes the
+/// release the catalogue pins — see `php::Availability`. Exported so the pin
+/// is inspectable (and testable) without exposing an install a user could
+/// trigger into a 404.
+///
+/// **`Availability` is deliberately absent from this list**, the same as
+/// [`nginx::Availability`]: [`mariadb::Availability`] already holds the
+/// `Availability` name at the crate root, and PHP's copy is a distinct type
+/// that happens to share the name (design decision: duplicated per package,
+/// not shared). It stays reachable at `php::Availability`.
 pub use php::{
-    BREW_PREFIXES, CATALOGUE, PhpMajor, brew_formula, brew_install_spec, brew_uninstall_spec,
-    discover_php_in, find_brew, php_runtime_for_major,
+    BREW_PREFIXES, CATALOGUE, PHP_PACKAGE_NAME, PHP_PACKAGES, PHP_WARMUP_BINARY, PhpMajor,
+    PhpPackage, PhpPackageInstall, brew_formula, brew_install_spec, brew_uninstall_spec,
+    discover_php_in, find_brew, install_php_package, php_package_for_host, php_package_for_target,
+    php_runtime_for_major,
 };
 pub use settings_repo::{SqliteWebServerSettings, WebServerSettingsRepository};
 pub use site::apply::{
