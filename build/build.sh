@@ -564,6 +564,11 @@ for dep in ${RECIPE_DEPENDS[@]+"${RECIPE_DEPENDS[@]}"}; do
 		bp_die "RECIPE_DEPENDS entry must be name:version, got: $dep"
 	dep_prefix="$(bp_dep_prefix "$dep_name" "$dep_version")"
 	if [ -d "$dep_prefix" ]; then
+		# Existence is the whole test, and it cannot tell one build of a version
+		# from another — which is how a rebuilt OpenSSL silently changed what
+		# nginx linked against. Reusing a prefix is still the right default here;
+		# what was missing is that nothing recorded WHICH build got reused, so
+		# stage_manifest now digests this prefix either way.
 		bp_log "dependency already built: $dep_name $dep_version"
 		continue
 	fi
@@ -754,6 +759,82 @@ json_array() {
 	printf ']'
 }
 
+# One value standing for the whole content of a staged dependency prefix.
+#
+# A dependency is satisfied by directory existence alone, and a consumer used to
+# record only the dependency's VERSION — so two different builds of openssl
+# 3.5.7 wrote the identical line, and rebuilding OpenSSL underneath changed what
+# nginx, PHP and MariaDB all link against with no artifact anywhere carrying a
+# value that differed. nginx's prefix drifted 611 bytes from its pin that way,
+# with every gate green. This is the value that differs.
+#
+# What it covers, and it is three streams into one sha256:
+#
+#   1. every path under the prefix, relative to it, byte-sorted and
+#      NUL-separated. Relative so the digest describes the tree and not where
+#      the build root happens to be; NUL-separated so a path containing a
+#      newline cannot masquerade as two paths in the streams below.
+#   2. each of those entries' st_mode in octal — which carries the file type,
+#      the permission bits and setuid/setgid/sticky — followed, for a symlink,
+#      by its target. Same order as (1), which is what associates the two.
+#   3. the SHA-256 of every regular file's content, in that same order.
+#
+# What it deliberately does NOT cover is time: no mtime, no atime, no ctime. A
+# digest that moved every time the tree was touched or copied would record
+# nothing at all, and this pipeline has already been bitten once by four bytes
+# of timestamp (see stage_pack). Nor uid/gid, which say who unpacked a tree
+# rather than what is in it; nor extended attributes, which COPYFILE_DISABLE=1
+# keeps out of the artifact as well.
+#
+# `stat -f` here is BSD stat's output format — GNU stat's -f is "file system
+# status" and would print something else entirely. Safe because PATH was
+# scrubbed to the system directories before any stage runs, so these are the
+# system tools whatever the caller had on PATH.
+prefix_digest() {
+	local tree="$1"
+	(
+		cd -- "$tree" || exit 1
+		find . -mindepth 1 -print0 | LC_ALL=C sort -z
+		find . -mindepth 1 -print0 | LC_ALL=C sort -z | xargs -0 stat -f '%Op%SY'
+		find . -mindepth 1 -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256
+	) | shasum -a 256 | cut -d' ' -f1
+}
+
+# The "dependencies" object: which build of each RECIPE_DEPENDS entry this
+# artifact was made against. Computed here, centrally, and never in a recipe —
+# three recipes reimplementing one digest is three chances to disagree about it,
+# and this pipeline has already shipped thrice-duplicated GPG code where one
+# copy compared the wrong field.
+#
+# Driven off RECIPE_DEPENDS rather than off what the dependency loop did, so a
+# resumed run that reused an existing prefix records the prefix it linked just
+# as a run that built one does. That is the case this exists for. The
+# name:version shape is not re-validated: the loop above runs on every
+# invocation, --from resumes included, and has already rejected anything else.
+json_dependencies() {
+	local first=1 dep name version prefix digest
+	printf '{'
+	for dep in ${RECIPE_DEPENDS[@]+"${RECIPE_DEPENDS[@]}"}; do
+		name="${dep%%:*}"
+		version="${dep#*:}"
+		prefix="$(bp_dep_prefix "$name" "$version")"
+		if [ -d "$prefix" ]; then
+			digest="$(prefix_digest "$prefix")"
+		else
+			# Only reachable if the prefix went away mid-run, since the loop
+			# above built or found it before any stage ran. Recorded rather than
+			# fatal: by now the artifact is packed and audited, and a manifest
+			# that does not exist is worse than one that says it does not know.
+			digest="unknown"
+		fi
+		if [ "$first" -eq 1 ]; then first=0; else printf ', '; fi
+		printf '"%s": {"version": "%s", "prefix": "%s", "tree_sha256": "%s"}' \
+			"$(json_string "$name")" "$(json_string "$version")" \
+			"$(json_string "$prefix")" "$(json_string "$digest")"
+	done
+	printf '}'
+}
+
 tool_version() {
 	local tool path
 	tool="$1"
@@ -766,7 +847,7 @@ stage_manifest() {
 	# §7. Single-builder trust (D1) is only acceptable because the inputs are
 	# recorded; this file is the whole of that acceptability.
 	local manifest="$OUT_DIR/$BUILD_NAME-$BUILD_VERSION-macos-$BUILD_ARCH.manifest.json"
-	local versions=() tool line
+	local versions=() tool line dependencies
 	bp_assert_under "$manifest" "$OUT_DIR" "write"
 	if [ -z "$TARBALL_SHA" ] && [ -f "$TARBALL" ]; then
 		TARBALL_SHA="$(shasum -a 256 -- "$TARBALL" | cut -d' ' -f1)"
@@ -778,6 +859,13 @@ stage_manifest() {
 	versions[${#versions[@]}]="clang: $(clang --version 2>&1 | head -n 1 || true)"
 	versions[${#versions[@]}]="macos-sdk: $(xcrun --show-sdk-version 2>/dev/null || echo unknown)"
 	versions[${#versions[@]}]="macos: $(sw_vers -productVersion 2>/dev/null || echo unknown)"
+
+	# Hashing whole trees is the one thing here that can fail on its own, so it
+	# happens BEFORE the redirect below opens the manifest. Inside that group an
+	# abort under set -e truncates the file mid-write, which would leave a
+	# half-written manifest next to a finished tarball; out here it leaves the
+	# previous one untouched.
+	dependencies="$(json_dependencies)"
 
 	{
 		printf '{\n'
@@ -799,6 +887,7 @@ stage_manifest() {
 		printf '  "configure_flags": %s,\n' \
 			"$(json_array ${RECIPE_CONFIGURE_FLAGS[@]+"${RECIPE_CONFIGURE_FLAGS[@]}"})"
 		printf '  "toolchain": %s,\n' "$(json_array ${versions[@]+"${versions[@]}"})"
+		printf '  "dependencies": %s,\n' "$dependencies"
 		printf '  "output": {\n'
 		printf '    "file": "%s",\n' "$(json_string "$(basename -- "$TARBALL")")"
 		printf '    "sha256": "%s"\n' "$(json_string "$TARBALL_SHA")"
