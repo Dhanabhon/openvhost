@@ -151,17 +151,22 @@ report, not a spec decision.
 4. Uninstalling the default major leaves the preference **legible**: the app can say "your default
    was 8.4, which is no longer installed", not just quietly serve 8.1.
 5. The preference survives a rescan and a restart.
-6. Setting a default **validates at save and defers the config change to the next Apply** — the
-   same shape `save_web_server_settings` already has.
+6. Setting a default **validates at save and then opens the diff**, exactly as the Web server page
+   does — `if (await settings.save()) applyDialogOpen = true;`
+   (`routes/web-server/+page.svelte:83`).
 
-   **Corrected: the first draft demanded "diff preview, validation, rollback", and that is not how
-   settings work here.** `save_web_server_settings` writes the row directly; what it adds is a
-   *validation* step (`NginxSettingsChecker` renders a candidate config and runs `nginx -t`), and
-   the generated config changes on the next Apply. Requiring an apply-with-diff for this one
-   setting would have made it the odd one out, not the rigorous one. The analogous validation here
-   is refusing a major that is not installed, which is cheap and exact.
+   **This item was "corrected" mid-slice and the correction was wrong; the original stands.** I
+   read `save_web_server_settings` — which does write the row directly, adding only an
+   `nginx -t` validation — and concluded the whole flow from half of it. The other half is on the
+   page, and its own comment says why it cannot be skipped: without it you are left with *"a Save
+   button that visibly does nothing on the page the user is actually on."*
 
-   What must **not** happen is a comment claiming a preview the code does not open.
+   Two validations, not one: **shape and installed-membership at save**, then the **diff** for the
+   config rewrite.
+
+   What must **not** happen is a comment claiming a preview the code does not open — and that is
+   precisely what shipped while this item was miscorrected, in three places, one of them the
+   button's own user-visible tooltip.
 7. Exhaustive matching on any new state; a throwaway variant must fail to compile.
 
 ## 8. Out of scope

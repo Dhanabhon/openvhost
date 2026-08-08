@@ -153,6 +153,19 @@ export const DEFAULT_PHP_MISSING_TITLE = 'Your default PHP is not installed';
  *  copy so a future i18n extraction has one file to walk. */
 export const MAKE_DEFAULT_LABEL = 'Make default';
 
+/**
+ * The button's text, which relabels while THIS row's write is in flight.
+ *
+ * The `settingDefault` marker is a string rather than a boolean precisely so a
+ * row can tell "somebody else is busy" (disabled) from "it is me" (disabled AND
+ * relabelled) — and the doc on that field said so while the button rendered a
+ * constant, which is the second half of a claim this slice shipped without.
+ * Mirrors `uninstallConfirmLabel`, which does the same for its own row.
+ */
+export function makeDefaultLabel(inFlight: boolean): string {
+	return inFlight ? 'Setting…' : MAKE_DEFAULT_LABEL;
+}
+
 /** The badge on the row the user chose. */
 export const DEFAULT_BADGE_LABEL = 'Default';
 

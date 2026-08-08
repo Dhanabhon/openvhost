@@ -373,3 +373,100 @@ describe('LanguagesStore', () => {
 		expect(s.env?.runtimes[0].installed).toBe(true);
 	});
 });
+
+// `setDefault` shipped with NO test at all, and the whole-branch review proved
+// it was a real gap rather than a style nit: deleting both the re-entrancy
+// guard and the refresh-on-success left 1391/1391 green. Its own reviewer drew
+// the conclusion worth keeping — that absence is very likely why the missing
+// apply-dialog wiring went unnoticed, because a test that actually invoked this
+// method and looked at what followed would have had to notice.
+describe('LanguagesStore.setDefault', () => {
+	it('refuses a second write while one is in flight', async () => {
+		let calls = 0;
+		const s = new LanguagesStore({
+			phpEnvironment: async () => env([row('8.1', true), row('8.3', true)]),
+			rescanPhpRuntimes: async () => env([row('8.1', true), row('8.3', true)]),
+			installPhp: async () => brewOutcome(''),
+			setDefaultPhp: async () => {
+				calls += 1;
+				await new Promise((r) => setTimeout(r, 5));
+			}
+		});
+		const [first, second] = await Promise.all([s.setDefault('8.1'), s.setDefault('8.3')]);
+		expect(calls).toBe(1);
+		// The refused one reports refusal rather than pretending it stored
+		// something — the caller opens a diff on `true`, so a lie here would open
+		// a dialog for a write that never happened.
+		expect([first, second].filter(Boolean).length).toBe(1);
+	});
+
+	it('marks which choice is in flight and clears it afterwards', async () => {
+		let seen = 'not-set';
+		const s = new LanguagesStore({
+			phpEnvironment: async () => env([row('8.1', true)]),
+			rescanPhpRuntimes: async () => env([row('8.1', true)]),
+			installPhp: async () => brewOutcome(''),
+			setDefaultPhp: async () => {
+				seen = s.settingDefault;
+			}
+		});
+		await s.setDefault('8.1');
+		expect(seen).toBe('8.1');
+		expect(s.settingDefault).toBe('');
+	});
+
+	it('names the operation, not a major, when clearing', async () => {
+		// `null` clears, and the marker still has to be non-empty or the
+		// re-entrancy guard above stops holding.
+		let seen = 'not-set';
+		const s = new LanguagesStore({
+			phpEnvironment: async () => env([row('8.1', true)]),
+			rescanPhpRuntimes: async () => env([row('8.1', true)]),
+			installPhp: async () => brewOutcome(''),
+			setDefaultPhp: async () => {
+				seen = s.settingDefault;
+			}
+		});
+		await s.setDefault(null);
+		expect(seen).not.toBe('');
+	});
+
+	it('re-reads the environment on success, so the badge reflects the store', async () => {
+		let reads = 0;
+		const s = new LanguagesStore({
+			phpEnvironment: async () => {
+				reads += 1;
+				return env([row('8.1', true)]);
+			},
+			rescanPhpRuntimes: async () => env([row('8.1', true)]),
+			installPhp: async () => brewOutcome(''),
+			setDefaultPhp: async () => {}
+		});
+		expect(await s.setDefault('8.1')).toBe(true);
+		// Without this the row would keep rendering the pre-write resolution and
+		// the user would see their choice not take.
+		expect(reads).toBe(1);
+	});
+
+	it('surfaces the error, reads nothing, and stays usable when the write fails', async () => {
+		let reads = 0;
+		const s = new LanguagesStore({
+			phpEnvironment: async () => {
+				reads += 1;
+				return env([row('8.1', true)]);
+			},
+			rescanPhpRuntimes: async () => env([row('8.1', true)]),
+			installPhp: async () => brewOutcome(''),
+			setDefaultPhp: async () => {
+				throw { kind: 'validation', field: 'default_major', message: 'PHP 9.9 is not installed' };
+			}
+		});
+		expect(await s.setDefault('9.9')).toBe(false);
+		expect(s.error).toContain('not installed');
+		// No refresh on failure: nothing changed, and a re-read would only be a
+		// chance to overwrite the error the user has not read yet.
+		expect(reads).toBe(0);
+		// And the guard released, so a corrected second attempt is possible.
+		expect(s.settingDefault).toBe('');
+	});
+});

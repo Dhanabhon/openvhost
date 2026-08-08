@@ -2339,13 +2339,50 @@ fn brew_searched_paths() -> Vec<String> {
 /// Reads a fresh row every call. `php_environment` is the Languages page's own
 /// mount/refresh read, so caching would mean a default set in one place and a
 /// page rendered in another could disagree about which major is served.
+/// **Takes `Option<&Db>`, and neither absence is an error on this path.**
+/// `state.db` is opened best-effort (`lib.rs`: "a missing/unreadable state.db
+/// must never stop the supervisor from starting"), and this is the Languages
+/// page's own mount read. A hard dependency here would take the whole page
+/// down — no rows, no Install, no Homebrew guidance — on a machine where it
+/// used to work fine, which is the failure `install_php` was deliberately
+/// written to avoid. No database means no stored preference, which is exactly
+/// what `None` already means.
+///
+/// An **unreadable** stored value is treated the same way, and that is a
+/// judgement rather than laziness: the only in-app route to clear a bad
+/// preference is the control on this very page, so failing here would brick
+/// the one surface that can fix it. The apply pipeline still fails closed on
+/// the same value (`apply_input`), so nothing is generated from a value we
+/// could not parse — the fallback is for *rendering*, not for serving.
 async fn read_default_php(
-    db: &Db,
+    db: Option<&Db>,
     installed: &[openvhost_core::PhpRuntime],
 ) -> Result<DefaultPhpDto, IpcError> {
+    let Some(db) = db else {
+        return Ok(DefaultPhpDto::from(&openvhost_core::DefaultPhp::resolve(
+            None, installed,
+        )));
+    };
     // Absent row => `None` => nobody has chosen. See `PhpSettingsRepository::get`:
     // reading never writes one.
-    let stored = SqlitePhpSettings::new(db).get().await?;
+    let stored = match SqlitePhpSettings::new(db).get().await {
+        Ok(stored) => stored,
+        Err(e) => {
+            // Deliberately not surfaced as a resolution state: naming it would
+            // need a fifth `DefaultPhp` variant, and the value is unbounded
+            // text that would then have to reach a user-facing sentence. The
+            // gap this leaves — the user is not TOLD why their choice stopped
+            // applying, only that it is not in effect — is recorded in the
+            // spec as owed.
+            eprintln!(
+                "openvhost: stored default PHP could not be read ({e}); \
+                 falling back to no preference"
+            );
+            return Ok(DefaultPhpDto::from(&openvhost_core::DefaultPhp::resolve(
+                None, installed,
+            )));
+        }
+    };
     Ok(DefaultPhpDto::from(&openvhost_core::DefaultPhp::resolve(
         stored.default_major.as_ref(),
         installed,
@@ -2484,7 +2521,7 @@ pub async fn php_environment(
         // so the major the page marks as default is always one of the rows it
         // rendered in the same response — the seam `render_set` keeps on its
         // own side by resolving against the very list its pool loop iterates.
-        default_php: read_default_php(db.inner(), &installed).await?,
+        default_php: read_default_php(Some(db.inner()), &installed).await?,
         runtimes: php_rows(&p.home, &installed, &[]),
     })
 }
@@ -2535,7 +2572,7 @@ pub async fn rescan_php_runtimes(
         // (and the reverse) without a relaunch. Spec claim 5 — the preference
         // survives a rescan — is this line plus the fact that nothing on the
         // rescan path writes to `php_settings`.
-        default_php: read_default_php(db.inner(), &installed.runtimes).await?,
+        default_php: read_default_php(Some(db.inner()), &installed.runtimes).await?,
         runtimes: php_rows(&p.home, &installed.runtimes, &[]),
     })
 }
@@ -6186,7 +6223,7 @@ mod default_php_ipc_tests {
         // pointing at it.
         let db = Db::open_in_memory().await.unwrap();
         assert_eq!(
-            read_default_php(&db, &installed(&["8.1", "8.3"]))
+            read_default_php(Some(&db), &installed(&["8.1", "8.3"]))
                 .await
                 .unwrap(),
             DefaultPhpDto::Unset {
@@ -6199,7 +6236,7 @@ mod default_php_ipc_tests {
     async fn a_fresh_database_with_no_php_reports_nothing_installed() {
         let db = Db::open_in_memory().await.unwrap();
         assert_eq!(
-            read_default_php(&db, &[]).await.unwrap(),
+            read_default_php(Some(&db), &[]).await.unwrap(),
             DefaultPhpDto::NothingInstalled
         );
     }
@@ -6212,7 +6249,7 @@ mod default_php_ipc_tests {
             .await
             .unwrap();
         assert_eq!(
-            read_default_php(&db, &rt).await.unwrap(),
+            read_default_php(Some(&db), &rt).await.unwrap(),
             DefaultPhpDto::Preferred {
                 major: "8.3".to_string()
             }
@@ -6230,7 +6267,7 @@ mod default_php_ipc_tests {
         write_default_php(&db, Some("8.1".into()), &rt)
             .await
             .unwrap();
-        let read = read_default_php(&db, &rt).await.unwrap();
+        let read = read_default_php(Some(&db), &rt).await.unwrap();
         assert_eq!(
             read,
             DefaultPhpDto::Preferred {
@@ -6259,7 +6296,9 @@ mod default_php_ipc_tests {
 
         // …and now 8.3 is gone.
         assert_eq!(
-            read_default_php(&db, &installed(&["8.1"])).await.unwrap(),
+            read_default_php(Some(&db), &installed(&["8.1"]))
+                .await
+                .unwrap(),
             DefaultPhpDto::PreferredMissing {
                 requested: "8.3".to_string(),
                 serving: Some("8.1".to_string()),
@@ -6277,9 +6316,11 @@ mod default_php_ipc_tests {
         write_default_php(&db, Some("8.3".into()), &installed(&["8.1", "8.3"]))
             .await
             .unwrap();
-        let _gone = read_default_php(&db, &installed(&["8.1"])).await.unwrap();
+        let _gone = read_default_php(Some(&db), &installed(&["8.1"]))
+            .await
+            .unwrap();
         assert_eq!(
-            read_default_php(&db, &installed(&["8.1", "8.3"]))
+            read_default_php(Some(&db), &installed(&["8.1", "8.3"]))
                 .await
                 .unwrap(),
             DefaultPhpDto::Preferred {
@@ -6336,7 +6377,7 @@ mod default_php_ipc_tests {
             .await
             .expect_err("an uninstalled major must be refused");
         assert_eq!(
-            read_default_php(&db, &rt).await.unwrap(),
+            read_default_php(Some(&db), &rt).await.unwrap(),
             DefaultPhpDto::Preferred {
                 major: "8.3".to_string()
             }
@@ -6355,7 +6396,7 @@ mod default_php_ipc_tests {
             .unwrap();
         write_default_php(&db, None, &rt).await.unwrap();
         assert_eq!(
-            read_default_php(&db, &rt).await.unwrap(),
+            read_default_php(Some(&db), &rt).await.unwrap(),
             DefaultPhpDto::Unset {
                 serving: "8.1".to_string()
             }
@@ -6370,7 +6411,7 @@ mod default_php_ipc_tests {
         let db = Db::open_in_memory().await.unwrap();
         write_default_php(&db, None, &[]).await.unwrap();
         assert_eq!(
-            read_default_php(&db, &[]).await.unwrap(),
+            read_default_php(Some(&db), &[]).await.unwrap(),
             DefaultPhpDto::NothingInstalled
         );
     }

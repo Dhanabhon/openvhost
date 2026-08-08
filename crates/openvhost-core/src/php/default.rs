@@ -111,7 +111,7 @@ impl DefaultPhp {
     /// consumer goes through it, so the fallback rule for
     /// [`Self::PreferredMissing`] is written down once rather than re-derived
     /// (differently) at each call site.
-    pub fn serving_major(&self) -> Option<&str> {
+    pub(crate) fn serving_major(&self) -> Option<&str> {
         match self {
             DefaultPhp::NothingInstalled => None,
             DefaultPhp::Unset { serving } => Some(serving),

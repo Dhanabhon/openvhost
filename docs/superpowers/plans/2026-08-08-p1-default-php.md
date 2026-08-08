@@ -43,9 +43,15 @@ Two tasks. Each compiles and tests green at its end.
 ## T2 — Desktop: setting it, and the seam
 
 1. Thread the preference through the command surface and the Languages page (spec D6).
-2. **Setting a default goes through the existing apply pipeline** — diff preview, validation,
-   rollback — like every other change that rewrites a config (spec claim 6). It is not a side-door
-   write.
+2. **Setting a default validates at save and then opens the diff**, mirroring
+   `web-server/+page.svelte`'s `onSave` — `if (await settings.save()) applyDialogOpen = true;`
+   (spec claim 6). Two validations, not one: shape and installed-membership at save, then the
+   diff for the config rewrite. It is not a side-door write.
+
+   *(This item was "corrected" mid-slice to drop the diff, on a reading of the Rust half of
+   `save_web_server_settings` alone. Both gates caught it: the other half is on the page, and its
+   own comment says skipping it leaves "a Save button that visibly does nothing on the page the
+   user is actually on." The original stands.)*
 3. Uninstalling the default major must leave the state legible (spec claim 4).
 
 **Prove, and report each by name:**

@@ -18,7 +18,7 @@
 	import {
 		DEFAULT_BADGE_LABEL,
 		DEFAULT_BADGE_TITLE,
-		MAKE_DEFAULT_LABEL,
+		makeDefaultLabel,
 		makeDefaultTitle
 	} from '../php-default.derive';
 	import {
@@ -337,7 +337,7 @@
 					disabled={settingDefault !== ''}
 					onclick={() => onMakeDefault(row.major)}
 				>
-					{MAKE_DEFAULT_LABEL}
+					{makeDefaultLabel(settingDefault === row.major)}
 				</Button>
 			{/if}
 		{/if}
