@@ -33,13 +33,60 @@ double-digit minor exists the order is not even "oldest" — `8.9`, `8.10`, `10.
 /Applications/ServBay/package/php/current       -> …/8.2/current
 ```
 
-The per-series `current` is the same shape we designed independently. The **second-level link is
-the part we do not have**: an explicit pointer at the default major, set by the user rather than
-derived from an ordering.
+The per-series `current` is the same shape we designed independently.
 
-Also measured, and worth stating because it is the basis of the whole off-Homebrew programme:
-ServBay's `php-fpm` has **zero Homebrew references** — it links only against
-`/Applications/ServBay/package/common/lib/…` (a shared 162 MB tree) and `/usr/lib`.
+**The first draft of this section then got the evidence wrong, and the correction is the useful
+part.** I read the second-level `package/php/current` as the model for our web catch-all. It is
+not. Its only consumer is `script/alias/servbay-php`, whose own header says it *"provides
+project-level PHP version management… uses the specified PHP version for executing PHP
+command-line tools like php, composer, php-fpm, pecl… If no configuration is found, it defaults to
+ServBay's default PHP installation."* That link is the **CLI** default.
+
+ServBay keeps **three separate mechanisms**, and the first draft collapsed them into one:
+
+| mechanism | answers |
+|---|---|
+| `package/php/current` + a per-project `.servbay.config` | which `php` you get in a terminal |
+| `enable-php-fpm-default.conf` → `unix:…/tmp/php-cgi.sock` | which PHP serves the **web** default |
+| `php-cgi-<version>.sock` | per-site |
+
+**Their web mechanism is an unversioned socket**, so the generated config never names a version —
+whichever pool is the default binds `php-cgi.sock`.
+
+**We deliberately do not copy that**, and the design below is unchanged because the reasons are
+independent of the mistake:
+
+- A config that **names the socket** can be read to learn which PHP serves the catch-all. Theirs
+  requires knowing which process bound an unversioned name.
+- Changing the default then flows through **diff preview → validate → rollback**, the pipeline this
+  app already has and treats as a differentiator. An unversioned socket changes hands with nothing
+  to preview.
+- An unversioned socket is ambiguous if two pools race for it.
+
+Also measured, and the basis of the whole off-Homebrew programme: ServBay's `php-fpm` has **zero
+Homebrew references** — it links only against `/Applications/ServBay/package/common/lib/…` (a
+shared 162 MB tree) and `/usr/lib`.
+
+## 2b. Where "follow ServBay" stops — measured, not assumed
+
+Their public build pipeline (`ServBay/ServBay-PKG-Builder-v1`) fetches with
+`curl -L --fail -o "$destination" "$url"` — **no `--proto`, no digest comparison, no signature
+check anywhere in `build_package`** — and produces **no checksum or manifest** alongside the
+artifacts it builds. Their package registry (`runtime/packages.conf`) is four tab-separated
+fields: name, version, x86_64 filename, arm64 filename. **There is no field a digest could go in.**
+
+Scope of that claim: I read the *build* link, not the client. It is possible their app verifies on
+download. What is directly observable is that this pipeline **produces nothing for a client to
+verify against**.
+
+This is the same finding slice 5A made about `static-php-cli`. Two unrelated supply chains in this
+domain, neither verifying.
+
+**So the owner's 2026-08-01 direction splits in two.** Follow ServBay's **product** model — own the
+package tree, `<major>/<version>/` with `current`, several versions side by side, an explicit
+default. Do **not** follow their **supply chain**: we pin 41 sources with digests, GPG-verify
+php-src through `--status-fd`, build under a network-denied sandbox, ship a `.sha256` and a
+manifest per artifact, and verify before extraction. Golden rule 6 requires it independently.
 
 ## 3. D1 — A stored preference, not a symlink
 
