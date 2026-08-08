@@ -36,7 +36,7 @@
 //!    — pcre2 by GPG signature, fmt by digest — and the compile then ran with
 //!    the network taken away, so an unverified fetch fails loudly instead of
 //!    succeeding quietly.
-//! 3. The finished tree passed all six points of the artifact contract
+//! 3. The finished tree passed all seven points of the artifact contract
 //!    (`build/audit.sh`, spec D6), including running from two different paths
 //!    and serving SQL across a restart.
 //!

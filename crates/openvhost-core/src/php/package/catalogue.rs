@@ -80,7 +80,8 @@
 //!    records `resumed_from: "pack"`, which is deliberate rather than a
 //!    regression to explain away. **It does not record the 8 `spc build`
 //!    flags**: `--from pack` skips `recipe_configure`, the only stage in
-//!    this pipeline that calls `bp_record_flags` (`build/build.sh:540`), so
+//!    this pipeline that calls `bp_record_flags` (defined at
+//!    `build/build.sh:540`), so
 //!    a repack manifest's `configure_flags` is `[]` — measured on this
 //!    build, not assumed. The flags are still pinned, just not here: they
 //!    live in `build/recipes/php.sh`'s `_php_spc_build_args`, which is where

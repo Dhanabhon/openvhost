@@ -248,8 +248,12 @@ pub struct NginxPackage {
 ///
 /// 1. **The tarball is not in this worktree's `build/out`.** Packing
 ///    today's staged prefix hashes to different bytes than `sha256` below,
-///    for the reason above. Locate the PR #57 artifact this pin actually
-///    names and confirm it still hashes to `sha256` below; this module's own
+///    for the reason above. The only copy of the PR #57 artifact this pin
+///    actually names is
+///    `.claude/worktrees/nginx-build/build/out/nginx-1.30.4-macos-arm64.tar.gz`
+///    — gitignored build output inside a prunable worktree, so treat it as
+///    findable today rather than durable, and give it a home before
+///    publishing. Confirm it still hashes to `sha256` below; this module's own
 ///    test `the_catalogue_pins_exactly_one_nginx_build_today` pins the same
 ///    digest as a literal, so a mismatch there is the first signal something
 ///    moved.
