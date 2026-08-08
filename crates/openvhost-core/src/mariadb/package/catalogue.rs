@@ -36,9 +36,40 @@
 //!    — pcre2 by GPG signature, fmt by digest — and the compile then ran with
 //!    the network taken away, so an unverified fetch fails loudly instead of
 //!    succeeding quietly.
-//! 3. The finished tree passed all six points of the artifact contract
+//! 3. The finished tree passed all seven points of the artifact contract
 //!    (`build/audit.sh`, spec D6), including running from two different paths
 //!    and serving SQL across a restart.
+//!
+//! **The digest below names a REPACKED tarball** (reproducible-pack design
+//! §5.3). `build/build.sh mariadb 11.4.9 --from pack` re-cut it from the staged
+//! prefix `/opt/openvhost-build/mariadb-11.4.9` so that the pin would name bytes
+//! the pipeline can *reproduce*. The three checks above stand unchanged, and not
+//! by assumption: every one of the 16 882 files in the previously pinned tarball
+//! has the same SHA-256 as the file at the same path in the prefix that was
+//! repacked, and `gunzip -c` of both tarballs gives the same raw tar,
+//! `1d55a367c1d519a9a525fb8439dc54b4d07f524e104deb38a4ef69a1cebe6232` — same
+//! entries, same modes, same mtimes. The whole difference is the four-byte MTIME
+//! field gzip writes into its own header from the clock. All seven contract
+//! checks were re-run against the repacked tarball rather than carried over.
+//!
+//! **Three costs, recorded rather than hidden — not one.** The repack's
+//! manifest carries `resumed_from: "pack"`, and three fields degraded
+//! between the manifest beside the previous pin and this one:
+//! `configure_flags` went from 24 entries — the entire plugin-disable set
+//! among them (`-DPLUGIN_CONNECT=NO`, `-DPLUGIN_OQGRAPH=NO`,
+//! `-DPLUGIN_S3=NO`, …) — to `[]`, because `--from pack` skips
+//! `recipe_configure`, the only stage that calls `bp_record_flags`.
+//! `recipe.vendored_on_disk` is `[]` for the same reason: that block records
+//! the digests of the pcre2 and fmt archives *as the build read them*, and
+//! the work tree holding them was cleaned up long ago, so there is nothing
+//! left to hash. And `recipe.bison.path` / `.version` — which bison actually
+//! built the parser — are both `""`, because bison is discovered inside
+//! `recipe_configure` too. **Which plugins exist in the shipped server is
+//! security-relevant configuration**, so none of this is cosmetic.
+//! `recipe.vendored` — what was pinned and verified — is unchanged, and the
+//! manifest cut beside the 2026-08-03 build still carries a populated
+//! `configure_flags`, both on-disk digests, and the bison path and version.
+//! Only a full rebuild puts any of the three back in a current manifest.
 //!
 //! **Single-builder trust, accepted explicitly by the owner (spec §13.1).**
 //! There is no independent reproduction of these bytes. The build manifest
@@ -183,36 +214,46 @@ pub struct MariadbPackage {
 /// user: `crate::mariadb::install_mariadb_package` refuses before any network
 /// work, naming the tag to publish.
 ///
-/// # The pin below is STALE and the bytes it names must not be published
+/// # History: the pin this one replaced, and why it was unpublishable
 ///
-/// A security audit BLOCKed the artifact this hash was taken from, on
-/// 2026-08-03. Its `mariadbd` resolves `basedir`, `plugin_dir` and
-/// `character-sets-dir` out of `/private/tmp/openvhost-build/...`, and
-/// `/private/tmp` is mode 1777 — so on a user's machine anything could create
-/// that tree and plant a plugin dylib or a charset index for the server to load
-/// (CWE-426 / CWE-427). Nothing was ever published, and
-/// [`Availability::AwaitingRelease`] is why. `build/build.sh` now refuses to
-/// build under a root with a world-writable ancestor, and contract check 7
-/// rejects the artifact even if one somehow appeared.
+/// **This section is past tense on purpose.** It described a live hazard until
+/// PR #52 rebuilt under `/opt`, and it kept saying so afterwards — a security
+/// statement that outlived its subject and then, when the pin moved again for
+/// reproducibility, was warning about bytes that no longer existed. A stale
+/// warning about a hash is worse than none: the next reader either believes a
+/// false claim or learns to skim the warnings.
 ///
-/// **To publish** — step 1 is not optional, and the rest cannot be reached
-/// without it, because the hash will not match until it is done:
+/// A security audit BLOCKed an *earlier* artifact on 2026-08-03. Its
+/// `mariadbd` resolved `basedir`, `plugin_dir` and `character-sets-dir` out of
+/// `/private/tmp/openvhost-build/...`, and `/private/tmp` is mode 1777 — so on
+/// a user's machine anything could create that tree and plant a plugin dylib or
+/// a charset index for the server to load (CWE-426 / CWE-427).
 ///
-/// 1. Prepare the build root once, then rebuild:
-///    ```text
-///    sudo mkdir -p /opt/openvhost-build
-///    sudo chown "$(id -u):$(id -g)" /opt/openvhost-build
-///    build/build.sh mariadb 11.4.9
-///    ```
-///    All seven contract checks must pass, twice — once on the staged tree and
-///    once on the packed tarball. The driver runs both.
-/// 2. Replace `sha256` below with the hash the `pack` stage printed, and run
-///    `the_real_artifact_installs_and_runs_from_the_package_tree` (it is
+/// Nothing was ever published, and [`Availability::AwaitingRelease`] is why.
+/// Two durable guards came out of it and both still hold: `build/build.sh`
+/// refuses to build under a root with a world-writable ancestor, and contract
+/// check 7 rejects an artifact carrying such a path even if one appeared.
+/// **"A neutral prefix is not an inert one"** is the sentence worth keeping.
+///
+/// # To publish
+///
+/// 1. Confirm the pin below still reproduces: `build/build.sh mariadb 11.4.9`
+///    (or `--from pack --keep-work` against an existing staged prefix) must
+///    print this exact hash. Since the pack stage stopped writing a timestamp
+///    into the gzip header, that is a real check rather than a formality.
+/// 2. **All seven contract checks must pass.** A full `build/build.sh` run
+///    (no `--from`) gets both runs for free: its `audit` stage runs them
+///    against the staged tree, and `verify-artifact` runs them again against
+///    the packed tarball. The `--from pack` shortcut in step 1 does not — it
+///    starts past `audit`, so it exercises the contract once, against the
+///    tarball only. Taking that shortcut means confirming the staged tree
+///    already has a passing, current audit behind it, not assuming one.
+/// 3. Run `the_real_artifact_installs_and_runs_from_the_package_tree` (it is
 ///    `#[ignore]`d; set `OPENVHOST_MARIADB_TARBALL`) — it fails unless the
 ///    tarball on disk is the one this pin names.
-/// 3. Create release `mariadb-11.4.9` carrying the tarball, its `.sha256` and
-///    the build manifest, confirm the served bytes still hash to the new pin,
-///    then flip `availability` to [`Availability::Published`].
+/// 4. Create release `mariadb-11.4.9` carrying the tarball, its `.sha256` and
+///    the build manifest, confirm the served bytes still hash to this pin, then
+///    flip `availability` to [`Availability::Published`].
 ///
 /// **`macos-x86_64` is deliberately absent** and this slice does not add it:
 /// there is no signature-checked x86_64 artifact, and shipping an unverified
@@ -224,7 +265,7 @@ pub const MARIADB_PACKAGES: [MariadbPackage; 1] = [MariadbPackage {
     version: "11.4.9",
     target: PackageTarget::MacosArm64,
     url: "https://github.com/Dhanabhon/openvhost/releases/download/mariadb-11.4.9/mariadb-11.4.9-macos-arm64.tar.gz",
-    sha256: "76ea96a4089e56953693d1af14e3ddd8da03cab291eada1fd1cf4e2c1df18304",
+    sha256: "854c34dcafef29dc72af2bcbd6d66271ae2e6167ab45e33c4f744d163675aeb0",
     format: ArchiveFormat::TarGz,
     availability: Availability::AwaitingRelease {
         tag: "mariadb-11.4.9",
@@ -321,7 +362,7 @@ mod tests {
         );
         assert_eq!(
             e.sha256,
-            "76ea96a4089e56953693d1af14e3ddd8da03cab291eada1fd1cf4e2c1df18304"
+            "854c34dcafef29dc72af2bcbd6d66271ae2e6167ab45e33c4f744d163675aeb0"
         );
         assert_eq!(e.format, ArchiveFormat::TarGz);
     }

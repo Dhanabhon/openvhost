@@ -708,7 +708,10 @@ mod tests {
     // gitignored build output rather than a committed fixture. It is checked in
     // rather than run by hand so the proof is repeatable:
     //
-    //   OPENVHOST_NGINX_TARBALL=$PWD/build/out/nginx-1.30.4-macos-arm64.tar.gz \
+    //   # NOT this worktree's build/out: that tarball is a repack of a prefix
+    //   # relinked against a rebuilt OpenSSL, so it hashes to other bytes. See
+    //   # the publish note on `NGINX_PACKAGES` for why, and for where it lives.
+    //   OPENVHOST_NGINX_TARBALL=.claude/worktrees/nginx-build/build/out/nginx-1.30.4-macos-arm64.tar.gz \
     //     cargo test -p openvhost-core --lib -- --ignored --nocapture \
     //     the_real_artifact_installs_and_runs_from_the_package_tree
     //
@@ -734,7 +737,7 @@ mod tests {
     #[ignore = "needs the real build artifact; set OPENVHOST_NGINX_TARBALL"]
     async fn the_real_artifact_installs_and_runs_from_the_package_tree() {
         let path = std::env::var("OPENVHOST_NGINX_TARBALL")
-            .expect("set OPENVHOST_NGINX_TARBALL to build/out/nginx-1.30.4-macos-arm64.tar.gz");
+            .expect("set OPENVHOST_NGINX_TARBALL to the tarball NGINX_PACKAGES pins");
         let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
         let sha = sha_hex(&bytes);
         assert_eq!(
@@ -811,7 +814,10 @@ mod tests {
     // Same gate as the group above: needs the real build artifact, ignored by
     // default, run with:
     //
-    //   OPENVHOST_NGINX_TARBALL=$PWD/build/out/nginx-1.30.4-macos-arm64.tar.gz \
+    //   # NOT this worktree's build/out: that tarball is a repack of a prefix
+    //   # relinked against a rebuilt OpenSSL, so it hashes to other bytes. See
+    //   # the publish note on `NGINX_PACKAGES` for why, and for where it lives.
+    //   OPENVHOST_NGINX_TARBALL=.claude/worktrees/nginx-build/build/out/nginx-1.30.4-macos-arm64.tar.gz \
     //     cargo test -p openvhost-core --lib -- --ignored --nocapture \
     //     the_tree_derived_version_agrees_with_what_the_binary_itself_prints
     //
@@ -828,7 +834,7 @@ mod tests {
     #[ignore = "needs the real build artifact; set OPENVHOST_NGINX_TARBALL"]
     async fn the_tree_derived_version_agrees_with_what_the_binary_itself_prints() {
         let path = std::env::var("OPENVHOST_NGINX_TARBALL")
-            .expect("set OPENVHOST_NGINX_TARBALL to build/out/nginx-1.30.4-macos-arm64.tar.gz");
+            .expect("set OPENVHOST_NGINX_TARBALL to the tarball NGINX_PACKAGES pins");
         let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
         let sha = sha_hex(&bytes);
         assert_eq!(

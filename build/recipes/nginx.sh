@@ -648,8 +648,20 @@ recipe_serve_probe() {
 # ---------------------------------------------------------------- manifest ----
 
 recipe_manifest_extra() {
-	local pcre2_actual
-	pcre2_actual="$(shasum -a 256 -- "$(_nginx_pcre2_archive)" 2>/dev/null | cut -d' ' -f1)"
+	local pcre2_actual pcre2_archive
+	pcre2_archive="$(_nginx_pcre2_archive)"
+	# Guarded, not a bare pipeline: under set -e a `shasum` that fails to stat a
+	# missing archive aborts this assignment, and this function runs inside
+	# build.sh's `{ ...; recipe_manifest_extra; ... } >"$manifest"` group, so an
+	# abort here truncates the manifest mid-write rather than merely falling
+	# back to "unknown" below. Exactly the state `--from pack` leaves once
+	# $BUILD_DOWNLOADS has been cleaned up — same shape as
+	# `_mariadb_vendored_on_disk`'s `[ -f "$archive" ] || continue` guard.
+	if [ -f "$pcre2_archive" ]; then
+		pcre2_actual="$(shasum -a 256 -- "$pcre2_archive" | cut -d' ' -f1)"
+	else
+		pcre2_actual=""
+	fi
 	printf '{"openssl": {"version": "%s", "linkage": "static"}, "pcre2": {"version": "%s", "sha256": "%s", "sha256_on_disk": "%s", "release_date": "%s", "last_checked": "%s", "verified": "gpg+sha256", "signing_key_fingerprint": "%s", "usage": "header only (src/pcre2.h.generic); linked against the system /usr/lib/libpcre2-8.dylib, never compiled or shipped"}, "zlib": {"source": "system (/usr/lib/libz.dylib via the Xcode/CLT SDK)", "note": "no fetch: nginx'"'"'s own default probe already succeeds against the SDK"}}' \
 		"$RECIPE_OPENSSL_VERSION" \
 		"$RECIPE_PCRE2_VERSION" "$RECIPE_PCRE2_SHA256" "${pcre2_actual:-unknown}" \
