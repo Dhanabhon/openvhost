@@ -204,36 +204,39 @@ pub struct MariadbPackage {
 /// user: `crate::mariadb::install_mariadb_package` refuses before any network
 /// work, naming the tag to publish.
 ///
-/// # The pin below is STALE and the bytes it names must not be published
+/// # History: the pin this one replaced, and why it was unpublishable
 ///
-/// A security audit BLOCKed the artifact this hash was taken from, on
-/// 2026-08-03. Its `mariadbd` resolves `basedir`, `plugin_dir` and
-/// `character-sets-dir` out of `/private/tmp/openvhost-build/...`, and
-/// `/private/tmp` is mode 1777 — so on a user's machine anything could create
-/// that tree and plant a plugin dylib or a charset index for the server to load
-/// (CWE-426 / CWE-427). Nothing was ever published, and
-/// [`Availability::AwaitingRelease`] is why. `build/build.sh` now refuses to
-/// build under a root with a world-writable ancestor, and contract check 7
-/// rejects the artifact even if one somehow appeared.
+/// **This section is past tense on purpose.** It described a live hazard until
+/// PR #52 rebuilt under `/opt`, and it kept saying so afterwards — a security
+/// statement that outlived its subject and then, when the pin moved again for
+/// reproducibility, was warning about bytes that no longer existed. A stale
+/// warning about a hash is worse than none: the next reader either believes a
+/// false claim or learns to skim the warnings.
 ///
-/// **To publish** — step 1 is not optional, and the rest cannot be reached
-/// without it, because the hash will not match until it is done:
+/// A security audit BLOCKed an *earlier* artifact on 2026-08-03. Its
+/// `mariadbd` resolved `basedir`, `plugin_dir` and `character-sets-dir` out of
+/// `/private/tmp/openvhost-build/...`, and `/private/tmp` is mode 1777 — so on
+/// a user's machine anything could create that tree and plant a plugin dylib or
+/// a charset index for the server to load (CWE-426 / CWE-427).
 ///
-/// 1. Prepare the build root once, then rebuild:
-///    ```text
-///    sudo mkdir -p /opt/openvhost-build
-///    sudo chown "$(id -u):$(id -g)" /opt/openvhost-build
-///    build/build.sh mariadb 11.4.9
-///    ```
-///    All seven contract checks must pass, twice — once on the staged tree and
-///    once on the packed tarball. The driver runs both.
-/// 2. Replace `sha256` below with the hash the `pack` stage printed, and run
-///    `the_real_artifact_installs_and_runs_from_the_package_tree` (it is
+/// Nothing was ever published, and [`Availability::AwaitingRelease`] is why.
+/// Two durable guards came out of it and both still hold: `build/build.sh`
+/// refuses to build under a root with a world-writable ancestor, and contract
+/// check 7 rejects an artifact carrying such a path even if one appeared.
+/// **"A neutral prefix is not an inert one"** is the sentence worth keeping.
+///
+/// # To publish
+///
+/// 1. Confirm the pin below still reproduces: `build/build.sh mariadb 11.4.9`
+///    (or `--from pack --keep-work` against an existing staged prefix) must
+///    print this exact hash. Since the pack stage stopped writing a timestamp
+///    into the gzip header, that is a real check rather than a formality.
+/// 2. Run `the_real_artifact_installs_and_runs_from_the_package_tree` (it is
 ///    `#[ignore]`d; set `OPENVHOST_MARIADB_TARBALL`) — it fails unless the
 ///    tarball on disk is the one this pin names.
 /// 3. Create release `mariadb-11.4.9` carrying the tarball, its `.sha256` and
-///    the build manifest, confirm the served bytes still hash to the new pin,
-///    then flip `availability` to [`Availability::Published`].
+///    the build manifest, confirm the served bytes still hash to this pin, then
+///    flip `availability` to [`Availability::Published`].
 ///
 /// **`macos-x86_64` is deliberately absent** and this slice does not add it:
 /// there is no signature-checked x86_64 artifact, and shipping an unverified
