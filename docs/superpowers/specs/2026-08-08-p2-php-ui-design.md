@@ -36,6 +36,8 @@ it is the last one still arguing against it.
 | `MysqlEnvironmentDto` carries the same `brewFound` bool (`databases.svelte.test.ts:58`) | The Databases page has the identical dead end. **Out of scope**, recorded in §9 |
 | `install_mysql_package` (`lib.rs:68`) and `PhpPackageInstall` (`lib.rs:125`, from 5A) both exist | The install half is wiring, not new machinery |
 | `PhpRuntimeDto.cataloged` already exists so a row can render without offering Install/Uninstall | The precedent for "show it, but offer nothing" is already here and should be reused, not re-derived |
+| **`PHP_PACKAGES` has exactly one row — 8.4 — while `CATALOGUE` offers 8.1 through 8.5 for Homebrew**, because a package build is per-major work | **`Unavailable` is the common case, not an edge case.** It is the state of four rows out of five, and will stay that way for a long time |
+| `macos-x86_64` is **deliberately absent**; an Intel host gets `NoPackageForTarget` rather than arm64 binaries | On Intel, *every* row is `Unavailable`. Homebrew is genuinely the only route there, and saying so is correct, not a failure |
 
 ## 3. D1 — `PhpPackageOfferDto`, mirroring MariaDB's three states
 
@@ -55,18 +57,32 @@ reason to fake it — see D4.
 
 Today: `!brewFound` → dead end, unconditionally, before anything else is considered.
 
-After: the dead end is shown only when there is **no route to a PHP at all** — no Homebrew *and*
-no packaged PHP installed *and* no package on offer. When any route exists, the page lists what
-it has and offers what it can.
+**The first draft of this section said the dead end should appear only when there is "no route to
+a PHP at all". That is wrong, and the catalogue is what corrects it.** Only **8.4** is pinned;
+8.1, 8.2, 8.3 and 8.5 have no package and will not for a long time, because a package build is
+per-major work. On Intel, nothing is packaged at all. So for most rows, **Homebrew genuinely is
+required, permanently, and saying so is correct.**
 
-**Today this changes nothing on any real machine**, because every offer is `AwaitingRelease` and
-no packaged PHP exists to find. That is the point: the change must land while it is provably
-inert, so the day a release flips `availability` the page is already right rather than being
-fixed in a panic.
+The bug was never that the page mentions Homebrew. It is that **one machine-wide boolean answers
+a question that is per-major**:
 
-**Do not soften the dead end into a warning.** A machine with genuinely no route to PHP still
-needs to be told plainly, with the searched paths listed verbatim, exactly as now. The bug is
-that the screen is unconditional, not that it is blunt.
+- *"Homebrew is required to install PHP"* — false. It is required to install **8.1, 8.2, 8.3 and
+  8.5**, and on Intel, all of them.
+- Blocking the whole page on it — wrong once any major is installable without it.
+
+After: `brewFound` stops being a page-level gate and becomes an input to a **per-row** answer. A
+row whose offer is `Available` needs no Homebrew. A row whose offer is `Unavailable` needs it, and
+should say so on the row. The page-level screen survives for the case it was actually written for
+— **nothing installed, and nothing installable by any route** — and keeps its blunt wording and
+its verbatim searched-paths list.
+
+**Do not soften that screen into a warning.** A user with no route to any PHP needs telling
+plainly. The change is *when* it appears, not *what* it says.
+
+**Today this changes nothing on any real machine**, because every offer resolves to
+`AwaitingRelease` or `Unavailable` and no packaged PHP exists to find. That is the point: the
+change lands while provably inert, so the day a release flips `availability` the page is already
+right rather than being fixed in a panic.
 
 ## 5. D3 — The badge, and a field that has been dead since it was written
 
@@ -87,6 +103,15 @@ wrong side by side, the fix is the layout, not inventing a patch level.
 
 Mirror what MySQL and MariaDB already do. The row's own offer decides; the frontend does not
 re-derive the rule.
+
+**`Unavailable` is the ordinary path, not the failure path.** Four of five rows carry it today,
+every row carries it on Intel, and `php_package_for_target` returns it for both reasons — no such
+major, and no artifact for this host. An `Unavailable` row installs through Homebrew exactly as it
+does now, with no apology and no degraded styling: that is a supported route, not a fallback the
+user should feel they are on.
+
+The three offer variants map cleanly onto the two ways a package can be missing, which is why
+MariaDB's `Unavailable { target }` carries `target` — reuse it rather than adding a fourth arm.
 
 **The packaged install path merges unproven, and this must be said out loud.** With every offer
 `AwaitingRelease`, no test and no live proof can exercise a real packaged PHP install end to end
@@ -111,8 +136,11 @@ state belonged, and the previous three were all found only after they had misled
 
 1. With **no Homebrew and a packaged PHP present**, the page lists it and does not render the
    no-brew dead end.
-2. With **no Homebrew, no packaged PHP, and no offer**, the dead end renders exactly as it does
-   today, searched paths and all.
+2. With **no Homebrew and nothing installable by any route**, the dead end renders exactly as it
+   does today, searched paths and all.
+2b. With **no Homebrew and an `Available` 8.4 alongside `Unavailable` 8.1/8.3/8.5**, the page
+   offers 8.4 and tells the 8.1/8.3/8.5 rows that Homebrew is what they need — **per row, not
+   page-wide**. This is the case D2 exists for and the one the first draft got wrong.
 3. A packaged row reports its **patch version from the tree** and spawns nothing to do it; a
    Homebrew row still reports `full_version: None`.
 4. The badge appears only on packaged rows, reuses MySQL's existing style, and cannot read as a
