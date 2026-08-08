@@ -132,11 +132,33 @@ the leaf.
 3. A packaged-only major produces **no `BrewFormula` step**.
 4. A brew-only major is **unchanged** — byte-for-byte the same inventory as today.
 5. With both installed, the packaged tree goes, the keg stays, and the confirmation **says so**.
-6. **No filesystem call in the executor can escape the packages root**, proven by construction —
-   a symlinked series directory, a symlinked version directory, a leaf symlink resolving back
-   *into* the tree (the fix wave's escape), and a dangling `current` beyond a symlinked series
-   directory (the fix wave's unconfined `remove_file`). Every one of those asserts the outside
-   entry **still exists**, before the `Result` is looked at: a redirected call returns `Ok(())`.
+6. **No filesystem write in the executor can escape the region it belongs to**, proven by
+   construction — a symlinked series directory, a symlinked version directory, a leaf symlink
+   resolving back *into* the tree (the fix wave's escape), and a dangling `current` beyond a
+   symlinked series directory (the fix wave's unconfined `remove_file`). Every one of those
+   asserts the outside entry **still exists**, before the `Result` is looked at: a redirected call
+   returns `Ok(())`.
+
+   **Two regions, three writes — corrected after the re-audit, which found this item both
+   narrower than the code and silent about a whole gate.** `remove_dir_all` and the `current`
+   cleanup are confined to **`<home>/packages`**; the generated-config `remove_file` is confined
+   to **`<home>/config/generated`**. That narrower root is deliberate: `config/custom` (the
+   user's own pool overrides) and `data/` (their databases) sit beside it and are an uninstall's
+   **keeps**, so a root at `<home>` or `<home>/config` would permit exactly the redirect worth
+   refusing.
+
+   The property that makes this auditable is that **all three writes go through one predicate**.
+   `run.rs`'s module header enumerates them and says what each reaches; if a fourth write is ever
+   added, that header is the thing that must stop being true first.
+
+   Two measured facts the guard quietly rests on, recorded so nobody has to re-derive them:
+   `remove_dir_all` does **not** follow symlinks *inside* the tree it is deleting (planted one
+   pointing outside; our tree went, the target survived), and containment is **regional, not
+   object identity** — a version directory symlinked at a *sibling inside the same root* is
+   `Contained` and the delete removes the wrong object in the right region. Blast radius there is
+   a re-installable package tree inside the app's own 0700 home, and the `current` cleanup then
+   refuses, so the run reports `Incomplete` rather than going quiet. **Do not widen the guard for
+   that case.**
 7. Logs, pool overrides and every site's saved PHP version are kept, exactly as the brew path
    already promises.
 8. **Nothing changes on a machine with no package tree** — every real machine today.
@@ -146,6 +168,14 @@ the leaf.
 Retiring the Homebrew paths (slice 7) · publishing any release (owner-gated, deferred) · the
 `Availability`-per-engine duplication (recorded in 5C §9) · the `install_mysql`/`install_mariadb`
 `State<Db>` hazard (filed separately).
+
+**A refusal message can read as a self-contradiction, in states no emitter reaches.** When a
+target resolves to the confinement root *itself*, the sentence becomes "… resolve to X, which is
+not inside X". The re-audit measured it on the documented residual (a generated file sitting
+directly in `<home>/config/generated`). Unreachable today from any inventory, and left alone
+rather than special-cased: a branch added for an unreachable state is a branch nothing can test.
+Fix it if an emitter ever makes that state reachable — the shape to add is a cause clause, not an
+equality special case.
 
 **Owed at the first version bump, not before** (found by T2, decided by neither of us): if a major
 ever holds **two** version directories, removing the `current` one and clearing the link leaves the

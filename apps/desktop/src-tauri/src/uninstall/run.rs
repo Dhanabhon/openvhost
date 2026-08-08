@@ -8,7 +8,9 @@
 //! brew failure therefore changes no local state at all, which is what makes
 //! "nothing was destroyed" checkable rather than merely intended.
 //!
-//! [`perform_uninstall`] itself makes exactly three kinds of filesystem call:
+//! [`perform_uninstall`] itself makes exactly three kinds of filesystem WRITE
+//! (it also reads — `symlink_metadata`, `canonicalize`, `metadata` — and
+//! `run_brew` spawns a process that writes plenty of its own):
 //!
 //! * `remove_file` on a path `inventory` produced under `config/generated/`
 //!   (PHP's generated pool config — the only [`super::Removal::GeneratedFile`]
