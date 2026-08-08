@@ -691,7 +691,30 @@ stage_pack() {
 	# extended attributes. An ad-hoc signature lives inside the Mach-O, not in an
 	# xattr, so nothing of consequence is dropped — and verify-artifact re-checks
 	# every signature after the round trip rather than taking that on trust.
-	COPYFILE_DISABLE=1 tar -czf "$TARBALL" -C "$BUILD_ROOT" "$BUILD_NAME-$BUILD_VERSION"
+	#
+	# gzip:!timestamp is what makes this stage REPRODUCIBLE, and it was measured
+	# before it was written: packing one staged prefix twice used to produce two
+	# different tarballs, but `gunzip -c` on both gave the SAME raw tar — same
+	# entries, same modes, same mtimes. The whole difference was the four-byte
+	# MTIME field gzip writes into its header from the clock. Everything this
+	# pipeline does up to and including tar was already deterministic; four bytes
+	# undid it.
+	#
+	# The option NAMES THE INTENT, which is why it is preferred over piping to
+	# `gzip -n`: `-n` means "no name", and suppressing the timestamp is a side
+	# effect of the same flag that a reader has to already know about to see why
+	# it is there. Both were measured on this toolchain (bsdtar 3.5.3 /
+	# libarchive 3.7.4) and both produce identical bytes across runs, so this is
+	# a choice about legibility, not correctness. bsdtar-only syntax is fine
+	# here: this pipeline is macOS-only by construction (codesign, otool, the
+	# artifact contract's Mach-O checks).
+	#
+	# What this buys, stated exactly: from a GIVEN STAGED PREFIX, pack produces
+	# identical bytes every time. It does NOT claim a full build from source
+	# reproduces — that can fail for reasons far below gzip, and nothing here
+	# has measured it.
+	COPYFILE_DISABLE=1 tar --options gzip:'!timestamp' -czf "$TARBALL" \
+		-C "$BUILD_ROOT" "$BUILD_NAME-$BUILD_VERSION"
 	TARBALL_SHA="$(shasum -a 256 -- "$TARBALL" | cut -d' ' -f1)"
 	printf '%s  %s\n' "$TARBALL_SHA" "$(basename -- "$TARBALL")" >"$TARBALL.sha256"
 	bp_log "packed $(basename -- "$TARBALL") ($TARBALL_SHA)"

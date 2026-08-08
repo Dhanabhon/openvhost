@@ -40,6 +40,27 @@
 //!    (`build/audit.sh`, spec D6), including running from two different paths
 //!    and serving SQL across a restart.
 //!
+//! **The digest below names a REPACKED tarball** (reproducible-pack design
+//! §5.3). `build/build.sh mariadb 11.4.9 --from pack` re-cut it from the staged
+//! prefix `/opt/openvhost-build/mariadb-11.4.9` so that the pin would name bytes
+//! the pipeline can *reproduce*. The three checks above stand unchanged, and not
+//! by assumption: every one of the 16 882 files in the previously pinned tarball
+//! has the same SHA-256 as the file at the same path in the prefix that was
+//! repacked, and `gunzip -c` of both tarballs gives the same raw tar,
+//! `1d55a367c1d519a9a525fb8439dc54b4d07f524e104deb38a4ef69a1cebe6232` — same
+//! entries, same modes, same mtimes. The whole difference is the four-byte MTIME
+//! field gzip writes into its own header from the clock. All seven contract
+//! checks were re-run against the repacked tarball rather than carried over.
+//!
+//! **One cost, recorded rather than hidden.** The repack's manifest carries
+//! `resumed_from: "pack"` and its `recipe.vendored_on_disk` is now `[]`: that
+//! block records the digests of the pcre2 and fmt archives *as the build read
+//! them*, and the work tree holding them was cleaned up long ago, so there is
+//! nothing left to hash. `recipe.vendored` — what was pinned and verified — is
+//! unchanged, and the manifest cut beside the 2026-08-03 build still carries
+//! both on-disk digests. Only a full rebuild puts them back in a current
+//! manifest.
+//!
 //! **Single-builder trust, accepted explicitly by the owner (spec §13.1).**
 //! There is no independent reproduction of these bytes. The build manifest
 //! published beside the tarball is what makes the inputs auditable, and it is
@@ -224,7 +245,7 @@ pub const MARIADB_PACKAGES: [MariadbPackage; 1] = [MariadbPackage {
     version: "11.4.9",
     target: PackageTarget::MacosArm64,
     url: "https://github.com/Dhanabhon/openvhost/releases/download/mariadb-11.4.9/mariadb-11.4.9-macos-arm64.tar.gz",
-    sha256: "76ea96a4089e56953693d1af14e3ddd8da03cab291eada1fd1cf4e2c1df18304",
+    sha256: "854c34dcafef29dc72af2bcbd6d66271ae2e6167ab45e33c4f744d163675aeb0",
     format: ArchiveFormat::TarGz,
     availability: Availability::AwaitingRelease {
         tag: "mariadb-11.4.9",
@@ -321,7 +342,7 @@ mod tests {
         );
         assert_eq!(
             e.sha256,
-            "76ea96a4089e56953693d1af14e3ddd8da03cab291eada1fd1cf4e2c1df18304"
+            "854c34dcafef29dc72af2bcbd6d66271ae2e6167ab45e33c4f744d163675aeb0"
         );
         assert_eq!(e.format, ArchiveFormat::TarGz);
     }

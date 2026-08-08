@@ -76,10 +76,25 @@
 //!    loaded from the relocated tree through `-d` pairs and no `php.ini`
 //!    anywhere, the response compared across a restart (php-recipe design
 //!    §9, items 3 and 5) — not `php-fpm -t`, and not a version print.
-//! 4. `resumed_from` is empty and the build manifest records all 8 `spc
-//!    build` flags: this artifact is one complete, non-resumed run, not a
-//!    tree assembled across several `--from <stage>` invocations whose
-//!    earlier stages nobody re-verified.
+//! 4. The build manifest records all 8 `spc build` flags and all 34 pinned
+//!    third-party sources — and it records `resumed_from: "pack"`, which is
+//!    deliberate rather than a regression to explain away. The tarball this
+//!    hash names was **repacked** from the staged prefix
+//!    `/opt/openvhost-build/php-8.4.24` by `build/build.sh php 8.4.24 --from
+//!    pack`, so that the pin would name bytes the pipeline can *reproduce*
+//!    (reproducible-pack design §5.3–§5.4). `--from` is recorded precisely so
+//!    that an artifact assembled from partly stale state cannot look like a
+//!    clean one, and this one is honest about being a repack.
+//!
+//!    What the repack did **not** change is the tree. `gunzip -c` of a
+//!    pre-repack pack and of this one give the same raw tar,
+//!    `df0dfb79c99ad02b6b0abfccdb74167f6ad8e89e08d28239f384a5405c3f63ae` —
+//!    same entries, same modes, same mtimes — so the only difference from the
+//!    artifact the one complete `spc build` run produced is the four-byte
+//!    MTIME field gzip writes into its own header from the clock. The staged
+//!    prefix is still what that single complete run installed: no stage was
+//!    re-run over it, and the seven contract checks below were re-run against
+//!    the repacked tarball, not carried over.
 //!
 //! **Single-builder trust, accepted explicitly by the owner** (build-pipeline
 //! design §13, decision 1 — the same acceptance nginx's and MariaDB's pins
@@ -281,7 +296,7 @@ pub const PHP_PACKAGES: [PhpPackage; 1] = [PhpPackage {
     version: "8.4.24",
     target: PackageTarget::MacosArm64,
     url: "https://github.com/Dhanabhon/openvhost/releases/download/php-8.4.24/php-8.4.24-macos-arm64.tar.gz",
-    sha256: "9fecd3a21fd397565a70cac031f2e7f5fa82f029580e3fa733e36dd724527240",
+    sha256: "c79b18c372f3f31f91bdefb79da08d81ffcc23e5f894f0a2b40060ffa6bcc2bb",
     format: ArchiveFormat::TarGz,
     availability: Availability::AwaitingRelease { tag: "php-8.4.24" },
     // Mirrors `_php-pins.sh`'s `PHP_PINS_UPSTREAM_RELEASE_DATE` /
@@ -387,7 +402,7 @@ mod tests {
         );
         assert_eq!(
             e.sha256,
-            "9fecd3a21fd397565a70cac031f2e7f5fa82f029580e3fa733e36dd724527240"
+            "c79b18c372f3f31f91bdefb79da08d81ffcc23e5f894f0a2b40060ffa6bcc2bb"
         );
         assert_eq!(e.format, ArchiveFormat::TarGz);
     }
