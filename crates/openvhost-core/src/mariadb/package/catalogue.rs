@@ -52,14 +52,24 @@
 //! field gzip writes into its own header from the clock. All seven contract
 //! checks were re-run against the repacked tarball rather than carried over.
 //!
-//! **One cost, recorded rather than hidden.** The repack's manifest carries
-//! `resumed_from: "pack"` and its `recipe.vendored_on_disk` is now `[]`: that
-//! block records the digests of the pcre2 and fmt archives *as the build read
-//! them*, and the work tree holding them was cleaned up long ago, so there is
-//! nothing left to hash. `recipe.vendored` — what was pinned and verified — is
-//! unchanged, and the manifest cut beside the 2026-08-03 build still carries
-//! both on-disk digests. Only a full rebuild puts them back in a current
-//! manifest.
+//! **Three costs, recorded rather than hidden — not one.** The repack's
+//! manifest carries `resumed_from: "pack"`, and three fields degraded
+//! between the manifest beside the previous pin and this one:
+//! `configure_flags` went from 24 entries — the entire plugin-disable set
+//! among them (`-DPLUGIN_CONNECT=NO`, `-DPLUGIN_OQGRAPH=NO`,
+//! `-DPLUGIN_S3=NO`, …) — to `[]`, because `--from pack` skips
+//! `recipe_configure`, the only stage that calls `bp_record_flags`.
+//! `recipe.vendored_on_disk` is `[]` for the same reason: that block records
+//! the digests of the pcre2 and fmt archives *as the build read them*, and
+//! the work tree holding them was cleaned up long ago, so there is nothing
+//! left to hash. And `recipe.bison.path` / `.version` — which bison actually
+//! built the parser — are both `""`, because bison is discovered inside
+//! `recipe_configure` too. **Which plugins exist in the shipped server is
+//! security-relevant configuration**, so none of this is cosmetic.
+//! `recipe.vendored` — what was pinned and verified — is unchanged, and the
+//! manifest cut beside the 2026-08-03 build still carries a populated
+//! `configure_flags`, both on-disk digests, and the bison path and version.
+//! Only a full rebuild puts any of the three back in a current manifest.
 //!
 //! **Single-builder trust, accepted explicitly by the owner (spec §13.1).**
 //! There is no independent reproduction of these bytes. The build manifest
@@ -231,10 +241,17 @@ pub struct MariadbPackage {
 ///    (or `--from pack --keep-work` against an existing staged prefix) must
 ///    print this exact hash. Since the pack stage stopped writing a timestamp
 ///    into the gzip header, that is a real check rather than a formality.
-/// 2. Run `the_real_artifact_installs_and_runs_from_the_package_tree` (it is
+/// 2. **All seven contract checks must pass.** A full `build/build.sh` run
+///    (no `--from`) gets both runs for free: its `audit` stage runs them
+///    against the staged tree, and `verify-artifact` runs them again against
+///    the packed tarball. The `--from pack` shortcut in step 1 does not — it
+///    starts past `audit`, so it exercises the contract once, against the
+///    tarball only. Taking that shortcut means confirming the staged tree
+///    already has a passing, current audit behind it, not assuming one.
+/// 3. Run `the_real_artifact_installs_and_runs_from_the_package_tree` (it is
 ///    `#[ignore]`d; set `OPENVHOST_MARIADB_TARBALL`) — it fails unless the
 ///    tarball on disk is the one this pin names.
-/// 3. Create release `mariadb-11.4.9` carrying the tarball, its `.sha256` and
+/// 4. Create release `mariadb-11.4.9` carrying the tarball, its `.sha256` and
 ///    the build manifest, confirm the served bytes still hash to this pin, then
 ///    flip `availability` to [`Availability::Published`].
 ///

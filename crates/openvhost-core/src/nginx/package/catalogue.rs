@@ -228,11 +228,29 @@ pub struct NginxPackage {
 /// `crate::nginx::install_nginx_package` refuses before any network work,
 /// naming the tag to publish.
 ///
+/// **Not a repack, unlike MariaDB's and PHP's pins — deliberately.** Both of
+/// those were re-cut from their staged prefix by reproducible-pack (design
+/// §5.3). This one was not: `/opt/openvhost-build/nginx-1.30.4` was relinked
+/// against a rebuilt OpenSSL on 2026-08-07, *after* this `sha256` was
+/// pinned, so packing today's prefix produces different bytes — measured:
+/// `bin/nginx` is the only file among 24 entries that differs, same size,
+/// 611 differing byte positions, embedded OpenSSL build timestamp `Mon Aug 3
+/// 15:05:42 2026 UTC` (pinned) vs `Fri Aug 7 02:52:02 2026 UTC` (prefix).
+/// **A repack of the drifted prefix still passes the artifact contract
+/// 7/7** — the contract cannot detect that the OpenSSL underneath was
+/// rebuilt from state that left no manifest, no log and no artifact.
+/// Passing the contract is not having provenance. The bytes named below are
+/// the PR #57 artifact, with its manifest — not reproducible from the
+/// prefix as it stands today. Re-pinning requires a documented rebuild, not
+/// a repack.
+///
 /// **To publish:**
 ///
-/// 1. Confirm the tarball at `build/out/nginx-1.30.4-macos-arm64.tar.gz`
-///    still hashes to `sha256` below — this module's own test
-///    `the_catalogue_pins_exactly_one_nginx_build_today` pins the same
+/// 1. **The tarball is not in this worktree's `build/out`.** Packing
+///    today's staged prefix hashes to different bytes than `sha256` below,
+///    for the reason above. Locate the PR #57 artifact this pin actually
+///    names and confirm it still hashes to `sha256` below; this module's own
+///    test `the_catalogue_pins_exactly_one_nginx_build_today` pins the same
 ///    digest as a literal, so a mismatch there is the first signal something
 ///    moved.
 /// 2. Create release `nginx-1.30.4` carrying the tarball, its `.sha256`

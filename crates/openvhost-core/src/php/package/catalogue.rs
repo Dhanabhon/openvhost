@@ -76,10 +76,16 @@
 //!    loaded from the relocated tree through `-d` pairs and no `php.ini`
 //!    anywhere, the response compared across a restart (php-recipe design
 //!    §9, items 3 and 5) — not `php-fpm -t`, and not a version print.
-//! 4. The build manifest records all 8 `spc build` flags and all 34 pinned
-//!    third-party sources — and it records `resumed_from: "pack"`, which is
-//!    deliberate rather than a regression to explain away. The tarball this
-//!    hash names was **repacked** from the staged prefix
+//! 4. The build manifest records all 34 pinned third-party sources — and it
+//!    records `resumed_from: "pack"`, which is deliberate rather than a
+//!    regression to explain away. **It does not record the 8 `spc build`
+//!    flags**: `--from pack` skips `recipe_configure`, the only stage in
+//!    this pipeline that calls `bp_record_flags` (`build/build.sh:540`), so
+//!    a repack manifest's `configure_flags` is `[]` — measured on this
+//!    build, not assumed. The flags are still pinned, just not here: they
+//!    live in `build/recipes/php.sh`'s `_php_spc_build_args`, which is where
+//!    to read them until a full rebuild repopulates this field. The tarball
+//!    this hash names was **repacked** from the staged prefix
 //!    `/opt/openvhost-build/php-8.4.24` by `build/build.sh php 8.4.24 --from
 //!    pack`, so that the pin would name bytes the pipeline can *reproduce*
 //!    (reproducible-pack design §5.3–§5.4). `--from` is recorded precisely so

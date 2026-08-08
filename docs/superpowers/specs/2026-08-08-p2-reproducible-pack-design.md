@@ -115,3 +115,17 @@ manifest's own `resumed_from` semantics, which already record honestly when a bu
 the served bytes and confirm the hash* — a check that the upload was not corrupted. After this, the
 same check also confirms the **pipeline** still produces what the catalogue claims, which is a
 different and stronger property.
+
+## Postscript, 2026-08-08 — nginx's pin was not re-cut, and that is not a D2 failure
+
+D2 and §5.3 above predate a fact found only in this slice's fix wave: between this pin being cut
+(2026-08-06) and the fix wave running, `/opt/openvhost-build/nginx-1.30.4` was relinked against a
+rebuilt OpenSSL (2026-08-07). A repack from today's prefix does not reproduce the pinned bytes —
+`bin/nginx` differs, 611 byte positions, same size — even though it still passes the artifact
+contract 7/7. **Passing the contract is not having provenance**, which is the reason this is
+recorded rather than quietly re-pinned to whatever the drifted prefix now produces.
+
+D2 and §5.3 are not false as written; they state this slice's intent before the drift was known.
+What changed is scope: one of the three pins cannot be re-cut from the current prefix without a
+documented OpenSSL rebuild first, which is separate work this slice does not do. The full account
+lives next to nginx's `sha256` field in `crates/openvhost-core/src/nginx/package/catalogue.rs`.
