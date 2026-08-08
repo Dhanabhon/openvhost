@@ -786,16 +786,41 @@ json_array() {
 # value that differed. nginx's prefix drifted 611 bytes from its pin that way,
 # with every gate green. This is the value that differs.
 #
-# What it covers, and it is three streams into one sha256:
+# The rule every stream below obeys, because breaking it is how this function
+# was first got wrong: NO FIELD MAY CONTAIN THE BYTE THAT SEPARATES ITS OWN
+# RECORDS. A field is either bounded (octal digits) or separated by NUL, which
+# is the one byte a path or a symlink target cannot hold.
+#
+# What it covers, and it is four streams into one sha256:
 #
 #   1. every path under the prefix, relative to it, byte-sorted and
 #      NUL-separated. Relative so the digest describes the tree and not where
-#      the build root happens to be; NUL-separated so a path containing a
-#      newline cannot masquerade as two paths in the streams below.
+#      the build root happens to be.
 #   2. each of those entries' st_mode in octal — which carries the file type,
-#      the permission bits and setuid/setgid/sticky — followed, for a symlink,
-#      by its target. Same order as (1), which is what associates the two.
-#   3. the SHA-256 of every regular file's content, in that same order.
+#      the permission bits and setuid/setgid/sticky — one per line, in the same
+#      order as (1), which is what associates the two. Octal digits and nothing
+#      else, so the newline that ends a record cannot occur inside one.
+#   3. every symlink's own path AND its target, both NUL-terminated, byte-
+#      sorted. A stream of its own rather than a `%SY` suffix on (2), because a
+#      target is unbounded text the tree's author chooses: riding in a
+#      newline-separated stream it can forge a record. That is measured, not
+#      supposed. Tree A `p1 -> "a\n120755 -> b"`, `p2 -> "c"` and tree B
+#      `p1 -> "a"`, `p2 -> "b\n120755 -> c"` are two materially different trees
+#      that hashed to the same b145ad8eab60… while the target rode in (2) —
+#      identical path sets, so stream (1) could not tell them apart either.
+#      Carrying its own path makes this stream self-describing, so it needs no
+#      positional agreement with (1) to be read; that agreement was the bug.
+#   4. the SHA-256 of every regular file's content, in that same order. Left on
+#      `shasum`'s own output format, which escapes a newline or a backslash in a
+#      file name (`\<digest>  ./n\nl`) rather than emitting it raw — checked,
+#      not assumed, since the rule above would otherwise fail here too.
+#
+# One `stat` per SYMLINK, but still one batched `stat` for the modes of
+# everything else. Per-entry would be simpler and is what a first reading
+# suggests, but measured on the largest real prefix here — mariadb-11.4.9,
+# 17245 entries, 39 of them symlinks — per-entry `sh -c` takes 59s against 1.6s
+# for this, and openssl-3.5.7 (160 entries, no symlinks at all) is unchanged at
+# 0.05s. The cost now scales with symlink count, not with tree size.
 #
 # What it deliberately does NOT cover is time: no mtime, no atime, no ctime. A
 # digest that moved every time the tree was touched or copied would record
@@ -809,11 +834,23 @@ json_array() {
 # scrubbed to the system directories before any stage runs, so these are the
 # system tools whatever the caller had on PATH.
 prefix_digest() {
-	local tree="$1"
+	local tree="$1" link target
 	(
 		cd -- "$tree" || exit 1
 		find . -mindepth 1 -print0 | LC_ALL=C sort -z
-		find . -mindepth 1 -print0 | LC_ALL=C sort -z | xargs -0 stat -f '%Op%SY'
+		find . -mindepth 1 -print0 | LC_ALL=C sort -z | xargs -0 stat -f '%Op'
+		find . -mindepth 1 -type l -print0 | LC_ALL=C sort -z |
+			while IFS= read -r -d '' link; do
+				# `%Y.` and then drop the `.`: command substitution strips EVERY
+				# trailing newline, so a target ending in one would otherwise
+				# record the same bytes as the same target without it — the
+				# defect above in miniature, reintroduced by the fix. The
+				# sentinel makes that newline interior, and interior bytes
+				# survive. `%Y` alone, not `%SY`: the ` -> ` decoration is for
+				# people reading `stat`, and this stream is read by sha256.
+				target="$(stat -f '%Y.' -- "$link")"
+				printf '%s\0%s\0' "$link" "${target%.}"
+			done
 		find . -mindepth 1 -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256
 	) | shasum -a 256 | cut -d' ' -f1
 }
@@ -849,11 +886,35 @@ prefix_digest() {
 # reaches the artifact — it is contract check 6's FastCGI client. A sentence
 # about linkage would be false there, and a provenance record that is false in
 # one of its three cases is the thing this file keeps being fixed for.
+#
+# BUILD_STAGE_RAN is a fact about this INVOCATION, not about every byte of the
+# artifact, and `--from build`/`--from configure` are where the two part
+# company: they set it, but `make` is incremental, so a consumer whose link step
+# decides it has nothing to do can leave the manifest naming a dependency digest
+# beside bytes linked against the previous one. A complete run cannot reach that
+# — it always re-runs `configure` — so it is confined to the `--from`
+# development aid, and `resumed_from` sits in the same manifest as the
+# disambiguator. Recorded here rather than fixed: the honest alternative is to
+# refuse a digest on any resumed run at all, which would strip the field from
+# precisely the runs a recipe author iterates with.
+#
+# Every shape this can emit, so a consumer can be written against the set rather
+# than against the case it happened to see first:
+#
+#   {}                                             recipe with no RECIPE_DEPENDS
+#   {"<name>": {version, prefix, tree_sha256: "<64 hex>"}}          observed
+#   {"<name>": {version, prefix, tree_sha256: null, not_observed: "…"}}
+#   {"<name>": {version, prefix, tree_sha256: null, prefix_missing: "…"}}
+#
+# `tree_sha256` is therefore either a 64-character hex string or `null`, never a
+# word standing in for one, and `null` always arrives with exactly one sentence
+# beside it saying which way the run failed to produce a digest.
 json_dependencies() {
-	local first=1 dep name version prefix digest
+	local first=1 dep name version prefix digest reason_key reason
 	# Fixed text, never interpolated, so every manifest that cannot vouch for
 	# its dependencies says it the same way and the string can be grepped for.
 	local unobserved='this run did not execute the build stage: this prefix is as it stands now, which is not necessarily what the artifact was built against'
+	local vanished='this prefix was present when the build began and is gone now: it was removed mid-run, so there is nothing left to digest'
 	printf '{'
 	for dep in ${RECIPE_DEPENDS[@]+"${RECIPE_DEPENDS[@]}"}; do
 		name="${dep%%:*}"
@@ -865,24 +926,38 @@ json_dependencies() {
 		printf '"%s": {"version": "%s", "prefix": "%s"' \
 			"$(json_string "$name")" "$(json_string "$version")" \
 			"$(json_string "$prefix")"
+		# Both no-digest cases fall through to ONE printf below, so that `null`
+		# means exactly "no digest" on every path and the differing reason rides
+		# in its own key. It used to be two shapes: the vanished-prefix arm wrote
+		# the STRING "unknown" into tree_sha256, which is the sentinel the arm
+		# below argues against — a consumer testing `tree_sha256 is not None`
+		# takes it for a digest, and two runs that both hit it record the
+		# identical line and compare equal, which is the failure this whole
+		# feature exists to remove, one layer down.
 		if [ "$BUILD_STAGE_RAN" -eq 0 ]; then
-			# null rather than a sentinel string: no hex digest can equal it,
-			# and a reader that expects one gets a type error instead of a
-			# false match. The sentence beside it is the explicit part.
-			printf ', "tree_sha256": null, "not_observed": "%s"}' \
-				"$(json_string "$unobserved")"
-			continue
-		fi
-		if [ -d "$prefix" ]; then
-			digest="$(prefix_digest "$prefix")"
-		else
+			reason_key='not_observed'
+			reason="$unobserved"
+		elif [ ! -d "$prefix" ]; then
 			# Only reachable if the prefix went away mid-run, since the loop
 			# above built or found it before any stage ran. Recorded rather than
 			# fatal: by now the artifact is packed and audited, and a manifest
 			# that does not exist is worse than one that says it does not know.
-			digest="unknown"
+			reason_key='prefix_missing'
+			reason="$vanished"
+		else
+			# Assigned, never inlined into printf's argument list: under `set -e`
+			# a failed command substitution aborts an assignment, but as an
+			# argument it is printf's own success that decides, and an empty
+			# digest would be written instead.
+			digest="$(prefix_digest "$prefix")"
+			printf ', "tree_sha256": "%s"}' "$(json_string "$digest")"
+			continue
 		fi
-		printf ', "tree_sha256": "%s"}' "$(json_string "$digest")"
+		# null rather than a sentinel string: no hex digest can equal it, and a
+		# reader that expects one gets a type error instead of a false match. The
+		# sentence beside it is the explicit part.
+		printf ', "tree_sha256": null, "%s": "%s"}' \
+			"$reason_key" "$(json_string "$reason")"
 	done
 	printf '}'
 }

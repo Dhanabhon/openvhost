@@ -253,6 +253,17 @@ pub struct NginxPackage {
 /// that, and it is not a theory: the pre-removal prefix digested to
 /// `0810760892…` and the rebuilt one to `e486946b…`.
 ///
+/// **`e486946b…` is still recomputable today, and that is worth one sentence
+/// because the digest algorithm changed after this manifest was written.** A
+/// symlink target used to ride in the same newline-separated stream as the
+/// file modes, where a target containing a newline could forge a record;
+/// `prefix_digest` now carries targets in a NUL-terminated stream of their own.
+/// `/opt/openvhost-build/openssl-3.5.7` holds 160 entries and **no symlinks**,
+/// so the two algorithms read it identically — re-running the corrected one
+/// over the untouched prefix prints `e486946bb7aa…`, the same value the
+/// manifest beside the artifact records. Nothing here needed restating, and
+/// nothing in that manifest was edited to make it agree.
+///
 /// **The old pin's provenance was stale a second, independent way.** It was
 /// cut from an in-progress revision of its own recipe: its manifest has no
 /// `recipe.pcre2.last_checked`, and `git blame` puts that field in `c87ec6c`
