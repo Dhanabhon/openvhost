@@ -1,7 +1,20 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <script lang="ts">
-	import type { InstallOutcomeDto, PhpRuntimeDto, ServiceStatus } from '../ipc';
+	import type {
+		PhpInstallOutcomeDto,
+		PhpInstallProgressDto,
+		PhpRuntimeDto,
+		ServiceStatus
+	} from '../ipc';
 	import type { UiLog } from '../languages.svelte';
+	import {
+		phpInstallOffered,
+		phpInstallProgressLabel,
+		phpInstallProgressPercent,
+		phpNoRouteNote,
+		phpOutcomeRender,
+		phpSourceBadge
+	} from '../php-install.derive';
 	import {
 		offersUninstall,
 		outOfCatalogueNote,
@@ -15,12 +28,15 @@
 	let {
 		row,
 		cataloged,
+		brewFound,
 		serviceState,
 		installing = '',
 		uninstalling = '',
 		log = [],
 		error = '',
 		outcome = null,
+		installProgress = null,
+		installTotal = null,
 		onInstall,
 		onUninstall,
 		onStart,
@@ -43,6 +59,18 @@
 		 *  — it just gets no Uninstall, because `Target::parse` would refuse the
 		 *  major and the dialog would open only to say so. */
 		cataloged: boolean;
+		/** Whether Homebrew is on this machine (off-Homebrew slice 5C design
+		 *  D2/D5). A required prop for the same reason `cataloged` is one: it is
+		 *  an input to a DECISION — whether this row's Install button can work at
+		 *  all — so a row rendered without it must fail to compile rather than
+		 *  default to "yes, brew is there".
+		 *
+		 *  It does NOT decide alone. `phpInstallOffered` pairs it with this row's
+		 *  own `offer`, because the question is per-major: an `Available` 8.4
+		 *  needs no Homebrew, while an `Unavailable` 8.1 needs it permanently.
+		 *  Answering that with one machine-wide bool is precisely what D2
+		 *  removes from the page above. */
+		brewFound: boolean;
 		/** The whole supervised state, not just whether it is running: `failed`
 		 *  carries the `stderrTail` this row renders, and a boolean cannot express
 		 *  it. Read from the shared services store by the caller, never tracked a
@@ -65,8 +93,25 @@
 		log?: UiLog[];
 		error?: string;
 		/** The last install attempt's outcome, whichever major it was for — this
-		 *  row only renders it once `outcome.major` matches its own. */
-		outcome?: InstallOutcomeDto | null;
+		 *  row only renders it once `outcome.major` matches its own. A TAGGED
+		 *  result since design D4: only the `brew` arm carries an `exitCode`,
+		 *  because only that route runs a child process. */
+		outcome?: PhpInstallOutcomeDto | null;
+		/** This row's own live pipeline state on the PACKAGED route, already
+		 *  scoped to this major by `LanguagesStore.progressFor`.
+		 *
+		 *  `null` is the only value a Homebrew machine can ever see (spec §8.6):
+		 *  `php-install-progress` is emitted solely by `run_package_install`, and
+		 *  `run_brew_install` streams `php-install-log` instead. So the block this
+		 *  prop gates renders nothing at all on every real machine today — which
+		 *  is why it is a display prop with a truthful `null` default rather than
+		 *  a required one like `brewFound`: nothing DECIDES on it, and forgetting
+		 *  to pass it degrades to exactly the behaviour that shipped before it
+		 *  existed. */
+		installProgress?: PhpInstallProgressDto | null;
+		/** The length the server declared for this download, `null` when it
+		 *  declared none. Read only alongside {@link installProgress}. */
+		installTotal?: number | null;
 		onInstall: (major: string) => void;
 		/** Opens the uninstall confirmation (package-uninstall design D6). Never
 		 *  uninstalls anything on its own — nothing is spawned until the dialog's
@@ -92,22 +137,40 @@
 		})
 	);
 	const rowOutcome = $derived(outcome && outcome.major === row.major ? outcome : null);
-	/** Brew exited 0 but the version was not found afterwards — `detected` exists
-	 *  precisely for this case. Silence here is the failure it prevents: without
-	 *  this message the user just presses Install again with nothing explaining
-	 *  why nothing happened. */
-	const notFound = $derived(
-		rowOutcome !== null && rowOutcome.exitCode === 0 && !rowOutcome.detected
+	/** Every arm of the settled result, classified once (design D4). NOT a
+	 *  `result.kind === 'brew'` test: that would leave the eight packaged arms
+	 *  rendering nothing at all — no error, no warning, no success — which is
+	 *  the C1 defect this row already fixed once for brew's own non-zero exit.
+	 *  `phpOutcomeRender` ends in `const unreachable: never`, so a ninth arm
+	 *  fails to compile there instead of silently rendering as silence here. */
+	const settled = $derived(
+		rowOutcome === null ? null : phpOutcomeRender(rowOutcome.result, row.major)
 	);
-	const justInstalled = $derived(rowOutcome !== null && rowOutcome.detected && row.installed);
-	/** C1 audit finding: `install_php` returns `Ok(InstallOutcomeDto { exit_code:
-	 *  Some(1), detected: false })` for a brew run that genuinely failed — a
-	 *  non-zero exit (or `None`, killed by a signal) is an OUTCOME to render, not
-	 *  a thrown error, so `error` above never carries it. `exitCode !== 0` covers
-	 *  both: `1` (or any other non-zero code) and `null` (no code at all) are both
-	 *  "not a clean exit". Checked before `notFound`/`justInstalled` in the
-	 *  markup below — those only make sense once `exitCode === 0`. */
-	const installFailed = $derived(rowOutcome !== null && rowOutcome.exitCode !== 0);
+	/** The failure line. For the brew route this is still exactly what it was —
+	 *  a non-zero exit, or `null` for a signal kill, is an OUTCOME to render and
+	 *  not a thrown error, so `error` above never carries it. */
+	const installFailed = $derived(settled?.alert ?? null);
+	/** It reported success and the runtime still is not there. Silence here is
+	 *  the failure it prevents: without this message the user just presses
+	 *  Install again with nothing explaining why nothing happened. */
+	const notFound = $derived(settled?.warning ?? null);
+	/** Paired with the row's own `installed`, so a claim of success is never made
+	 *  about a row the environment re-read did not confirm. */
+	const justInstalled = $derived((settled?.succeeded ?? false) && row.installed);
+	/** Provenance, not status (design D3). `null` for a Homebrew keg, which is
+	 *  why nothing new appears on a machine that has only ever used brew. */
+	const sourceBadge = $derived(phpSourceBadge(row.source));
+	/** Whether Install could actually work for THIS major on THIS machine — the
+	 *  row's own offer paired with `brewFound`, never one or the other alone. */
+	const installOffered = $derived(phpInstallOffered(row.offer, brewFound));
+	/** …and why not, when it could not. Absent affordance, present explanation. */
+	const noRouteNote = $derived(phpNoRouteNote(row.offer, row.major, brewFound));
+	/** `null` whenever there is nothing honest to draw — before the first byte,
+	 *  with no declared length, and for the three steps after the download, which
+	 *  are moments rather than durations. */
+	const installPercent = $derived(
+		installProgress === null ? null : phpInstallProgressPercent(installProgress, installTotal)
+	);
 </script>
 
 <div class="row lang-row" data-testid="lang-row-{row.major}">
@@ -120,6 +183,21 @@
 		<span class="version">PHP {row.major}</span>
 		{#if row.recommended}
 			<span class="badge recommended">Recommended</span>
+		{/if}
+		<!-- WHICH INSTALL put these binaries here (design D3). Absent when nothing
+		     is installed, and absent for a Homebrew keg — unlike MysqlRow's and
+		     WebServerRow's otherwise identical chips, which do label their brewed
+		     runtimes. See `phpSourceBadge` for why this one does not: a chip on all
+		     five rows of a brew-only machine would say the same thing five times,
+		     and it would be a visible change to every real machine today, which
+		     spec §8.6 forbids. Kept beside the version, never beside the status
+		     pill in the next cell, so it cannot read as a second status. -->
+		{#if sourceBadge}
+			<span
+				class="badge source source-{row.source?.kind}"
+				title={sourceBadge.title}
+				data-testid="php-source-{row.major}">{sourceBadge.label}</span
+			>
 		{/if}
 	</div>
 
@@ -142,16 +220,25 @@
 
 	<div class="row-actions">
 		{#if !row.installed}
-			<Button
-				variant="primary"
-				size="sm"
-				testId="install-{row.major}"
-				ariaLabel="Install PHP {row.major}"
-				disabled={installing !== ''}
-				onclick={() => onInstall(row.major)}
-			>
-				{isInstalling ? 'Installing…' : 'Install'}
-			</Button>
+			<!-- Offered only where it could actually work (design D2/D4). With no
+			     Homebrew, `install_php` on an `AwaitingRelease` or `Unavailable`
+			     offer fails at `find_brew()` before anything is spawned, so the
+			     button's only possible outcome would be "Homebrew was not found" —
+			     the affordance-that-can-only-fail this codebase keeps deleting. The
+			     note below the row says what is missing instead. An `Available`
+			     offer keeps its button with or without brew: that row is ours. -->
+			{#if installOffered}
+				<Button
+					variant="primary"
+					size="sm"
+					testId="install-{row.major}"
+					ariaLabel="Install PHP {row.major}"
+					disabled={installing !== ''}
+					onclick={() => onInstall(row.major)}
+				>
+					{isInstalling ? 'Installing…' : 'Install'}
+				</Button>
+			{/if}
 		{:else}
 			{#if row.serviceId && serviceState !== null}
 				{#if serviceState.kind === 'failed'}
@@ -203,6 +290,17 @@
 	</div>
 </div>
 
+{#if !row.installed && noRouteNote !== null}
+	<!-- Why this row has no Install button. PER ROW, never page-wide (design
+	     D2): on a machine with a packaged 8.4 and no Homebrew, 8.4 installs and
+	     8.1/8.3/8.5 do not, and one sentence at the top of the page cannot be
+	     true of both. Same neutral secondary-text treatment as the
+	     out-of-catalogue note below and for the same reason — `Unavailable` is
+	     the ordinary state of four majors out of five, and every major on Intel.
+	     Nothing here is broken; something is simply not installed. -->
+	<p class="note" data-testid="php-no-route-{row.major}">{noRouteNote}</p>
+{/if}
+
 {#if row.installed && !cataloged}
 	<!-- Why the Uninstall button is not there. An absent affordance with no
 	     explanation is this page's own recurring failure (C2/C3): the user is
@@ -213,6 +311,49 @@
 	<p class="note" data-testid="php-out-of-catalogue-{row.major}">
 		{outOfCatalogueNote('php', row.major)}
 	</p>
+{/if}
+
+{#if isInstalling && installProgress !== null}
+	<!-- The packaged route's pipeline, the only progress feedback that route has:
+	     it spawns no child process, so `LogPane` below stays empty for the whole
+	     of it — brew's output is a different channel entirely. Without this the
+	     day a release is published a user presses Install and watches nothing
+	     happen for the length of a download.
+
+	     `verified` and `extracted` are SEPARATE sentences on purpose (see
+	     `phpInstallProgressLabel`): a download that was checked against the
+	     built-in SHA-256 and one that merely arrived must never look identical,
+	     which is the whole of what golden rule 6 buys.
+
+	     BOTH HALVES OF THIS CONDITION ARE LOAD-BEARING, for different reasons,
+	     and it is written once rather than split into a named derived precisely
+	     so neither can go quietly redundant:
+
+	      * `installProgress !== null` is what keeps spec §8.6 true. A brew
+	        install sets `installing` to this major and never emits a single
+	        progress event — `php-install-progress` has one emitter,
+	        `run_package_install` — so gating on `isInstalling` alone would put a
+	        download line under every Install press on every real machine today.
+	      * `isInstalling` is what makes the line go away when the run settles.
+	        `install()`'s `finally` clears `installing` before the settled outcome
+	        renders, so without it a finished "Installed —…" would sit above the
+	        success message for the rest of the page's life. -->
+	<p class="note progress" data-testid="php-install-progress-{row.major}">
+		{phpInstallProgressLabel(installProgress, installTotal)}
+	</p>
+	{#if installPercent !== null}
+		<div
+			class="bar"
+			role="progressbar"
+			aria-label="Downloading PHP {row.major}"
+			aria-valuemin={0}
+			aria-valuemax={100}
+			aria-valuenow={installPercent}
+			data-testid="php-install-bar-{row.major}"
+		>
+			<span class="fill" style="width: {installPercent}%"></span>
+		</div>
+	{/if}
 {/if}
 
 {#if log.length > 0}
@@ -232,25 +373,17 @@
 	<p class="error" role="alert" style="white-space: pre-wrap">{error}</p>
 {/if}
 
-{#if installFailed}
+{#if installFailed !== null}
 	<!-- C1 fix: brew's own non-zero exit (or a signal kill, `exitCode === null`)
 	     used to render NOTHING — no error (nothing threw), no `notFound` (that
 	     branch requires `exitCode === 0`), and by then the log had already been
 	     hidden by the `isInstalling` gate above. Spec §6 calls this a "Failed" row
-	     state; this is it. -->
-	<p class="error" role="alert">
-		{#if rowOutcome?.exitCode !== null && rowOutcome?.exitCode !== undefined}
-			brew exited with code {rowOutcome.exitCode} while installing PHP {row.major}.
-		{:else}
-			brew was killed before installing PHP {row.major} finished.
-		{/if}
-		Check the log above for what brew actually did.
-	</p>
-{:else if notFound}
-	<p class="warn" role="alert">
-		Homebrew reported success installing PHP {row.major}, but the version was not found afterwards.
-		Check the log above for what brew actually did.
-	</p>
+	     state; this is it. Since design D4 the wording lives in
+	     `phpOutcomeRender`, which answers for the packaged arms too so that none
+	     of them can reintroduce the same silence. -->
+	<p class="error" role="alert">{installFailed}</p>
+{:else if notFound !== null}
+	<p class="warn" role="alert">{notFound}</p>
 {/if}
 
 {#if serviceState?.kind === 'failed'}
@@ -306,14 +439,30 @@
 	.primary {
 		font-weight: 600;
 		display: flex;
+		/* Wraps since the source badge landed, exactly as MysqlRow.svelte's
+		   identical comment records doing once already: this cell can now hold
+		   "PHP 8.4" + "Recommended" + "OpenVHost 8.4.24", which on one nowrap
+		   line would push the row's action column off-screen — the failure the
+		   status-bar slice and the responsive slice have each had to fix. Inert
+		   until a packaged row exists: with the two chips this cell held before,
+		   the content still fits the 190px track and nothing wraps. */
+		flex-wrap: wrap;
 		align-items: center;
-		gap: 8px;
+		gap: 6px 8px;
 		min-width: 0;
 	}
 	.primary .version {
 		white-space: nowrap;
 	}
-	.badge.recommended {
+	/* Shared chip base, transcribed line-for-line from MysqlRow.svelte's own
+	   `.badge` rather than approximated — the same discipline 4C's review
+	   applied to WebServerRow's copy of it. Svelte scopes styles per component,
+	   so a third literal copy is the only way three components can share one
+	   look; extracting a shared component would change the class attribute (and
+	   therefore the markup) of two already-shipped, already-tested rows.
+	   `.recommended` below overrides the palette at a higher specificity, so
+	   its rendering is byte-for-byte what it was before the base existed. */
+	.badge {
 		display: inline-flex;
 		align-items: center;
 		/* Never absorb the shortfall by squashing: if this cell is ever too
@@ -325,9 +474,31 @@
 		border-radius: var(--vh-radius-pill);
 		font-size: var(--vh-text-caption);
 		font-weight: 600;
+		color: var(--vh-text-2);
+		background: var(--vh-surface-2);
+		border: 1px solid var(--vh-border);
+	}
+	.badge.recommended {
 		color: var(--vh-accent);
 		background: var(--vh-selected);
 		border: 1px solid color-mix(in oklab, var(--vh-accent) 35%, transparent);
+	}
+	/* Provenance, not status: a quieter weight than `.recommended` so it reads
+	   as metadata beside the version rather than competing with the StatusPill
+	   in the next column. */
+	.badge.source {
+		font-weight: 500;
+		letter-spacing: 0.01em;
+	}
+	/* The packaged chip borrows the link accent to say "this one is ours".
+	   `--vh-link` is brand-700, the same token MysqlRow.svelte's and
+	   WebServerRow.svelte's identical chips use. Disjoint from every colour
+	   StatusPill can paint (`--vh-run`/`--vh-start`/`--vh-fail`/`--vh-stop`),
+	   and it carries no status dot, so it cannot read as a status beside one. */
+	.badge.source-packaged {
+		color: var(--vh-link);
+		border-color: color-mix(in oklab, var(--vh-link) 35%, transparent);
+		background: color-mix(in oklab, var(--vh-link) 8%, transparent);
 	}
 	.meta {
 		color: var(--vh-text-2);
@@ -362,6 +533,32 @@
 		margin: 0 var(--vh-space-4) var(--vh-space-3);
 		color: var(--vh-text-2);
 		font-size: var(--vh-text-table);
+	}
+	/* The live pipeline line. Tabular numerals so a byte counter ticking up does
+	   not shuffle the words after it left and right on every event. Transcribed
+	   line-for-line from `MysqlRow.svelte`'s own `.note.progress`/`.bar`/`.fill`
+	   rather than approximated — the same discipline the source badge above
+	   followed, and for the same reason: Svelte scopes styles per component, so a
+	   literal copy is the only way two components can share one look without
+	   changing the markup of an already-shipped, already-tested row. */
+	.note.progress {
+		font-variant-numeric: tabular-nums;
+	}
+	.bar {
+		margin: 0 var(--vh-space-4) var(--vh-space-3);
+		height: 4px;
+		border-radius: 2px;
+		background: var(--vh-surface-2);
+		overflow: hidden;
+	}
+	.bar .fill {
+		display: block;
+		height: 100%;
+		background: var(--vh-link);
+		/* Width only — a transform-based fill would need a wrapper to avoid
+		   scaling the rounded ends, and 4px of bar is not worth that. The
+		   transition is short enough to read as "it moved", not as animation. */
+		transition: width var(--vh-dur-fast) linear;
 	}
 	.pool-stderr {
 		margin: 0 var(--vh-space-4) var(--vh-space-3);

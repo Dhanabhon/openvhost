@@ -31,7 +31,7 @@ import {
 	uninstallPlan,
 	webServerSettings
 } from './index';
-import type { WebServerSettingsDto } from './index';
+import type { PhpInstallOutcomeDto, WebServerSettingsDto } from './index';
 
 const sample = {
 	appVersion: '0.1.0',
@@ -312,8 +312,19 @@ describe('pendingInstall', () => {
 describe('installPhp', () => {
 	beforeEach(() => invokeMock.mockReset());
 
+	// Every fixture below is annotated `PhpInstallOutcomeDto`, and that
+	// annotation is the test. `installPhp` is a pure pass-through over an
+	// untyped `invoke` mock, so an unannotated object literal makes both
+	// assertions below pass for ANY shape — including the retired brew-shaped
+	// `{ major, exitCode, detected }`, which can no longer cross the wire at
+	// all since design D4 tagged the result. The type is what makes the stale
+	// shape a compile error rather than a green test about a dead contract.
+	// Audit fix wave, item 1; this slice's headline bug was a shape bug.
 	it('passes the major through and returns the outcome on success', async () => {
-		const outcome = { major: '8.4', exitCode: 0, detected: true };
+		const outcome: PhpInstallOutcomeDto = {
+			major: '8.4',
+			result: { kind: 'brew', exitCode: 0, detected: true }
+		};
 		invokeMock.mockResolvedValueOnce(outcome);
 		await expect(installPhp('8.4')).resolves.toEqual(outcome);
 		expect(invokeMock).toHaveBeenCalledWith('install_php', { major: '8.4' });
@@ -323,7 +334,30 @@ describe('installPhp', () => {
 		// The silent-failure case this project keeps catching: brew reports
 		// success but the version never appears. The wrapper must not paper
 		// over that combination — it is exactly what the caller has to render.
-		const outcome = { major: '8.4', exitCode: 0, detected: false };
+		// `exitCode` lives on the `brew` arm and nowhere else, so naming that
+		// arm is what makes this test's own title true of the value it uses.
+		const outcome: PhpInstallOutcomeDto = {
+			major: '8.4',
+			result: { kind: 'brew', exitCode: 0, detected: false }
+		};
+		invokeMock.mockResolvedValueOnce(outcome);
+		await expect(installPhp('8.4')).resolves.toEqual(outcome);
+	});
+
+	it('passes a packaged outcome through with no exitCode to misread', async () => {
+		// The other family of the union, and the render the tagged result
+		// exists to prevent: a SUCCESSFUL packaged install carries no
+		// `exitCode`, because no child process ran. A wrapper that reshaped
+		// this into the brew record would fail to compile here.
+		const outcome: PhpInstallOutcomeDto = {
+			major: '8.4',
+			result: {
+				kind: 'installed',
+				version: '8.4.24',
+				detected: true,
+				ledger: { kind: 'recorded' }
+			}
+		};
 		invokeMock.mockResolvedValueOnce(outcome);
 		await expect(installPhp('8.4')).resolves.toEqual(outcome);
 	});

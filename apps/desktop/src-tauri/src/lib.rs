@@ -32,6 +32,11 @@ mod mysql_admin;
 /// event and the two install commands. A sibling of `commands` rather than more
 /// of it (that file is ~8 200 lines).
 mod mysql_pkg;
+/// PHP's own package tree, on the wire (off-Homebrew slice 5C): the runtime
+/// SOURCE a Languages row carries, the per-major package OFFER, the routing rule
+/// `install_php` applies to it, and the tagged result both of its routes return.
+/// A sibling of `mysql_pkg`/`mariadb_pkg`, mirroring their shape.
+mod php_pkg;
 mod quit;
 
 // Ungated: `stack::StackPaths` is a portable type named by `commands.rs` on
@@ -95,6 +100,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::php_environment,
             commands::rescan_php_runtimes,
             commands::install_php,
+            php_pkg::cancel_php_install,
             commands::pending_install,
             commands::mysql_environment,
             commands::rescan_mysql,
@@ -124,6 +130,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::ServiceRegisteredEvent,
             commands::ServiceUnregisteredEvent,
             commands::PhpInstallLogEvent,
+            php_pkg::PhpInstallProgressEvent,
             commands::MysqlInstallLogEvent,
             mysql_pkg::MysqlInstallProgressEvent,
             commands::MysqlInitLogEvent,

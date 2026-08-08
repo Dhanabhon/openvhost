@@ -8,8 +8,26 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { render } from 'svelte/server';
 import LanguageRow from './LanguageRow.svelte';
-import type { InstallOutcomeDto, PhpRuntimeDto, ServiceStatus } from '$lib/ipc';
+import type {
+	PhpInstallOutcomeDto,
+	PhpInstallProgressDto,
+	PhpRuntimeDto,
+	ServiceStatus
+} from '$lib/ipc';
 import type { UiLog } from '$lib/languages.svelte';
+
+/** A settled Homebrew install — the route every real machine still takes, and
+ *  the only arm of `PhpInstallResultDto` that carries an exit code
+ *  (off-Homebrew slice 5C design D4). The literals these calls replace said
+ *  `{ major, exitCode, detected }` back when the outcome type was brew-shaped;
+ *  every assertion about them is unchanged. */
+function brewOutcome(
+	major: string,
+	exitCode: number | null,
+	detected: boolean
+): PhpInstallOutcomeDto {
+	return { major, result: { kind: 'brew', exitCode, detected } };
+}
 
 /** One row, with sensible installed-shape defaults so most tests only need to
  *  state `major` and `installed` — mirrors `row()` in languages.svelte.test.ts. */
@@ -29,6 +47,10 @@ function r(
 		path: installed ? `/opt/homebrew/opt/php@${major}/sbin/php-fpm` : null,
 		socketPath: installed ? `/Users/x/.openvhost/run/php-fpm-${major}.sock` : null,
 		serviceId: installed ? `php-fpm-${major}` : null,
+		// See `row()` in languages.svelte.test.ts — a Homebrew keg matching
+		// `path` above, and the absence four of five majors report today.
+		source: installed ? { kind: 'homebrew' } : null,
+		offer: { kind: 'unavailable', target: 'macos-arm64' },
 		...overrides
 	};
 }
@@ -39,23 +61,39 @@ function renderRow(props: {
 	 *  out-of-catalogue tests below pass `false` explicitly, which is the point:
 	 *  the row cannot decide this for itself, so it must be told. */
 	cataloged?: boolean;
+	/** Defaults to TRUE — a machine with Homebrew, which is every real machine
+	 *  today and the state the rest of this file was written against. The D2
+	 *  tests below pass `false` explicitly. Defaulting it this way is what makes
+	 *  "nothing changes where Homebrew is present" (spec §8.6) something the
+	 *  EXISTING assertions keep proving rather than something new ones claim. */
+	brewFound?: boolean;
 	serviceState?: ServiceStatus['state'] | null;
 	installing?: string;
 	uninstalling?: string;
 	log?: UiLog[];
 	error?: string;
-	outcome?: InstallOutcomeDto | null;
+	outcome?: PhpInstallOutcomeDto | null;
+	/** Defaults to NULL — the only value a Homebrew machine can ever produce
+	 *  (spec §8.6), since `php-install-progress` is emitted solely by
+	 *  `run_package_install`. Defaulting it this way is what makes "a brew
+	 *  install paints no pipeline" something every EXISTING assertion in this
+	 *  file keeps proving rather than something one new test claims. */
+	installProgress?: PhpInstallProgressDto | null;
+	installTotal?: number | null;
 }): string {
 	return render(LanguageRow, {
 		props: {
 			row: props.row,
 			cataloged: props.cataloged ?? true,
+			brewFound: props.brewFound ?? true,
 			serviceState: props.serviceState ?? null,
 			installing: props.installing ?? '',
 			uninstalling: props.uninstalling ?? '',
 			log: props.log ?? [],
 			error: props.error ?? '',
 			outcome: props.outcome ?? null,
+			installProgress: props.installProgress ?? null,
+			installTotal: props.installTotal ?? null,
 			onInstall: () => {},
 			onUninstall: () => {},
 			onStart: () => {},
@@ -120,7 +158,7 @@ describe('LanguageRow', () => {
 		// again and again with nothing to explain the silence.
 		const body = renderRow({
 			row: r('8.4', false),
-			outcome: { major: '8.4', exitCode: 0, detected: false }
+			outcome: brewOutcome('8.4', 0, false)
 		});
 		expect(body).toMatch(/could not find|was not found/i);
 		expect(body).not.toContain('data-testid="install-success-8.4"');
@@ -135,7 +173,7 @@ describe('LanguageRow', () => {
 	it('tells the user a pool still has to be created after a successful install', () => {
 		const body = renderRow({
 			row: r('8.4', true, { fullVersion: '8.4.12' }),
-			outcome: { major: '8.4', exitCode: 0, detected: true }
+			outcome: brewOutcome('8.4', 0, true)
 		});
 		expect(body).toMatch(/apply/i);
 	});
@@ -149,7 +187,7 @@ describe('LanguageRow', () => {
 	it('renders a failed brew exit instead of nothing', () => {
 		const body = renderRow({
 			row: r('8.4', false),
-			outcome: { major: '8.4', exitCode: 1, detected: false }
+			outcome: brewOutcome('8.4', 1, false)
 		});
 		expect(body).toMatch(/exited with code 1/i);
 		expect(body).toMatch(/php 8\.4/i);
@@ -158,7 +196,7 @@ describe('LanguageRow', () => {
 	it('renders a killed-by-signal brew run (no exit code at all) as failed too', () => {
 		const body = renderRow({
 			row: r('8.4', false),
-			outcome: { major: '8.4', exitCode: null, detected: false }
+			outcome: brewOutcome('8.4', null, false)
 		});
 		expect(body).toMatch(/killed/i);
 	});
@@ -172,7 +210,7 @@ describe('LanguageRow', () => {
 			row: r('8.4', false),
 			installing: '',
 			log: [{ id: '8.4', tsMs: 1, level: 'info', line: 'Error: dependency foo failed to build' }],
-			outcome: { major: '8.4', exitCode: 1, detected: false }
+			outcome: brewOutcome('8.4', 1, false)
 		});
 		expect(body).toContain('Error: dependency foo failed to build');
 	});
@@ -290,7 +328,7 @@ describe('a failed pool', () => {
 		const out = renderRow({
 			row: installed,
 			serviceState: { kind: 'failed', exit: 78, stderrTail: ['pool is broken'] },
-			outcome: { major: '8.4', exitCode: 1, detected: false }
+			outcome: brewOutcome('8.4', 1, false)
 		});
 		expect(out).toContain('brew exited with code 1');
 		expect(out).toContain('pool is broken');
@@ -347,7 +385,7 @@ describe('the pool status pill', () => {
 		const out = renderRow({
 			row: { ...installed, fullVersion: '8.4.13' },
 			serviceState: null,
-			outcome: { major: '8.4', exitCode: 0, detected: true }
+			outcome: brewOutcome('8.4', 0, true)
 		});
 		expect(out).toContain('8.4.13');
 	});
@@ -469,6 +507,206 @@ describe('LanguageRow — an installed major this build does not manage', () => 
 	});
 });
 
+// Design D3. Provenance, not health — which install put these binaries here.
+describe('LanguageRow — where a runtime came from', () => {
+	it('names the exact patch level for a runtime OpenVHost installed', () => {
+		// Slice 5B's whole asymmetry, finally spent: the version is a directory
+		// name in our own tree, so nothing was executed to learn it.
+		const body = renderRow({
+			row: r('8.4', true, { source: { kind: 'packaged', version: '8.4.24' } })
+		});
+		expect(body).toContain('data-testid="php-source-8.4"');
+		expect(body).toContain('OpenVHost 8.4.24');
+	});
+
+	// Deliberately unlike MysqlRow's and WebServerRow's otherwise identical
+	// chips, which DO label their brewed runtimes. Spec §5 says Homebrew rows
+	// carry none, and §8.6 is why it is binding: a chip on all five rows would
+	// be a visible change to every real machine today.
+	it('gives a Homebrew keg no badge at all', () => {
+		const body = renderRow({ row: r('8.3', true, { source: { kind: 'homebrew' } }) });
+		expect(body).not.toContain('data-testid="php-source-8.3"');
+	});
+
+	it('gives a major with nothing installed no badge', () => {
+		expect(renderRow({ row: r('8.4', false) })).not.toContain('data-testid="php-source-8.4"');
+	});
+
+	// The badge is provenance, not a second status, so it must coexist with a
+	// failed pill rather than reading as a contradiction beside one. Same
+	// property `webserver.panel.test.ts` pins for the identical chip.
+	it('coexists with a failed status pill rather than reading as a contradiction', () => {
+		const body = renderRow({
+			row: r('8.4', true, { source: { kind: 'packaged', version: '8.4.24' } }),
+			serviceState: { kind: 'failed', exit: 1, stderrTail: ['boom'] }
+		});
+		expect(body).toContain('data-testid="php-source-8.4"');
+		expect(body).toContain('data-testid="lang-pill-8.4"');
+	});
+
+	// A status pill is `class="pill pill-<kind>"` with a `.dot` child; this is a
+	// `.badge`, with neither. Structural, not a colour assertion — SSR has no
+	// stylesheet, so the palette is checked by reading the stylesheet below.
+	//
+	// The class list is matched apart from Svelte's own per-component scope
+	// class (`svelte-<hash>`), which is appended to every styled element. That
+	// hash is also why this badge is a third literal copy of MySQL's CSS rather
+	// than a shared component: extracting one would move the hash, and so change
+	// the rendered markup of two already-shipped rows.
+	it('is not a status pill, structurally', () => {
+		const body = renderRow({
+			row: r('8.4', true, { source: { kind: 'packaged', version: '8.4.24' } }),
+			serviceState: { kind: 'running' }
+		});
+		const badge = body.match(/<span[^>]*data-testid="php-source-8\.4"[^>]*>/)?.[0] ?? '';
+		const classes = (badge.match(/class="([^"]*)"/)?.[1] ?? '')
+			.split(/\s+/)
+			.filter((c) => !c.startsWith('svelte-'));
+		expect(classes).toEqual(['badge', 'source', 'source-packaged']);
+		expect(badge).not.toMatch(/\bpill\b/);
+	});
+});
+
+// Design D2, per row. `brewFound` is an INPUT to a per-major answer here; the
+// page no longer answers it for everyone at once.
+describe('LanguageRow — whether Install can actually work', () => {
+	const available = { kind: 'available', version: '8.4.24' } as const;
+	const awaiting = { kind: 'awaitingRelease', tag: 'php-8.4.24' } as const;
+	const unavailable = { kind: 'unavailable', target: 'macos-arm64' } as const;
+
+	// §8.6 — every real machine today. All three offer states, with Homebrew
+	// present, must render exactly what they rendered before this slice: an
+	// Install button and not one word more.
+	it('changes nothing on a machine with Homebrew, in any offer state', () => {
+		for (const offer of [available, awaiting, unavailable]) {
+			const body = renderRow({ row: r('8.4', false, { offer }), brewFound: true });
+			expect(body, offer.kind).toContain('data-testid="install-8.4"');
+			expect(body, offer.kind).not.toContain('data-testid="php-no-route-8.4"');
+			expect(body, offer.kind).not.toMatch(/needs Homebrew/i);
+		}
+	});
+
+	// §8.5 as corrected. On this Apple Silicon machine 8.4 is `AwaitingRelease`
+	// today AND has a working Homebrew Install button; the first draft of the
+	// spec would have deleted it. What AwaitingRelease withholds is the PACKAGED
+	// route, never the Homebrew one.
+	it('keeps the Homebrew Install button on an AwaitingRelease row', () => {
+		const body = renderRow({ row: r('8.4', false, { offer: awaiting }), brewFound: true });
+		expect(body).toContain('data-testid="install-8.4"');
+	});
+
+	// §8.2b's installable row: our own bytes, so Homebrew is irrelevant to it.
+	it('offers Install for an Available major even with no Homebrew', () => {
+		const body = renderRow({ row: r('8.4', false, { offer: available }), brewFound: false });
+		expect(body).toContain('data-testid="install-8.4"');
+		expect(body).not.toContain('data-testid="php-no-route-8.4"');
+	});
+
+	// §8.2b's other rows. Absent affordance, PRESENT EXPLANATION — this page has
+	// shipped the other shape twice (C2/C3) and both times the user was left
+	// pressing nothing and learning nothing. `install_php` here would fail at
+	// `find_brew()` before spawning anything, so the button could only ever
+	// produce "Homebrew was not found".
+	it('replaces Install with a per-row explanation when nothing can install it', () => {
+		const body = renderRow({ row: r('8.1', false, { offer: unavailable }), brewFound: false });
+		expect(body).not.toContain('data-testid="install-8.1"');
+		expect(body).toContain('data-testid="php-no-route-8.1"');
+		expect(body).toContain('Homebrew');
+		expect(body).toContain('macos-arm64');
+	});
+
+	// §8.5's other half: the row names the tag a maintainer has to publish,
+	// because the next action genuinely is not the user's.
+	it('names the unpublished release on an AwaitingRelease row with no Homebrew', () => {
+		const body = renderRow({ row: r('8.4', false, { offer: awaiting }), brewFound: false });
+		expect(body).not.toContain('data-testid="install-8.4"');
+		expect(body).toContain('php-8.4.24');
+		expect(body).toMatch(/maintainer/i);
+	});
+
+	// An installed row has nothing to install, so the note must not appear
+	// beside its Start/Stop and Uninstall controls — that would read as though
+	// the PHP it is running were somehow unavailable.
+	it('says nothing about routes on a row that is already installed', () => {
+		const body = renderRow({
+			row: r('8.3', true, { offer: unavailable }),
+			brewFound: false,
+			serviceState: { kind: 'running' }
+		});
+		expect(body).not.toContain('data-testid="php-no-route-8.3"');
+		expect(body).toContain('data-testid="stop-php-fpm-8.3"');
+	});
+});
+
+// SSR renders markup with no stylesheet attached, so the two things that make a
+// badge a badge — that it is MySQL's chip and not a lookalike, and that it
+// cannot be mistaken for a status — are read straight off the stylesheets here.
+// Both are cheap, and 4C's review checked the first one by hand; this makes the
+// third copy unable to drift silently instead.
+describe('the source badge, as CSS', () => {
+	const styleOf = (rel: string) =>
+		readFileSync(new URL(rel, import.meta.url), 'utf8').match(/<style>([\s\S]*?)<\/style>/)?.[1] ??
+		'';
+
+	/** One rule's declarations, comments stripped and whitespace flattened, so
+	 *  two copies compare equal iff they SET THE SAME THINGS — a differing
+	 *  comment is not a difference, a differing declaration is. */
+	function declarations(css: string, selector: string): string {
+		const escaped = selector.replace(/\./g, '\\.');
+		const rule = css.match(new RegExp(`\\n\\t${escaped}\\s*\\{([^}]*)\\}`));
+		if (rule === null) throw new Error(`no \`${selector}\` rule found`);
+		return rule[1]
+			.replace(/\/\*[\s\S]*?\*\//g, '')
+			.split(';')
+			.map((d) => d.trim().replace(/\s+/g, ' '))
+			.filter((d) => d !== '')
+			.join('; ');
+	}
+
+	// Design D3: reuse MySQL's existing chip rather than a lookalike. Svelte
+	// scopes styles per component, so three components can only share one look
+	// by holding three literal copies — and three literal copies can only be
+	// kept honest by comparing them.
+	it('sets exactly what MysqlRow.svelte’s identical chip sets', () => {
+		const row = styleOf('./LanguageRow.svelte');
+		const mysql = styleOf('./MysqlRow.svelte');
+		for (const selector of ['.badge', '.badge.source', '.badge.source-packaged']) {
+			expect(declarations(row, selector), selector).toBe(declarations(mysql, selector));
+		}
+	});
+
+	// Without this the assertion above passes vacuously if a selector is renamed
+	// on BOTH sides — and, worse, `declarations` returning '' for both would read
+	// as agreement.
+	it('actually found declarations to compare', () => {
+		const row = styleOf('./LanguageRow.svelte');
+		expect(declarations(row, '.badge.source-packaged')).toContain('--vh-link');
+		expect(declarations(row, '.badge').split(';').length).toBeGreaterThan(5);
+	});
+
+	// "Cannot read as a status beside one" made mechanical: the two palettes are
+	// disjoint. StatusPill paints run/start/fail/stop and nothing else; the
+	// packaged chip paints `--vh-link` and nothing else. A future edit that
+	// reached for a state colour here would put a green or red chip next to a
+	// pill of a different colour, which is a contradiction the user has to
+	// resolve.
+	it('shares no colour token with StatusPill', () => {
+		const badge = [
+			declarations(styleOf('./LanguageRow.svelte'), '.badge'),
+			declarations(styleOf('./LanguageRow.svelte'), '.badge.source'),
+			declarations(styleOf('./LanguageRow.svelte'), '.badge.source-packaged')
+		].join('; ');
+		const pill = styleOf('./StatusPill.svelte');
+
+		for (const token of ['--vh-run', '--vh-start', '--vh-fail', '--vh-stop']) {
+			expect(badge, token).not.toContain(token);
+			expect(pill, `StatusPill should still use ${token}`).toContain(token);
+		}
+		expect(badge).toContain('--vh-link');
+		expect(pill).not.toContain('--vh-link');
+	});
+});
+
 // The wrapped narrow layout is a CSS container query and there is no layout engine here, so
 // nothing below asserts that anything WRAPS — that was measured in a browser and the numbers
 // are in the PR. What is worth guarding is the two ways it can rot silently, both of which
@@ -542,5 +780,123 @@ describe('the narrow-width layout', () => {
 			`the row costs ${oneLineCost}px on one line but only wraps below ${wrapsBelow}px — ` +
 				`raise the @container threshold above ${oneLineCost}`
 		).toBeGreaterThanOrEqual(oneLineCost);
+	});
+
+	// ------------------------------------------------------------------
+	// The packaged route's progress, wired in the 5C fix wave.
+	//
+	// Vacuity: every "renders it" test asserts a testid the fixture does not
+	// otherwise produce, and each is paired with a negative case on the same
+	// testid. Proven by mutation against the row's one guard, once per half:
+	// narrowing `{#if isInstalling && installProgress !== null}` to
+	// `{#if isInstalling}` reddened 'paints nothing at all while a Homebrew
+	// install runs' (and, at the route level, its page-wide twin); narrowing it
+	// to `{#if installProgress !== null}` reddened 'stops painting the pipeline
+	// once the run settles' and 'paints nothing while another major is the one
+	// installing'. Neither half is redundant, which is why the condition is
+	// written once inline rather than behind a named derived that could go
+	// quietly half-dead.
+	// ------------------------------------------------------------------
+	describe('the packaged install pipeline', () => {
+		const notInstalled = () => r('8.4', false, { offer: { kind: 'available', version: '8.4.24' } });
+
+		// SPEC §8.6, and the single most important assertion in this block. A brew
+		// install sets `installing` to this major and emits no progress event
+		// EVER — `php-install-progress` has one emitter, `run_package_install` —
+		// so a gate on `installing` alone would put a download line under every
+		// Install press on every real machine today.
+		it('paints nothing at all while a Homebrew install runs', () => {
+			const body = renderRow({
+				row: notInstalled(),
+				installing: '8.4',
+				installProgress: null
+			});
+			expect(body).not.toContain('php-install-progress-8.4');
+			expect(body).not.toContain('php-install-bar-8.4');
+			expect(body).not.toContain('progressbar');
+			// And the button still says what it always said mid-install.
+			expect(body).toContain('Installing…');
+		});
+
+		it('names the step the packaged pipeline is on', () => {
+			const body = renderRow({
+				row: notInstalled(),
+				installing: '8.4',
+				installProgress: { kind: 'verified' }
+			});
+			expect(body).toContain('php-install-progress-8.4');
+			expect(body).toMatch(/checksum/i);
+		});
+
+		// The bar is drawn only where a percentage is honest: bytes arriving
+		// against a length the server actually declared.
+		it('draws a bar with the real percentage while bytes are arriving', () => {
+			const body = renderRow({
+				row: notInstalled(),
+				installing: '8.4',
+				installProgress: { kind: 'downloaded', bytes: 512 },
+				installTotal: 2048
+			});
+			expect(body).toContain('php-install-bar-8.4');
+			expect(body).toContain('aria-valuenow="25"');
+			expect(body).toContain('width: 25%');
+		});
+
+		it('draws no bar when the server declared no length, rather than one on a guess', () => {
+			const body = renderRow({
+				row: notInstalled(),
+				installing: '8.4',
+				installProgress: { kind: 'downloaded', bytes: 512 },
+				installTotal: null
+			});
+			// The line still renders — it just reads "so far" instead of a share.
+			expect(body).toContain('php-install-progress-8.4');
+			expect(body).toContain('so far');
+			expect(body).not.toContain('php-install-bar-8.4');
+		});
+
+		it('draws no bar for the steps that are moments rather than durations', () => {
+			for (const progress of [
+				{ kind: 'started', total: 4096 },
+				{ kind: 'verified' },
+				{ kind: 'extracted' },
+				{ kind: 'linked' }
+			] satisfies PhpInstallProgressDto[]) {
+				const body = renderRow({
+					row: notInstalled(),
+					installing: '8.4',
+					installProgress: progress,
+					installTotal: 4096
+				});
+				expect(body, progress.kind).toContain('php-install-progress-8.4');
+				expect(body, progress.kind).not.toContain('php-install-bar-8.4');
+			}
+		});
+
+		// `install()` resets `installing` to '' before the settled outcome renders,
+		// so without this half a finished "Extracted…" would sit above the success
+		// message for the rest of the page's life.
+		it('stops painting the pipeline once the run settles', () => {
+			const body = renderRow({
+				row: notInstalled(),
+				installing: '',
+				installProgress: { kind: 'linked' }
+			});
+			expect(body).not.toContain('php-install-progress-8.4');
+			expect(body).not.toContain('php-install-bar-8.4');
+		});
+
+		// Progress arriving for a DIFFERENT row must not paint this one. The
+		// caller already scopes it (`LanguagesStore.progressFor`), and this is the
+		// row's own half of that contract: it paints only while IT is the major
+		// installing.
+		it('paints nothing while another major is the one installing', () => {
+			const body = renderRow({
+				row: notInstalled(),
+				installing: '8.3',
+				installProgress: { kind: 'verified' }
+			});
+			expect(body).not.toContain('php-install-progress-8.4');
+		});
 	});
 });

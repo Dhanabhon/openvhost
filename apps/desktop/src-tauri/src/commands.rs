@@ -24,6 +24,10 @@ use openvhost_core::site::scaffold::{ScaffoldOutcome, ScaffoldStep, scaffold, sc
 // already ~8 200 lines); only the two DTOs a `MysqlInstanceDto` embeds are
 // named here.
 use crate::mysql_pkg::{MysqlPackageOfferDto, MysqlRuntimeSourceDto};
+// PHP's package surface likewise lives in its own sibling module; the two DTOs
+// a `PhpRuntimeDto` embeds and the tagged outcome `install_php` returns for
+// BOTH of its routes (design D4) are named here.
+use crate::php_pkg::{PhpInstallOutcomeDto, PhpPackageOfferDto, PhpRuntimeSourceDto};
 
 use crate::stack::StackPaths;
 
@@ -1775,11 +1779,23 @@ pub struct PhpRuntimeDto {
     pub recommended: bool,
     /// A more precise version string than `major` (e.g. a patch level), when
     /// one is known. `None` does NOT mean anything is wrong with this row —
-    /// it means we do not know the patch level. The only prober we have,
-    /// `openvhost_conf::probe_php_fpm_version`, returns `major.minor` and
-    /// never a patch level, so today this is `None` for every row. Echoing
-    /// `major` back into this field instead would render "8.3" twice next to
-    /// each other and imply a patch level was fetched when it was not.
+    /// it means we do not know the patch level.
+    ///
+    /// **A packaged row knows it; a Homebrew row still does not**, and that
+    /// asymmetry is the point (PHP-discovery design D1, off-Homebrew slice
+    /// 5B). OpenVHost's own install writes the exact version down as a
+    /// directory name — `packages/php/8.4/8.4.24/` — so a packaged row reports
+    /// `8.4.24` with **nothing executed** to find out. Homebrew's would have to
+    /// be probed, and the only prober we have,
+    /// `openvhost_conf::probe_php_fpm_version`, returns `major.minor` and never
+    /// a patch level, so a Homebrew row stays `None` — which is what every row
+    /// carried before there was a package tree to read.
+    ///
+    /// **Never echo `major` back into this field.** It would render "8.3" twice
+    /// next to each other and imply a patch level was fetched when it was not.
+    /// A packaged 8.4 row shows `8.4` and `8.4.24`; a brew 8.5 row shows `8.5`
+    /// and nothing. If those look wrong side by side the fix is the layout, not
+    /// an invented patch level.
     pub full_version: Option<String>,
     pub path: Option<String>,
     /// Where this version's pool listens. `None` until installed.
@@ -1787,29 +1803,51 @@ pub struct PhpRuntimeDto {
     /// The supervisor id for this version's pool, so the UI can drive
     /// start/stop from the row without inventing the id itself.
     pub service_id: Option<String>,
+    /// Where this row's binaries came from — OpenVHost's own package tree or a
+    /// Homebrew keg (off-Homebrew slice 5C design D3). `None` when nothing is
+    /// installed for this major, which is the ONLY reason it is optional: an
+    /// installed runtime always knows its own source.
+    ///
+    /// Two install sources coexist by design during the migration, so "which
+    /// php-fpm am I actually running" has to be answerable without the user
+    /// reading a path — the same question `MysqlInstanceDto::source` answers
+    /// for mysqld.
+    pub source: Option<PhpRuntimeSourceDto>,
+    /// Whether THIS BUILD publishes a verified package for this major on THIS
+    /// host, and which version it would install (design D1).
+    ///
+    /// Distinct from `cataloged`: that says "this build manages the major", and
+    /// is what gates the Homebrew Install/Uninstall affordances; this says "and
+    /// there are bytes of our own for your architecture". The two disagree on
+    /// every real machine today — 8.4 is pinned but its release is unpublished
+    /// (`AwaitingRelease`) and no other major has a built artifact at all
+    /// (`Unavailable`) — which is exactly why this is a state and not a bool.
+    ///
+    /// Not an `Option`: "no package for this major" is `Unavailable`, which
+    /// names the target it looked for. A `None` beside it would be a second
+    /// spelling of the same absence.
+    pub offer: PhpPackageOfferDto,
 }
 
-/// What the Languages page needs to decide which of the three states to show
-/// (spec §6.1). `brew_found` false means the page must guide, not list.
+/// What the Languages page needs to decide which state to show (spec §6.1).
+///
+/// `brew_found` means exactly one thing — **we looked for Homebrew and did not
+/// find it** — and `brew_searched` lists the paths verbatim so a user can check
+/// the right place on their own machine. That is honest and it stays.
+///
+/// What it is NOT is the page's first and highest-priority state (off-Homebrew
+/// slice 5C design D5). A machine with no Homebrew is not a machine with no
+/// PHP: it may already have a packaged runtime listed in `runtimes`, or a major
+/// whose `offer` is installable from our own tree. Whether the page has a route
+/// to any PHP at all is a question about the ROWS, and answering it from this
+/// bool alone is what made the page tell a user it could not install PHP while
+/// simultaneously not listing the PHP they already had.
 #[derive(Debug, Clone, serde::Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct PhpEnvironmentDto {
     pub brew_found: bool,
     pub brew_searched: Vec<String>,
     pub runtimes: Vec<PhpRuntimeDto>,
-}
-
-/// The outcome of an `install_php` call. `detected: false` alongside
-/// `exit_code: Some(0)` is the case that matters most: brew reporting success
-/// while no `php-fpm` appears afterwards is the silent-failure class this
-/// project keeps catching, so the DTO carries it explicitly rather than
-/// leaving the UI to infer it from an empty rescan.
-#[derive(Debug, Clone, serde::Serialize, specta::Type)]
-#[serde(rename_all = "camelCase")]
-pub struct InstallOutcomeDto {
-    pub major: String,
-    pub exit_code: Option<i32>,
-    pub detected: bool,
 }
 
 /// One line of `brew install`'s output, forwarded live while an install runs.
@@ -1846,16 +1884,27 @@ pub(crate) fn now_ms() -> u64 {
 /// Tauri-free so the row-building logic is testable without a live
 /// `AppHandle` or a real supervisor.
 ///
-/// `full_versions` maps a major to a more precise string (e.g. a patch
-/// level) the page can show next to it, when one is actually known. In
-/// production this is empty: the only prober we have,
-/// `openvhost_conf::probe_php_fpm_version`, returns `major.minor` and never
-/// a patch level, so there is nothing more precise to hand in today — and
-/// echoing `major` back in as if it were that string would render "8.3"
-/// twice and imply a patch level had been fetched when it had not. Wiring a
-/// true patch-level prober is future work; keeping this a separate parameter
-/// means that upgrade will not have to touch this function's callers beyond
-/// what they pass in.
+/// `full_versions` maps a major to a more precise string (e.g. a patch level)
+/// the page can show next to it, when one is actually known. **It is the
+/// HOMEBREW half of that question, and in production it is still empty**: the
+/// only prober we have, `openvhost_conf::probe_php_fpm_version`, returns
+/// `major.minor` and never a patch level, so there is nothing more precise to
+/// hand in for a keg today — and echoing `major` back in as if it were that
+/// string would render "8.3" twice and imply a patch level had been fetched
+/// when it had not. Wiring a true patch-level prober is future work; keeping
+/// this a separate parameter means that upgrade will not have to touch this
+/// function's callers beyond what they pass in.
+///
+/// A **packaged** runtime needs no such map and never consults it: its exact
+/// version is already written down as the directory name our own installer
+/// chose (`PhpRuntimeSource::Packaged { version }`, PHP-discovery design D1),
+/// so `full_version` is filled from the runtime itself and **nothing is
+/// executed** to learn it. The runtime's own source wins over the map for the
+/// same reason: it describes THIS install, while a map keyed only by major
+/// could carry a different install's answer.
+///
+/// Spawns nothing, opens nothing, and takes no probe closure — the whole
+/// function is a fold over data the caller already has.
 fn php_rows(
     home: &Path,
     installed: &[openvhost_core::PhpRuntime],
@@ -1873,15 +1922,27 @@ fn php_rows(
             // reporting itself as offered.
             cataloged: openvhost_core::CATALOGUE.contains(&major),
             recommended: Some(major) == newest,
-            full_version: found.and_then(|_| {
-                full_versions
-                    .iter()
-                    .find(|(m, _)| *m == major)
-                    .map(|(_, v)| (*v).to_string())
+            full_version: found.and_then(|rt| {
+                // The packaged answer first, and it costs a `clone`: the tree
+                // recorded this runtime's exact version at install time, so
+                // `PhpRuntimeSource::version()` is a read of something already
+                // written down. Only a Homebrew row falls through to the map,
+                // which is empty in production — see this function's doc.
+                rt.source.version().map(str::to_string).or_else(|| {
+                    full_versions
+                        .iter()
+                        .find(|(m, _)| *m == major)
+                        .map(|(_, v)| (*v).to_string())
+                })
             }),
             path: found.map(|rt| rt.fpm_bin.display().to_string()),
             socket_path: spec.as_ref().and_then(|s| s.endpoint.clone()),
             service_id: spec.map(|s| s.id),
+            source: found.map(|rt| PhpRuntimeSourceDto::from(&rt.source)),
+            // Per major, on the row (design D1) — PHP's headline feature is
+            // several majors side by side, so one answer for the whole page
+            // would be wrong for every row but one.
+            offer: crate::php_pkg::package_offer(major),
         }
     };
 
@@ -2215,10 +2276,11 @@ pub async fn php_environment(
         .as_ref()
         .map(|r| r.php.clone())
         .unwrap_or_default();
-    // See `php_rows`'s doc comment: there is no patch-level prober yet, so
-    // there is nothing more precise than `major` to hand in here. An empty
-    // map, not a `(major, major)` echo — `full_version` must read as
-    // "unknown", not as a copy of `major`.
+    // Empty, and still deliberately so: this map is the HOMEBREW patch level
+    // (see `php_rows`'s doc), there is no prober for one, and a
+    // `(major, major)` echo would make `full_version` read as a fetched patch
+    // level instead of "unknown". A PACKAGED row does not come through here at
+    // all — it fills `full_version` from the version its own install recorded.
     Ok(PhpEnvironmentDto {
         brew_found: openvhost_core::find_brew().is_some(),
         brew_searched: brew_searched_paths(),
@@ -2259,10 +2321,9 @@ pub async fn rescan_php_runtimes(
     // No seed: nothing was installed here, and a seed is only ever a record of
     // what THIS app just asked brew for.
     let installed = rescan_into_state(runtimes.inner(), sup.inner(), p, None).await?;
-    // See `php_rows`'s doc comment: there is no patch-level prober yet, so
-    // there is nothing more precise than `major` to hand in here. An empty
-    // map, not a `(major, major)` echo — `full_version` must read as
-    // "unknown", not as a copy of `major`.
+    // Empty for the same reason `php_environment`'s is — see the comment
+    // there: this map is the Homebrew patch level, and there is still no
+    // prober that returns one.
     Ok(PhpEnvironmentDto {
         brew_found: openvhost_core::find_brew().is_some(),
         brew_searched: brew_searched_paths(),
@@ -2388,6 +2449,17 @@ impl From<PackageOperation> for PackageOperationDto {
         }
     }
 }
+
+/// The `(kind, operation)` pair a PHP **install** run is tagged with — either
+/// route — and the same pair [`crate::php_pkg::cancel_php_install`] fires on.
+///
+/// One definition rather than the two inline spellings this used to have, for
+/// the audit F1 reason [`MYSQL_INSTALL_RUN`] gives at length: the button and the
+/// run it is meant to stop cannot drift apart if they read the same value.
+/// `InstallKind::Php` is what keeps a PHP install out of `cancel_mysql_install`'s
+/// and `cancel_mariadb_install`'s reach and vice versa.
+pub(crate) const PHP_INSTALL_RUN: (InstallKind, PackageOperation) =
+    (InstallKind::Php, PackageOperation::Install);
 
 /// The `(kind, operation)` pair a MySQL **install** run is tagged with, and the
 /// same pair the Databases page's Cancel button
@@ -2630,14 +2702,28 @@ pub async fn pending_install(
         }))
 }
 
-/// Install a PHP major via Homebrew, streaming its output live, then rescan
-/// so the freshly installed version (if it appears) gets a supervisor row.
+/// Install a PHP major — from OpenVHost's own package tree when this build
+/// publishes one for that major on this host, and via Homebrew otherwise
+/// (off-Homebrew slice 5C design D4).
+///
+/// **One command, one routing rule.** The alternative — two commands with the
+/// page dispatching on the row's `offer` — was rejected because it puts the rule
+/// in two places, which is the cross-file constant-pair shape this project has
+/// been bitten by, and because it makes D4's own sentence ("the frontend does
+/// not re-derive the rule") false. The route is decided HERE, by re-reading
+/// `php_pkg::package_offer` — the same compiled-in table that filled the row's
+/// `offer` field — so no argument a caller can supply chooses a pipeline.
+///
+/// **On every real machine today this is the Homebrew route**, unchanged: every
+/// offer this build can make is `AwaitingRelease` or `Unavailable`, and
+/// `php_pkg::route_for` sends both to Homebrew (spec §8.5 corrected, §8.6).
 ///
 /// Every argument that reaches `brew`'s argv is validated or derived from
 /// managed state before this function does anything observable: `major` is
 /// parsed and checked against the catalogue allowlist, `brew` is located by
 /// absolute path (never `PATH`), and `brew_install_spec` itself refuses a
-/// non-absolute `brew` path.
+/// non-absolute `brew` path. The packaged route reaches no argv at all — its URL
+/// and hash come only from `openvhost_core::PHP_PACKAGES`.
 #[tauri::command]
 #[specta::specta]
 pub async fn install_php(
@@ -2647,7 +2733,7 @@ pub async fn install_php(
     paths: tauri::State<'_, Option<StackPaths>>,
     sup: tauri::State<'_, Arc<Supervisor>>,
     lock: tauri::State<'_, InstallLock>,
-) -> Result<InstallOutcomeDto, IpcError> {
+) -> Result<PhpInstallOutcomeDto, IpcError> {
     // Both guard layers, before anything else happens.
     let major = openvhost_core::PhpMajor::parse(&major)?;
 
@@ -2662,6 +2748,52 @@ pub async fn install_php(
 
     let p = stack_paths(&paths)?;
 
+    // A compiled-in table lookup — nothing spawned, nothing fetched — so its
+    // position ahead of the Homebrew route's own checks changes nothing
+    // observable about that route. Matched exhaustively; a third route would
+    // have to be handled here rather than inherited.
+    let result = match crate::php_pkg::route_for(&crate::php_pkg::package_offer(major.as_str())) {
+        crate::php_pkg::PhpInstallRoute::Package => {
+            crate::php_pkg::run_package_install(
+                &app,
+                &major,
+                p,
+                lock.inner(),
+                runtimes.inner(),
+                sup.inner(),
+            )
+            .await?
+        }
+        crate::php_pkg::PhpInstallRoute::Homebrew => {
+            run_brew_install(&app, &major, p, lock.inner(), runtimes.inner(), sup.inner()).await?
+        }
+    };
+
+    Ok(PhpInstallOutcomeDto {
+        major: major.as_str().to_string(),
+        result,
+    })
+}
+
+/// The Homebrew half of [`install_php`], moved out of it verbatim when the
+/// routing arrived and otherwise untouched (spec §8.6: nothing changes on a
+/// machine with Homebrew and no package tree).
+///
+/// Everything below — the already-installed refusal, the `find_brew` message and
+/// the paths it lists, `brew_install_spec`'s own refusal, the live
+/// `PhpInstallLogEvent` pump, the spawn-then-record-then-await ordering, the
+/// seeded `detected`, and the rescan on a non-zero exit — is the code that was
+/// here before, with the same errors on the same conditions.
+///
+/// The one deliberate change is the cancelled arm; see it for why.
+async fn run_brew_install(
+    app: &tauri::AppHandle,
+    major: &openvhost_core::PhpMajor,
+    p: &StackPaths,
+    lock: &InstallLock,
+    runtimes: &RwLock<Option<InstalledRuntimes>>,
+    sup: &Supervisor,
+) -> Result<crate::php_pkg::PhpInstallResultDto, IpcError> {
     let before: Vec<String> = runtimes
         .read()
         .map_err(|_| IpcError::Core {
@@ -2687,7 +2819,7 @@ pub async fn install_php(
     // Returns Result: it refuses a non-absolute brew path, because composing
     // PATH from one yields an empty leading component and exec resolves that
     // as the working directory.
-    let spec = openvhost_core::brew_install_spec(&brew, &major)?;
+    let spec = openvhost_core::brew_install_spec(&brew, major)?;
     let (tx, mut rx) = tokio::sync::mpsc::channel(256);
 
     // Forward brew's output as it arrives, so a long install is visibly
@@ -2727,9 +2859,10 @@ pub async fn install_php(
         tx,
     ));
     let abort_handle = install_task.abort_handle();
-    lock.inner().set_running(
-        InstallKind::Php,
-        PackageOperation::Install,
+    let (kind, operation) = PHP_INSTALL_RUN;
+    lock.set_running(
+        kind,
+        operation,
         major.as_str().to_string(),
         abort_handle.clone(),
     );
@@ -2738,22 +2871,30 @@ pub async fn install_php(
     // for why that is a `Drop` impl and not a matching call at each return
     // point, and why it aborts rather than merely clearing the slot.
     let _running_guard = RunningInstallGuard {
-        lock: lock.inner(),
+        lock,
         abort: abort_handle,
     };
 
     let exit_code = match install_task.await {
         Ok(result) => result?,
-        // Aborted by `perform_quit`: the task's future was genuinely dropped
-        // (so `KillOnDrop` ran and brew's process group is gone), and this
-        // command has nothing left to report but that it did not finish.
+        // The task's future was genuinely dropped, so `KillOnDrop` ran and
+        // brew's process group is gone.
+        //
+        // THE ONE DELIBERATE CHANGE to this route (spec §8.6). This used to
+        // return `Err(IpcError::Proc("… because the app is quitting"))`, which
+        // was true when `perform_quit` was the only thing that could abort a PHP
+        // run. `cancel_php_install` is a second cause as of this slice, and that
+        // message would be a plain lie for it. `Cancelled` is true of both
+        // causes, and it is what the MySQL and MariaDB installs already return
+        // for the identical event. Nothing observable moves during a quit — the
+        // window is being destroyed as this resolves — so the change is confined
+        // to the cause that did not exist before.
         Err(join_err) if join_err.is_cancelled() => {
-            return Err(IpcError::Proc {
-                message: "the install was aborted because the app is quitting".into(),
-            });
+            return Ok(crate::php_pkg::PhpInstallResultDto::Cancelled);
         }
         // Any other join failure (a panic inside `run_task`) is not this
-        // command's fault to hide.
+        // command's fault to hide. Left as a thrown error, unchanged: no new
+        // cause reaches it, so nothing justifies moving it.
         Err(join_err) => {
             return Err(IpcError::Proc {
                 message: format!("the install task ended unexpectedly: {join_err}"),
@@ -2772,15 +2913,14 @@ pub async fn install_php(
     // version probe instead is what made a successful `brew install mysql@8.4`
     // report failure: the probe was killed at its 5 s bound during macOS's
     // ~11.5 s first-run scan of the new binary, every single time.
-    let seed = openvhost_core::php_runtime_for_major(&brew_prefixes(), &major);
+    let seed = openvhost_core::php_runtime_for_major(&brew_prefixes(), major);
     let detected = seed.is_some();
     // Seeded so the MANAGED state and the supervisor row are right too, not
     // just the answer: the apply pipeline reads that list, so a version missing
     // from it is a version sites cannot be applied against.
-    rescan_into_state(runtimes.inner(), sup.inner(), p, seed).await?;
+    rescan_into_state(runtimes, sup, p, seed).await?;
 
-    Ok(InstallOutcomeDto {
-        major: major.as_str().to_string(),
+    Ok(crate::php_pkg::PhpInstallResultDto::Brew {
         exit_code,
         detected,
     })
@@ -2840,8 +2980,10 @@ mod php_ipc_tests {
 
     #[test]
     fn the_patch_level_is_absent_rather_than_a_repeat_of_the_major() {
-        // Our only prober returns major.minor. Echoing it into `full_version`
-        // would render "8.3" twice and imply a patch level we never fetched.
+        // The HOMEBREW half of `full_version` (off-Homebrew slice 5C design
+        // D3): our only prober returns major.minor, so a keg's patch level is
+        // still unknown. Echoing the major into `full_version` would render
+        // "8.3" twice and imply a patch level we never fetched.
         let installed = vec![openvhost_core::PhpRuntime {
             major: "8.3".into(),
             fpm_bin: PathBuf::from("/opt/homebrew/opt/php@8.3/sbin/php-fpm"),
@@ -2854,6 +2996,236 @@ mod php_ipc_tests {
             three.full_version.is_none(),
             "got {:?} — an unknown patch level must be None, not a copy of the major",
             three.full_version
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // `full_version`, finally carrying something — for packaged rows only
+    // (off-Homebrew slice 5C design D3).
+    //
+    // VACUITY: filling `full_version` from `major` (the trap the field's own
+    // doc names) reddens
+    // `a_packaged_row_reports_the_patch_version_the_tree_recorded_not_its_major`
+    // and `a_packaged_rows_own_version_wins_over_a_map_keyed_only_by_major`;
+    // dropping the `rt.source.version()` half back to the old
+    // `found.and_then(|_| full_versions…)` reddens all four tests in this
+    // group except the Homebrew one. Both were run.
+    // ------------------------------------------------------------------
+
+    /// One packaged runtime, from a tree laid out the way our own installer
+    /// lays it out. The field that was `None` on every row since it was added
+    /// now answers `8.4.24` — and that answer is neither the major echoed back
+    /// nor a guess: it is the version directory the install chose.
+    #[test]
+    fn a_packaged_row_reports_the_patch_version_the_tree_recorded_not_its_major() {
+        let installed = vec![openvhost_core::PhpRuntime {
+            major: "8.4".into(),
+            fpm_bin: PathBuf::from("/Users/x/.openvhost/packages/php/8.4/8.4.24/bin/php-fpm"),
+            source: openvhost_core::PhpRuntimeSource::Packaged {
+                version: "8.4.24".into(),
+            },
+        }];
+        let rows = php_rows(Path::new("/tmp/ovh"), &installed, &[]);
+        let four = rows.iter().find(|r| r.major == "8.4").unwrap();
+        assert!(four.installed);
+        assert_eq!(four.full_version.as_deref(), Some("8.4.24"));
+        // The trap this field's own comment names, asserted rather than
+        // assumed: a value that merely repeats `major` implies a patch level
+        // was fetched when it was not.
+        assert_ne!(
+            four.full_version.as_deref(),
+            Some(four.major.as_str()),
+            "full_version must not be the major echoed back"
+        );
+        // And it agrees with the tree it came from, so a row cannot report a
+        // version that no directory on disk has.
+        assert!(
+            four.path
+                .as_deref()
+                .is_some_and(|p| p.contains("/packages/php/8.4/8.4.24/")),
+            "got {:?}",
+            four.path
+        );
+    }
+
+    /// **No spawn.** Slice 5B made this a compiler guarantee one layer down —
+    /// `discover_packaged` takes no probe argument at all — and this is the DTO
+    /// layer's half of the same claim: `php_rows` takes no probe either, and
+    /// the version below is reported for a binary that does not exist on this
+    /// machine, under a home that does not exist either. Anything that tried
+    /// to execute `fpm_bin` to learn the patch level would fail or hang here
+    /// rather than pass.
+    #[test]
+    fn nothing_is_executed_to_learn_a_packaged_rows_version() {
+        let installed = vec![openvhost_core::PhpRuntime {
+            major: "8.4".into(),
+            fpm_bin: PathBuf::from(
+                "/nonexistent-openvhost-test/packages/php/8.4/8.4.24/bin/php-fpm",
+            ),
+            source: openvhost_core::PhpRuntimeSource::Packaged {
+                version: "8.4.24".into(),
+            },
+        }];
+        assert!(
+            !installed[0].fpm_bin.exists(),
+            "this test is only meaningful while the binary genuinely does not exist"
+        );
+        let rows = php_rows(Path::new("/nonexistent-openvhost-test"), &installed, &[]);
+        let four = rows.iter().find(|r| r.major == "8.4").unwrap();
+        assert_eq!(four.full_version.as_deref(), Some("8.4.24"));
+    }
+
+    /// The runtime's own recorded version wins over the probe map, which is
+    /// keyed only by major and so could carry a DIFFERENT install's answer.
+    /// The map exists for Homebrew rows; a packaged row never needs it.
+    #[test]
+    fn a_packaged_rows_own_version_wins_over_a_map_keyed_only_by_major() {
+        let installed = vec![openvhost_core::PhpRuntime {
+            major: "8.4".into(),
+            fpm_bin: PathBuf::from("/Users/x/.openvhost/packages/php/8.4/8.4.24/bin/php-fpm"),
+            source: openvhost_core::PhpRuntimeSource::Packaged {
+                version: "8.4.24".into(),
+            },
+        }];
+        let rows = php_rows(Path::new("/tmp/ovh"), &installed, &[("8.4", "8.4.99")]);
+        let four = rows.iter().find(|r| r.major == "8.4").unwrap();
+        assert_eq!(four.full_version.as_deref(), Some("8.4.24"));
+    }
+
+    /// Side by side, which is the whole point of the page: the packaged row
+    /// knows its patch level and the Homebrew row does not, and the second is
+    /// not "broken" for saying so.
+    #[test]
+    fn a_homebrew_row_stays_unknown_beside_a_packaged_one_that_knows() {
+        let installed = vec![
+            openvhost_core::PhpRuntime {
+                major: "8.3".into(),
+                fpm_bin: PathBuf::from("/opt/homebrew/opt/php@8.3/sbin/php-fpm"),
+                source: openvhost_core::PhpRuntimeSource::Homebrew,
+            },
+            openvhost_core::PhpRuntime {
+                major: "8.4".into(),
+                fpm_bin: PathBuf::from("/Users/x/.openvhost/packages/php/8.4/8.4.24/bin/php-fpm"),
+                source: openvhost_core::PhpRuntimeSource::Packaged {
+                    version: "8.4.24".into(),
+                },
+            },
+        ];
+        let rows = php_rows(Path::new("/tmp/ovh"), &installed, &[]);
+        let three = rows.iter().find(|r| r.major == "8.3").unwrap();
+        let four = rows.iter().find(|r| r.major == "8.4").unwrap();
+        assert!(three.installed && four.installed);
+        assert_eq!(three.full_version, None);
+        assert_eq!(four.full_version.as_deref(), Some("8.4.24"));
+    }
+
+    // ------------------------------------------------------------------
+    // The source, on the row (off-Homebrew slice 5C design D3).
+    //
+    // VACUITY: hard-coding `source: Some(PhpRuntimeSourceDto::Homebrew)` in
+    // `php_rows`' build closure reddens the packaged assertion below;
+    // hard-coding `None` reddens both installed assertions; filling it for
+    // every row (`Some(...)` regardless of `found`) reddens the uninstalled
+    // one. All three were run.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn a_row_says_which_install_put_its_binaries_there_and_an_empty_row_says_nothing() {
+        let installed = vec![
+            openvhost_core::PhpRuntime {
+                major: "8.3".into(),
+                fpm_bin: PathBuf::from("/opt/homebrew/opt/php@8.3/sbin/php-fpm"),
+                source: openvhost_core::PhpRuntimeSource::Homebrew,
+            },
+            openvhost_core::PhpRuntime {
+                major: "8.4".into(),
+                fpm_bin: PathBuf::from("/Users/x/.openvhost/packages/php/8.4/8.4.24/bin/php-fpm"),
+                source: openvhost_core::PhpRuntimeSource::Packaged {
+                    version: "8.4.24".into(),
+                },
+            },
+        ];
+        let rows = php_rows(Path::new("/tmp/ovh"), &installed, &[]);
+        assert_eq!(
+            rows.iter().find(|r| r.major == "8.3").unwrap().source,
+            Some(crate::php_pkg::PhpRuntimeSourceDto::Homebrew)
+        );
+        assert_eq!(
+            rows.iter().find(|r| r.major == "8.4").unwrap().source,
+            Some(crate::php_pkg::PhpRuntimeSourceDto::Packaged {
+                version: "8.4.24".into()
+            })
+        );
+        let uninstalled = rows.iter().find(|r| r.major == "8.1").unwrap();
+        assert!(!uninstalled.installed);
+        assert_eq!(
+            uninstalled.source, None,
+            "a row with nothing installed has no provenance to report"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // The offer, on the row and PER MAJOR (design D1).
+    //
+    // VACUITY: replacing `package_offer(major)` with `package_offer("8.4")`
+    // reddens `the_offer_is_answered_per_major_not_once_for_the_whole_page`;
+    // replacing it with a constant `Unavailable` reddens the AwaitingRelease
+    // test. Both were run.
+    // ------------------------------------------------------------------
+
+    /// PHP's headline feature is several majors side by side, so one offer for
+    /// the whole page would be wrong for every row but one. On this machine
+    /// today 8.4 is pinned-but-unpublished while 8.1 has no artifact at all,
+    /// and the rows say so separately.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn the_offer_is_answered_per_major_not_once_for_the_whole_page() {
+        let rows = php_rows(Path::new("/tmp/ovh"), &[], &[]);
+        let four = &rows.iter().find(|r| r.major == "8.4").unwrap().offer;
+        let one = &rows.iter().find(|r| r.major == "8.1").unwrap().offer;
+        assert_ne!(four, one, "two majors cannot share one page-wide answer");
+    }
+
+    /// **What an `AwaitingRelease` row actually carries**, which is what every
+    /// non-absence offer resolves to today: a release tag a human has to
+    /// publish, and no version a user could install. This is the state the
+    /// page must render, and the reason this slice's packaged install path
+    /// merges unexercised.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn the_one_pinned_major_carries_the_tag_it_is_waiting_on_and_offers_no_install() {
+        let rows = php_rows(Path::new("/tmp/ovh"), &[], &[]);
+        let four = rows.iter().find(|r| r.major == "8.4").unwrap();
+        assert_eq!(
+            four.offer,
+            crate::php_pkg::PhpPackageOfferDto::AwaitingRelease {
+                tag: "php-8.4.24".into()
+            }
+        );
+        // The row is still cataloged — Homebrew can install this major today,
+        // and `cataloged` is what gates that affordance. The offer is a
+        // SEPARATE fact: there are no bytes of our own to fetch yet.
+        assert!(four.cataloged);
+    }
+
+    /// A hand-installed major carries an offer too — an absence naming the
+    /// target — rather than a missing field the page has to special-case.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn a_row_outside_the_catalogue_carries_an_absence_rather_than_no_offer() {
+        let installed = vec![openvhost_core::PhpRuntime {
+            major: "7.4".into(),
+            fpm_bin: PathBuf::from("/opt/homebrew/opt/php@7.4/sbin/php-fpm"),
+            source: openvhost_core::PhpRuntimeSource::Homebrew,
+        }];
+        let rows = php_rows(Path::new("/tmp/ovh"), &installed, &[]);
+        let hand_installed = rows.iter().find(|r| r.major == "7.4").unwrap();
+        assert!(!hand_installed.cataloged);
+        assert_eq!(
+            hand_installed.offer,
+            crate::php_pkg::PhpPackageOfferDto::Unavailable {
+                target: "macos-arm64".into()
+            }
         );
     }
 
@@ -3878,6 +4250,86 @@ mod php_ipc_tests {
         let lock = InstallLock::default();
         let (kind, operation) = MYSQL_INSTALL_RUN;
         assert!(!lock.abort_running_if(kind, operation));
+    }
+
+    /// The same audit F1 guarantee for PHP's own Cancel
+    /// ([`crate::php_pkg::cancel_php_install`], off-Homebrew slice 5C): it
+    /// aborts a PHP install and nothing else.
+    ///
+    /// PHP is the case where the pair check earns its keep twice over, because
+    /// PHP is the one engine with TWO install routes — `install_php` tags both
+    /// with [`PHP_INSTALL_RUN`], so one cancel covers a `brew install` and a
+    /// packaged download alike, while still leaving a MySQL install, a MariaDB
+    /// install, a MySQL init and PHP's own uninstall untouched.
+    #[tokio::test]
+    async fn a_php_install_cancel_aborts_only_a_php_install() {
+        let (cancel_kind, cancel_operation) = PHP_INSTALL_RUN;
+
+        // The positive case first, so the refusals below cannot pass by
+        // aborting nothing whatsoever.
+        let lock = InstallLock::default();
+        let task = tokio::spawn(std::future::pending::<()>());
+        lock.set_running(
+            cancel_kind,
+            cancel_operation,
+            "8.4".to_string(),
+            task.abort_handle(),
+        );
+        assert!(
+            lock.abort_running_if(cancel_kind, cancel_operation),
+            "the cancel must report that it stopped the PHP install it named"
+        );
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the run did not settle after the cancel fired");
+        match result {
+            Err(join_err) => assert!(join_err.is_cancelled(), "got {join_err:?}"),
+            Ok(()) => panic!("the cancel returned true but the run ran to completion"),
+        }
+
+        // `(Php, Uninstall)` differs only in operation and `(Mysql, Install)`
+        // only in kind, so a check that dropped either discriminator fails
+        // here.
+        for (kind, operation) in [
+            (InstallKind::Php, PackageOperation::Uninstall),
+            MYSQL_INSTALL_RUN,
+            MYSQL_INIT_RUN,
+            MARIADB_INSTALL_RUN,
+            MARIADB_INIT_RUN,
+        ] {
+            let lock = InstallLock::default();
+            let mut task = tokio::spawn(std::future::pending::<()>());
+            lock.set_running(kind, operation, "occupant".to_string(), task.abort_handle());
+
+            assert!(
+                !lock.abort_running_if(cancel_kind, cancel_operation),
+                "a PHP-install cancel claimed it stopped a {kind:?}/{operation:?} run"
+            );
+            assert!(
+                still_running(&mut task).await,
+                "a PHP-install cancel ABORTED a {kind:?}/{operation:?} run"
+            );
+            task.abort();
+        }
+    }
+
+    /// PHP's pair must be a genuinely different VALUE from every other engine's
+    /// — the audit F1 lesson stated as the value it turns on, not as behaviour.
+    /// Had `PHP_INSTALL_RUN` been spelled with another kind, the loop above
+    /// would still pass while `cancel_mysql_install` silently gained the power
+    /// to kill a PHP install.
+    #[test]
+    fn a_php_install_is_not_tagged_as_any_other_engines_run() {
+        for other in [
+            MYSQL_INSTALL_RUN,
+            MYSQL_INIT_RUN,
+            MARIADB_INSTALL_RUN,
+            MARIADB_INIT_RUN,
+        ] {
+            assert_ne!(PHP_INSTALL_RUN, other, "PHP shares a pair with {other:?}");
+        }
+        assert_eq!(PHP_INSTALL_RUN.0, InstallKind::Php);
+        assert_eq!(PHP_INSTALL_RUN.1, PackageOperation::Install);
     }
 }
 

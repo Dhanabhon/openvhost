@@ -49,6 +49,14 @@ use crate::php::package::catalogue::{
     Availability, PHP_PACKAGE_NAME, PHP_WARMUP_BINARY, PhpPackage, php_package_for_host,
 };
 
+/// Why a [`LedgerWrite::Failed`] carries no database error: there was no
+/// database to ask. Declared once here, where the only `None` arm is, so the
+/// sentence a user could eventually read is not retyped at a call site.
+///
+/// Written in the register of the other `reason` values on this type, which are
+/// `CoreError::to_string()` — a fact, not a paragraph.
+const NO_LEDGER_REASON: &str = "state.db was unavailable, so nothing recorded this install";
+
 /// The result of installing one catalogued PHP build.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhpPackageInstall {
@@ -73,6 +81,17 @@ pub struct PhpPackageInstall {
 /// a user should be able to distinguish — a download that was verified from one
 /// that merely arrived — are distinct variants, not log text.
 ///
+/// **`ledger` is optional, and PHP is the only install path where it is**
+/// (5C audit LOW-4). `state.db` is opened best-effort at startup, so a machine
+/// whose store is missing or unreadable has no [`InstallLedger`] to hand over —
+/// and refusing the install there would make a degraded `state.db` into "PHP
+/// cannot be installed", which is exactly what [`LedgerWrite`] exists to avoid
+/// saying. Pass `None` only for that: the package tree IS the inventory, so a
+/// skipped row costs provenance and never correctness, and it is reported as
+/// [`LedgerWrite::Failed`] rather than silently omitted. Every other engine's
+/// command takes a `State<Db>`, so Tauri refuses the whole call before their
+/// installers are reached and the question never arises for them.
+///
 /// **Cancellation.** As with the MySQL, MariaDB and nginx paths: dropping the
 /// returned future is the cancel. The staging directory is an RAII temporary
 /// removed as the future unwinds, and the process-wide install permit is
@@ -87,10 +106,12 @@ pub struct PhpPackageInstall {
 /// - [`CoreError::PackageNotPublished`] — before any network or filesystem
 ///   work, while the release hosting the pinned artifact does not exist yet.
 ///   This is the state today for 8.4.
+///
+/// A ledger that cannot be written is **not** an error: see `ledger` above.
 pub async fn install_php_package(
     major: &PhpMajor,
     root: &PackagesRoot,
-    ledger: &InstallLedger,
+    ledger: Option<&InstallLedger>,
     progress: impl FnMut(Progress) + Send,
 ) -> Result<PhpPackageInstall, CoreError> {
     let entry = php_package_for_host(major)?;
@@ -117,7 +138,7 @@ pub async fn install_php_package(
 async fn install_entry(
     entry: &PhpPackage,
     root: &PackagesRoot,
-    ledger: &InstallLedger,
+    ledger: Option<&InstallLedger>,
     progress: impl FnMut(Progress) + Send,
 ) -> Result<PhpPackageInstall, CoreError> {
     // Every component below is a compiled-in `&'static str` from the catalogue,
@@ -138,21 +159,39 @@ async fn install_entry(
     // MySQL-from-tarball design D4, reused unchanged: we asked for this
     // version, so we know it. Recorded only after the tree is on disk — a
     // failed install must leave no phantom row.
-    let ledger_write = match ledger
-        .record(&package.name, &package.major, &package.version)
-        .await
-    {
-        Ok(installed_at) => LedgerWrite::Recorded { installed_at },
-        Err(e) => {
-            tracing::error!(
+    //
+    // The `None` arm is 5C audit LOW-4: no store to write to is the same
+    // OUTCOME as a write that failed — the tree is installed, the row is not
+    // there — so it reports as one rather than as a second, quieter kind of
+    // nothing. See this module's public entry point for who passes `None`.
+    let ledger_write = match ledger {
+        Some(ledger) => match ledger
+            .record(&package.name, &package.major, &package.version)
+            .await
+        {
+            Ok(installed_at) => LedgerWrite::Recorded { installed_at },
+            Err(e) => {
+                tracing::error!(
+                    name = %package.name,
+                    version = %package.version,
+                    dir = %package.dir.display(),
+                    error = %e,
+                    "PHP is installed but its ledger row could not be written"
+                );
+                LedgerWrite::Failed {
+                    reason: e.to_string(),
+                }
+            }
+        },
+        None => {
+            tracing::warn!(
                 name = %package.name,
                 version = %package.version,
                 dir = %package.dir.display(),
-                error = %e,
-                "PHP is installed but its ledger row could not be written"
+                "PHP is installed but state.db was unavailable, so nothing recorded it"
             );
             LedgerWrite::Failed {
-                reason: e.to_string(),
+                reason: NO_LEDGER_REASON.to_string(),
             }
         }
     };
@@ -452,13 +491,15 @@ mod tests {
 
     // ------------------------------------------------------------------
     // Group 1 — a successful install lands where the catalogue says, warms the
-    // right binary, and records the version.
+    // right binary, and records the version — or says why it could not.
     //
     // Vacuity: every assertion is against a path or value the fixture does not
     // pre-create, and each test asserts a positive fact about the finished tree
     // before drawing any conclusion. Proven by mutation — pointing
     // `PHP_PACKAGE_NAME` at "mysql" moved the install to the wrong tree and
-    // failed this group.
+    // failed this group. `an_install_with_no_ledger_still_lands_…` is the one
+    // test here that group-wide mutation does not cover, because it guards an
+    // arm nothing else reaches; it carries its own mutation record.
     // ------------------------------------------------------------------
 
     #[tokio::test]
@@ -468,7 +509,7 @@ mod tests {
         let url = serve_once(archive.clone());
         let entry = entry_for(url, sha_hex(&archive));
 
-        let out = install_entry(&entry, &fx.root, &fx.ledger, |_| {})
+        let out = install_entry(&entry, &fx.root, Some(&fx.ledger), |_| {})
             .await
             .unwrap();
 
@@ -502,7 +543,7 @@ mod tests {
         let url = serve_once(archive.clone());
         let entry = entry_for(url, sha_hex(&archive));
 
-        install_entry(&entry, &fx.root, &fx.ledger, |_| {})
+        install_entry(&entry, &fx.root, Some(&fx.ledger), |_| {})
             .await
             .unwrap();
 
@@ -528,7 +569,7 @@ mod tests {
         let url = serve_once(archive.clone());
         let entry = entry_for(url, sha_hex(&archive));
 
-        let out = install_entry(&entry, &fx.root, &fx.ledger, |_| {})
+        let out = install_entry(&entry, &fx.root, Some(&fx.ledger), |_| {})
             .await
             .unwrap();
 
@@ -556,6 +597,89 @@ mod tests {
         assert!(fx.ledger.list("nginx").await.unwrap().is_empty());
     }
 
+    /// The counterpart to the test above, and the reason `ledger` is an
+    /// `Option` at all (5C audit LOW-4): **a degraded `state.db` costs
+    /// provenance, never correctness.** With no ledger to write to, the install
+    /// must still land in full — tree, warm-up and `current` link — and the
+    /// missing row must surface as [`LedgerWrite::Failed`] carrying
+    /// [`NO_LEDGER_REASON`], not as an error and not as a silent success.
+    ///
+    /// The row count is the half that makes this discriminating. Without it the
+    /// test could not tell "reported failed" from "reported failed and wrote a
+    /// row anyway", which is exactly what a `None` arm bolted onto a working
+    /// writer would do. The fixture's own [`InstallLedger`] is a live writer
+    /// over the same `state.db`, so a row appearing there would be visible.
+    ///
+    /// Vacuity: proven by mutation, twice, because the `None` arm has two ways
+    /// to be wrong. Returning `Err(CoreError::Internal(…))` from it failed at
+    /// the `unwrap()`; returning `LedgerWrite::Recorded { installed_at: … }`
+    /// failed the `Failed` match below. Neither mutation disturbed any other
+    /// test in this module, which is what makes this test the only thing
+    /// holding that arm.
+    #[tokio::test]
+    async fn an_install_with_no_ledger_still_lands_and_reports_the_missing_row() {
+        let fx = Fixture::new().await;
+        let sanctuary = Sanctuary::snapshot(&fx).await;
+        let warmed = fx.evidence.join("php-fpm-ran");
+        let archive = php_shaped_targz(
+            &script(&format!("/usr/bin/touch {}", warmed.display())),
+            &script("exit 0"),
+        );
+        let url = serve_once(archive.clone());
+        let entry = entry_for(url, sha_hex(&archive));
+
+        // `None` is precisely what the desktop app passes when `state.db` never
+        // opened: `app.try_state::<Db>()` is `None` and there is no
+        // `InstallLedger` to construct.
+        let out = install_entry(&entry, &fx.root, None, |_| {}).await.unwrap();
+
+        // The install landed, in full. Asserted first, because every conclusion
+        // below is worthless if nothing ran.
+        assert_eq!(out.package.dir, fx.version_dir());
+        assert_eq!(out.package.version, "8.4.24");
+        assert!(
+            fx.version_dir().join("bin/php-fpm").is_file(),
+            "a missing ledger cost the package tree, which is the one thing it must never cost"
+        );
+        assert!(
+            warmed.is_file(),
+            "the warm-up was skipped, so macOS's first-execution check lands on the user's Start"
+        );
+        assert_eq!(
+            std::fs::read_link(fx.current_link()).unwrap(),
+            PathBuf::from("8.4.24"),
+            "`current` must point at the version we just installed"
+        );
+        assert!(
+            fx.staging_dirs().is_empty(),
+            "staging survived a ledger-less success"
+        );
+
+        // …and it said so, in the state that exists to say it.
+        match &out.ledger {
+            LedgerWrite::Failed { reason } => assert_eq!(
+                reason.as_str(),
+                NO_LEDGER_REASON,
+                "the missing row must carry the no-database reason, not a database error"
+            ),
+            LedgerWrite::Recorded { .. } => panic!(
+                "no ledger was handed over, so nothing can have recorded this: {:?}",
+                out.ledger
+            ),
+        }
+
+        // "Reported failed" and "recorded it anyway" are different facts, and
+        // only this assertion separates them.
+        assert_eq!(
+            fx.ledger_rows().await,
+            0,
+            "a row appeared for an install that was handed no ledger"
+        );
+        sanctuary
+            .assert_untouched(&fx, "after a ledger-less install")
+            .await;
+    }
+
     /// Golden rule 6, made observable: the bytes are verified BEFORE anything
     /// unpacks them, and a user watching progress can tell a verified download
     /// from one that merely arrived.
@@ -567,7 +691,7 @@ mod tests {
         let entry = entry_for(url, sha_hex(&archive));
         let (seen, sink) = recorder();
 
-        install_entry(&entry, &fx.root, &fx.ledger, sink)
+        install_entry(&entry, &fx.root, Some(&fx.ledger), sink)
             .await
             .unwrap();
 
@@ -618,7 +742,7 @@ mod tests {
         // the release asset" case.
         let entry = entry_for(url, sha_hex(b"not the bytes we pinned"));
 
-        let err = install_entry(&entry, &fx.root, &fx.ledger, |_| {})
+        let err = install_entry(&entry, &fx.root, Some(&fx.ledger), |_| {})
             .await
             .unwrap_err();
 
@@ -645,7 +769,7 @@ mod tests {
         let url = serve_once(archive.clone());
         let entry = entry_for(url, sha_hex(&archive));
 
-        install_entry(&entry, &fx.root, &fx.ledger, |_| {})
+        install_entry(&entry, &fx.root, Some(&fx.ledger), |_| {})
             .await
             .unwrap();
 
@@ -683,7 +807,7 @@ mod tests {
         let sanctuary = Sanctuary::snapshot(&fx).await;
         let major = PhpMajor::parse("8.4").unwrap();
 
-        let err = install_php_package(&major, &fx.root, &fx.ledger, |_| {})
+        let err = install_php_package(&major, &fx.root, Some(&fx.ledger), |_| {})
             .await
             .unwrap_err();
 
@@ -726,7 +850,7 @@ mod tests {
         let sanctuary = Sanctuary::snapshot(&fx).await;
         let major = PhpMajor::parse("8.5").unwrap();
 
-        let err = install_php_package(&major, &fx.root, &fx.ledger, |_| {})
+        let err = install_php_package(&major, &fx.root, Some(&fx.ledger), |_| {})
             .await
             .unwrap_err();
 
@@ -783,7 +907,7 @@ mod tests {
         // pair is otherwise handled exactly as production would.
         let entry = entry_for(serve_once(bytes), sha);
 
-        let out = install_entry(&entry, &fx.root, &fx.ledger, |_| {})
+        let out = install_entry(&entry, &fx.root, Some(&fx.ledger), |_| {})
             .await
             .unwrap();
 
