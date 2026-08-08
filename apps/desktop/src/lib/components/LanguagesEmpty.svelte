@@ -1,28 +1,52 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <script lang="ts">
+	import { phpInstallInvite } from '../php-install.derive';
 	import Button from './Button.svelte';
 
 	/**
-	 * The states a brand-new machine actually lands in (Task 7). A machine
-	 * that has never had PHP installed has very likely never had Homebrew
-	 * installed either — `brewFound` is checked FIRST, and takes priority over
-	 * `anyInstalled`, because "no PHP, press Install" is a dead end one level
-	 * further up on a machine that cannot install anything at all.
+	 * The states a brand-new machine actually lands in (Task 7).
+	 *
+	 * `noRouteToAnyPhp` is checked FIRST and takes priority over `anyInstalled`,
+	 * because "no PHP, press Install" is a dead end one level further up on a
+	 * machine that cannot install anything at all. That reasoning is unchanged.
+	 *
+	 * What changed (off-Homebrew slice 5C design D2) is what answers it. It used
+	 * to be `!brewFound`, and after slices 5A/5B that is a different question: a
+	 * machine with no Homebrew and a packaged PHP was being told it could not
+	 * install PHP, on a page that was simultaneously not listing the PHP it
+	 * already had. The decision now comes from `noRouteToAnyPhp` in
+	 * `php-install.derive.ts`, which is defined as "no row on this page has an
+	 * Install button and nothing is already installed" — so this screen and the
+	 * rows can never disagree.
+	 *
+	 * The copy below is NOT softened, on purpose. A user with no route to any
+	 * PHP needs telling plainly, with the paths we actually searched. What
+	 * changed is *when* it appears, not *what* it says.
 	 *
 	 * Three states, chosen in this order:
-	 *   1. no brew        -> `languages-no-brew`
-	 *   2. brew, no PHP   -> `languages-no-php`
-	 *   3. brew + a PHP   -> renders nothing; the caller's own rowlist is the UI
+	 *   1. no route at all -> `languages-no-brew`
+	 *   2. a route, no PHP -> `languages-no-php`
+	 *   3. a PHP installed -> renders nothing; the caller's own rowlist is the UI
 	 */
 	let {
 		brewFound,
+		noRouteToAnyPhp,
 		anyInstalled,
 		brewSearched = [],
 		installing = '',
 		onRescan,
 		onOpenBrewSite
 	}: {
+		/** Still exactly what it always meant: we looked for Homebrew and did or
+		 *  did not find it (design D5). What it is no longer is this page's first
+		 *  and highest-priority state — that job moved to `noRouteToAnyPhp`. All
+		 *  it decides here is which install route the invitation names. */
 		brewFound: boolean;
+		/** Nothing installed AND nothing installable by any route. Computed by
+		 *  the caller from the whole environment, never re-derived here: the
+		 *  answer depends on every row's `offer`, which this component has no
+		 *  business holding. */
+		noRouteToAnyPhp: boolean;
 		anyInstalled: boolean;
 		/** Every path `find_brew()` actually checked (spec §6.1) — rendered
 		 *  verbatim rather than a hardcoded guess, because an Intel Mac's
@@ -74,7 +98,7 @@
 		'/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"';
 </script>
 
-{#if !brewFound}
+{#if noRouteToAnyPhp}
 	<div class="empty" data-testid="languages-no-brew">
 		<h3>Homebrew is required to install PHP</h3>
 		<p>
@@ -111,9 +135,13 @@
 {:else if !anyInstalled}
 	<div class="empty invite" data-testid="languages-no-php">
 		<h3>Install PHP to get started</h3>
-		<p>
-			Choose a version below — OpenVHost installs it through Homebrew and serves your sites with it.
-		</p>
+		<!-- The Homebrew sentence is verbatim what this page has always shown and
+		     is still exactly right wherever Homebrew is present — every real
+		     machine today, which is what keeps spec §8.6 true. It is only wrong on
+		     the machine D2 exists for: no Homebrew, but a packaged version there
+		     for the taking. Naming Homebrew there would be the same page-wide
+		     claim about a per-major fact that D2 removes one branch up. -->
+		<p>{phpInstallInvite(brewFound)}</p>
 	</div>
 {/if}
 

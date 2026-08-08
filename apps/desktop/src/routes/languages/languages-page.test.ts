@@ -340,6 +340,188 @@ describe('the /languages route — uninstall', () => {
 	});
 });
 
+// Off-Homebrew slice 5C design D2, at the layer where the bug actually lived:
+// the page, not the components. `LanguagesEmpty` renders whatever it is told;
+// what was wrong was that the page told it `!brewFound` and hid the rowlist on
+// the same bool. Every case below is a whole assembled page.
+describe('the /languages route — the dead end is no longer "no Homebrew"', () => {
+	const packaged = (major: string): PhpRuntimeDto =>
+		row(major, true, {
+			source: { kind: 'packaged', version: `${major}.24` },
+			fullVersion: `${major}.24`,
+			path: `/Users/x/.openvhost/packages/php/${major}/current/sbin/php-fpm`
+		});
+
+	// §8.1 — the headline, and the single most user-visible thing the whole
+	// off-Homebrew programme was for. A machine with a packaged PHP and no
+	// Homebrew was being told it could not install PHP, on a page that was
+	// simultaneously not listing the PHP it already had.
+	it('lists a packaged PHP and shows no dead end, on a machine with no Homebrew', () => {
+		languagesStore.env = env(false, [packaged('8.4'), row('8.1', false)]);
+		const { body } = render(LanguagesPage);
+		expect(body).not.toContain('data-testid="languages-no-brew"');
+		expect(body).toContain('data-testid="lang-row-8.4"');
+		expect(body).toContain('data-testid="php-source-8.4"');
+		expect(body).toContain('OpenVHost 8.4.24');
+	});
+
+	// §8.2 — the case the screen was actually written for. Unchanged, searched
+	// paths and all: the change is WHEN it appears, not WHAT it says.
+	it('renders the dead end exactly as before with no Homebrew and no route at all', () => {
+		languagesStore.env = env(false, [row('8.1', false), row('8.4', false)]);
+		const { body } = render(LanguagesPage);
+		expect(body).toContain('data-testid="languages-no-brew"');
+		expect(body).toContain('Homebrew is required to install PHP');
+		expect(body).toContain('/opt/homebrew/bin/brew');
+		expect(body).toContain('/bin/bash -c');
+		// …and the rowlist stays hidden, because there is nothing to offer.
+		expect(body).not.toMatch(/data-testid="lang-row-/);
+	});
+
+	// §8.2b — the case D2 exists for, and the one the spec's first draft got
+	// wrong. 8.4 is installable from our own tree; 8.1/8.3/8.5 need Homebrew and
+	// say so PER ROW. One sentence at the top of the page cannot be true of both.
+	it('offers the packaged major and tells the others what they need, per row', () => {
+		languagesStore.env = env(false, [
+			row('8.1', false),
+			row('8.3', false),
+			row('8.4', false, { offer: { kind: 'available', version: '8.4.24' } }),
+			row('8.5', false)
+		]);
+		const { body } = render(LanguagesPage);
+
+		expect(body).not.toContain('data-testid="languages-no-brew"');
+		expect(body).toContain('data-testid="install-8.4"');
+		expect(body).not.toContain('data-testid="php-no-route-8.4"');
+
+		for (const major of ['8.1', '8.3', '8.5']) {
+			expect(body, major).toContain(`data-testid="lang-row-${major}"`);
+			expect(body, major).not.toContain(`data-testid="install-${major}"`);
+			expect(body, major).toContain(`data-testid="php-no-route-${major}"`);
+		}
+		expect(body).toMatch(/needs Homebrew/);
+	});
+
+	// The rescan is the ONE control that unsticks a user who has gone off to
+	// install Homebrew by hand. It used to be gated on `brewFound`, which was
+	// the exact complement of the dead end only while `!brewFound` triggered it.
+	// After D2 that page has no dead end and would have had no Check again
+	// either — the C2 regression, reintroduced by the fix for something else.
+	it('still offers Check again on a no-Homebrew page that renders no dead end', () => {
+		languagesStore.env = env(false, [packaged('8.4')]);
+		const { body } = render(LanguagesPage);
+		expect(body).toContain('data-testid="languages-check-again-header"');
+		expect(body).not.toContain('data-testid="languages-check-again"');
+	});
+
+	// The invariant behind both gates: exactly one "Check again" on screen, in
+	// every state this page can be in. Two would be a duplicated control; zero
+	// would be a user with no way back.
+	it('shows exactly one Check again in every state', () => {
+		const states: PhpEnvironmentDto[] = [
+			env(false, []),
+			env(false, [row('8.4', false)]),
+			env(false, [packaged('8.4')]),
+			env(false, [row('8.4', false, { offer: { kind: 'available', version: '8.4.24' } })]),
+			env(true, []),
+			env(true, [row('8.4', false)]),
+			env(true, [row('8.3', true)])
+		];
+		for (const [i, state] of states.entries()) {
+			languagesStore.env = state;
+			const { body } = render(LanguagesPage);
+			const header = body.includes('data-testid="languages-check-again-header"') ? 1 : 0;
+			const own = body.includes('data-testid="languages-check-again"') ? 1 : 0;
+			expect(header + own, `state ${i}`).toBe(1);
+		}
+	});
+
+	// A brew that went missing AFTER setup — uninstalled, or a PATH change. The
+	// installed pool keeps its row and its controls, because an already-running
+	// php-fpm needs no brew to serve. This state existed before the slice; what
+	// changes is that the not-installed rows beside it now explain themselves
+	// instead of offering a button that could only report "Homebrew was not
+	// found".
+	it('keeps an installed row usable when Homebrew has gone missing', () => {
+		languagesStore.env = env(false, [row('8.3', true), row('8.4', false)]);
+		servicesStore.services = [svc('php-fpm-8.3', { kind: 'running' })];
+		const { body } = render(LanguagesPage);
+		expect(body).not.toContain('data-testid="languages-no-brew"');
+		expect(body).toContain('data-testid="lang-row-8.3"');
+		expect(body).toContain('data-testid="stop-php-fpm-8.3"');
+		expect(body).toContain('data-testid="uninstall-8.3"');
+		expect(body).not.toContain('data-testid="install-8.4"');
+		expect(body).toContain('data-testid="php-no-route-8.4"');
+	});
+});
+
+// §8.6 — "nothing changes on a machine with Homebrew and no package tree, which
+// is every real machine today, including the developer's. Establish it, do not
+// assert it." This is that establishment: the exact environment this machine
+// reports, rendered whole, checked against the page as it was before the slice.
+describe('the /languages route — a machine with Homebrew and no package tree', () => {
+	/** What `php_environment` returns on this Apple Silicon machine today: brew
+	 *  present, 8.3 installed as a keg, 8.4 pinned but `AwaitingRelease` (no
+	 *  release published), and every other major `Unavailable` (no artifact
+	 *  built). */
+	const today = (): PhpEnvironmentDto =>
+		env(true, [
+			row('8.1', false),
+			row('8.2', false),
+			row('8.3', true),
+			row('8.4', false, { offer: { kind: 'awaitingRelease', tag: 'php-8.4.24' } }),
+			row('8.5', false, { recommended: true })
+		]);
+
+	it('offers Install on every uninstalled row, including the AwaitingRelease one', () => {
+		// The first draft of spec §8.5 would have deleted 8.4's button — a
+		// working control, on the only machine anyone is running.
+		languagesStore.env = today();
+		const { body } = render(LanguagesPage);
+		for (const major of ['8.1', '8.2', '8.4', '8.5']) {
+			expect(body, major).toContain(`data-testid="install-${major}"`);
+		}
+	});
+
+	it('adds no note, no badge and no new copy anywhere on the page', () => {
+		languagesStore.env = today();
+		const { body } = render(LanguagesPage);
+		expect(body).not.toMatch(/data-testid="php-no-route-/);
+		expect(body).not.toMatch(/data-testid="php-source-/);
+		expect(body).not.toMatch(/needs Homebrew/);
+		expect(body).not.toMatch(/php-8\.4\.24/);
+		expect(body).not.toMatch(/maintainer/i);
+	});
+
+	it('renders no dead end, and the invitation only while nothing is installed', () => {
+		languagesStore.env = today();
+		const withPhp = render(LanguagesPage).body;
+		expect(withPhp).not.toContain('data-testid="languages-no-brew"');
+		expect(withPhp).not.toContain('data-testid="languages-no-php"');
+
+		languagesStore.env = env(true, [row('8.4', false)]);
+		const withoutPhp = render(LanguagesPage).body;
+		expect(withoutPhp).not.toContain('data-testid="languages-no-brew"');
+		expect(withoutPhp).toContain('data-testid="languages-no-php"');
+		expect(withoutPhp).toContain(
+			'Choose a version below — OpenVHost installs it through Homebrew and serves your sites with it.'
+		);
+	});
+
+	it('keeps every row and its lifecycle controls exactly where they were', () => {
+		languagesStore.env = today();
+		servicesStore.services = [svc('php-fpm-8.3', { kind: 'running' })];
+		const { body } = render(LanguagesPage);
+		for (const major of ['8.1', '8.2', '8.3', '8.4', '8.5']) {
+			expect(body, major).toContain(`data-testid="lang-row-${major}"`);
+		}
+		expect(body).toContain('data-testid="lang-pill-8.3"');
+		expect(body).toContain('data-testid="stop-php-fpm-8.3"');
+		expect(body).toContain('data-testid="uninstall-8.3"');
+		expect(body).toContain('data-testid="languages-check-again-header"');
+	});
+});
+
 // Task 1's wiring, observed from this page rather than re-implemented: the
 // layout's `onServiceUnregistered` subscription calls
 // `ServicesStore.applyUnregistered`, and this page reads that same shared

@@ -82,6 +82,60 @@ describe('LanguagesStore', () => {
 		expect(noBrew.brewFound).toBe(false);
 	});
 
+	// Off-Homebrew slice 5C design D2/D5. `brewFound` keeps its job and loses
+	// the one it should not have had: it is no longer the page's first and
+	// highest-priority state. The table itself is `php-install.derive.test.ts`'s;
+	// what is only testable HERE is what the getter answers before the first
+	// snapshot lands.
+	it('claims no dead end before it has looked', async () => {
+		// `env` is null on the very first frame of every visit, and a dead end is
+		// a claim about what this machine CANNOT do. Answering "yes" here would
+		// be one refactor away from flashing the bluntest screen in the app on
+		// every page load.
+		const s = new LanguagesStore(api());
+		expect(s.env).toBeNull();
+		expect(s.noRouteToAnyPhp).toBe(false);
+
+		// …and it still answers honestly once a snapshot with nothing in it
+		// arrives, so the guard above is not just suppressing the state.
+		const dead = new LanguagesStore(
+			api({ env: { brewFound: false, brewSearched: [], runtimes: [] } })
+		);
+		await dead.refresh();
+		expect(dead.noRouteToAnyPhp).toBe(true);
+	});
+
+	it('stops calling a machine with no Homebrew a dead end once it has a route', async () => {
+		// §8.1: a packaged PHP already installed. §8.2b: one installable from our
+		// own tree. Neither is a dead end, and both used to render one.
+		const installed = new LanguagesStore(
+			api({
+				env: {
+					brewFound: false,
+					brewSearched: ['/opt/homebrew/bin/brew'],
+					runtimes: [row('8.4', true, { source: { kind: 'packaged', version: '8.4.24' } })]
+				}
+			})
+		);
+		await installed.refresh();
+		expect(installed.noRouteToAnyPhp).toBe(false);
+
+		const offered = new LanguagesStore(
+			api({
+				env: {
+					brewFound: false,
+					brewSearched: ['/opt/homebrew/bin/brew'],
+					runtimes: [
+						row('8.1', false),
+						row('8.4', false, { offer: { kind: 'available', version: '8.4.24' } })
+					]
+				}
+			})
+		);
+		await offered.refresh();
+		expect(offered.noRouteToAnyPhp).toBe(false);
+	});
+
 	it('marks which version is installing and clears it when done', async () => {
 		const s = new LanguagesStore(api({ outcome: brewOutcome('8.4') }));
 		const p = s.install('8.4');

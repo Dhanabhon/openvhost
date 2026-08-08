@@ -8,6 +8,7 @@
 // must leave a test failing, not just a UI regression nothing catches.
 import { errorMessage } from './errors';
 import type { PhpEnvironmentDto, PhpInstallOutcomeDto } from './ipc';
+import { noRouteToAnyPhp } from './php-install.derive';
 
 export interface LanguagesApi {
 	phpEnvironment(): Promise<PhpEnvironmentDto>;
@@ -52,6 +53,22 @@ export class LanguagesStore {
 
 	get anyInstalled(): boolean {
 		return this.env?.runtimes.some((r) => r.installed) ?? false;
+	}
+
+	/**
+	 * Whether this machine has no route to any PHP at all — the ONE case the
+	 * page-level "Homebrew is required" dead end is for (off-Homebrew slice 5C
+	 * design D2). Nothing installed, and nothing installable by any route.
+	 *
+	 * `false` while `env` is still `null`, and that is not a default so much as
+	 * the only honest answer: we have not looked yet, and a dead end is a claim
+	 * about what this machine cannot do. The page does not render this branch
+	 * before `env` arrives anyway (`{#if store.env}`), so the value is never
+	 * painted — but a getter that guessed "yes" would be one refactor away from
+	 * flashing the bluntest screen in the app on every page load.
+	 */
+	get noRouteToAnyPhp(): boolean {
+		return this.env === null ? false : noRouteToAnyPhp(this.env);
 	}
 
 	/**

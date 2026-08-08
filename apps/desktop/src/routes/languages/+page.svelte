@@ -137,20 +137,23 @@
 	     today: a second runtime (Node.js, Python, Go — see ServBay's equivalent page)
 	     becomes a new group here rather than a redesign of this page.
 
-	     Task 7's empty states: `LanguagesEmpty` reads `store.brewFound` and
-	     `store.anyInstalled` to distinguish "no Homebrew at all" from "Homebrew
-	     found, nothing installed yet", rendering ABOVE the rowlist in both cases
-	     (never in place of it — see the rowlist's own condition below) as one
-	     clear invitation/explanation rather than four rows all failing the same
-	     way. Once a version is installed, `LanguagesEmpty` renders nothing and
-	     the rowlist is the whole UI, same as before this task.
+	     Task 7's empty states: `LanguagesEmpty` distinguishes "no route to any PHP
+	     at all" from "a route exists, nothing installed yet", rendering ABOVE the
+	     rowlist in both cases (never in place of it — see the rowlist's own
+	     condition below) as one clear invitation/explanation rather than four
+	     rows all failing the same way. Once a version is installed,
+	     `LanguagesEmpty` renders nothing and the rowlist is the whole UI.
 
 	     The rowlist itself is hidden only when there is truly nothing to show it
-	     for: no brew AND nothing installed. `anyInstalled` alone is enough to keep
-	     it visible even without brew — an already-installed, already-running
-	     php-fpm pool does not need brew to serve, or to Start/Stop, so a brew
-	     that went missing after setup (uninstalled, PATH changed) must not hide
-	     it from view. -->
+	     for, and that is now the SAME question the dead end asks — hence the same
+	     predicate, negated (off-Homebrew slice 5C design D2). It used to be
+	     `brewFound || anyInstalled`, which was right about two of its three cases
+	     and wrong about the one this programme exists for: a machine with no
+	     Homebrew and a packaged PHP available had its rows hidden while being
+	     told it could not install PHP. `anyInstalled` still keeps the list
+	     visible without brew — an already-running php-fpm pool does not need brew
+	     to serve, or to Start/Stop, so a brew that went missing after setup must
+	     not hide it from view — and `noRouteToAnyPhp` already folds that in. -->
 	<section class="panel languages-panel" aria-label="PHP" data-testid="languages">
 		{#if store.error !== '' && store.env === null}
 			<div class="empty">
@@ -175,21 +178,28 @@
 			{/if}
 			<LanguagesEmpty
 				brewFound={store.brewFound}
+				noRouteToAnyPhp={store.noRouteToAnyPhp}
 				anyInstalled={store.anyInstalled}
 				brewSearched={store.env.brewSearched}
 				installing={store.installing}
 				onRescan={() => void onRescan()}
 				onOpenBrewSite={() => void openHomebrewSite().catch((e) => store.fail(e))}
 			/>
-			{#if store.brewFound}
+			{#if !store.noRouteToAnyPhp}
 				<!-- C2 fix: `LanguagesEmpty` only renders its OWN "Check again" button
-				     in the `!brewFound` branch, so once brew is found the rescan
-				     became unreachable from the UI — yet that is exactly what a user
-				     needs after running `brew install php@8.2` in a terminal:
-				     discovering a version this page did not have at launch, without
-				     a relaunch. Shown for every `brewFound` state (both "brew, no PHP
-				     yet" and "brew, already installed") so it never sits next to
-				     `LanguagesEmpty`'s own no-brew copy of the same control. -->
+				     in the dead-end branch, so wherever that branch does not render,
+				     the rescan would be unreachable from the UI — yet that is exactly
+				     what a user needs after running `brew install php@8.2` in a
+				     terminal: discovering a version this page did not have at launch,
+				     without a relaunch.
+
+				     The condition is the EXACT COMPLEMENT of `LanguagesEmpty`'s
+				     dead-end branch, so precisely one "Check again" is on screen in
+				     every state. It used to be `store.brewFound`, which was the same
+				     complement only while `!brewFound` was what triggered the dead
+				     end. After design D2 it is not: a machine with no Homebrew and a
+				     packaged PHP renders no dead end, and gating on `brewFound` there
+				     would have left the page with no rescan control at all. -->
 				<div class="check-again">
 					<!-- A1 audit finding: `rescan_php_runtimes` takes `InstallLock` with
 					     `.lock().await` (H1's fix), so this button now blocks for the
@@ -207,12 +217,13 @@
 					</Button>
 				</div>
 			{/if}
-			{#if store.brewFound || store.anyInstalled}
+			{#if !store.noRouteToAnyPhp}
 				<div class="rowlist">
 					{#each store.env.runtimes as runtime (runtime.major)}
 						<LanguageRow
 							row={runtime}
 							cataloged={runtime.cataloged}
+							brewFound={store.brewFound}
 							serviceState={runtime.serviceId === null
 								? null
 								: (servicesStore.services.find((s) => s.id === runtime.serviceId)?.state ?? null)}

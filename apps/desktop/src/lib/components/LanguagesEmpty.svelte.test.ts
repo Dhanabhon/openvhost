@@ -17,6 +17,13 @@ import LanguagesEmpty from './LanguagesEmpty.svelte';
 
 function renderEmpty(props: {
 	brewFound: boolean;
+	/** Defaults to `!brewFound`, which is EXACTLY what this component asked
+	 *  before design D2 split the two apart. Every test written before that
+	 *  slice therefore keeps asserting precisely what it always asserted, with
+	 *  no edit to a single expectation — the point being that D2 changed *when*
+	 *  the dead end appears and nothing about *what* it says. The D2 tests below
+	 *  pass the two apart deliberately. */
+	noRouteToAnyPhp?: boolean;
 	anyInstalled?: boolean;
 	brewSearched?: string[];
 	installing?: string;
@@ -26,6 +33,7 @@ function renderEmpty(props: {
 	return render(LanguagesEmpty, {
 		props: {
 			brewFound: props.brewFound,
+			noRouteToAnyPhp: props.noRouteToAnyPhp ?? !props.brewFound,
 			anyInstalled: props.anyInstalled ?? false,
 			brewSearched: props.brewSearched ?? [],
 			installing: props.installing ?? '',
@@ -142,5 +150,87 @@ describe('LanguagesEmpty', () => {
 	it('leaves Check again enabled when no install is running', () => {
 		const body = renderEmpty({ brewFound: false, brewSearched: [], installing: '' });
 		expect(checkAgainButtonTag(body)).not.toContain('disabled');
+	});
+});
+
+// Off-Homebrew slice 5C design D2. The bug was never that this page mentions
+// Homebrew — for 8.1/8.2/8.3/8.5, and for every major on Intel, Homebrew
+// genuinely is required and saying so is correct. The bug was that ONE
+// machine-wide bool answered a question that is per-major, and blocked the
+// whole page on it.
+describe('LanguagesEmpty — the dead end is no longer "no Homebrew"', () => {
+	// §8.1, at this component's own level: `brewFound: false` on its own must
+	// no longer be enough. Everything above this block still passes `brewFound:
+	// false` and still gets the screen, because the helper defaults
+	// `noRouteToAnyPhp` to `!brewFound` — the pre-D2 rule. THIS is the test that
+	// pulls the two apart.
+	it('renders no dead end without Homebrew when a route to a PHP exists', () => {
+		const body = renderEmpty({
+			brewFound: false,
+			noRouteToAnyPhp: false,
+			anyInstalled: true,
+			brewSearched: ['/opt/homebrew/bin/brew']
+		});
+		expect(body).not.toContain('data-testid="languages-no-brew"');
+		// …and it does not fall through to the "install something" invitation
+		// either: a PHP is installed, and the caller's rowlist is the whole UI.
+		expect(body).not.toContain('data-testid="languages-no-php"');
+	});
+
+	// §8.2b's page half: nothing installed yet, but 8.4 is installable from our
+	// own tree. The invitation belongs here, not the dead end.
+	it('invites an install without Homebrew when a packaged version is offered', () => {
+		const body = renderEmpty({
+			brewFound: false,
+			noRouteToAnyPhp: false,
+			anyInstalled: false,
+			brewSearched: ['/opt/homebrew/bin/brew']
+		});
+		expect(body).not.toContain('data-testid="languages-no-brew"');
+		expect(body).toContain('data-testid="languages-no-php"');
+		// The invitation must not claim the install goes through Homebrew when
+		// Homebrew is exactly what is missing — the same page-wide claim about a
+		// per-major fact that D2 removes one branch up.
+		expect(body).not.toMatch(/homebrew/i);
+	});
+
+	// §8.6, from the other direction: the sentence a machine WITH Homebrew sees
+	// is unchanged, word for word.
+	it('still names Homebrew in the invitation wherever Homebrew is present', () => {
+		const body = renderEmpty({ brewFound: true, anyInstalled: false });
+		expect(body).toContain(
+			'Choose a version below — OpenVHost installs it through Homebrew and serves your sites with it.'
+		);
+	});
+
+	// §8.2. The screen is not softened into a warning — it is the same blunt
+	// heading, the same verbatim searched-paths list, the same install command
+	// and the same recovery control it has always been. Only its trigger moved.
+	it('is unchanged, word for word and path for path, when it does render', () => {
+		const body = renderEmpty({
+			brewFound: false,
+			noRouteToAnyPhp: true,
+			anyInstalled: false,
+			brewSearched: ['/opt/homebrew/bin/brew', '/usr/local/bin/brew']
+		});
+		expect(body).toContain('Homebrew is required to install PHP');
+		expect(body).toContain('/opt/homebrew/bin/brew');
+		expect(body).toContain('/usr/local/bin/brew');
+		expect(body).toContain('/bin/bash -c');
+		expect(body).toContain('data-testid="open-brew-site"');
+		expect(body).toContain('data-testid="languages-check-again"');
+	});
+
+	// The dead end outranks the invitation, which is the ordering this component
+	// has always had and the reason it has it: "no PHP, press Install" is a dead
+	// end one level further up on a machine that cannot install anything.
+	it('shows the dead end rather than the invitation when both would apply', () => {
+		const body = renderEmpty({
+			brewFound: false,
+			noRouteToAnyPhp: true,
+			anyInstalled: false
+		});
+		expect(body).toContain('data-testid="languages-no-brew"');
+		expect(body).not.toContain('data-testid="languages-no-php"');
 	});
 });
