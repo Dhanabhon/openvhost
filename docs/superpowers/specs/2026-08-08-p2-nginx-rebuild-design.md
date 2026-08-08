@@ -54,10 +54,24 @@ check. And the consumer records only the version string:
 
 Two different builds of 3.5.7 produce that identical line. So a rebuilt OpenSSL silently changes
 what every consumer links against, and **no artifact anywhere carries a value that would differ.**
-`openssl-3.5.7` has three consumers — nginx, PHP and MariaDB.
+~~`openssl-3.5.7` has three consumers — nginx, PHP and MariaDB.~~
 
-MariaDB and PHP did not drift only because nothing re-ran *their* link stage afterwards. That is
-luck, not a property. The same silence is waiting for both.
+~~MariaDB and PHP did not drift only because nothing re-ran *their* link stage afterwards. That is
+luck, not a property. The same silence is waiting for both.~~
+
+> **Corrected 2026-08-09 — the two struck sentences were measurably wrong, and the error was mine.**
+> `openssl-3.5.7` has **two** consumers, not three: `nginx.sh:154` and `mariadb.sh:150` both declare
+> `RECIPE_DEPENDS=("openssl:$RECIPE_OPENSSL_VERSION")`, but `php.sh:167` declares
+> `RECIPE_DEPENDS=("nginx:$_PHP_PROBE_NGINX_VERSION")` — a FastCGI *client* for contract check 6, of
+> which no byte reaches the artifact. PHP's OpenSSL is **3.6.3**, digest-pinned in `_php-pins.sh:190`
+> and compiled by `spc` inside PHP's own closure, so it is untouched by anything under discussion
+> here.
+>
+> The hole and the diagnosis are unaffected — nginx really is a consumer, and it really did drift.
+> What is affected is the reach: **MariaDB is the one other engine exposed to this**, and the
+> "silence waiting for both" is waiting for one. The correction matters because the sloppy version
+> would have justified work on PHP that has no basis, and because "built against" and "linked
+> against" are not interchangeable once a dependency is a test fixture.
 
 ## 3. D1 — Rebuild rather than repack, even though repacking would probably work
 
