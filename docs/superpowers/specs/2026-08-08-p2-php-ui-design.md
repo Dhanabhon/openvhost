@@ -186,6 +186,14 @@ confinement (already filed).
   inert today.
 - **The catch-all serves the oldest installed PHP** (5B §7). Still an owner decision, and the
   Languages page is where a user would most plausibly expect to see or set it.
+- **In the §8.2b state, the page names Homebrew but offers no way to get it.** The per-row note
+  says a major needs Homebrew; the page-level screen — which carries the `brew.sh` control and the
+  install command — no longer renders, because a packaged route exists. T2 reported this rather
+  than inventing a second page-level element the spec did not ask for, which was the right call:
+  the state is unreachable today (no offer is `Available` anywhere), and what it should look like
+  depends on a page that does not exist until packaged installs actually work.
+  **This is a decision owed before any `availability` flips to `Published`**, alongside the
+  hash-confirmation obligation.
 - **`Availability` is declared once per engine, with the doc comments duplicated verbatim** —
   `mariadb/package/catalogue.rs:112`, `nginx/package/catalogue.rs:154`, and PHP's own from 5A.
   Same family as the four-way packaged-resolver duplication already filed. Do **not** unify it in
