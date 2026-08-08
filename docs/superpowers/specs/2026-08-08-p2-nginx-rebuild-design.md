@@ -106,6 +106,28 @@ against. Requirements:
   entries must come back **identical** — if either moves, stop and report, because the manifest is a
   sidecar and cannot change the tarball.
 
+> **The third bullet was REFUSED, 2026-08-09, and the code changed instead.** It is kept as written
+> because it was the instruction the slice was given, and because the reason it is wrong is the most
+> useful thing this slice learned.
+>
+> `json_dependencies` digests whatever prefix is on disk *at manifest time*. A `--from pack` run
+> produces no bytes, so regenerating MariaDB's manifest (staged 2026-08-03) would have recorded the
+> OpenSSL rebuilt on 2026-08-08, and PHP's (staged 2026-08-07) the nginx rebuilt the same day — in
+> both cases a precise, confident, **wrong** claim about what those bytes were built against, and in
+> PHP's case one whose subject is not even a build input. And the check this bullet proposes
+> could not have caught it: the bullet's own reasoning says why, since a sidecar cannot change a
+> tarball, so both `sha256` entries come back identical exactly as demanded while the manifests
+> acquire a fabrication. **A gate whose passing is guaranteed by the same fact that makes the
+> failure invisible is not a gate.** That is this slice's own defect class, one engine over.
+>
+> So the defect was fixed where it lives, in the driver rather than in the sequencing: a run that
+> did not execute the build stage now records `"tree_sha256": null` and a `"not_observed"` sentence
+> instead of a digest it did not observe. A run that *builds* while reusing an already-staged
+> dependency still records the digest — that is the case D3 exists for, since reuse during a build
+> is how nginx drifted. MariaDB's and PHP's manifests are left alone, and both catalogue entries now
+> say in prose that their manifests predate this record and gain one at their next rebuild from
+> source. §7 item 5 is void with them; it had no way to fail.
+
 Explicitly **not** in scope: content-addressed dependency prefixes, rebuilding a consumer when its
 dep digest moved, or refusing to reuse a mismatched dep. Recording makes the next drift *visible*;
 acting on it automatically is a larger design and a separate slice.
@@ -137,6 +159,8 @@ moment the re-pin lands, but until then it is the bytes the shipped catalogue na
 4. **The manifest records the OpenSSL build**, and the value demonstrably changes when the dep is
    rebuilt and holds steady when it is not.
 5. **MariaDB's and PHP's `sha256` pins are unchanged** after their manifests are regenerated.
+   *(Void, 2026-08-09 — the regeneration was refused; see the note under §5. This obligation could
+   not fail, which is why it is recorded as void rather than met.)*
 6. **Nothing user-visible changes**: every `availability` stays `AwaitingRelease`.
 7. **The build root outside the four exempt paths is byte-identical** before and after.
 8. The catalogue's nginx doc comment and the reproducible-pack spec's postscript both stop

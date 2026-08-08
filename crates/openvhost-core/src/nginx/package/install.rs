@@ -708,10 +708,7 @@ mod tests {
     // gitignored build output rather than a committed fixture. It is checked in
     // rather than run by hand so the proof is repeatable:
     //
-    //   # NOT this worktree's build/out: that tarball is a repack of a prefix
-    //   # relinked against a rebuilt OpenSSL, so it hashes to other bytes. See
-    //   # the publish note on `NGINX_PACKAGES` for why, and for where it lives.
-    //   OPENVHOST_NGINX_TARBALL=.claude/worktrees/nginx-build/build/out/nginx-1.30.4-macos-arm64.tar.gz \
+    //   OPENVHOST_NGINX_TARBALL=$PWD/build/out/nginx-1.30.4-macos-arm64.tar.gz \
     //     cargo test -p openvhost-core --lib -- --ignored --nocapture \
     //     the_real_artifact_installs_and_runs_from_the_package_tree
     //
@@ -814,10 +811,7 @@ mod tests {
     // Same gate as the group above: needs the real build artifact, ignored by
     // default, run with:
     //
-    //   # NOT this worktree's build/out: that tarball is a repack of a prefix
-    //   # relinked against a rebuilt OpenSSL, so it hashes to other bytes. See
-    //   # the publish note on `NGINX_PACKAGES` for why, and for where it lives.
-    //   OPENVHOST_NGINX_TARBALL=.claude/worktrees/nginx-build/build/out/nginx-1.30.4-macos-arm64.tar.gz \
+    //   OPENVHOST_NGINX_TARBALL=$PWD/build/out/nginx-1.30.4-macos-arm64.tar.gz \
     //     cargo test -p openvhost-core --lib -- --ignored --nocapture \
     //     the_tree_derived_version_agrees_with_what_the_binary_itself_prints
     //

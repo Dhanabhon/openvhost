@@ -228,35 +228,57 @@ pub struct NginxPackage {
 /// `crate::nginx::install_nginx_package` refuses before any network work,
 /// naming the tag to publish.
 ///
-/// **Not a repack, unlike MariaDB's and PHP's pins — deliberately.** Both of
-/// those were re-cut from their staged prefix by reproducible-pack (design
-/// §5.3). This one was not: `/opt/openvhost-build/nginx-1.30.4` was relinked
-/// against a rebuilt OpenSSL on 2026-08-07, *after* this `sha256` was
-/// pinned, so packing today's prefix produces different bytes — measured:
-/// `bin/nginx` is the only file among 24 entries that differs, same size,
-/// 611 differing byte positions, embedded OpenSSL build timestamp `Mon Aug 3
-/// 15:05:42 2026 UTC` (pinned) vs `Fri Aug 7 02:52:02 2026 UTC` (prefix).
-/// **A repack of the drifted prefix still passes the artifact contract
-/// 7/7** — the contract cannot detect that the OpenSSL underneath was
-/// rebuilt from state that left no manifest, no log and no artifact.
-/// Passing the contract is not having provenance. The bytes named below are
-/// the PR #57 artifact, with its manifest — not reproducible from the
-/// prefix as it stands today. Re-pinning requires a documented rebuild, not
-/// a repack.
+/// **Cut from an observed rebuild of both OpenSSL and nginx on 2026-08-08,
+/// and reproducible as a repack from the prefix that rebuild staged.** The
+/// pin this replaced (`a29e7d61…`, PR #57) had neither property, and the two
+/// findings that produced it are worth keeping, because a future reader of
+/// this field will be asking exactly the questions they answer.
+///
+/// **The durable one: a repack of the drifted prefix passed the artifact
+/// contract 7/7** — measured live, zero checks skipped — so swapping the pin
+/// to it would have replaced an audited artifact with an unexplained one
+/// while every gate stayed green. *Passing the contract is not having
+/// provenance.* That is why the repack was refused and this rebuild happened
+/// instead.
+///
+/// **What had drifted, and why nothing noticed.** `/opt/openvhost-build`'s
+/// `openssl-3.5.7` carried mtime 2026-08-07 09:52:10 and its
+/// `nginx-1.30.4/bin/nginx` 09:52:59 — 49 seconds later, and 09:52 local is
+/// 02:52 UTC, the exact string embedded in the drifted binary. So a
+/// dependency was rebuilt and its consumer relinked in one run, after
+/// `a29e7d61…` was cut; `bin/nginx` was the only file among 24 that differed,
+/// same size, 611 differing byte positions. Nothing could see it because
+/// `build.sh` recorded only `"version": "3.5.7"`, a line two different builds
+/// of 3.5.7 write identically. The manifest's `dependencies` block closes
+/// that, and it is not a theory: the pre-removal prefix digested to
+/// `0810760892…` and the rebuilt one to `e486946b…`.
+///
+/// **The old pin's provenance was stale a second, independent way.** It was
+/// cut from an in-progress revision of its own recipe: its manifest has no
+/// `recipe.pcre2.last_checked`, and `git blame` puts that field in `c87ec6c`
+/// — PR #57 itself — authored 21:31 +07 on 2026-08-06, while the manifest
+/// beside the pinned tarball was written 15:50 +07 the same day. The
+/// `include_str!` tripwire below stayed green throughout, because it compares
+/// date literals and a key fingerprint, not the recipe revision the bytes
+/// came from. That gap is filed separately.
 ///
 /// **To publish:**
 ///
-/// 1. **The tarball is not in this worktree's `build/out`.** Packing
-///    today's staged prefix hashes to different bytes than `sha256` below,
-///    for the reason above. The only copy of the PR #57 artifact this pin
-///    actually names is
-///    `.claude/worktrees/nginx-build/build/out/nginx-1.30.4-macos-arm64.tar.gz`
-///    — gitignored build output inside a prunable worktree, so treat it as
-///    findable today rather than durable, and give it a home before
-///    publishing. Confirm it still hashes to `sha256` below; this module's own
-///    test `the_catalogue_pins_exactly_one_nginx_build_today` pins the same
-///    digest as a literal, so a mismatch there is the first signal something
-///    moved.
+/// 1. Confirm the tarball at `build/out/nginx-1.30.4-macos-arm64.tar.gz`
+///    still hashes to `sha256` below. Since the pack stage stopped writing a
+///    timestamp into the gzip header, re-packing the staged prefix
+///    (`build/build.sh --from pack nginx 1.30.4`) must print this same hash,
+///    so that is a real check rather than a formality. This module's own test
+///    `the_catalogue_pins_exactly_one_nginx_build_today` pins the same digest
+///    as a literal, so a mismatch there is the first signal something moved.
+///
+///    **That shortcut costs the manifest, so take a copy first.** A `--from
+///    pack` run rewrites the sidecar step 2 publishes: it starts past
+///    `configure`, so `configure_flags` comes back empty, and it never links,
+///    so the dependency block comes back `"not_observed"` instead of naming
+///    the OpenSSL build. It also starts past `audit`, so it exercises the
+///    contract once, against the tarball only. The manifest in `build/out`
+///    today is from the complete 2026-08-08 run and is the one to ship.
 /// 2. Create release `nginx-1.30.4` carrying the tarball, its `.sha256`
 ///    sidecar and `nginx-1.30.4-macos-arm64.manifest.json`, confirm the
 ///    served bytes still hash to the pin, then flip `availability` to

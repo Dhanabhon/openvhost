@@ -631,6 +631,15 @@ should_run() {
 	return 1
 }
 
+# Whether THIS invocation ran the build stage — the one that compiles and links
+# the artifact's own binaries. It is the difference between a manifest that
+# reports a dependency digest and one that admits it cannot: see
+# json_dependencies. A run
+# resumed past `build` (--from pack, say) repacks bytes some earlier run
+# produced, so the dependency prefixes sitting on disk now are not necessarily
+# the ones those bytes were built against, however confidently they hash.
+BUILD_STAGE_RAN=0
+
 # Named up front rather than inside stage_pack, so that --from verify-artifact
 # and --from manifest still know what they are talking about.
 TARBALL="$OUT_DIR/$BUILD_NAME-$BUILD_VERSION-macos-$BUILD_ARCH.tar.gz"
@@ -654,7 +663,16 @@ stage_configure() {
 	recipe_configure
 }
 
-stage_build() { recipe_build; }
+stage_build() {
+	recipe_build
+	# Recorded here rather than in the dispatch below, so the fact lives next to
+	# the thing it is a fact about. After recipe_build, not before: what this
+	# licenses json_dependencies to claim is that this run COMPLETED producing
+	# the artifact's bytes against the prefixes on disk. (Under set -e a failed
+	# build never reaches the manifest anyway, so the ordering costs nothing and
+	# cannot mislead.)
+	BUILD_STAGE_RAN=1
+}
 
 stage_install() {
 	# The staged tree IS the neutral prefix (D8). Installing elsewhere and moving
@@ -807,17 +825,54 @@ prefix_digest() {
 # copy compared the wrong field.
 #
 # Driven off RECIPE_DEPENDS rather than off what the dependency loop did, so a
-# resumed run that reused an existing prefix records the prefix it linked just
-# as a run that built one does. That is the case this exists for. The
-# name:version shape is not re-validated: the loop above runs on every
-# invocation, --from resumes included, and has already rejected anything else.
+# BUILD that reused an already-staged prefix records what it built against just
+# as one that staged the prefix itself does. That is the case this exists for —
+# reuse during a build is exactly how nginx drifted. The name:version shape is not
+# re-validated: the loop above runs on every invocation, --from resumes
+# included, and has already rejected anything else.
+#
+# A digest is only evidence when THIS run built (BUILD_STAGE_RAN). Hashing a
+# prefix is possible in any run; it means something in a run that produced the
+# artifact's bytes, because then the prefixes on disk ARE the ones it was built
+# against. In a run resumed past `build` it means nothing — those bytes were
+# produced days ago, possibly against a different build of the same version, so
+# digesting today's prefix would write a precise, confident, WRONG claim. That
+# is the failure this whole block exists to remove, so such a run says so
+# instead. Not by leaving the field out: `resumed_from` would let a reader
+# infer it, and "a reader could infer it" is the standard this pipeline keeps
+# rejecting. An absent value is also ambiguous between "no dependencies" and
+# "not looked at", where an empty object for a recipe with no RECIPE_DEPENDS is
+# honest in both kinds of run.
+#
+# "Built against" and not "linked against", deliberately: php.sh's one
+# RECIPE_DEPENDS entry is nginx, which nothing links and no byte of which
+# reaches the artifact — it is contract check 6's FastCGI client. A sentence
+# about linkage would be false there, and a provenance record that is false in
+# one of its three cases is the thing this file keeps being fixed for.
 json_dependencies() {
 	local first=1 dep name version prefix digest
+	# Fixed text, never interpolated, so every manifest that cannot vouch for
+	# its dependencies says it the same way and the string can be grepped for.
+	local unobserved='this run did not execute the build stage: this prefix is as it stands now, which is not necessarily what the artifact was built against'
 	printf '{'
 	for dep in ${RECIPE_DEPENDS[@]+"${RECIPE_DEPENDS[@]}"}; do
 		name="${dep%%:*}"
 		version="${dep#*:}"
 		prefix="$(bp_dep_prefix "$name" "$version")"
+		if [ "$first" -eq 1 ]; then first=0; else printf ', '; fi
+		# version and prefix are what the RECIPE declares, so they are true of
+		# this run either way; only the digest is a claim about the artifact.
+		printf '"%s": {"version": "%s", "prefix": "%s"' \
+			"$(json_string "$name")" "$(json_string "$version")" \
+			"$(json_string "$prefix")"
+		if [ "$BUILD_STAGE_RAN" -eq 0 ]; then
+			# null rather than a sentinel string: no hex digest can equal it,
+			# and a reader that expects one gets a type error instead of a
+			# false match. The sentence beside it is the explicit part.
+			printf ', "tree_sha256": null, "not_observed": "%s"}' \
+				"$(json_string "$unobserved")"
+			continue
+		fi
 		if [ -d "$prefix" ]; then
 			digest="$(prefix_digest "$prefix")"
 		else
@@ -827,10 +882,7 @@ json_dependencies() {
 			# that does not exist is worse than one that says it does not know.
 			digest="unknown"
 		fi
-		if [ "$first" -eq 1 ]; then first=0; else printf ', '; fi
-		printf '"%s": {"version": "%s", "prefix": "%s", "tree_sha256": "%s"}' \
-			"$(json_string "$name")" "$(json_string "$version")" \
-			"$(json_string "$prefix")" "$(json_string "$digest")"
+		printf ', "tree_sha256": "%s"}' "$(json_string "$digest")"
 	done
 	printf '}'
 }
