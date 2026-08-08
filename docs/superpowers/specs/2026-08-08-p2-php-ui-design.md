@@ -113,6 +113,21 @@ user should feel they are on.
 The three offer variants map cleanly onto the two ways a package can be missing, which is why
 MariaDB's `Unavailable { target }` carries `target` — reuse it rather than adding a fourth arm.
 
+**The result type cannot be `InstallOutcomeDto`, and T1 stopped rather than force it.** That type
+is brew-shaped — `major`, `exit_code: Option<i32>`, `detected` — and `LanguageRow.svelte:110`
+derives `installFailed = rowOutcome.exitCode !== 0`. Since `null !== 0`, a **successful** packaged
+install, which has no exit code because no child process runs, would render under `role="alert"`
+as *"brew was killed before installing PHP 8.4 finished."* The comment beside that code explains
+exactly why it is right for brew and therefore wrong here: it treats "no code at all" as "not a
+clean exit", which is true of a killed process and meaningless for an installer that never
+spawned one.
+
+So `install_php` returns a **tagged result** with a `Brew { exit_code }` arm alongside the package
+arms, and gains a progress event and a cancel command mirroring `mariadb_pkg`'s. The alternative —
+two commands with the frontend dispatching on the row's offer — was rejected: it puts the routing
+rule in two places, which is the same shape as the cross-file constant pairs this project has been
+bitten by, and it makes D4's own sentence false.
+
 **The packaged install path merges unproven, and this must be said out loud.** With every offer
 `AwaitingRelease`, no test and no live proof can exercise a real packaged PHP install end to end
 — exactly the position the MariaDB UI slice merged in. The obligation that carries: **before any
@@ -145,8 +160,14 @@ state belonged, and the previous three were all found only after they had misled
    Homebrew row still reports `full_version: None`.
 4. The badge appears only on packaged rows, reuses MySQL's existing style, and cannot read as a
    status pill beside one.
-5. Install **routes** by the row's offer, and an `AwaitingRelease` row offers no Install button —
-   it says what it is waiting for.
+5. Install **routes** by the row's offer. An `AwaitingRelease` row offers **no packaged install**
+   and says what it is waiting for.
+
+   **Corrected after T1 found this contradicted §8.6.** As first written, "offers no Install
+   button" would have *removed a working control*: on this Apple Silicon machine 8.4 is
+   `AwaitingRelease` today **and** has a functioning Homebrew Install button. The Homebrew route
+   is untouched in every state. What `AwaitingRelease` withholds is the packaged route, and what
+   it adds is naming the tag a maintainer has to publish.
 6. **Nothing changes on a machine with Homebrew and no package tree** — which is every real
    machine today, including the developer's. Establish it, do not assert it.
 7. Every new enum arm is matched **exhaustively**; a throwaway variant must fail to compile.
