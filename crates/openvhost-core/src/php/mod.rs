@@ -13,7 +13,10 @@ pub use brew::{
 /// (`discover::discover_php_in`) is private to that module — a caller outside
 /// this crate that could see only Homebrew would be blind to every PHP
 /// OpenVHost installed itself, which is the whole point of slice 5B.
-pub use discover::{BREW_PREFIXES, PhpRuntimeSource, discover_php, php_runtime_for_major};
+pub use discover::{
+    BREW_PREFIXES, PackagedPhpInstall, PhpRuntimeSource, discover_php, packaged_php_install,
+    php_runtime_for_major,
+};
 pub use package::{
     Availability, PHP_PACKAGE_NAME, PHP_PACKAGES, PHP_WARMUP_BINARY, PhpPackage, PhpPackageInstall,
     install_php_package, php_package_for_host, php_package_for_target,

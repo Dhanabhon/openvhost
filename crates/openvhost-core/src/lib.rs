@@ -121,10 +121,10 @@ pub use openvhost_pkg::{ArchiveFormat, InstalledPackage, PackagesRoot, PkgError,
 /// that happens to share the name (design decision: duplicated per package,
 /// not shared). It stays reachable at `php::Availability`.
 pub use php::{
-    BREW_PREFIXES, CATALOGUE, PHP_PACKAGE_NAME, PHP_PACKAGES, PHP_WARMUP_BINARY, PhpMajor,
-    PhpPackage, PhpPackageInstall, PhpRuntimeSource, brew_formula, brew_install_spec,
-    brew_uninstall_spec, discover_php, find_brew, install_php_package, php_package_for_host,
-    php_package_for_target, php_runtime_for_major,
+    BREW_PREFIXES, CATALOGUE, PHP_PACKAGE_NAME, PHP_PACKAGES, PHP_WARMUP_BINARY,
+    PackagedPhpInstall, PhpMajor, PhpPackage, PhpPackageInstall, PhpRuntimeSource, brew_formula,
+    brew_install_spec, brew_uninstall_spec, discover_php, find_brew, install_php_package,
+    packaged_php_install, php_package_for_host, php_package_for_target, php_runtime_for_major,
 };
 pub use settings_repo::{SqliteWebServerSettings, WebServerSettingsRepository};
 pub use site::apply::{

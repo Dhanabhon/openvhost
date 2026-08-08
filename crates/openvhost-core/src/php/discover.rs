@@ -184,7 +184,22 @@ pub fn php_runtime_for_major(prefixes: &[&Path], major: &PhpMajor) -> Option<Php
         })
 }
 
-/// The packaged runtime this major's `current` link selects, or `None` when
+/// The packaged install a major's `current` link selects: the exact upstream
+/// version, and the CONCRETE directory that holds it.
+///
+/// The pair rather than a bare `PathBuf` because both readers need both halves
+/// — discovery reports the version on [`PhpRuntimeSource::Packaged`], and an
+/// uninstall has to name the directory it is about to take off disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackagedPhpInstall {
+    /// The exact upstream release, e.g. `"8.4.24"`.
+    pub version: String,
+    /// `packages/php/<major>/<version>/` — **never**
+    /// `packages/php/<major>/current/` (design D3).
+    pub dir: PathBuf,
+}
+
+/// The packaged install this major's `current` link selects, or `None` when
 /// the major has no usable packaged install.
 ///
 /// Copies [`crate::mysql::packaged_mysql_runtime`]'s discipline exactly rather
@@ -198,19 +213,32 @@ pub fn php_runtime_for_major(prefixes: &[&Path], major: &PhpMajor) -> Option<Php
 ///   single plain directory-name component, containing neither `..` nor an
 ///   absolute path — see that function for the security reasoning);
 /// * the resolved version directory is checked to be a DIRECT CHILD of the
-///   major directory before its binary is ever handed out, belt-and-braces
-///   over the rule above and stated structurally so it keeps holding whatever
-///   a future `join` does with an unexpected target shape;
+///   major directory before it is ever handed out, belt-and-braces over the
+///   rule above and stated structurally so it keeps holding whatever a future
+///   `join` does with an unexpected target shape;
 /// * the returned path names the **concrete version directory**, never
 ///   `current` (design D3) — see [`PhpRuntime`]'s own doc comment.
 ///
-/// Private, and `major` is a `&str` rather than a [`PhpMajor`] on purpose:
+/// `major` is a `&str` rather than a [`PhpMajor`] on purpose:
 /// [`PhpMajor::parse`] is catalogue-gated, and a packaged 8.1 that a later
 /// build stopped offering must still be DISCOVERED (it is running the user's
 /// sites). The shape rule that keeps a directory name safe to join is applied
 /// here as well as in the walk, so the containment holds however this is
 /// reached.
-fn packaged_php_runtime(root: &PackagesRoot, major: &str) -> Option<PhpRuntime> {
+///
+/// **`pub`, and it is the same predicate discovery uses — that is the point.**
+/// Off-Homebrew slice 5D's uninstall has to answer "is the row the user
+/// clicked Uninstall on OURS?", and the only correct answer is the one
+/// [`discover_php`] gave when it built that row. Two functions that both mean
+/// "the packaged install for this major" are two functions that will disagree
+/// the first time one of the four checks above moves; there is one, and
+/// [`packaged_php_runtime`] is a thin mapping over it. Note the checks include
+/// `bin/php-fpm` really being a file: a major directory that cannot supply a
+/// runtime is not the row's source either — discovery reports it through
+/// [`Discovery::unidentified`] and lets Homebrew's entry occupy the major.
+///
+/// Reads the filesystem (one `read_link`, one `is_file`); spawns nothing.
+pub fn packaged_php_install(root: &PackagesRoot, major: &str) -> Option<PackagedPhpInstall> {
     if !super::brew::is_major_minor_shape(major) {
         return None;
     }
@@ -220,14 +248,25 @@ fn packaged_php_runtime(root: &PackagesRoot, major: &str) -> Option<PhpRuntime> 
     if dir.parent() != Some(major_dir.as_path()) {
         return None;
     }
-    let fpm_bin = dir.join(PACKAGED_FPM_REL);
-    if !fpm_bin.is_file() {
+    if !dir.join(PACKAGED_FPM_REL).is_file() {
         return None;
     }
+    Some(PackagedPhpInstall { version, dir })
+}
+
+/// The packaged runtime this major's `current` link selects, or `None` when
+/// the major has no usable packaged install.
+///
+/// A mapping over [`packaged_php_install`] and nothing more — every check, and
+/// every reason for it, lives there.
+fn packaged_php_runtime(root: &PackagesRoot, major: &str) -> Option<PhpRuntime> {
+    let install = packaged_php_install(root, major)?;
     Some(PhpRuntime {
         major: major.to_string(),
-        fpm_bin,
-        source: PhpRuntimeSource::Packaged { version },
+        fpm_bin: install.dir.join(PACKAGED_FPM_REL),
+        source: PhpRuntimeSource::Packaged {
+            version: install.version,
+        },
     })
 }
 
@@ -1515,5 +1554,126 @@ mod tests {
             found.runtimes[0].fpm_bin.starts_with(&major_dir),
             "...while looking lexically in-tree, which is why the check misses it"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Group P7 — `packaged_php_install`: ONE predicate, two readers.
+    //
+    // Off-Homebrew slice 5D needs the same question discovery asks ("is this
+    // major's row ours, and which directory is it?") to decide what an
+    // uninstall removes. Two functions that both mean that would disagree the
+    // first time one of the four checks moved; there is one, and
+    // `packaged_php_runtime` is a mapping over it.
+    //
+    // VACUITY, measured by mutation: dropping the `bin/php-fpm` `is_file`
+    // check from `packaged_php_install` fails
+    // `an_install_and_a_runtime_are_the_same_answer` and Group P4's broken-tree
+    // tests together — which is the point, because that is the check whose
+    // absence would let an uninstall delete a tree discovery refused to use.
+    // ------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn an_install_names_the_concrete_version_directory() {
+        let (_home, root) = packaged_8_4_24();
+        let install = packaged_php_install(&root, "8.4").unwrap();
+        assert_eq!(install.version, "8.4.24");
+        assert_eq!(
+            install.dir,
+            root.package_dir(PHP_PACKAGE_NAME, "8.4", "8.4.24")
+        );
+        assert!(
+            !install.dir.components().any(|c| c.as_os_str() == "current"),
+            "{:?} runs through the current link",
+            install.dir
+        );
+    }
+
+    /// The property the uninstall depends on: whenever discovery reports a
+    /// packaged runtime for a major, this answers `Some` for the directory that
+    /// runtime lives in — and whenever it does not, this answers `None`.
+    /// Checked over every shape the tree can take rather than the happy one.
+    #[cfg(unix)]
+    #[test]
+    fn an_install_and_a_runtime_are_the_same_answer() {
+        for (name, build) in [
+            ("selected and complete", 0u8),
+            ("no bin/php-fpm in the version directory", 1),
+            ("current points at a version that is not installed", 2),
+            ("installed but no current link", 3),
+            ("nothing at all", 4),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let root = PackagesRoot::from_home(home.path());
+            match build {
+                0 => {
+                    install_fake_package(&root, "8.4", "8.4.24", "fpm\n");
+                    point_current(&root, "8.4", "8.4.24");
+                }
+                1 => {
+                    std::fs::create_dir_all(root.package_dir(PHP_PACKAGE_NAME, "8.4", "8.4.24"))
+                        .unwrap();
+                    point_current(&root, "8.4", "8.4.24");
+                }
+                2 => point_current(&root, "8.4", "8.4.99"),
+                3 => install_fake_package(&root, "8.4", "8.4.24", "fpm\n"),
+                _ => {}
+            }
+            let install = packaged_php_install(&root, "8.4");
+            let runtime = packaged_php_runtime(&root, "8.4");
+            assert_eq!(
+                install.is_some(),
+                runtime.is_some(),
+                "{name}: install={install:?} runtime={runtime:?}"
+            );
+            if let (Some(install), Some(runtime)) = (install, runtime) {
+                assert!(
+                    runtime.fpm_bin.starts_with(&install.dir),
+                    "{name}: the runtime's binary is outside the install's directory"
+                );
+                assert_eq!(
+                    runtime.source,
+                    PhpRuntimeSource::Packaged {
+                        version: install.version
+                    },
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    /// The containment rules apply however this is reached, because slice 5D
+    /// feeds `dir` to a `remove_dir_all`. `current_version` owns the rule; this
+    /// pins that `packaged_php_install` really does route through it.
+    #[cfg(unix)]
+    #[test]
+    fn an_install_refuses_every_current_link_shape_that_is_not_one_plain_name() {
+        for target in ["..", "../../../etc", "/etc", "a/b", "./8.4.24", ""] {
+            let home = tempfile::tempdir().unwrap();
+            let root = PackagesRoot::from_home(home.path());
+            install_fake_package(&root, "8.4", "8.4.24", "fpm\n");
+            point_current(&root, "8.4", target);
+            assert_eq!(
+                packaged_php_install(&root, "8.4"),
+                None,
+                "`current` -> {target:?} was accepted"
+            );
+        }
+    }
+
+    /// The shape gate is applied here too, not only in the walk — a caller that
+    /// reaches this directly (slice 5D's uninstall does) must not be able to
+    /// put a surprising name into a path component.
+    #[cfg(unix)]
+    #[test]
+    fn an_install_refuses_a_major_that_is_not_major_minor_shaped() {
+        let (_home, root) = packaged_8_4_24();
+        for major in ["8", "8.4.1", "../8.4", "8.x", ""] {
+            assert_eq!(
+                packaged_php_install(&root, major),
+                None,
+                "{major:?} was accepted as a major"
+            );
+        }
     }
 }

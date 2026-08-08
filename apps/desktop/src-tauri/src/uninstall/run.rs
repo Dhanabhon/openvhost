@@ -44,7 +44,7 @@ use openvhost_core::{Db, Site, SiteRepository, SqliteSiteRepository};
 use openvhost_proc::{ProcError, SpawnSpec, Supervisor, TaskEvent, TaskStream};
 use tauri_specta::Event;
 
-use super::{Blocker, PackageKind, Target, UninstallPlan, build_plan, inventory};
+use super::{Blocker, PackageKind, PackagedPhp, Target, UninstallPlan, build_plan, inventory};
 use crate::commands::{
     InstallLock, IpcError, MariadbInstallLogEvent, MysqlInstallLogEvent, PackageOperation,
     PhpInstallLogEvent, RunningInstallGuard, now_ms, rescan_into_state, rescan_mariadb_into_state,
@@ -121,9 +121,17 @@ pub(crate) struct UninstallRun<'a> {
     /// `/opt/homebrew` and refuse or proceed depending on what is installed
     /// there.
     ///
-    /// `None` for a target with no Homebrew formula at all (MariaDB, D5) —
-    /// there is no keg to resolve, so there is nothing for the caller to read.
+    /// `None` for a target with no Homebrew formula at all (MariaDB, D5; and a
+    /// PHP major this app packaged, off-Homebrew slice 5D D2) — there is no
+    /// `brew uninstall` for an alias to redirect, so there is nothing for the
+    /// caller to read.
     pub(crate) keg: Option<openvhost_core::KegProvenance>,
+    /// What OpenVHost's own package tree holds for this target, read fresh by
+    /// the caller for the same reason `sites` and `keg` are: an install can
+    /// finish, or a `current` link swing, while a confirmation dialog sits
+    /// open. `None` on every machine with no packaged PHP for this major, which
+    /// is the unchanged Homebrew path. See [`super::PackagedPhp`].
+    pub(crate) packaged: Option<PackagedPhp>,
     pub(crate) runner: Arc<dyn BrewRunner>,
     pub(crate) log: UninstallLogSink,
 }
@@ -157,12 +165,13 @@ pub(crate) async fn perform_uninstall(run: UninstallRun<'_>) -> Result<Uninstall
         &run.sup.snapshot(),
         &run.sites,
         run.keg.as_ref(),
+        run.packaged.as_ref(),
     );
     if !blockers.is_empty() {
         return Err(refusal(&run.target, &blockers));
     }
 
-    let inv = inventory(&run.target, &run.home);
+    let inv = inventory(&run.target, &run.home, run.packaged.as_ref());
     let mut problems: Vec<String> = Vec::new();
 
     // The inventory's ORDER is the execution order, and the same list the
@@ -410,12 +419,18 @@ pub async fn uninstall_plan(
     let target = Target::parse(kind, &major)?;
     let p = stack_paths(&paths)?;
     let sites = SqliteSiteRepository::new(db.inner()).list().await?;
+    // Both filesystem reads happen HERE, and their answers are what cross into
+    // `build_plan` — see `uninstall::inventory`'s purity invariant. `packaged`
+    // is resolved first because `keg_provenance` depends on it: a packaged row
+    // runs no `brew uninstall`, so there is no alias to look up.
+    let packaged = target.packaged(&p.home);
     Ok(build_plan(
         &target,
         &p.home,
         &sup.snapshot(),
         &sites,
-        target.keg_provenance().as_ref(),
+        target.keg_provenance(packaged.as_ref()).as_ref(),
+        packaged.as_ref(),
     ))
 }
 
@@ -466,17 +481,24 @@ pub async fn uninstall_package(
     };
 
     let p = stack_paths(&paths)?;
-    // Homebrew is required only for a formula-having target (PHP/MySQL):
-    // `Target::formula` is `None` for MariaDB (P1 MariaDB UI design D5), whose
-    // uninstall never spawns brew at all (see `Removal::PackageTree`). Gating
-    // the lookup on that fact — rather than requiring Homebrew unconditionally
-    // — is what stops "Homebrew was not found" from refusing a MariaDB
-    // uninstall on a machine that never touched Homebrew in the first place.
-    // The placeholder path is never read on that arm: `run.target
+    // Resolved once, and reused by every question below that depends on it:
+    // which formula this uninstall names, whether Homebrew has to be found at
+    // all, whether an aliased keg can be in the way, and what the executor
+    // removes. Read here rather than carried over from whatever plan the dialog
+    // was built from — an install can finish while a confirmation sits open.
+    let packaged = target.packaged(&p.home);
+    // Homebrew is required only for a formula-having target:
+    // `Target::formula` is `None` for MariaDB (P1 MariaDB UI design D5) and for
+    // a PHP major this app packaged (off-Homebrew slice 5D D2), neither of
+    // which spawns brew at all (see `Removal::PackageTree`). Gating the lookup
+    // on that fact — rather than requiring Homebrew unconditionally — is what
+    // stops "Homebrew was not found" from refusing to remove a directory on a
+    // machine that never touched Homebrew in the first place.
+    // The placeholder path is never read on those arms: `run.target
     // .uninstall_spec(&run.brew)` is called only from `run_brew`, itself only
-    // reached for a `Removal::BrewFormula` step, and MariaDB's inventory never
-    // produces one.
-    let brew = match target.formula() {
+    // reached for a `Removal::BrewFormula` step, which neither inventory
+    // produces.
+    let brew = match target.formula(packaged.as_ref()) {
         Some(_) => openvhost_core::find_brew().ok_or_else(|| IpcError::Core {
             message: format!(
                 "Homebrew was not found. Looked for bin/brew under: {}",
@@ -503,7 +525,8 @@ pub async fn uninstall_package(
         // Re-read here, not carried over from whatever plan the dialog was
         // built from: `brew upgrade php` in another terminal can turn a
         // versioned keg into an alias between the two.
-        keg: target.keg_provenance(),
+        keg: target.keg_provenance(packaged.as_ref()),
+        packaged,
         runner: Arc::new(ProcBrewRunner),
         log,
     })
@@ -764,6 +787,11 @@ mod tests {
             lock,
             sites,
             keg: Some(keg),
+            // Homebrew's row: no packaged install for this major. Every
+            // executor test that existed before off-Homebrew slice 5D is a
+            // brew-path test and stays one, which is what makes "the brew path
+            // is untouched" checkable rather than asserted.
+            packaged: None,
             runner,
             log: silent(),
         }
@@ -786,6 +814,10 @@ mod tests {
             lock,
             sites: Vec::new(),
             keg: None,
+            // MariaDB's `PackageTree` path is built from compile-time
+            // constants, so it needs nothing threaded in — see
+            // `Target::packaged`'s own MariaDB arm.
+            packaged: None,
             runner,
             log: silent(),
         }
