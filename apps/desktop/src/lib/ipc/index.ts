@@ -16,7 +16,6 @@ import type {
 	CreateSiteResult,
 	FileChangeDto,
 	HomeUsageDto,
-	InstallOutcomeDto,
 	IpcError,
 	LogLevel,
 	LogLine,
@@ -61,6 +60,11 @@ import type {
 	PendingInstallDto,
 	PhpEnvironmentDto,
 	PhpInstallLogEvent,
+	PhpInstallOutcomeDto,
+	PhpInstallProgressDto,
+	PhpInstallProgressEvent,
+	PhpInstallResultDto,
+	PhpLedgerWriteDto,
 	PhpPackageOfferDto,
 	PhpRuntimeDto,
 	PhpRuntimeSourceDto,
@@ -87,7 +91,6 @@ export type {
 	CreateSiteResult,
 	FileChangeDto,
 	HomeUsageDto,
-	InstallOutcomeDto,
 	IpcError,
 	LogLevel,
 	LogLine,
@@ -132,6 +135,11 @@ export type {
 	PendingInstallDto,
 	PhpEnvironmentDto,
 	PhpInstallLogEvent,
+	PhpInstallOutcomeDto,
+	PhpInstallProgressDto,
+	PhpInstallProgressEvent,
+	PhpInstallResultDto,
+	PhpLedgerWriteDto,
 	PhpPackageOfferDto,
 	PhpRuntimeDto,
 	PhpRuntimeSourceDto,
@@ -424,12 +432,41 @@ export async function rescanPhpRuntimes(): Promise<PhpEnvironmentDto> {
 }
 
 /**
- * Install a PHP major via Homebrew. Streams its output live through
- * {@link onPhpInstallLog} while it runs, then resolves with the outcome —
- * including `detected`, which can be `false` even when `exitCode` is `0`.
+ * Install a PHP major — from OpenVHost's own package tree when this build
+ * publishes one for that major on this host, and via Homebrew otherwise
+ * (off-Homebrew slice 5C design D4). **The route is decided server-side**, from
+ * the same table that fills a row's `offer`; nothing here chooses a pipeline.
+ *
+ * Resolves with a TAGGED outcome rather than throwing on a package-pipeline
+ * failure — a verification failure, a stall, an unpublished release and an
+ * unsupported host are all states of `result`, because throwing them would
+ * discard the distinction `PhpPackageOfferDto`'s three states exist to make.
+ *
+ * `result.kind === 'brew'` is the Homebrew route, and it is the ONLY arm with an
+ * `exitCode`: it is the only one with a child process. A packaged install
+ * spawns nothing, so testing `exitCode !== 0` against any other arm would read a
+ * success as "brew was killed". Its `detected` can be `false` even when
+ * `exitCode` is `0` — that is the silent-failure case it exists for.
+ *
+ * Streams brew's output through {@link onPhpInstallLog} on the Homebrew route,
+ * and typed pipeline states through {@link onPhpInstallProgress} on the packaged
+ * one. Shares the one install lock with every other package operation.
  */
-export async function installPhp(major: string): Promise<InstallOutcomeDto> {
+export async function installPhp(major: string): Promise<PhpInstallOutcomeDto> {
 	return unwrap(commands.installPhp(major));
+}
+
+/**
+ * Cancel an in-flight PHP install — the mirror of {@link cancelMariadbInstall},
+ * and the identical reasoning: neither a download nor a `brew install` has a
+ * wall-clock bound, and the install permit is process-wide, so an install nobody
+ * can stop starves every later one.
+ *
+ * Cancels whichever route the install took, and resolves `false` when the slot
+ * holds something else (a MySQL install, an uninstall) or nothing at all.
+ */
+export async function cancelPhpInstall(): Promise<boolean> {
+	return unwrap(commands.cancelPhpInstall());
 }
 
 /**
@@ -463,10 +500,26 @@ export async function uninstallPackage(kind: PackageKind, major: string): Promis
 	await unwrap(commands.uninstallPackage(kind, major));
 }
 
-/** Subscribe to `php-install-log`. Same `IpcError` contract as {@link onServiceState}. */
+/** Subscribe to `php-install-log` — brew's own output, so the HOMEBREW route
+ *  only. Same `IpcError` contract as {@link onServiceState}. */
 export async function onPhpInstallLog(cb: (ev: PhpInstallLogEvent) => void): Promise<() => void> {
 	try {
 		return await events.phpInstallLogEvent.listen((e) => cb(e.payload));
+	} catch (e) {
+		throw normalizeError(e);
+	}
+}
+
+/** Subscribe to `php-install-progress` — one typed state per pipeline step on
+ *  the PACKAGED route, the mirror of {@link onMysqlInstallProgress}. Carries
+ *  `major`, unlike MariaDB's, because several PHP majors sit side by side and a
+ *  progress bar has to know which row it belongs to. Same `IpcError` contract as
+ *  {@link onServiceState}. */
+export async function onPhpInstallProgress(
+	cb: (ev: PhpInstallProgressEvent) => void
+): Promise<() => void> {
+	try {
+		return await events.phpInstallProgressEvent.listen((e) => cb(e.payload));
 	} catch (e) {
 		throw normalizeError(e);
 	}

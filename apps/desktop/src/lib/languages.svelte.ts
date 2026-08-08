@@ -7,12 +7,12 @@
 // rather than only on a button's `disabled` attribute — deleting that attribute
 // must leave a test failing, not just a UI regression nothing catches.
 import { errorMessage } from './errors';
-import type { InstallOutcomeDto, PhpEnvironmentDto } from './ipc';
+import type { PhpEnvironmentDto, PhpInstallOutcomeDto } from './ipc';
 
 export interface LanguagesApi {
 	phpEnvironment(): Promise<PhpEnvironmentDto>;
 	rescanPhpRuntimes(): Promise<PhpEnvironmentDto>;
-	installPhp(major: string): Promise<InstallOutcomeDto>;
+	installPhp(major: string): Promise<PhpInstallOutcomeDto>;
 }
 
 /** Same shape `LogPane.svelte` already renders (`services.svelte.ts`'s `UiLog`),
@@ -38,7 +38,11 @@ export class LanguagesStore {
 	installing = $state('');
 	log = $state<UiLog[]>([]);
 	error = $state('');
-	outcome = $state<InstallOutcomeDto | null>(null);
+	/** The last install attempt's outcome, whichever route it took (off-Homebrew
+	 *  slice 5C design D4). A TAGGED result, not a brew-shaped record: only
+	 *  `result.kind === 'brew'` carries an `exitCode`, because only that route
+	 *  runs a child process. */
+	outcome = $state<PhpInstallOutcomeDto | null>(null);
 
 	constructor(private api: LanguagesApi) {}
 
@@ -123,7 +127,9 @@ export class LanguagesStore {
 	}
 
 	/**
-	 * Install `major` via Homebrew. Always re-reads the environment with
+	 * Install `major` — the route (OpenVHost's own package tree, or Homebrew) is
+	 * decided server-side from the same table that fills a row's `offer`, so
+	 * nothing here dispatches on it. Always re-reads the environment with
 	 * {@link refresh} on success rather than assuming the row is now installed —
 	 * `detected` exists precisely because brew can exit 0 without the version
 	 * being found afterwards, and assuming would hide that.

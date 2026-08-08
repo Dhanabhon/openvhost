@@ -24,9 +24,10 @@ use openvhost_core::site::scaffold::{ScaffoldOutcome, ScaffoldStep, scaffold, sc
 // already ~8 200 lines); only the two DTOs a `MysqlInstanceDto` embeds are
 // named here.
 use crate::mysql_pkg::{MysqlPackageOfferDto, MysqlRuntimeSourceDto};
-// PHP's package surface likewise lives in its own sibling module; only the two
-// DTOs a `PhpRuntimeDto` embeds are named here.
-use crate::php_pkg::{PhpPackageOfferDto, PhpRuntimeSourceDto};
+// PHP's package surface likewise lives in its own sibling module; the two DTOs
+// a `PhpRuntimeDto` embeds and the tagged outcome `install_php` returns for
+// BOTH of its routes (design D4) are named here.
+use crate::php_pkg::{PhpInstallOutcomeDto, PhpPackageOfferDto, PhpRuntimeSourceDto};
 
 use crate::stack::StackPaths;
 
@@ -1849,19 +1850,6 @@ pub struct PhpEnvironmentDto {
     pub runtimes: Vec<PhpRuntimeDto>,
 }
 
-/// The outcome of an `install_php` call. `detected: false` alongside
-/// `exit_code: Some(0)` is the case that matters most: brew reporting success
-/// while no `php-fpm` appears afterwards is the silent-failure class this
-/// project keeps catching, so the DTO carries it explicitly rather than
-/// leaving the UI to infer it from an empty rescan.
-#[derive(Debug, Clone, serde::Serialize, specta::Type)]
-#[serde(rename_all = "camelCase")]
-pub struct InstallOutcomeDto {
-    pub major: String,
-    pub exit_code: Option<i32>,
-    pub detected: bool,
-}
-
 /// One line of `brew install`'s output, forwarded live while an install runs.
 /// Same shape and reasoning as [`ServiceLogEvent`] — see its declaration —
 /// except `major` names which install this line belongs to, and `stream` is
@@ -2462,6 +2450,17 @@ impl From<PackageOperation> for PackageOperationDto {
     }
 }
 
+/// The `(kind, operation)` pair a PHP **install** run is tagged with — either
+/// route — and the same pair [`crate::php_pkg::cancel_php_install`] fires on.
+///
+/// One definition rather than the two inline spellings this used to have, for
+/// the audit F1 reason [`MYSQL_INSTALL_RUN`] gives at length: the button and the
+/// run it is meant to stop cannot drift apart if they read the same value.
+/// `InstallKind::Php` is what keeps a PHP install out of `cancel_mysql_install`'s
+/// and `cancel_mariadb_install`'s reach and vice versa.
+pub(crate) const PHP_INSTALL_RUN: (InstallKind, PackageOperation) =
+    (InstallKind::Php, PackageOperation::Install);
+
 /// The `(kind, operation)` pair a MySQL **install** run is tagged with, and the
 /// same pair the Databases page's Cancel button
 /// ([`crate::mysql_pkg::cancel_mysql_install`]) fires on.
@@ -2703,14 +2702,28 @@ pub async fn pending_install(
         }))
 }
 
-/// Install a PHP major via Homebrew, streaming its output live, then rescan
-/// so the freshly installed version (if it appears) gets a supervisor row.
+/// Install a PHP major — from OpenVHost's own package tree when this build
+/// publishes one for that major on this host, and via Homebrew otherwise
+/// (off-Homebrew slice 5C design D4).
+///
+/// **One command, one routing rule.** The alternative — two commands with the
+/// page dispatching on the row's `offer` — was rejected because it puts the rule
+/// in two places, which is the cross-file constant-pair shape this project has
+/// been bitten by, and because it makes D4's own sentence ("the frontend does
+/// not re-derive the rule") false. The route is decided HERE, by re-reading
+/// `php_pkg::package_offer` — the same compiled-in table that filled the row's
+/// `offer` field — so no argument a caller can supply chooses a pipeline.
+///
+/// **On every real machine today this is the Homebrew route**, unchanged: every
+/// offer this build can make is `AwaitingRelease` or `Unavailable`, and
+/// `php_pkg::route_for` sends both to Homebrew (spec §8.5 corrected, §8.6).
 ///
 /// Every argument that reaches `brew`'s argv is validated or derived from
 /// managed state before this function does anything observable: `major` is
 /// parsed and checked against the catalogue allowlist, `brew` is located by
 /// absolute path (never `PATH`), and `brew_install_spec` itself refuses a
-/// non-absolute `brew` path.
+/// non-absolute `brew` path. The packaged route reaches no argv at all — its URL
+/// and hash come only from `openvhost_core::PHP_PACKAGES`.
 #[tauri::command]
 #[specta::specta]
 pub async fn install_php(
@@ -2720,7 +2733,7 @@ pub async fn install_php(
     paths: tauri::State<'_, Option<StackPaths>>,
     sup: tauri::State<'_, Arc<Supervisor>>,
     lock: tauri::State<'_, InstallLock>,
-) -> Result<InstallOutcomeDto, IpcError> {
+) -> Result<PhpInstallOutcomeDto, IpcError> {
     // Both guard layers, before anything else happens.
     let major = openvhost_core::PhpMajor::parse(&major)?;
 
@@ -2735,6 +2748,52 @@ pub async fn install_php(
 
     let p = stack_paths(&paths)?;
 
+    // A compiled-in table lookup — nothing spawned, nothing fetched — so its
+    // position ahead of the Homebrew route's own checks changes nothing
+    // observable about that route. Matched exhaustively; a third route would
+    // have to be handled here rather than inherited.
+    let result = match crate::php_pkg::route_for(&crate::php_pkg::package_offer(major.as_str())) {
+        crate::php_pkg::PhpInstallRoute::Package => {
+            crate::php_pkg::run_package_install(
+                &app,
+                &major,
+                p,
+                lock.inner(),
+                runtimes.inner(),
+                sup.inner(),
+            )
+            .await?
+        }
+        crate::php_pkg::PhpInstallRoute::Homebrew => {
+            run_brew_install(&app, &major, p, lock.inner(), runtimes.inner(), sup.inner()).await?
+        }
+    };
+
+    Ok(PhpInstallOutcomeDto {
+        major: major.as_str().to_string(),
+        result,
+    })
+}
+
+/// The Homebrew half of [`install_php`], moved out of it verbatim when the
+/// routing arrived and otherwise untouched (spec §8.6: nothing changes on a
+/// machine with Homebrew and no package tree).
+///
+/// Everything below — the already-installed refusal, the `find_brew` message and
+/// the paths it lists, `brew_install_spec`'s own refusal, the live
+/// `PhpInstallLogEvent` pump, the spawn-then-record-then-await ordering, the
+/// seeded `detected`, and the rescan on a non-zero exit — is the code that was
+/// here before, with the same errors on the same conditions.
+///
+/// The one deliberate change is the cancelled arm; see it for why.
+async fn run_brew_install(
+    app: &tauri::AppHandle,
+    major: &openvhost_core::PhpMajor,
+    p: &StackPaths,
+    lock: &InstallLock,
+    runtimes: &RwLock<Option<InstalledRuntimes>>,
+    sup: &Supervisor,
+) -> Result<crate::php_pkg::PhpInstallResultDto, IpcError> {
     let before: Vec<String> = runtimes
         .read()
         .map_err(|_| IpcError::Core {
@@ -2760,7 +2819,7 @@ pub async fn install_php(
     // Returns Result: it refuses a non-absolute brew path, because composing
     // PATH from one yields an empty leading component and exec resolves that
     // as the working directory.
-    let spec = openvhost_core::brew_install_spec(&brew, &major)?;
+    let spec = openvhost_core::brew_install_spec(&brew, major)?;
     let (tx, mut rx) = tokio::sync::mpsc::channel(256);
 
     // Forward brew's output as it arrives, so a long install is visibly
@@ -2800,9 +2859,10 @@ pub async fn install_php(
         tx,
     ));
     let abort_handle = install_task.abort_handle();
-    lock.inner().set_running(
-        InstallKind::Php,
-        PackageOperation::Install,
+    let (kind, operation) = PHP_INSTALL_RUN;
+    lock.set_running(
+        kind,
+        operation,
         major.as_str().to_string(),
         abort_handle.clone(),
     );
@@ -2811,22 +2871,30 @@ pub async fn install_php(
     // for why that is a `Drop` impl and not a matching call at each return
     // point, and why it aborts rather than merely clearing the slot.
     let _running_guard = RunningInstallGuard {
-        lock: lock.inner(),
+        lock,
         abort: abort_handle,
     };
 
     let exit_code = match install_task.await {
         Ok(result) => result?,
-        // Aborted by `perform_quit`: the task's future was genuinely dropped
-        // (so `KillOnDrop` ran and brew's process group is gone), and this
-        // command has nothing left to report but that it did not finish.
+        // The task's future was genuinely dropped, so `KillOnDrop` ran and
+        // brew's process group is gone.
+        //
+        // THE ONE DELIBERATE CHANGE to this route (spec §8.6). This used to
+        // return `Err(IpcError::Proc("… because the app is quitting"))`, which
+        // was true when `perform_quit` was the only thing that could abort a PHP
+        // run. `cancel_php_install` is a second cause as of this slice, and that
+        // message would be a plain lie for it. `Cancelled` is true of both
+        // causes, and it is what the MySQL and MariaDB installs already return
+        // for the identical event. Nothing observable moves during a quit — the
+        // window is being destroyed as this resolves — so the change is confined
+        // to the cause that did not exist before.
         Err(join_err) if join_err.is_cancelled() => {
-            return Err(IpcError::Proc {
-                message: "the install was aborted because the app is quitting".into(),
-            });
+            return Ok(crate::php_pkg::PhpInstallResultDto::Cancelled);
         }
         // Any other join failure (a panic inside `run_task`) is not this
-        // command's fault to hide.
+        // command's fault to hide. Left as a thrown error, unchanged: no new
+        // cause reaches it, so nothing justifies moving it.
         Err(join_err) => {
             return Err(IpcError::Proc {
                 message: format!("the install task ended unexpectedly: {join_err}"),
@@ -2845,15 +2913,14 @@ pub async fn install_php(
     // version probe instead is what made a successful `brew install mysql@8.4`
     // report failure: the probe was killed at its 5 s bound during macOS's
     // ~11.5 s first-run scan of the new binary, every single time.
-    let seed = openvhost_core::php_runtime_for_major(&brew_prefixes(), &major);
+    let seed = openvhost_core::php_runtime_for_major(&brew_prefixes(), major);
     let detected = seed.is_some();
     // Seeded so the MANAGED state and the supervisor row are right too, not
     // just the answer: the apply pipeline reads that list, so a version missing
     // from it is a version sites cannot be applied against.
-    rescan_into_state(runtimes.inner(), sup.inner(), p, seed).await?;
+    rescan_into_state(runtimes, sup, p, seed).await?;
 
-    Ok(InstallOutcomeDto {
-        major: major.as_str().to_string(),
+    Ok(crate::php_pkg::PhpInstallResultDto::Brew {
         exit_code,
         detected,
     })
@@ -4183,6 +4250,86 @@ mod php_ipc_tests {
         let lock = InstallLock::default();
         let (kind, operation) = MYSQL_INSTALL_RUN;
         assert!(!lock.abort_running_if(kind, operation));
+    }
+
+    /// The same audit F1 guarantee for PHP's own Cancel
+    /// ([`crate::php_pkg::cancel_php_install`], off-Homebrew slice 5C): it
+    /// aborts a PHP install and nothing else.
+    ///
+    /// PHP is the case where the pair check earns its keep twice over, because
+    /// PHP is the one engine with TWO install routes — `install_php` tags both
+    /// with [`PHP_INSTALL_RUN`], so one cancel covers a `brew install` and a
+    /// packaged download alike, while still leaving a MySQL install, a MariaDB
+    /// install, a MySQL init and PHP's own uninstall untouched.
+    #[tokio::test]
+    async fn a_php_install_cancel_aborts_only_a_php_install() {
+        let (cancel_kind, cancel_operation) = PHP_INSTALL_RUN;
+
+        // The positive case first, so the refusals below cannot pass by
+        // aborting nothing whatsoever.
+        let lock = InstallLock::default();
+        let task = tokio::spawn(std::future::pending::<()>());
+        lock.set_running(
+            cancel_kind,
+            cancel_operation,
+            "8.4".to_string(),
+            task.abort_handle(),
+        );
+        assert!(
+            lock.abort_running_if(cancel_kind, cancel_operation),
+            "the cancel must report that it stopped the PHP install it named"
+        );
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the run did not settle after the cancel fired");
+        match result {
+            Err(join_err) => assert!(join_err.is_cancelled(), "got {join_err:?}"),
+            Ok(()) => panic!("the cancel returned true but the run ran to completion"),
+        }
+
+        // `(Php, Uninstall)` differs only in operation and `(Mysql, Install)`
+        // only in kind, so a check that dropped either discriminator fails
+        // here.
+        for (kind, operation) in [
+            (InstallKind::Php, PackageOperation::Uninstall),
+            MYSQL_INSTALL_RUN,
+            MYSQL_INIT_RUN,
+            MARIADB_INSTALL_RUN,
+            MARIADB_INIT_RUN,
+        ] {
+            let lock = InstallLock::default();
+            let mut task = tokio::spawn(std::future::pending::<()>());
+            lock.set_running(kind, operation, "occupant".to_string(), task.abort_handle());
+
+            assert!(
+                !lock.abort_running_if(cancel_kind, cancel_operation),
+                "a PHP-install cancel claimed it stopped a {kind:?}/{operation:?} run"
+            );
+            assert!(
+                still_running(&mut task).await,
+                "a PHP-install cancel ABORTED a {kind:?}/{operation:?} run"
+            );
+            task.abort();
+        }
+    }
+
+    /// PHP's pair must be a genuinely different VALUE from every other engine's
+    /// — the audit F1 lesson stated as the value it turns on, not as behaviour.
+    /// Had `PHP_INSTALL_RUN` been spelled with another kind, the loop above
+    /// would still pass while `cancel_mysql_install` silently gained the power
+    /// to kill a PHP install.
+    #[test]
+    fn a_php_install_is_not_tagged_as_any_other_engines_run() {
+        for other in [
+            MYSQL_INSTALL_RUN,
+            MYSQL_INIT_RUN,
+            MARIADB_INSTALL_RUN,
+            MARIADB_INIT_RUN,
+        ] {
+            assert_ne!(PHP_INSTALL_RUN, other, "PHP shares a pair with {other:?}");
+        }
+        assert_eq!(PHP_INSTALL_RUN.0, InstallKind::Php);
+        assert_eq!(PHP_INSTALL_RUN.1, PackageOperation::Install);
     }
 }
 

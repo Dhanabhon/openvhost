@@ -179,16 +179,47 @@ export const commands = {
 	 */
 	rescanPhpRuntimes: () => typedError<PhpEnvironmentDto, IpcError>(__TAURI_INVOKE("rescan_php_runtimes")),
 	/**
-	 *  Install a PHP major via Homebrew, streaming its output live, then rescan
-	 *  so the freshly installed version (if it appears) gets a supervisor row.
+	 *  Install a PHP major — from OpenVHost's own package tree when this build
+	 *  publishes one for that major on this host, and via Homebrew otherwise
+	 *  (off-Homebrew slice 5C design D4).
+	 * 
+	 *  **One command, one routing rule.** The alternative — two commands with the
+	 *  page dispatching on the row's `offer` — was rejected because it puts the rule
+	 *  in two places, which is the cross-file constant-pair shape this project has
+	 *  been bitten by, and because it makes D4's own sentence ("the frontend does
+	 *  not re-derive the rule") false. The route is decided HERE, by re-reading
+	 *  `php_pkg::package_offer` — the same compiled-in table that filled the row's
+	 *  `offer` field — so no argument a caller can supply chooses a pipeline.
+	 * 
+	 *  **On every real machine today this is the Homebrew route**, unchanged: every
+	 *  offer this build can make is `AwaitingRelease` or `Unavailable`, and
+	 *  `php_pkg::route_for` sends both to Homebrew (spec §8.5 corrected, §8.6).
 	 * 
 	 *  Every argument that reaches `brew`'s argv is validated or derived from
 	 *  managed state before this function does anything observable: `major` is
 	 *  parsed and checked against the catalogue allowlist, `brew` is located by
 	 *  absolute path (never `PATH`), and `brew_install_spec` itself refuses a
-	 *  non-absolute `brew` path.
+	 *  non-absolute `brew` path. The packaged route reaches no argv at all — its URL
+	 *  and hash come only from `openvhost_core::PHP_PACKAGES`.
 	 */
-	installPhp: (major: string) => typedError<InstallOutcomeDto, IpcError>(__TAURI_INVOKE("install_php", { major })),
+	installPhp: (major: string) => typedError<PhpInstallOutcomeDto, IpcError>(__TAURI_INVOKE("install_php", { major })),
+	/**
+	 *  Cancel an in-flight PHP install, if one is running.
+	 * 
+	 *  **Kind- and operation-checked**, exactly like `cancel_mariadb_install` and
+	 *  `cancel_mysql_install`: the check and the abort happen under one
+	 *  `InstallLock::abort_running_if` acquisition, so the slot cannot change in
+	 *  between, and both discriminators must match. That is the audit F1 guarantee
+	 *  — a run tagged with another engine's pair would be abortable from the wrong
+	 *  button — and [`PHP_INSTALL_RUN`] is what makes PHP's pair a genuinely
+	 *  different value rather than an identical one wearing a different label.
+	 * 
+	 *  Cancels **either** route: a PHP install occupies one slot whichever pipeline
+	 *  it took. Dropping the future is the cancel in both cases — for the packaged
+	 *  route the staging directory unwinds with it, and for the Homebrew route
+	 *  `run_task`'s `KillOnDrop` takes brew's whole process group down.
+	 */
+	cancelPhpInstall: () => typedError<boolean, IpcError>(__TAURI_INVOKE("cancel_php_install")),
 	/**
 	 *  Whatever is currently installing or initializing, if anything — for the
 	 *  quit dialog: a build/init in progress is invisible to
@@ -452,6 +483,7 @@ export const events = {
 	mysqlInstallLogEvent: makeEvent<MysqlInstallLogEvent>("mysql-install-log-event"),
 	mysqlInstallProgressEvent: makeEvent<MysqlInstallProgressEvent>("mysql-install-progress-event"),
 	phpInstallLogEvent: makeEvent<PhpInstallLogEvent>("php-install-log-event"),
+	phpInstallProgressEvent: makeEvent<PhpInstallProgressEvent>("php-install-progress-event"),
 	quitRequestedEvent: makeEvent<QuitRequestedEvent>("quit-requested-event"),
 	serviceLogEvent: makeEvent<ServiceLogEvent>("service-log-event"),
 	serviceRegisteredEvent: makeEvent<ServiceRegisteredEvent>("service-registered-event"),
@@ -598,19 +630,6 @@ export type HomeUsageDto = {
  *  discriminator for `InstallLock`'s slot.
  */
 export type InstallKindDto = "php" | "mysql" | "mariadb";
-
-/**
- *  The outcome of an `install_php` call. `detected: false` alongside
- *  `exit_code: Some(0)` is the case that matters most: brew reporting success
- *  while no `php-fpm` appears afterwards is the silent-failure class this
- *  project keeps catching, so the DTO carries it explicitly rather than
- *  leaving the UI to infer it from an empty rescan.
- */
-export type InstallOutcomeDto = {
-	major: string,
-	exitCode: number | null,
-	detected: boolean,
-};
 
 /**
  *  Serializable command error (spec §7.2). Establishes the pattern:
@@ -1328,6 +1347,133 @@ export type PhpInstallLogEvent = {
 	stream: string,
 	line: string,
 };
+
+/**
+ *  `install_php`'s return: the major it was for, and how it ended.
+ * 
+ *  `major` sits OUTSIDE the result union because every consumer needs it to
+ *  attribute the outcome to a row, on every branch — the same reasoning
+ *  `mysql_pkg::MysqlInstallOutcomeDto` states for its own copy, and the reason
+ *  PHP follows MySQL here rather than MariaDB (which ships one series and so
+ *  has nothing to attribute).
+ */
+export type PhpInstallOutcomeDto = {
+	major: string,
+	result: PhpInstallResultDto,
+};
+
+/**
+ *  One step of the packaged install pipeline, as the user watches it — the wire
+ *  copy of `openvhost_pkg::Progress`, identical in shape to
+ *  `mysql_pkg::MysqlInstallProgressDto` and `mariadb_pkg`'s (the pipeline
+ *  itself is shared). Kept as its own type rather than reused, mirroring every
+ *  other per-engine DTO in this app: the wire shapes must be able to diverge
+ *  without an edit to one silently reaching the others.
+ * 
+ *  Emitted only on the [`PhpInstallRoute::Package`] route. The Homebrew route
+ *  still streams `commands::PhpInstallLogEvent` — brew's own output — and this
+ *  slice does not touch it.
+ */
+export type PhpInstallProgressDto = { kind: "started"; total: number | null } | { kind: "downloaded"; bytes: number } | 
+/**
+ *  Its own variant, never folded into `Extracted`: golden rule 6 makes
+ *  SHA-256 verification a requirement, and a requirement the UI cannot
+ *  distinguish structurally is one a substring match on prose would
+ *  "prove".
+ */
+{ kind: "verified" } | { kind: "extracted" } | { kind: "linked" };
+
+/**
+ *  One pipeline step, forwarded live while a packaged install runs.
+ * 
+ *  Carries `major`, unlike [`crate::mariadb_pkg::MariadbInstallProgressEvent`]
+ *  and exactly like `mysql_pkg::MysqlInstallProgressEvent`: MariaDB ships one
+ *  series so a field nothing can vary would be overhead, while PHP's whole
+ *  point is several majors side by side and a progress bar has to know which
+ *  row it belongs to.
+ */
+export type PhpInstallProgressEvent = {
+	major: string,
+	tsMs: number,
+	progress: PhpInstallProgressDto,
+};
+
+/**
+ *  How one `install_php` call ended — **both routes, one union** (design D4).
+ * 
+ *  The two families are deliberately not interchangeable:
+ * 
+ *  * [`Self::Brew`] is the only arm carrying an `exit_code`, because it is the
+ *    only arm with a child process. Everything the Homebrew route reported
+ *    before this slice is here, unchanged and under one tag.
+ *  * Every other arm is the package pipeline's. A verification failure, a
+ *    stall, an unpublished release and an unsupported host are **states of the
+ *    result**, never thrown errors: throwing them would discard exactly the
+ *    distinction `PhpPackageOfferDto`'s three states exist to make.
+ * 
+ *  Note what [`Self::Installed`] does NOT have: an exit code. That absence is
+ *  the fix — see this module's own doc comment for the render it prevents.
+ */
+export type PhpInstallResultDto = 
+/**
+ *  `brew install php@<major>` ran to completion (cleanly or not).
+ * 
+ *  **The per-variant `rename_all` is load-bearing, not decoration.** On an
+ *  enum, serde's container-level `rename_all` renames the VARIANTS and not
+ *  their fields, so `exit_code` reached the webview as `exit_code` while
+ *  every hand-written consumer read `exitCode` — the same snake_case seam
+ *  that made `fieldErrors` mark nothing. Every sibling result enum in this
+ *  app happens to have single-word fields only, so this is the first place
+ *  it could bite. `the_wire_uses_camel_case_keys_everywhere` is what keeps
+ *  it fixed; deleting this attribute reddens it.
+ * 
+ *  `exit_code` is brew's own, and `None` means it was killed by a signal
+ *  rather than exiting — "not a clean exit", which is what makes
+ *  `exitCode !== 0` the right test HERE and the wrong test anywhere else.
+ * 
+ *  `detected` answers the silent-failure case this project keeps catching:
+ *  brew reporting success while no `php-fpm` appears afterwards. It comes
+ *  from a stat of the formula directory brew was asked to create, never
+ *  from a version probe — deriving it from a probe is what made a
+ *  successful `brew install mysql@8.4` report failure.
+ */
+{ kind: "brew"; exitCode: number | null; detected: boolean } | 
+/**
+ *  The packaged route finished: the tree is on disk and `current` points at
+ *  it. `version` is the exact patch level the catalogue pinned.
+ */
+{ kind: "installed"; version: string; detected: boolean; ledger: PhpLedgerWriteDto } | { kind: "alreadyInstalled"; version: string } | 
+/**
+ *  The run's future was dropped — `cancel_php_install`, or `perform_quit`
+ *  on the way out. Staging unwound with it, so this is a plain "nothing
+ *  happened", not a failure to explain away.
+ */
+{ kind: "cancelled" } | { kind: "verificationFailed"; expected: string; actual: string } | { kind: "stalled"; detail: string } | 
+/**
+ *  The pinned build exists but the release that would serve it has not been
+ *  published — see [`PhpPackageOfferDto::AwaitingRelease`]. `tag` is the
+ *  release a human has to create.
+ * 
+ *  [`route_for`] sends an `AwaitingRelease` OFFER to Homebrew, so reaching
+ *  this arm means the catalogue changed under a run in flight. It is
+ *  classified rather than flattened anyway: `install_php_package` refuses
+ *  with `CoreError::PackageNotPublished` before any network or filesystem
+ *  work, and that refusal must survive the trip to the webview as itself.
+ */
+{ kind: "awaitingRelease"; tag: string } | { kind: "unavailable"; target: string } | { kind: "failed"; reason: string };
+
+/**
+ *  Whether a packaged install was also recorded in `state.db`'s package ledger
+ *  — the PHP mirror of `mariadb_pkg::MariadbLedgerWriteDto`, over the same
+ *  `openvhost_core::mysql::LedgerWrite` (the ledger is package-agnostic), so
+ *  only the WIRE type is duplicated and not the underlying model.
+ * 
+ *  A state rather than a boolean, for the reason its Rust counterpart is one:
+ *  the failure carries a reason worth showing. The package is installed either
+ *  way — the tree is the inventory — so a failed row costs provenance, never
+ *  correctness.
+ */
+export type PhpLedgerWriteDto = { kind: "recorded" } | { kind: "failed"; reason: string };
 
 /**
  *  Whether this build can install a given PHP major from its own package tree

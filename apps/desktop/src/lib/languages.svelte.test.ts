@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, expect, it } from 'vitest';
 import { LanguagesStore, type LanguagesApi } from './languages.svelte';
-import type { InstallOutcomeDto, PhpEnvironmentDto, PhpRuntimeDto } from './ipc';
+import type { PhpEnvironmentDto, PhpInstallOutcomeDto, PhpRuntimeDto } from './ipc';
 
 /** One catalogue/installed row, with sensible installed-shape defaults so most
  *  tests only need to state `major` and `installed`. */
@@ -37,16 +37,24 @@ function env(runtimes: PhpRuntimeDto[]): PhpEnvironmentDto {
 	return { brewFound: true, brewSearched: ['/opt/homebrew/bin/brew'], runtimes };
 }
 
+/** A clean Homebrew install of `major` — the route every real machine takes
+ *  today, and the only arm of `PhpInstallResultDto` that carries an exit code
+ *  (off-Homebrew slice 5C design D4). The packaged arms are unreachable while
+ *  every offer this build can make is `AwaitingRelease` or `Unavailable`. */
+function brewOutcome(major: string): PhpInstallOutcomeDto {
+	return { major, result: { kind: 'brew', exitCode: 0, detected: true } };
+}
+
 /** A `LanguagesApi` fake. `env`/`outcome` overrides are shared by every call
  *  that needs one — the tests that need per-call behaviour (a counter, a
  *  delay) construct the api object directly instead of going through this. */
 function api(
-	overrides: { env?: PhpEnvironmentDto; outcome?: InstallOutcomeDto } = {}
+	overrides: { env?: PhpEnvironmentDto; outcome?: PhpInstallOutcomeDto } = {}
 ): LanguagesApi {
 	return {
 		phpEnvironment: async () => overrides.env ?? env([]),
 		rescanPhpRuntimes: async () => overrides.env ?? env([]),
-		installPhp: async () => overrides.outcome ?? { major: '', exitCode: 0, detected: true }
+		installPhp: async () => overrides.outcome ?? brewOutcome('')
 	};
 }
 
@@ -75,7 +83,7 @@ describe('LanguagesStore', () => {
 	});
 
 	it('marks which version is installing and clears it when done', async () => {
-		const s = new LanguagesStore(api({ outcome: { major: '8.4', exitCode: 0, detected: true } }));
+		const s = new LanguagesStore(api({ outcome: brewOutcome('8.4') }));
 		const p = s.install('8.4');
 		expect(s.installing).toBe('8.4');
 		expect(await p).toBe(true);
@@ -90,7 +98,7 @@ describe('LanguagesStore', () => {
 			installPhp: async () => {
 				calls += 1;
 				await new Promise((r) => setTimeout(r, 5));
-				return { major: '8.4', exitCode: 0, detected: true };
+				return brewOutcome('8.4');
 			}
 		});
 		await Promise.all([s.install('8.4'), s.install('8.3')]);
@@ -156,7 +164,7 @@ describe('LanguagesStore', () => {
 				throw { kind: 'core', message: 'transient' };
 			},
 			rescanPhpRuntimes: async () => env([]),
-			installPhp: async () => ({ major: '8.3', exitCode: 0, detected: true })
+			installPhp: async () => brewOutcome('8.3')
 		});
 		await s.refresh();
 		await s.refresh();
@@ -176,7 +184,7 @@ describe('LanguagesStore', () => {
 				if (calls === 1) return env([row('8.3', true)]);
 				throw { kind: 'core', message: 'transient' };
 			},
-			installPhp: async () => ({ major: '8.3', exitCode: 0, detected: true })
+			installPhp: async () => brewOutcome('8.3')
 		});
 		await s.rescan();
 		await s.rescan();
@@ -194,7 +202,7 @@ describe('LanguagesStore', () => {
 				return env([row('8.4', calls > 1)]);
 			},
 			rescanPhpRuntimes: async () => env([row('8.4', true)]),
-			installPhp: async () => ({ major: '8.4', exitCode: 0, detected: true })
+			installPhp: async () => brewOutcome('8.4')
 		});
 		await s.refresh();
 		expect(s.env?.runtimes[0].installed).toBe(false);
