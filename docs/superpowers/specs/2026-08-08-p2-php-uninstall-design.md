@@ -125,6 +125,26 @@ Retiring the Homebrew paths (slice 7) · publishing any release (owner-gated, de
 `Availability`-per-engine duplication (recorded in 5C §9) · the `install_mysql`/`install_mariadb`
 `State<Db>` hazard (filed separately).
 
+**Owed at the first version bump, not before** (found by T2, decided by neither of us): if a major
+ever holds **two** version directories, removing the `current` one and clearing the link leaves the
+sibling behind — and `looks_like_a_broken_install` counts any entry, so discovery would report the
+major as an install it cannot identify. Unreachable today: `PHP_PACKAGES` pins one version and
+`install_package` refuses a duplicate version directory. It becomes reachable the moment the pin
+moves.
+
+The two candidate answers are *remove the whole major directory* and *repoint `current` at the
+newest sibling*, and which is right depends on an **upgrade flow that does not exist yet**. My
+leaning, recorded so it is not re-derived from scratch: the Languages row is **per major**, so
+"Uninstall PHP 8.4" most honestly means the major — but an upgrade path may want the sibling kept,
+and that decision belongs with whoever designs it.
+
+**A Windows stub is owed.** `remove_current_link` on `openvhost-pkg`'s platform facade is
+implemented for unix and returns `Unsupported` on Windows, with the intended shape documented
+beside the existing `update_current` (verify reparse point → `fs::remove_dir`, never
+`remove_dir_all`). This extends a seam that already had this shape rather than inventing a new
+abstraction, which is why it did not need both platform specialists up front — but the
+implementation is a hand-off, consistent with the macOS-first scope decision.
+
 **Carried forward, still owed before any `availability` flips:** hash-confirm the served bytes ·
 the `awaiting_release_is_the_only_non_absence_offer…` tripwire is a re-audit signal, not a test to
 update · the mixed-offer page has no `brew.sh` control · the packaged install has no
