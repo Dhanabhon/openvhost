@@ -29,3 +29,20 @@ pub(crate) fn update_current(link: &Path, version: &str) -> Result<(), PkgError>
         windows::update_current(link, version)
     }
 }
+
+/// Remove `link` (…/current) itself, never what it points at.
+///
+/// The counterpart of [`update_current`], and per-OS for the same reason: unix
+/// unlinks a symlink with `remove_file`, while a Windows junction is a
+/// directory reparse point and needs `remove_dir`. A caller that reached for
+/// `std::fs::remove_file` directly would compile on both and be wrong on one.
+pub(crate) fn remove_current(link: &Path) -> Result<(), PkgError> {
+    #[cfg(unix)]
+    {
+        unix::remove_current(link)
+    }
+    #[cfg(windows)]
+    {
+        windows::remove_current(link)
+    }
+}

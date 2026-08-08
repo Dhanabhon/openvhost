@@ -16,3 +16,16 @@ pub(crate) fn update_current(_link: &Path, _version: &str) -> Result<(), PkgErro
         "current-link on Windows is not implemented in v1 (macOS-first)".to_string(),
     ))
 }
+
+/// macOS-first v1: the removal half of the same deferred capability. The
+/// Windows shape is `fs::remove_dir` on the junction — **never**
+/// `remove_dir_all`, whose blast radius here is the real package payload
+/// (S22) — after verifying the entry is a reparse point rather than a real
+/// directory. Deliberately NOT written here; an explicit error so a Windows
+/// build fails loudly at the link step instead of pretending a link was
+/// removed and leaving discovery reporting a broken install.
+pub(crate) fn remove_current(_link: &Path) -> Result<(), PkgError> {
+    Err(PkgError::Unsupported(
+        "current-link on Windows is not implemented in v1 (macOS-first)".to_string(),
+    ))
+}

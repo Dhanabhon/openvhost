@@ -20,4 +20,9 @@ mod testkit;
 
 pub use error::PkgError;
 pub use install::install_package;
+/// The removal half of `current`-link maintenance, under the name a caller
+/// outside this crate reads it by. The installer's `update_current` stays
+/// private — it is only ever called by [`install_package`] — but an uninstall
+/// lives elsewhere and still must not spell a per-OS link removal by hand.
+pub use layout::remove_current as remove_current_link;
 pub use request::{ArchiveFormat, InstallRequest, InstalledPackage, PackagesRoot, Progress};

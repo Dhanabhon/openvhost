@@ -173,6 +173,21 @@ pub(crate) fn update_current(link: &Path, version_dir_name: &str) -> Result<(), 
     platform::update_current(link, version_dir_name)
 }
 
+/// Remove `link` (…/current) itself — the link, never its target.
+///
+/// `pub`, unlike [`update_current`]: the only writer of a `current` link is
+/// this crate's own installer, but the only *remover* is an uninstall living
+/// outside it, and a caller that spelled `std::fs::remove_file` by hand would
+/// compile on Windows and be wrong there (a junction is a directory reparse
+/// point). Re-exported as `remove_current_link` — the qualified name a caller
+/// reads without this module's context.
+///
+/// Refuses anything that is not a link, and treats an absent link as done. See
+/// the per-OS implementations for both rules.
+pub fn remove_current(link: &Path) -> Result<(), PkgError> {
+    platform::remove_current(link)
+}
+
 fn already_installed(name: &str, version: &str) -> PkgError {
     PkgError::AlreadyInstalled {
         name: name.to_string(),
@@ -306,6 +321,69 @@ mod tests {
             update_current(&link, "8.4.1"),
             Err(PkgError::Unsupported(_))
         ));
+    }
+
+    /// The removal half, and the property that makes it safe to call from an
+    /// uninstall: the LINK goes, the directory it named does not.
+    ///
+    /// VACUITY: neutered by having `platform::unix::remove_current` call
+    /// `fs::remove_dir_all(link)` instead of `fs::remove_file(link)` — the
+    /// second assertion then failed, because that call follows the link and
+    /// takes the version directory's contents with it.
+    #[cfg(unix)]
+    #[test]
+    fn removing_current_removes_the_link_and_never_its_target() {
+        let (_h, r) = root();
+        let major = r.major_dir("php", "8.4");
+        let version = major.join("8.4.1");
+        std::fs::create_dir_all(&version).unwrap();
+        std::fs::write(version.join("marker"), b"payload").unwrap();
+        let link = r.current_link("php", "8.4");
+        update_current(&link, "8.4.1").unwrap();
+
+        remove_current(&link).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link).is_err(),
+            "the link itself must be gone"
+        );
+        assert_eq!(
+            std::fs::read(version.join("marker")).unwrap(),
+            b"payload",
+            "the version directory the link named must survive"
+        );
+    }
+
+    /// The S22 refusal, on the removal side. A real directory sitting where
+    /// `current` belongs is the one shape whose removal would destroy a
+    /// payload, so it is refused rather than deleted — the same rule
+    /// `current_refuses_to_replace_real_dir` pins for the write side.
+    #[cfg(unix)]
+    #[test]
+    fn removing_current_refuses_a_real_directory() {
+        let (_h, r) = root();
+        let link = r.current_link("php", "8.4");
+        std::fs::create_dir_all(&link).unwrap();
+        std::fs::write(link.join("inside"), b"x").unwrap();
+
+        assert!(matches!(
+            remove_current(&link),
+            Err(PkgError::Unsupported(_))
+        ));
+        assert!(
+            link.join("inside").is_file(),
+            "nothing inside it may be touched either"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removing_an_absent_current_is_not_an_error() {
+        let (_h, r) = root();
+        // The post-state is exactly what was asked for, so this is done, not
+        // failed — the same reading the uninstall executor gives an already
+        // missing pool config.
+        remove_current(&r.current_link("php", "8.4")).unwrap();
     }
 
     #[test]

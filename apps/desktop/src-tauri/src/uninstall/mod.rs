@@ -184,6 +184,88 @@ pub struct UninstallPlan {
     pub blockers: Vec<Blocker>,
 }
 
+/// What OpenVHost's OWN package tree holds for the target an uninstall names —
+/// runtime state, resolved by the caller and handed to the pure half.
+///
+/// The exact counterpart of [`KegProvenance`], and for the same reason
+/// (off-Homebrew slice 5D design D1). [`inventory`] must not stat anything: a
+/// destructive operation whose plan was recomputed against the disk at
+/// execution time could show a dialog saying it removes X while the executor
+/// removes Y. So the two filesystem reads this needs — which version directory
+/// `current` selects, and whether Homebrew also has this major — happen in
+/// [`Target::packaged`], and only the ANSWER crosses into the plan.
+///
+/// `Some(_)` means the row the user pressed Uninstall on is ours; `None` means
+/// it is Homebrew's, which is every machine that has never installed a
+/// packaged PHP and is therefore today's behaviour, unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PackagedPhp {
+    /// The CONCRETE version directory — `packages/php/8.4/8.4.24`, never
+    /// `packages/php/8.4/current` (design D4). `current` is a link whose target
+    /// can move; recording it would mean the directory the dialog named and the
+    /// directory `run`'s `remove_dir_all` reaches are two different questions
+    /// asked at two different moments.
+    pub(crate) version_dir: PathBuf,
+    /// The Homebrew keg for the SAME major, which this uninstall LEAVES ALONE
+    /// (design D3), or `None` when Homebrew has no PHP under this major.
+    ///
+    /// A machine can have both, and discovery shows one row — ours. Removing
+    /// both would destroy more than that row described; removing ours in
+    /// silence would leave a rescan still showing the major, which a user would
+    /// reasonably read as "the uninstall failed". So it is named under
+    /// [`UninstallPlan::keeps`], which exists for exactly this.
+    pub(crate) brew_keg: Option<PathBuf>,
+}
+
+/// The Homebrew prefixes to search, in `openvhost-core`'s own order (Apple
+/// Silicon before Intel) so this module classifies a keg against the same
+/// installation discovery would run.
+///
+/// A function rather than a `const`: `openvhost_core::BREW_PREFIXES` is an
+/// array of `&'static str`, and turning it into `&Path`s requires dereferencing
+/// each element — `.map(Path::new)` over `.iter()` would borrow the temporary
+/// array instead, which is why the two call sites here cannot simply share a
+/// static.
+fn brew_prefixes() -> Vec<&'static Path> {
+    openvhost_core::BREW_PREFIXES
+        .iter()
+        .map(|p| Path::new(*p))
+        .collect()
+}
+
+/// The keg `formula` resolves to on this machine, when there is one — the
+/// directory a plan names under [`UninstallPlan::keeps`] as surviving.
+///
+/// Exhaustive over [`KegProvenance`] with **no wildcard arm**, and the two
+/// `Some` arms are not an oversight:
+///
+/// * `OwnKeg` is the plain case — Homebrew has this formula's own keg.
+/// * `ForeignKeg` is Homebrew's alias trap seen from the other side. On a
+///   machine where `php@8.5` is an alias for the unversioned `php`, removing a
+///   packaged 8.5 still leaves that keg behind, and a rescan will still show
+///   8.5 — so it is exactly the case where saying nothing would read as "the
+///   uninstall failed" (design D3's rejected alternative). It is a keg, it
+///   survives, it gets named. Nothing is refused here: a refusal is
+///   [`keg_blocker`]'s job, and it only applies when a `brew uninstall` is
+///   actually going to run.
+/// * `Unresolved` means nothing was found to keep. Note this is the OPPOSITE
+///   reading to [`Blocker::UnknownKeg`]'s, and correctly so: there, "I could
+///   not tell" must not authorise a destructive `brew uninstall`; here it only
+///   decides whether a reassurance is printed about a keg no evidence says
+///   exists.
+///
+/// `prefixes` is a parameter rather than [`brew_prefixes`] read inline for the
+/// reason [`Target::keg_provenance`]'s own doc gives about the executor: a test
+/// that could not choose them would consult the developer's own
+/// `/opt/homebrew` and pass or fail on what happens to be installed there.
+fn brew_keg_path(prefixes: &[&Path], formula: &str) -> Option<PathBuf> {
+    match openvhost_core::keg_provenance(prefixes, formula) {
+        KegProvenance::OwnKeg { keg } => Some(keg),
+        KegProvenance::ForeignKeg { keg, .. } => Some(keg),
+        KegProvenance::Unresolved { .. } => None,
+    }
+}
+
 /// A package kind paired with its VALIDATED major — the only way anything in
 /// this module names a formula, a path or a service id.
 ///
@@ -289,10 +371,10 @@ impl Target {
         }
     }
 
-    /// The Homebrew formula this version's uninstall would name — THE
-    /// definition, read from `openvhost-core` so the string a dialog shows, the
-    /// string a refusal quotes and the string that reaches `brew`'s argv are
-    /// one expression rather than three that can drift.
+    /// The Homebrew formula THIS uninstall would name — THE definition, read
+    /// from `openvhost-core` so the string a dialog shows, the string a refusal
+    /// quotes and the string that reaches `brew`'s argv are one expression
+    /// rather than three that can drift.
     ///
     /// `None` for MariaDB (P1 MariaDB UI design D5): a packaged MariaDB has no
     /// Homebrew origin and never will, so there is no correct formula string —
@@ -302,30 +384,126 @@ impl Target {
     /// below ([`Self::keg_provenance`], [`Self::uninstall_spec`]) has to
     /// decide what an absent formula means for it, rather than inheriting a
     /// PHP/MySQL assumption by default.
-    pub(crate) fn formula(&self) -> Option<String> {
+    ///
+    /// **`None` for a PHP major this app packaged too** (off-Homebrew slice 5D
+    /// design D2), which is why this takes `packaged` rather than being a
+    /// function of `self` alone. The question is not "does Homebrew have a name
+    /// for this version" — it always does — but "does THIS uninstall run
+    /// `brew uninstall`", and for a packaged row the answer is no: its program
+    /// files are [`Removal::PackageTree`], the way MariaDB's are. Answering
+    /// `Some` there would offer to remove a formula that need not be installed
+    /// at all, and on the both-installed machine would destroy the Homebrew keg
+    /// D3 promises to keep.
+    ///
+    /// Every consequence follows from this one seam, which is the argument for
+    /// putting it here rather than special-casing each site: [`Self::
+    /// keg_provenance`] stops looking up an alias for a `brew uninstall` that
+    /// will not run, [`blockers`] stops refusing on it, and `uninstall_package`
+    /// stops demanding Homebrew be installed before it will remove a directory.
+    pub(crate) fn formula(&self, packaged: Option<&PackagedPhp>) -> Option<String> {
         match self {
+            Target::Php(_) if packaged.is_some() => None,
             Target::Php(m) => Some(openvhost_core::brew_formula(m)),
+            // Not gated on `packaged`, and NOT because a packaged MySQL cannot
+            // exist — one can, and `install_mysql_package` is wired. This slice
+            // is scoped to PHP (design §9), so MySQL's arm is left exactly as
+            // it was rather than changed without a spec; the identical gap is
+            // recorded in 5D's report for its own slice.
             Target::Mysql(m) => Some(openvhost_core::mysql_brew_formula(m)),
             Target::Mariadb => None,
         }
     }
 
     /// What [`Self::formula`]'s `opt` link actually resolves to on THIS
-    /// machine — `None` when there is no formula to look one up for
-    /// (MariaDB).
+    /// machine — `None` when there is no formula to look one up for (MariaDB,
+    /// or a PHP major this app packaged).
     ///
     /// A filesystem read (a `canonicalize`), so it lives here rather than
     /// inside the pure [`blockers`] — the caller performs it and passes the
     /// answer in, exactly as it does for the supervisor snapshot and the site
     /// list. That keeps `blockers` a pure function of its inputs and keeps the
     /// executor's tests off the developer's own `/opt/homebrew`.
-    pub(crate) fn keg_provenance(&self) -> Option<KegProvenance> {
-        let formula = self.formula()?;
-        let prefixes: Vec<&Path> = openvhost_core::BREW_PREFIXES
-            .iter()
-            .map(Path::new)
-            .collect();
-        Some(openvhost_core::keg_provenance(&prefixes, &formula))
+    ///
+    /// For a packaged PHP the `None` is not a shrug: the alias trap this
+    /// resolves exists because `brew uninstall php@8.5` can remove the user's
+    /// linked `php`, and an uninstall that spawns no `brew` cannot spring it.
+    /// The keg is still NAMED, under [`PackagedPhp::brew_keg`] — as something
+    /// kept, not something checked.
+    pub(crate) fn keg_provenance(&self, packaged: Option<&PackagedPhp>) -> Option<KegProvenance> {
+        let formula = self.formula(packaged)?;
+        Some(openvhost_core::keg_provenance(&brew_prefixes(), &formula))
+    }
+
+    /// What OpenVHost's own package tree holds for this target, and the
+    /// Homebrew keg that tree's uninstall would leave alone.
+    ///
+    /// **The filesystem read, kept out of the plan.** Two cheap calls — a
+    /// `read_link` plus an `is_file` for our own tree, and a `canonicalize` per
+    /// Homebrew prefix — performed HERE and handed to [`inventory`] and
+    /// [`build_plan`] as a value, exactly as [`Self::keg_provenance`] is. It is
+    /// re-read by the executor rather than carried over from whatever plan a
+    /// dialog was built from, for the same reason the blockers are: an install
+    /// can finish, or a `current` link swing, while a confirmation sits open.
+    ///
+    /// The packaged answer comes from
+    /// [`openvhost_core::packaged_php_install`] — the very predicate
+    /// `discover_php` used to build the row the user pressed Uninstall on, not
+    /// a second opinion about it. That is what makes "remove what the row
+    /// described" (design D3) a property rather than a hope.
+    pub(crate) fn packaged(&self, home: &Path) -> Option<PackagedPhp> {
+        match self {
+            Target::Php(major) => {
+                let root = openvhost_core::PackagesRoot::from_home(home);
+                let install = openvhost_core::packaged_php_install(&root, major.as_str())?;
+                Some(PackagedPhp {
+                    version_dir: install.dir,
+                    // The same builder `Self::formula` delegates to, called
+                    // directly for the same reason `inventory`'s PHP arm calls
+                    // it directly: `Self::formula` answers "what would this
+                    // uninstall name", and on this path that is deliberately
+                    // `None` — while the question here is the different one of
+                    // what Homebrew calls this major, whoever removes it.
+                    brew_keg: brew_keg_path(&brew_prefixes(), &openvhost_core::brew_formula(major)),
+                })
+            }
+            // Not `None` because a packaged MySQL cannot exist — see
+            // `Self::formula`'s MySQL arm for why this slice leaves it alone.
+            Target::Mysql(_) => None,
+            // MariaDB's package tree needs nothing threaded in: it has exactly
+            // one series and `inventory` builds its `PackageTree` path from
+            // compile-time constants, which is what let it ship before this
+            // parameter existed.
+            Target::Mariadb => None,
+        }
+    }
+
+    /// Where this target's per-major `current` link lives in OpenVHost's own
+    /// package tree.
+    ///
+    /// Every arm answers, and none is `None`: the question "where would this
+    /// target's `current` link be" has an answer for all three, independently
+    /// of whether this slice ever removes that target's package tree. An
+    /// `Option` here would have to encode a *second* fact — "…and it happens to
+    /// sit inside the tree the executor is about to delete", for MariaDB —
+    /// which is the executor's business and is decided there, by whether the
+    /// link is left dangling. (A boolean standing in for a state has now been
+    /// the shape of three defects in this codebase; this is the same trap one
+    /// level down.)
+    ///
+    /// Through [`openvhost_core::PackagesRoot`]'s facade, never
+    /// `major_dir.join("current")` spelled by hand: `openvhost-pkg`'s installer
+    /// swings this link through that facade, and a second spelling here is how
+    /// the writer and the reader end up naming different files.
+    pub(crate) fn packaged_current_link(&self, home: &Path) -> PathBuf {
+        let root = openvhost_core::PackagesRoot::from_home(home);
+        match self {
+            Target::Php(m) => root.current_link(openvhost_core::PHP_PACKAGE_NAME, m.as_str()),
+            Target::Mysql(m) => root.current_link(openvhost_core::MYSQL_PACKAGE_NAME, m.as_str()),
+            Target::Mariadb => root.current_link(
+                openvhost_core::MARIADB_PACKAGE_NAME,
+                openvhost_core::MARIADB_SERIES,
+            ),
+        }
     }
 
     /// `brew uninstall <formula>`, composed entirely inside `openvhost-core`.
@@ -356,20 +534,57 @@ impl Target {
 pub(crate) enum Removal {
     /// `brew uninstall <formula>` — the program files.
     BrewFormula { formula: String, what: String },
-    /// A file THIS app generated. Never a directory, never recursive: see
-    /// `run`'s executor for why `remove_file` is the only filesystem call an
-    /// uninstall makes.
+    /// A file THIS app generated, under `<home>/config/generated/`. Never a
+    /// directory, never recursive — a `remove_file`, which the executor
+    /// confines to that root by checking the file's PARENT, since that is the
+    /// part `remove_file` resolves. See `run`'s module header for what all
+    /// three of its filesystem calls can and cannot reach; the sentence that
+    /// stood here ("the only filesystem call an uninstall makes") stopped being
+    /// true when MariaDB's `PackageTree` arrived.
     GeneratedFile { path: PathBuf, what: String },
     /// A package tree THIS APP's OWN installer created under
-    /// `<home>/packages/` — never a Homebrew keg. MariaDB's only source
-    /// (`Target::formula` is `None` for it, P1 MariaDB UI design D5), so its
-    /// program files are removed by taking this tree off disk directly
-    /// instead of spawning `brew uninstall`, which has nothing to uninstall.
-    /// `path` is always built from compile-time constants
-    /// (`MARIADB_PACKAGE_NAME`/`MARIADB_SERIES`) joined onto the resolved
-    /// home — see `run`'s executor for the removal itself and exactly what
-    /// that path shape does, and does not, guarantee about the
-    /// `remove_dir_all` it feeds.
+    /// `<home>/packages/` — never a Homebrew keg. Emitted whenever
+    /// [`Target::formula`] is `None`, i.e. whenever there is no `brew
+    /// uninstall` to spawn: MariaDB always (P1 MariaDB UI design D5), and a PHP
+    /// major this app packaged (off-Homebrew slice 5D design D2).
+    ///
+    /// **`path` is NOT built from compile-time constants alone.** It was, while
+    /// MariaDB was the only source — `MARIADB_PACKAGE_NAME`/`MARIADB_SERIES`
+    /// joined onto the resolved home — and that sentence stood here until slice
+    /// 5D made it false. PHP's version directory carries a component read off
+    /// the disk: `packages/php/<major>/<version>/`, where `<version>` is
+    /// whatever this major's `current` link named.
+    ///
+    /// What holds instead, and is the property to check when auditing the
+    /// `remove_dir_all` this feeds:
+    ///
+    /// * every component is produced inside `openvhost-core`, through
+    ///   `PackagesRoot`'s layout facade, from a resolved home. The precise
+    ///   claim is **not** that IPC never gets near this path — IPC *selects*
+    ///   `<major>`. What holds is that the selection is a choice from a fixed
+    ///   set rather than a string that becomes a path component:
+    ///   [`Target::parse`] accepts only a `PhpMajor`, whose `parse` is gated on
+    ///   the compile-time `CATALOGUE`, so the `<major>` values reachable over
+    ///   IPC are exactly the ones this build compiled in and **no client byte
+    ///   is ever concatenated into a component**. (The looser sentence this
+    ///   replaces — "no IPC or client input reaches any of them" — was right
+    ///   about the substance and wrong as written, which is the class of
+    ///   imprecision that has cost this project a comment audit before.);
+    /// * `<major>` is a validated `PhpMajor` (catalogue-gated at
+    ///   [`Target::parse`]) or a compile-time constant;
+    /// * `<version>` has passed `openvhost_core::mysql::current_version`'s
+    ///   single-`Component::Normal` rule and `packaged_php_install`'s
+    ///   direct-child check, so it cannot be `..`, absolute, or multi-component
+    ///   — see [`openvhost_core::packaged_php_install`];
+    /// * `path` names the CONCRETE version directory and never routes through
+    ///   the `current` link (design D4).
+    ///
+    /// None of that is traversal-proof on its own, and it is not claimed to be:
+    /// a symlink at an INTERMEDIATE component still redirects the delete, which
+    /// is why design D4 requires the executor to canonicalise this path against
+    /// the packages root and refuse if it escapes, rather than trusting a check
+    /// made three layers up by a caller it cannot see. See `run`'s executor for
+    /// the removal itself.
     PackageTree { path: PathBuf, what: String },
     /// `Supervisor::unregister` — the row on the Services page and in the tray.
     ServiceRow { id: String },
@@ -440,14 +655,25 @@ fn kept_headline(what: &str, path: Option<PathBuf>) -> KeptItem {
 /// wildcard arm, so a third package family cannot inherit PHP's inventory (or
 /// an empty one) by default.
 ///
-/// A pure function of `(target, home)`: it does not stat anything, so the plan
-/// a dialog shows and the sequence the executor runs are the same value even
-/// if the disk changed in between. The one consequence is that
+/// A pure function of `(target, home, packaged)`: it does not stat anything,
+/// so the plan a dialog shows and the sequence the executor runs are the same
+/// value even if the disk changed in between. The one consequence is that
 /// `Removal::ServiceRow` is listed even when no row happens to be registered
 /// (an installed-but-never-initialized MySQL major has none) — the executor
 /// treats "already absent" as done, which is the honest reading of a removal
 /// anyway.
-pub(crate) fn inventory(target: &Target, home: &Path) -> Inventory {
+///
+/// `packaged` is the third input rather than a lookup for exactly that reason
+/// (off-Homebrew slice 5D design D1): whether a PHP major's program files are
+/// a Homebrew keg or a directory of ours is a question about the disk, and
+/// asking it HERE would make the answer depend on the moment the question was
+/// asked. [`Target::packaged`] asks it once, in the caller; the value crosses;
+/// the plan stays a function of what it was handed. See [`PackagedPhp`].
+///
+/// `None` on any non-PHP target — the parameter describes PHP's two install
+/// sources, and the other arms ignore it by construction rather than by
+/// convention.
+pub(crate) fn inventory(target: &Target, home: &Path, packaged: Option<&PackagedPhp>) -> Inventory {
     match target {
         Target::Php(major) => {
             let m = major.as_str();
@@ -462,17 +688,49 @@ pub(crate) fn inventory(target: &Target, home: &Path) -> Inventory {
                     .parent()
                     .map(Path::to_path_buf)
             });
+            // The ONE structural difference a packaged install makes, and it is
+            // deliberately the only one: the program files come off disk
+            // directly instead of through `brew uninstall`. Everything below —
+            // the generated pool config, the service row, the logs, the
+            // overrides, the site settings — is identical whichever source
+            // provided the binaries, because none of it was ever Homebrew's.
+            let program_files = match packaged {
+                // 5D D2/D4. `version_dir` is the concrete
+                // `packages/php/<major>/<version>`, resolved by the caller and
+                // never routed through `current` — see `Removal::PackageTree`'s
+                // own doc comment for exactly what that path shape does and
+                // does not guarantee.
+                Some(pkg) => Removal::PackageTree {
+                    path: pkg.version_dir.clone(),
+                    what: format!("The PHP {m} program files"),
+                },
+                // Unchanged, and it is every machine that never installed a
+                // packaged PHP.
+                None => Removal::BrewFormula {
+                    // Not `target.formula(packaged)`: that returns
+                    // `Option<String>` — `None` for MariaDB (D5) and now for a
+                    // packaged PHP (5D D2) — and this arm already knows it has
+                    // one. Calling the same builder `Target::formula` itself
+                    // delegates to is the one expression, not an `.expect()` on
+                    // the option.
+                    formula: openvhost_core::brew_formula(major),
+                    what: format!("The PHP {m} program files"),
+                },
+            };
+            // 5D D3. A machine can have both sources for one major and
+            // discovery shows a single row, ours; this uninstall takes that row
+            // and says out loud what it is walking past. `None` when Homebrew
+            // has no PHP under this major, and `None` for a Homebrew row, where
+            // the keg is what is being REMOVED.
+            let surviving_keg = packaged.and_then(|pkg| pkg.brew_keg.as_ref()).map(|keg| {
+                kept(
+                    &format!("The Homebrew PHP {m} keg — untouched"),
+                    Some(keg.clone()),
+                )
+            });
             Inventory {
                 removes: vec![
-                    Removal::BrewFormula {
-                        // Not `target.formula()`: that returns `Option<String>`
-                        // now that MariaDB has to admit absence (D5), and this
-                        // arm already knows it has one — calling the same
-                        // builder `Target::formula` itself delegates to is the
-                        // one expression, not an `.expect()` on the option.
-                        formula: openvhost_core::brew_formula(major),
-                        what: format!("The PHP {m} program files"),
-                    },
+                    program_files,
                     Removal::GeneratedFile {
                         path: crate::stack::php_pool_config_path(home, m),
                         what: "The generated php-fpm pool config".to_string(),
@@ -500,7 +758,13 @@ pub(crate) fn inventory(target: &Target, home: &Path) -> Inventory {
                         &format!("Every site's saved PHP version — a site set to {m} keeps it"),
                         None,
                     ),
-                ],
+                ]
+                .into_iter()
+                // Appended rather than inserted: the headline stays first, and
+                // the three entries above stay byte-for-byte where a brew-only
+                // machine has always seen them.
+                .chain(surviving_keg)
+                .collect(),
             }
         }
         Target::Mysql(major) => {
@@ -626,8 +890,18 @@ pub(crate) fn service_blocker(id: &str, state: &ServiceState) -> Option<Blocker>
 /// rather than fabricating a formula string, so that invariant does not have
 /// to be trusted by a caller who reaches this function some other way (this
 /// module's own tests among them).
-pub(crate) fn keg_blocker(target: &Target, keg: &KegProvenance) -> Option<Blocker> {
-    let formula = target.formula()?;
+///
+/// **`packaged` is not a second copy of that state, it is the same one**
+/// (off-Homebrew slice 5D): this check is about what a `brew uninstall` would
+/// remove, so it must ask the same [`Target::formula`] the spawn will, with the
+/// same argument. A packaged PHP therefore answers `None` here for the same
+/// structural reason MariaDB does — there is no `brew uninstall` to protect.
+pub(crate) fn keg_blocker(
+    target: &Target,
+    keg: &KegProvenance,
+    packaged: Option<&PackagedPhp>,
+) -> Option<Blocker> {
+    let formula = target.formula(packaged)?;
     match keg {
         KegProvenance::OwnKeg { .. } => None,
         KegProvenance::ForeignKeg { owner, keg } => Some(Blocker::ForeignKeg {
@@ -651,8 +925,11 @@ pub(crate) fn keg_blocker(target: &Target, keg: &KegProvenance) -> Option<Blocke
 /// filesystem by the caller for the same reason `services` and `sites` are —
 /// see [`Target::keg_provenance`].
 ///
-/// `keg` is `None` for a target with no Homebrew formula (MariaDB, D5): there
-/// is no keg to be aliased, so there is nothing for this check to refuse.
+/// `keg` is `None` for a target with no Homebrew formula (MariaDB, D5; and a
+/// packaged PHP, 5D D2): there is no `brew uninstall` for an alias to redirect,
+/// so there is nothing for this check to refuse. `packaged` is passed through
+/// to [`keg_blocker`] so that both ends of that sentence are decided by one
+/// expression rather than by a caller remembering to pass `keg: None`.
 ///
 /// The keg check comes FIRST because it is categorically different from the
 /// other two: those say "do this, then retry", and this one says OpenVHost will
@@ -662,10 +939,11 @@ pub(crate) fn blockers(
     services: &[ServiceStatus],
     sites: &[Site],
     keg: Option<&KegProvenance>,
+    packaged: Option<&PackagedPhp>,
 ) -> Vec<Blocker> {
     let mut out = Vec::new();
     if let Some(keg) = keg
-        && let Some(blocker) = keg_blocker(target, keg)
+        && let Some(blocker) = keg_blocker(target, keg, packaged)
     {
         out.push(blocker);
     }
@@ -706,20 +984,27 @@ pub(crate) fn blockers(
 /// Build the plan a dialog renders and a disabled state reads.
 ///
 /// `disabled` is `!blockers.is_empty()`; the UI does not re-derive the rule.
+///
+/// Every argument after `target` is state the CALLER read — the supervisor
+/// snapshot, the site list, the Homebrew keg and (off-Homebrew slice 5D)
+/// OpenVHost's own package tree. Nothing in here or below it touches the disk,
+/// which is what makes the value a dialog renders and the value the executor
+/// walks the same value rather than two answers to the same question.
 pub(crate) fn build_plan(
     target: &Target,
     home: &Path,
     services: &[ServiceStatus],
     sites: &[Site],
     keg: Option<&KegProvenance>,
+    packaged: Option<&PackagedPhp>,
 ) -> UninstallPlan {
-    let inv = inventory(target, home);
+    let inv = inventory(target, home, packaged);
     UninstallPlan {
         kind: target.kind(),
         major: target.major().to_string(),
         removes: inv.removes.iter().map(Removal::describe).collect(),
         keeps: inv.keeps,
-        blockers: blockers(target, services, sites, keg),
+        blockers: blockers(target, services, sites, keg, packaged),
     }
 }
 
@@ -760,6 +1045,99 @@ mod tests {
         }
     }
 
+    // ---- packaged-PHP fixtures (off-Homebrew slice 5D) -------------------
+
+    /// The resolved packaged state for `<home>/packages/php/<major>/<version>`,
+    /// built BY HAND rather than by resolving a real tree.
+    ///
+    /// That is the point of design D1: `inventory` is handed a value, so the
+    /// tests of the plan need no disk at all and keep using the same
+    /// nonexistent `/tmp/ovh` every other inventory test uses.
+    /// [`Target::packaged`] — the half that does touch a filesystem — is tested
+    /// separately, inside a `TempDir`.
+    fn packaged_at(home: &str, major: &str, version: &str, brew_keg: Option<&str>) -> PackagedPhp {
+        PackagedPhp {
+            version_dir: PathBuf::from(home)
+                .join("packages/php")
+                .join(major)
+                .join(version),
+            brew_keg: brew_keg.map(PathBuf::from),
+        }
+    }
+
+    /// The common case: ours, and Homebrew has nothing under this major.
+    fn packaged_only(major: &str, version: &str) -> PackagedPhp {
+        packaged_at("/tmp/ovh", major, version, None)
+    }
+
+    /// Lay down `packages/php/<major>/<version>/bin/php-fpm` under `home`,
+    /// exactly where `build/recipes/php.sh` puts it (`bin`, never brew's
+    /// `sbin`), and point `current` at it the way `openvhost-pkg` does — a
+    /// RELATIVE symlink whose target is the bare version string.
+    ///
+    /// Mirrors `openvhost_core::php::discover`'s own fixtures deliberately: the
+    /// property under test is that [`Target::packaged`] answers what discovery
+    /// answered, so it has to be built the way discovery's tests build it.
+    ///
+    /// `pub(super)` so the executor's tests build the tree the SAME way: two
+    /// spellings of "install a packaged PHP" are two spellings that will
+    /// disagree, and the executor's whole job is to remove what this produces.
+    #[cfg(unix)]
+    pub(super) fn install_packaged_php(home: &Path, major: &str, version: &str) {
+        let root = openvhost_core::PackagesRoot::from_home(home);
+        let bin = root
+            .package_dir(openvhost_core::PHP_PACKAGE_NAME, major, version)
+            .join("bin/php-fpm");
+        std::fs::create_dir_all(bin.parent().expect("bin dir")).expect("create version dir");
+        std::fs::write(&bin, format!("{version} fpm\n")).expect("write php-fpm");
+    }
+
+    /// Point (or re-point) `packages/php/<major>/current` at `version`.
+    /// `pub(super)` for the reason [`install_packaged_php`] is.
+    #[cfg(unix)]
+    pub(super) fn point_current(home: &Path, major: &str, version: &str) {
+        let root = openvhost_core::PackagesRoot::from_home(home);
+        let link = root.current_link(openvhost_core::PHP_PACKAGE_NAME, major);
+        std::fs::create_dir_all(link.parent().expect("major dir")).expect("create major dir");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(PathBuf::from(version), &link).expect("link current");
+    }
+
+    /// Everything else a PHP inventory names, so a test that then deletes the
+    /// tree is deleting something that was really there.
+    #[cfg(unix)]
+    fn provision_php_paths(home: &Path, major: &str) {
+        for path in [
+            crate::stack::php_pool_config_path(home, major),
+            home.join("logs/services")
+                .join(format!("php-fpm-{major}"))
+                .join("error.log"),
+            home.join("config/custom/php")
+                .join(major)
+                .join("pool.d/z.conf"),
+        ] {
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
+            std::fs::write(&path, b"x").expect("write file");
+        }
+    }
+
+    /// brew's real layout: `<root>/Cellar/<owner>/<version>`, with
+    /// `<root>/opt/<formula>` a RELATIVE symlink into it — the same fixture
+    /// `openvhost_core::keg`'s own tests use, so `brew_keg_path` meets the
+    /// shape it meets in production rather than an absolute link it never sees.
+    #[cfg(unix)]
+    fn brew_layout(root: &Path, formula: &str, owner: &str, version: &str) {
+        let keg = root.join("Cellar").join(owner).join(version);
+        std::fs::create_dir_all(&keg).expect("create keg");
+        let opt = root.join("opt");
+        std::fs::create_dir_all(&opt).expect("create opt");
+        std::os::unix::fs::symlink(
+            PathBuf::from("..").join("Cellar").join(owner).join(version),
+            opt.join(formula),
+        )
+        .expect("link opt");
+    }
+
     /// Every `ServiceState`, so the blocker predicate is exercised over the
     /// whole enum rather than the two variants that happened to come to mind.
     fn every_state() -> Vec<ServiceState> {
@@ -786,7 +1164,7 @@ mod tests {
     #[test]
     fn a_php_uninstall_removes_the_formula_the_pool_config_and_the_row() {
         let home = Path::new("/tmp/ovh");
-        let inv = inventory(&php("8.4"), home);
+        let inv = inventory(&php("8.4"), home, None);
         assert_eq!(
             inv.removes,
             vec![
@@ -807,7 +1185,7 @@ mod tests {
 
     #[test]
     fn a_php_uninstall_keeps_the_logs_the_custom_pool_dir_and_every_site_setting() {
-        let inv = inventory(&php("8.4"), Path::new("/tmp/ovh"));
+        let inv = inventory(&php("8.4"), Path::new("/tmp/ovh"), None);
         let paths: Vec<Option<&str>> = inv.keeps.iter().map(|k| k.path.as_deref()).collect();
         assert_eq!(
             paths,
@@ -825,7 +1203,7 @@ mod tests {
         // The absence of a `GeneratedFile` here is the assertion. Removing
         // my.cnf would break the reinstall round trip D2 promises, because
         // nothing re-renders it for an already-initialized datadir.
-        let inv = inventory(&mysql("8.4"), Path::new("/tmp/ovh"));
+        let inv = inventory(&mysql("8.4"), Path::new("/tmp/ovh"), None);
         assert_eq!(
             inv.removes,
             vec![
@@ -842,7 +1220,7 @@ mod tests {
 
     #[test]
     fn a_mysql_uninstall_keeps_the_datadir_the_password_the_my_cnf_and_the_overrides() {
-        let inv = inventory(&mysql("8.4"), Path::new("/tmp/ovh"));
+        let inv = inventory(&mysql("8.4"), Path::new("/tmp/ovh"), None);
         assert_eq!(
             inv.keeps,
             vec![
@@ -883,7 +1261,7 @@ mod tests {
         // count 0 and this fails; adding a second `kept_headline` makes it 2
         // and it fails the other way.
         for target in [php("8.1"), php("8.4"), mysql("8.4")] {
-            let keeps = inventory(&target, Path::new("/tmp/ovh")).keeps;
+            let keeps = inventory(&target, Path::new("/tmp/ovh"), None).keeps;
             let headlines: Vec<KeptItem> = keeps.into_iter().filter(|k| k.headline).collect();
             assert_eq!(
                 headlines.len(),
@@ -901,7 +1279,7 @@ mod tests {
         // so the flagged item must be the DATADIR: `my.cnf` also carries a
         // path, and naming it there would tell a user their databases live in
         // a config file. The PHP sentence is about the logs.
-        let mysql_headline = inventory(&mysql("8.4"), Path::new("/tmp/ovh"))
+        let mysql_headline = inventory(&mysql("8.4"), Path::new("/tmp/ovh"), None)
             .keeps
             .into_iter()
             .find(|k| k.headline)
@@ -912,7 +1290,7 @@ mod tests {
             Some("/tmp/ovh/data/mysql/8.4")
         );
 
-        let php_headline = inventory(&php("8.4"), Path::new("/tmp/ovh"))
+        let php_headline = inventory(&php("8.4"), Path::new("/tmp/ovh"), None)
             .keeps
             .into_iter()
             .find(|k| k.headline)
@@ -934,6 +1312,7 @@ mod tests {
             &[],
             &[],
             Some(&own_keg()),
+            None,
         );
         let v = serde_json::to_value(&plan).unwrap();
         assert_eq!(v["keeps"][0]["headline"], true);
@@ -948,7 +1327,7 @@ mod tests {
         // it may not put the user's data or logs on the chopping block.
         let home = Path::new("/tmp/ovh");
         for target in [php("8.1"), php("8.4"), mysql("8.4")] {
-            for removal in inventory(&target, home).removes {
+            for removal in inventory(&target, home, None).removes {
                 if let Removal::GeneratedFile { path, .. } = removal {
                     let p = path.display().to_string();
                     assert!(
@@ -974,7 +1353,14 @@ mod tests {
         // VACUITY: removing the second sentence from `Removal::BrewFormula`'s
         // arm makes both assertions fail for both kinds.
         for target in [php("8.4"), mysql("8.4")] {
-            let plan = build_plan(&target, Path::new("/tmp/ovh"), &[], &[], Some(&own_keg()));
+            let plan = build_plan(
+                &target,
+                Path::new("/tmp/ovh"),
+                &[],
+                &[],
+                Some(&own_keg()),
+                None,
+            );
             let brew_line = plan.removes.first().expect("the formula is removal #1");
             assert!(
                 brew_line.contains("may also remove dependencies"),
@@ -996,7 +1382,7 @@ mod tests {
         // drift into naming different formulas.
         let brew = Path::new("/opt/homebrew/bin/brew");
         for target in [php("8.4"), mysql("8.4")] {
-            let inv = inventory(&target, Path::new("/tmp/ovh"));
+            let inv = inventory(&target, Path::new("/tmp/ovh"), None);
             let Some(Removal::BrewFormula { formula, .. }) = inv.removes.first() else {
                 panic!("the formula must be the FIRST removal: {:?}", inv.removes);
             };
@@ -1096,7 +1482,7 @@ mod tests {
             keg: PathBuf::from("/opt/homebrew/Cellar/php/8.5.9"),
         };
         assert_eq!(
-            blockers(&php("8.5"), &[], &[], Some(&keg)),
+            blockers(&php("8.5"), &[], &[], Some(&keg), None),
             vec![Blocker::ForeignKeg {
                 formula: "php@8.5".to_string(),
                 owner: "php".to_string(),
@@ -1106,7 +1492,7 @@ mod tests {
         // The prose has to name BOTH the formula the user would have clicked
         // and the thing that would actually be removed — a refusal that says
         // only "can't do that" teaches nothing.
-        let text = blockers(&php("8.5"), &[], &[], Some(&keg))[0].describe();
+        let text = blockers(&php("8.5"), &[], &[], Some(&keg), None)[0].describe();
         assert!(text.contains("php@8.5"), "{text}");
         assert!(text.contains("/opt/homebrew/Cellar/php/8.5.9"), "{text}");
         assert!(text.contains("brew uninstall php"), "{text}");
@@ -1122,7 +1508,7 @@ mod tests {
             keg: PathBuf::from("/opt/homebrew/Cellar/mysql/8.4.11"),
         };
         assert_eq!(
-            blockers(&mysql("8.4"), &[], &[], Some(&keg)),
+            blockers(&mysql("8.4"), &[], &[], Some(&keg), None),
             vec![Blocker::ForeignKeg {
                 formula: "mysql@8.4".to_string(),
                 owner: "mysql".to_string(),
@@ -1143,7 +1529,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            blockers(&php("8.4"), &[], &[], Some(&keg)),
+            blockers(&php("8.4"), &[], &[], Some(&keg), None),
             vec![Blocker::UnknownKeg {
                 formula: "php@8.4".to_string(),
                 searched: vec![
@@ -1158,8 +1544,8 @@ mod tests {
     fn a_formula_that_owns_its_keg_is_not_blocked_by_the_keg_check() {
         // The other side of the refusal — without this the check would be
         // indistinguishable from "uninstall never works".
-        assert!(keg_blocker(&php("8.4"), &own_keg()).is_none());
-        assert!(blockers(&php("8.4"), &[], &[], Some(&own_keg())).is_empty());
+        assert!(keg_blocker(&php("8.4"), &own_keg(), None).is_none());
+        assert!(blockers(&php("8.4"), &[], &[], Some(&own_keg()), None).is_empty());
     }
 
     #[test]
@@ -1174,7 +1560,7 @@ mod tests {
             owner: "php".to_string(),
             keg: PathBuf::from("/opt/homebrew/Cellar/php/8.5.9"),
         };
-        let found = blockers(&php("8.5"), &services, &sites, Some(&keg));
+        let found = blockers(&php("8.5"), &services, &sites, Some(&keg), None);
         assert_eq!(found.len(), 3, "got {found:?}");
         assert!(matches!(found[0], Blocker::ForeignKeg { .. }));
         assert!(matches!(found[1], Blocker::ServiceNotTerminal { .. }));
@@ -1191,7 +1577,7 @@ mod tests {
                 owner: "other".to_string(),
                 keg: PathBuf::from("/opt/homebrew/Cellar/other/1.0"),
             };
-            let Some(Blocker::ForeignKeg { formula, .. }) = keg_blocker(&target, &keg) else {
+            let Some(Blocker::ForeignKeg { formula, .. }) = keg_blocker(&target, &keg, None) else {
                 panic!("expected a ForeignKeg refusal");
             };
             let spec = target
@@ -1230,7 +1616,7 @@ mod tests {
             site("blog", "blog.localhost", "8.1"),
             site("wiki", "wiki.localhost", "8.4"),
         ];
-        let found = blockers(&php("8.4"), &[], &sites, Some(&own_keg()));
+        let found = blockers(&php("8.4"), &[], &sites, Some(&own_keg()), None);
         assert_eq!(
             found,
             vec![Blocker::SitesPinned {
@@ -1242,7 +1628,7 @@ mod tests {
     #[test]
     fn a_php_major_no_site_uses_has_no_site_blocker() {
         let sites = vec![site("blog", "blog.localhost", "8.1")];
-        assert!(blockers(&php("8.4"), &[], &sites, Some(&own_keg())).is_empty());
+        assert!(blockers(&php("8.4"), &[], &sites, Some(&own_keg()), None).is_empty());
     }
 
     #[test]
@@ -1253,7 +1639,7 @@ mod tests {
         let mut s = site("shop", "shop.localhost", "8.4");
         s.enabled = false;
         assert_eq!(
-            blockers(&php("8.4"), &[], &[s], Some(&own_keg())),
+            blockers(&php("8.4"), &[], &[s], Some(&own_keg()), None),
             vec![Blocker::SitesPinned {
                 domains: vec!["shop.localhost".to_string()],
             }]
@@ -1267,7 +1653,7 @@ mod tests {
         // edit that "helpfully" blocked on an initialized datadir would break
         // D2's whole round trip, so pin it.
         let sites = vec![site("shop", "shop.localhost", "8.4")];
-        assert!(blockers(&mysql("8.4"), &[], &sites, Some(&own_keg())).is_empty());
+        assert!(blockers(&mysql("8.4"), &[], &sites, Some(&own_keg()), None).is_empty());
     }
 
     #[test]
@@ -1276,7 +1662,7 @@ mod tests {
         // told about the sites has been made to guess twice.
         let services = vec![status("php-fpm-8.4", ServiceState::Running)];
         let sites = vec![site("shop", "shop.localhost", "8.4")];
-        let found = blockers(&php("8.4"), &services, &sites, Some(&own_keg()));
+        let found = blockers(&php("8.4"), &services, &sites, Some(&own_keg()), None);
         assert_eq!(found.len(), 2, "got {found:?}");
         assert!(matches!(found[0], Blocker::ServiceNotTerminal { .. }));
         assert!(matches!(found[1], Blocker::SitesPinned { .. }));
@@ -1291,7 +1677,7 @@ mod tests {
             status("nginx", ServiceState::Running),
             status("mysql-8.4", ServiceState::Running),
         ];
-        assert!(blockers(&php("8.4"), &services, &[], Some(&own_keg())).is_empty());
+        assert!(blockers(&php("8.4"), &services, &[], Some(&own_keg()), None).is_empty());
     }
 
     #[test]
@@ -1302,6 +1688,7 @@ mod tests {
             &[],
             &[],
             Some(&own_keg()),
+            None,
         );
         assert!(plan.blockers.is_empty());
         assert_eq!(plan.kind, PackageKind::Mysql);
@@ -1320,8 +1707,8 @@ mod tests {
         // cannot re-order or filter one side only.
         let target = php("8.4");
         let home = Path::new("/tmp/ovh");
-        let plan = build_plan(&target, home, &[], &[], Some(&own_keg()));
-        let expected: Vec<String> = inventory(&target, home)
+        let plan = build_plan(&target, home, &[], &[], Some(&own_keg()), None);
+        let expected: Vec<String> = inventory(&target, home, None)
             .removes
             .iter()
             .map(Removal::describe)
@@ -1383,6 +1770,7 @@ mod tests {
             &[],
             &[],
             Some(&own_keg()),
+            None,
         ))
         .unwrap();
         assert_eq!(v["kind"], "php");
@@ -1401,14 +1789,14 @@ mod tests {
 
     #[test]
     fn mariadb_has_no_homebrew_formula_and_php_mysql_still_do() {
-        assert_eq!(mariadb().formula(), None);
-        assert_eq!(php("8.4").formula(), Some("php@8.4".to_string()));
-        assert_eq!(mysql("8.4").formula(), Some("mysql@8.4".to_string()));
+        assert_eq!(mariadb().formula(None), None);
+        assert_eq!(php("8.4").formula(None), Some("php@8.4".to_string()));
+        assert_eq!(mysql("8.4").formula(None), Some("mysql@8.4".to_string()));
     }
 
     #[test]
     fn mariadb_has_no_keg_to_resolve() {
-        assert_eq!(mariadb().keg_provenance(), None);
+        assert_eq!(mariadb().keg_provenance(None), None);
     }
 
     /// VACUITY (neuter-and-watch-it-fail): temporarily made this arm
@@ -1437,7 +1825,7 @@ mod tests {
     /// production path.
     #[test]
     fn keg_blocker_admits_absence_for_a_formula_less_target_rather_than_fabricating_one() {
-        assert_eq!(keg_blocker(&mariadb(), &own_keg()), None);
+        assert_eq!(keg_blocker(&mariadb(), &own_keg(), None), None);
     }
 
     #[test]
@@ -1465,7 +1853,7 @@ mod tests {
     #[test]
     fn a_mariadb_uninstall_removes_the_package_tree_and_the_row_and_keeps_the_data() {
         let home = Path::new("/tmp/ovh");
-        let inv = inventory(&mariadb(), home);
+        let inv = inventory(&mariadb(), home, None);
         assert_eq!(
             inv.removes,
             vec![
@@ -1507,7 +1895,7 @@ mod tests {
 
     #[test]
     fn a_mariadb_uninstall_has_exactly_one_headline_kept_item_naming_the_datadir() {
-        let keeps = inventory(&mariadb(), Path::new("/tmp/ovh")).keeps;
+        let keeps = inventory(&mariadb(), Path::new("/tmp/ovh"), None).keeps;
         let headlines: Vec<KeptItem> = keeps.into_iter().filter(|k| k.headline).collect();
         assert_eq!(headlines.len(), 1, "got {headlines:?}");
         assert_eq!(headlines[0].what, "Your databases");
@@ -1520,7 +1908,7 @@ mod tests {
     #[test]
     fn a_mariadb_uninstall_is_never_blocked_by_sites_or_the_keg_check() {
         let sites = vec![site("shop", "shop.localhost", "8.4")];
-        assert!(blockers(&mariadb(), &[], &sites, None).is_empty());
+        assert!(blockers(&mariadb(), &[], &sites, None, None).is_empty());
     }
 
     /// The one blocker MariaDB CAN still have: its own service still
@@ -1529,7 +1917,7 @@ mod tests {
     #[test]
     fn a_running_mariadb_service_still_blocks_its_own_uninstall() {
         let services = vec![status("mariadb-11.4", ServiceState::Running)];
-        let found = blockers(&mariadb(), &services, &[], None);
+        let found = blockers(&mariadb(), &services, &[], None, None);
         assert_eq!(
             found,
             vec![Blocker::ServiceNotTerminal {
@@ -1541,7 +1929,7 @@ mod tests {
 
     #[test]
     fn a_mariadb_plan_with_no_blockers_may_proceed_and_lists_both_halves() {
-        let plan = build_plan(&mariadb(), Path::new("/tmp/ovh"), &[], &[], None);
+        let plan = build_plan(&mariadb(), Path::new("/tmp/ovh"), &[], &[], None, None);
         assert!(plan.blockers.is_empty());
         assert_eq!(plan.kind, PackageKind::Mariadb);
         assert_eq!(plan.major, "11.4");
@@ -1561,6 +1949,649 @@ mod tests {
             serde_json::from_value::<PackageKind>(serde_json::json!("mariadb")).unwrap(),
             PackageKind::Mariadb
         );
+    }
+
+    // ======================================================================
+    // Off-Homebrew slice 5D — a PHP major THIS app packaged.
+    // ======================================================================
+
+    /// Every `(target, packaged)` combination this module can be asked about.
+    ///
+    /// The blanket invariants below are checked over the whole space rather
+    /// than over the case that came to mind — `Target` has three variants and
+    /// PHP now has three shapes (Homebrew's, ours alone, ours beside a keg),
+    /// and it is the combinations that a per-arm test misses.
+    fn every_shape() -> Vec<(Target, Option<PackagedPhp>)> {
+        vec![
+            (php("8.1"), None),
+            (php("8.4"), None),
+            (php("8.4"), Some(packaged_only("8.4", "8.4.24"))),
+            (
+                php("8.4"),
+                Some(packaged_at(
+                    "/tmp/ovh",
+                    "8.4",
+                    "8.4.24",
+                    Some("/opt/homebrew/Cellar/php@8.4/8.4.13"),
+                )),
+            ),
+            (mysql("8.4"), None),
+            (mariadb(), None),
+        ]
+    }
+
+    // ---- PURITY: `inventory` stats nothing (design D1) -------------------
+    //
+    // VACUITY: `inventory_stats_nothing_...` fails the moment `inventory`
+    // resolves anything itself — replacing its `packaged` parameter with an
+    // inline `target.packaged(home)` makes the second call name 8.4.99 and the
+    // assertion reports two different `Removal::PackageTree` paths. Measured;
+    // see the task report.
+
+    /// ESTABLISHED rather than asserted: the disk really moves between the two
+    /// calls, in three ways that would each change the answer of a function
+    /// that looked, and the value does not move with it.
+    ///
+    /// For a destructive operation this is a TOCTOU defence, not a style
+    /// preference: if the plan were recomputed against the disk at execution
+    /// time, the dialog could say it removes 8.4.24 while the executor removes
+    /// 8.4.99.
+    #[cfg(unix)]
+    #[test]
+    fn inventory_stats_nothing_so_the_disk_can_move_under_a_plan() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        install_packaged_php(home, "8.4", "8.4.24");
+        point_current(home, "8.4", "8.4.24");
+        provision_php_paths(home, "8.4");
+
+        // Resolved the way production resolves it, so what follows is about a
+        // real value and not a hand-built one.
+        let packaged = php("8.4").packaged(home).expect("a packaged 8.4");
+        let before = inventory(&php("8.4"), home, Some(&packaged));
+
+        // Three independent ways to change the answer of a function that
+        // looked at the disk:
+        // 1. a second version installed and `current` swung onto it;
+        install_packaged_php(home, "8.4", "8.4.99");
+        point_current(home, "8.4", "8.4.99");
+        // 2. the version directory the plan names, deleted;
+        std::fs::remove_dir_all(&packaged.version_dir).expect("remove version dir");
+        // 3. every other path the plan names, deleted.
+        std::fs::remove_dir_all(home.join("config")).expect("remove config");
+        std::fs::remove_dir_all(home.join("logs")).expect("remove logs");
+
+        // The fixture is discriminating: re-resolving NOW names a different
+        // directory, so a version of `inventory` that consulted the disk would
+        // have answered differently. Without this the test could pass against a
+        // mutation that changed nothing.
+        let re_resolved = php("8.4").packaged(home).expect("8.4.99 is packaged now");
+        assert_ne!(
+            re_resolved.version_dir, packaged.version_dir,
+            "the disk did not actually move; this test would prove nothing"
+        );
+
+        assert_eq!(
+            inventory(&php("8.4"), home, Some(&packaged)),
+            before,
+            "inventory must be a function of its arguments, not of the disk"
+        );
+    }
+
+    /// The other half of the invariant: the value a dialog renders and the list
+    /// the executor walks are ONE value, for a packaged target too — the
+    /// packaged twin of `the_plans_removes_are_the_inventorys_removes_in_order`.
+    #[test]
+    fn a_packaged_plan_renders_exactly_the_list_the_executor_walks() {
+        let target = php("8.4");
+        let home = Path::new("/tmp/ovh");
+        let packaged = packaged_at(
+            "/tmp/ovh",
+            "8.4",
+            "8.4.24",
+            Some("/opt/homebrew/Cellar/php@8.4/8.4.13"),
+        );
+        let plan = build_plan(&target, home, &[], &[], None, Some(&packaged));
+        let inv = inventory(&target, home, Some(&packaged));
+        assert_eq!(
+            plan.removes,
+            inv.removes
+                .iter()
+                .map(Removal::describe)
+                .collect::<Vec<_>>()
+        );
+        // The keeps travel whole, D3's new entry included — a dialog that
+        // dropped it would promise nothing about the keg it walks past.
+        assert_eq!(plan.keeps, inv.keeps);
+    }
+
+    // ---- A BREW-ONLY MAJOR IS UNCHANGED ----------------------------------
+
+    /// The whole value, both halves at once, pinned against what this function
+    /// returned before slice 5D existed.
+    ///
+    /// MEASURED, not assumed: `inventory` was dumped with `{:#?}` for PHP 8.1,
+    /// 8.4 and 8.5, MySQL 8.4 and MariaDB on `c4b0732` (the commit this branch
+    /// is based on) and again on this branch with `packaged: None`. The two
+    /// dumps were byte-for-byte identical, 6046 bytes each, including every
+    /// `Removal::describe` string. This test is the part of that measurement
+    /// that keeps running.
+    ///
+    /// It pins the value TOGETHER rather than `removes` and `keeps` separately
+    /// (which the tests above already do): the failure it is here to catch is
+    /// an entry appearing somewhere, and a per-half assertion cannot see one
+    /// added to the other half.
+    #[test]
+    fn a_brew_only_php_majors_inventory_is_exactly_what_it_was_before_this_slice() {
+        assert_eq!(
+            inventory(&php("8.4"), Path::new("/tmp/ovh"), None),
+            Inventory {
+                removes: vec![
+                    Removal::BrewFormula {
+                        formula: "php@8.4".to_string(),
+                        what: "The PHP 8.4 program files".to_string(),
+                    },
+                    Removal::GeneratedFile {
+                        path: PathBuf::from("/tmp/ovh/config/generated/php/8.4/php-fpm.conf"),
+                        what: "The generated php-fpm pool config".to_string(),
+                    },
+                    Removal::ServiceRow {
+                        id: "php-fpm-8.4".to_string(),
+                    },
+                ],
+                keeps: vec![
+                    KeptItem {
+                        what: "Your PHP 8.4 logs".to_string(),
+                        path: Some("/tmp/ovh/logs/services/php-fpm-8.4".to_string()),
+                        headline: true,
+                    },
+                    KeptItem {
+                        what: "Your own php-fpm pool overrides".to_string(),
+                        path: Some("/tmp/ovh/config/custom/php/8.4/pool.d".to_string()),
+                        headline: false,
+                    },
+                    KeptItem {
+                        what: "Every site's saved PHP version — a site set to 8.4 keeps it"
+                            .to_string(),
+                        path: None,
+                        headline: false,
+                    },
+                ],
+            }
+        );
+    }
+
+    /// Spec §8.8 — nothing changes on a machine with no package tree, which is
+    /// every real machine today. Driven through the REAL resolver rather than a
+    /// hand-passed `None`, so it is the production path that is pinned.
+    #[cfg(unix)]
+    #[test]
+    fn a_machine_with_no_package_tree_gets_the_homebrew_plan_it_always_got() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        let packaged = php("8.4").packaged(home);
+        assert_eq!(packaged, None, "an empty home has no packaged PHP");
+        assert_eq!(
+            inventory(&php("8.4"), Path::new("/tmp/ovh"), packaged.as_ref()),
+            inventory(&php("8.4"), Path::new("/tmp/ovh"), None)
+        );
+        assert_eq!(
+            php("8.4").formula(packaged.as_ref()),
+            Some("php@8.4".to_string())
+        );
+    }
+
+    // ---- A PACKAGED MAJOR PLANS NO BREW STEP (design D2) -----------------
+
+    #[test]
+    fn a_packaged_php_major_is_removed_as_a_package_tree_with_no_brew_step() {
+        let packaged = packaged_only("8.4", "8.4.24");
+        let inv = inventory(&php("8.4"), Path::new("/tmp/ovh"), Some(&packaged));
+        assert_eq!(
+            inv.removes,
+            vec![
+                Removal::PackageTree {
+                    path: PathBuf::from("/tmp/ovh/packages/php/8.4/8.4.24"),
+                    what: "The PHP 8.4 program files".to_string(),
+                },
+                // Unchanged from the Homebrew arm, and that is the claim:
+                // neither of these was ever Homebrew's to provide.
+                Removal::GeneratedFile {
+                    path: PathBuf::from("/tmp/ovh/config/generated/php/8.4/php-fpm.conf"),
+                    what: "The generated php-fpm pool config".to_string(),
+                },
+                Removal::ServiceRow {
+                    id: "php-fpm-8.4".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_packaged_php_major_names_no_homebrew_formula_and_looks_up_no_keg() {
+        let packaged = packaged_only("8.4", "8.4.24");
+        assert_eq!(php("8.4").formula(Some(&packaged)), None);
+        assert_eq!(php("8.4").keg_provenance(Some(&packaged)), None);
+        // The same target without a packaged install is untouched — the seam
+        // is the packaged state, not the major.
+        assert_eq!(php("8.4").formula(None), Some("php@8.4".to_string()));
+    }
+
+    /// The consequence that matters most in practice. On the machine this
+    /// project measured, `php@8.5` is one of Homebrew's aliases for the
+    /// unversioned `php`, and a Homebrew 8.5 uninstall is REFUSED for it (see
+    /// `an_aliased_php_major_is_refused_and_the_refusal_names_what_would_go`).
+    /// A packaged 8.5 spawns no brew at all, so the same machine state must not
+    /// refuse it — otherwise the only PHP a user could remove is the one this
+    /// app did not install.
+    #[test]
+    fn a_packaged_major_is_not_refused_by_homebrews_alias_trap() {
+        let keg = KegProvenance::ForeignKeg {
+            owner: "php".to_string(),
+            keg: PathBuf::from("/opt/homebrew/Cellar/php/8.5.9"),
+        };
+        let packaged = packaged_only("8.5", "8.5.9");
+        assert_eq!(keg_blocker(&php("8.5"), &keg, Some(&packaged)), None);
+        assert!(blockers(&php("8.5"), &[], &[], Some(&keg), Some(&packaged)).is_empty());
+        // And the refusal did not go away — it stopped applying to a target it
+        // was never about. Without this the test above is indistinguishable
+        // from having deleted the check.
+        assert!(!blockers(&php("8.5"), &[], &[], Some(&keg), None).is_empty());
+    }
+
+    /// The blockers that are NOT about Homebrew still apply. A packaged
+    /// uninstall is not a privileged one.
+    #[test]
+    fn a_packaged_major_is_still_blocked_by_its_own_service_and_by_pinned_sites() {
+        let packaged = packaged_only("8.4", "8.4.24");
+        let services = vec![status("php-fpm-8.4", ServiceState::Running)];
+        let sites = vec![site("shop", "shop.localhost", "8.4")];
+        let found = blockers(&php("8.4"), &services, &sites, None, Some(&packaged));
+        assert_eq!(found.len(), 2, "got {found:?}");
+        assert!(matches!(found[0], Blocker::ServiceNotTerminal { .. }));
+        assert!(matches!(found[1], Blocker::SitesPinned { .. }));
+    }
+
+    /// The seam D2 exists to hold, checked over every shape rather than per
+    /// arm: `uninstall_package` decides whether Homebrew must be FOUND from
+    /// `Target::formula`, and `inventory` decides whether brew is SPAWNED. If
+    /// those two could disagree, a machine would either be told it needs
+    /// Homebrew to delete a directory, or reach `run_brew` with a placeholder
+    /// path for a `brew` that was never located.
+    #[test]
+    fn a_brew_step_is_planned_exactly_when_this_uninstall_names_a_formula() {
+        for (target, packaged) in every_shape() {
+            let p = packaged.as_ref();
+            let plans_brew = inventory(&target, Path::new("/tmp/ovh"), p)
+                .removes
+                .iter()
+                .any(|r| matches!(r, Removal::BrewFormula { .. }));
+            assert_eq!(
+                plans_brew,
+                target.formula(p).is_some(),
+                "{} (packaged: {}) plans brew={plans_brew} but names formula={:?}",
+                target.display(),
+                p.is_some(),
+                target.formula(p)
+            );
+        }
+    }
+
+    /// Exactly one removal provides the program files, it is always the FIRST
+    /// step, and never both shapes. Two would remove the version twice over;
+    /// zero would report success having left the binaries in place.
+    ///
+    /// The index is asserted because the executor's refusals SAY SO. A
+    /// `Confinement::Refused` returns "Nothing was removed." and a non-zero
+    /// `brew uninstall` returns early on the same reasoning: no step can have
+    /// run before the one that provides the program files, because there is no
+    /// step before it. That holds for every shape today and nothing pinned it —
+    /// a future edit putting a `GeneratedFile` first would make a destructive
+    /// operation's error message state a falsehood with every test still green.
+    ///
+    /// VACUITY: that is the exact edit measured — `GeneratedFile` moved ahead
+    /// of the program files in the PHP arm fails this on the FIRST shape,
+    /// quoting the reordered list. The count assertion beside it still passed,
+    /// so the index is the half that catches it.
+    #[test]
+    fn exactly_one_removal_provides_the_program_files_in_every_shape() {
+        for (target, packaged) in every_shape() {
+            let removes = inventory(&target, Path::new("/tmp/ovh"), packaged.as_ref()).removes;
+            let provides_program_files = |r: &Removal| {
+                matches!(r, Removal::BrewFormula { .. } | Removal::PackageTree { .. })
+            };
+            let count = removes.iter().filter(|r| provides_program_files(r)).count();
+            assert_eq!(
+                count,
+                1,
+                "{} (packaged: {}) has {count} program-files removals",
+                target.display(),
+                packaged.is_some()
+            );
+            assert!(
+                removes.first().is_some_and(provides_program_files),
+                "{} (packaged: {}) does not remove the program files FIRST, so a refusal there \
+                 would say \"Nothing was removed\" after something already had: {removes:?}",
+                target.display(),
+                packaged.is_some()
+            );
+        }
+    }
+
+    /// T1's half of design D4's containment: the plan may only ever hand the
+    /// executor a path inside `<home>/packages/`.
+    ///
+    /// Deliberately NOT claimed as traversal-proof. This is a lexical test on a
+    /// value; a symlink at an intermediate component still redirects a
+    /// `remove_dir_all`, and no test of the plan can see that. The executor's
+    /// own canonicalising guard (task T2, spec D4) is the half that can.
+    #[test]
+    fn every_package_tree_removal_names_a_path_under_the_packages_root() {
+        let home = Path::new("/tmp/ovh");
+        for (target, packaged) in every_shape() {
+            for removal in inventory(&target, home, packaged.as_ref()).removes {
+                if let Removal::PackageTree { path, .. } = removal {
+                    let p = path.display().to_string();
+                    assert!(
+                        p.starts_with("/tmp/ovh/packages/"),
+                        "{} would remove {p}, which is outside the package tree",
+                        target.display()
+                    );
+                }
+            }
+        }
+    }
+
+    // ---- BOTH INSTALLED (design D3) --------------------------------------
+
+    #[test]
+    fn with_both_installed_the_packaged_tree_goes_and_the_homebrew_keg_is_kept() {
+        let packaged = packaged_at(
+            "/tmp/ovh",
+            "8.4",
+            "8.4.24",
+            Some("/opt/homebrew/Cellar/php@8.4/8.4.13"),
+        );
+        let inv = inventory(&php("8.4"), Path::new("/tmp/ovh"), Some(&packaged));
+
+        assert_eq!(
+            inv.removes.first(),
+            Some(&Removal::PackageTree {
+                path: PathBuf::from("/tmp/ovh/packages/php/8.4/8.4.24"),
+                what: "The PHP 8.4 program files".to_string(),
+            })
+        );
+        assert_eq!(
+            inv.keeps.last(),
+            Some(&KeptItem {
+                what: "The Homebrew PHP 8.4 keg — untouched".to_string(),
+                path: Some("/opt/homebrew/Cellar/php@8.4/8.4.13".to_string()),
+                headline: false,
+            })
+        );
+        // "Untouched" has to be true of the list the executor WALKS, not only
+        // of the sentence printed beside it.
+        for removal in &inv.removes {
+            let line = removal.describe();
+            assert!(!line.contains("Cellar"), "a removal names the keg: {line}");
+            assert!(
+                !matches!(removal, Removal::BrewFormula { .. }),
+                "a brew uninstall would take the keg with it: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_keg_keep_is_absent_when_homebrew_has_nothing_under_this_major() {
+        let inv = inventory(
+            &php("8.4"),
+            Path::new("/tmp/ovh"),
+            Some(&packaged_only("8.4", "8.4.24")),
+        );
+        assert!(
+            !inv.keeps.iter().any(|k| k.what.contains("Homebrew")),
+            "nothing to keep, so nothing to promise: {:?}",
+            inv.keeps
+        );
+    }
+
+    #[test]
+    fn a_homebrew_row_never_lists_its_own_keg_as_kept() {
+        // There the keg is what is being REMOVED. A "kept" line about it would
+        // be the exact opposite of true.
+        let inv = inventory(&php("8.4"), Path::new("/tmp/ovh"), None);
+        assert!(
+            !inv.keeps.iter().any(|k| k.what.contains("keg")),
+            "{:?}",
+            inv.keeps
+        );
+    }
+
+    /// The headline is the sentence the confirmation is ABOUT, and adding a
+    /// fourth kept item must not move it — see [`KeptItem::headline`] for the
+    /// reorder bug this flag exists to prevent.
+    #[test]
+    fn the_headline_is_still_the_logs_in_every_packaged_shape() {
+        for (target, packaged) in every_shape() {
+            let keeps = inventory(&target, Path::new("/tmp/ovh"), packaged.as_ref()).keeps;
+            let headlines: Vec<&KeptItem> = keeps.iter().filter(|k| k.headline).collect();
+            assert_eq!(
+                headlines.len(),
+                1,
+                "{} (packaged: {}) has {} headline items",
+                target.display(),
+                packaged.is_some(),
+                headlines.len()
+            );
+            // And it is still the RIGHT item: a count alone passes with the
+            // flag on the keg.
+            if matches!(target, Target::Php(_)) {
+                assert_eq!(
+                    headlines[0].what,
+                    format!("Your PHP {} logs", target.major())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_kept_keg_reaches_the_wire_with_its_path() {
+        // The dialog is in another language; a keep whose path did not
+        // serialize would render as a bare reassurance naming nowhere.
+        let packaged = packaged_at(
+            "/tmp/ovh",
+            "8.4",
+            "8.4.24",
+            Some("/opt/homebrew/Cellar/php@8.4/8.4.13"),
+        );
+        let plan = build_plan(
+            &php("8.4"),
+            Path::new("/tmp/ovh"),
+            &[],
+            &[],
+            None,
+            Some(&packaged),
+        );
+        let v = serde_json::to_value(&plan).unwrap();
+        assert_eq!(
+            v["keeps"][3]["what"],
+            "The Homebrew PHP 8.4 keg — untouched"
+        );
+        assert_eq!(v["keeps"][3]["path"], "/opt/homebrew/Cellar/php@8.4/8.4.13");
+        assert_eq!(v["keeps"][3]["headline"], false);
+        assert_eq!(v["keeps"][0]["headline"], true);
+    }
+
+    // ---- `Target::packaged` — the filesystem read, kept out of the plan ---
+
+    #[cfg(unix)]
+    #[test]
+    fn packaged_resolves_the_concrete_version_directory_and_never_current() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        install_packaged_php(home, "8.4", "8.4.24");
+        point_current(home, "8.4", "8.4.24");
+
+        let packaged = php("8.4").packaged(home).expect("a packaged 8.4");
+        assert_eq!(
+            packaged.version_dir,
+            home.join("packages/php/8.4/8.4.24"),
+            "design D4: the concrete version directory"
+        );
+        assert!(
+            !packaged.version_dir.ends_with("current"),
+            "a path through `current` is a path whose target can move"
+        );
+    }
+
+    /// "Remove what the row described" (design D3) is only a property if the
+    /// uninstall's question and discovery's question are the SAME question.
+    /// They are: one function answers both.
+    #[cfg(unix)]
+    #[test]
+    fn packaged_agrees_with_the_discovery_that_built_the_row() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        install_packaged_php(home, "8.4", "8.4.24");
+        point_current(home, "8.4", "8.4.24");
+
+        let root = openvhost_core::PackagesRoot::from_home(home);
+        let found = openvhost_core::discover_php(&root, &[], &|_| None);
+        assert_eq!(found.runtimes.len(), 1, "got {found:?}");
+        assert_eq!(
+            found.runtimes[0].source,
+            openvhost_core::PhpRuntimeSource::Packaged {
+                version: "8.4.24".to_string()
+            }
+        );
+
+        let packaged = php("8.4").packaged(home).expect("a packaged 8.4");
+        assert!(
+            found.runtimes[0].fpm_bin.starts_with(&packaged.version_dir),
+            "the row's binary {:?} must live inside the directory the uninstall removes ({:?})",
+            found.runtimes[0].fpm_bin,
+            packaged.version_dir
+        );
+    }
+
+    /// The other direction, and the reason the `bin/php-fpm` check belongs in
+    /// the shared predicate: a package tree discovery will not USE is not one
+    /// this uninstall may remove, because the row the user pressed Uninstall on
+    /// is then Homebrew's and `brew uninstall` is the right plan for it.
+    #[cfg(unix)]
+    #[test]
+    fn a_package_tree_discovery_will_not_use_is_not_one_this_uninstall_removes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        let root = openvhost_core::PackagesRoot::from_home(home);
+        // A version directory with no `bin/php-fpm` in it at all.
+        std::fs::create_dir_all(root.package_dir(
+            openvhost_core::PHP_PACKAGE_NAME,
+            "8.4",
+            "8.4.24",
+        ))
+        .expect("create version dir");
+        point_current(home, "8.4", "8.4.24");
+
+        assert_eq!(php("8.4").packaged(home), None);
+        let found = openvhost_core::discover_php(&root, &[], &|_| None);
+        assert!(found.runtimes.is_empty(), "got {found:?}");
+        assert!(
+            !found.is_complete(),
+            "a broken tree of OURS is reported, not dropped"
+        );
+    }
+
+    /// `version_dir` is what T2's `remove_dir_all` is pointed at, so the link
+    /// shapes `current_version` refuses matter here more than anywhere else in
+    /// the codebase.
+    #[cfg(unix)]
+    #[test]
+    fn a_tampered_current_link_yields_no_packaged_install_to_remove() {
+        for target in ["..", "../../../etc", "/etc", "a/b", "./8.4.24", ""] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let home = tmp.path();
+            install_packaged_php(home, "8.4", "8.4.24");
+            point_current(home, "8.4", target);
+            assert_eq!(
+                php("8.4").packaged(home),
+                None,
+                "`current` -> {target:?} was accepted"
+            );
+        }
+    }
+
+    /// Scope, stated in a test rather than only in a comment: this slice
+    /// threads the packaged state in for PHP only. A packaged MySQL CAN exist
+    /// — `install_mysql_package` is wired — and its uninstall still plans
+    /// `brew uninstall mysql@8.4`. That gap is real and is recorded for its own
+    /// slice; when it is closed, this test fails and has to be changed on
+    /// purpose rather than a behaviour changing quietly.
+    #[cfg(unix)]
+    #[test]
+    fn only_php_threads_a_packaged_state_in_for_now() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        let root = openvhost_core::PackagesRoot::from_home(home);
+        let dir = root.package_dir(openvhost_core::MYSQL_PACKAGE_NAME, "8.4", "8.4.11");
+        for name in ["mysqld", "mysql", "mysqladmin"] {
+            let bin = dir.join("bin").join(name);
+            std::fs::create_dir_all(bin.parent().expect("bin dir")).expect("create bin dir");
+            std::fs::write(&bin, b"x").expect("write binary");
+        }
+        let link = root.current_link(openvhost_core::MYSQL_PACKAGE_NAME, "8.4");
+        std::os::unix::fs::symlink(PathBuf::from("8.4.11"), &link).expect("link current");
+        // Discovery finds it, so this is a real packaged MySQL and not an
+        // empty directory the assertion below would pass over trivially.
+        assert!(
+            openvhost_core::packaged_mysql_runtime(
+                &root,
+                &openvhost_core::MysqlMajor::parse("8.4").expect("catalogue major")
+            )
+            .is_some()
+        );
+
+        assert_eq!(mysql("8.4").packaged(home), None);
+        assert_eq!(mariadb().packaged(home), None);
+    }
+
+    // ---- which keg is named as surviving ---------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn the_kept_keg_is_the_one_homebrew_actually_resolves_to() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prefix = tmp.path();
+        brew_layout(prefix, "php@8.4", "php@8.4", "8.4.13");
+        // Canonicalized, because `keg_provenance` is: on macOS a tempdir under
+        // `/var` resolves to `/private/var`, and comparing against the
+        // uncanonicalized path would make a correct answer look wrong.
+        let expected =
+            std::fs::canonicalize(prefix.join("Cellar/php@8.4/8.4.13")).expect("canonicalize");
+        assert_eq!(brew_keg_path(&[prefix], "php@8.4"), Some(expected));
+    }
+
+    /// Homebrew's alias trap seen from the KEEPING side. On a machine where
+    /// `php@8.5` is an alias for the unversioned `php`, removing a packaged 8.5
+    /// still leaves that keg behind and a rescan still shows 8.5 — which is
+    /// precisely the case where saying nothing would read as "the uninstall
+    /// failed" (design D3's rejected alternative).
+    #[cfg(unix)]
+    #[test]
+    fn an_aliased_keg_is_still_named_as_surviving() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prefix = tmp.path();
+        brew_layout(prefix, "php@8.5", "php", "8.5.9");
+        let expected =
+            std::fs::canonicalize(prefix.join("Cellar/php/8.5.9")).expect("canonicalize");
+        assert_eq!(brew_keg_path(&[prefix], "php@8.5"), Some(expected));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nothing_is_named_as_surviving_when_homebrew_has_no_such_keg() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert_eq!(brew_keg_path(&[tmp.path()], "php@8.4"), None);
     }
 
     /// A `Site` with the fields these predicates read; everything else is
