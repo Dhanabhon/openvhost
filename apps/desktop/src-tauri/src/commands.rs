@@ -13,8 +13,8 @@ use openvhost_conf::WebServerAdapter;
 
 use openvhost_core::{
     ApplyError, ApplyInput, ChangeKind, CoreInfo, Db, Docroot, Domain, InstalledRuntimes, NewSite,
-    PhpVersion, Site, SiteId, SiteName, SiteRepository, SqliteSiteRepository,
-    SqliteWebServerSettings, WebServer, WebServerSettingsRepository,
+    PhpSettingsRepository, PhpVersion, Site, SiteId, SiteName, SiteRepository, SqlitePhpSettings,
+    SqliteSiteRepository, SqliteWebServerSettings, WebServer, WebServerSettingsRepository,
 };
 // Not re-exported at the crate root like the flat types above: `scaffold`'s
 // home is the `site` submodule (Tasks 2-3), and it stays that way rather than
@@ -722,7 +722,8 @@ pub struct ApplyLock(pub(crate) tokio::sync::Mutex<()>);
 
 /// Build the apply input from state.db plus the runtimes probed at startup.
 ///
-/// The nginx settings are read here, alongside the sites, so BOTH entry points
+/// The nginx settings and the default-PHP preference are read here, alongside
+/// the sites, so BOTH entry points
 /// to the pipeline (`plan_config_apply` for the pending-changes banner and
 /// `apply_config` for the apply itself) see the same stored values. Reading them
 /// per call rather than caching is deliberate: `apply_config` recomputes its plan
@@ -744,6 +745,7 @@ async fn apply_input(
     };
     let repo = SqliteSiteRepository::new(db);
     let settings = SqliteWebServerSettings::new(db);
+    let php_settings = SqlitePhpSettings::new(db);
     Ok(ApplyInput {
         home: paths.home.clone(),
         sites: repo.list().await?,
@@ -751,6 +753,11 @@ async fn apply_input(
         // Absent row => documented defaults, and nothing is written. See
         // `WebServerSettingsRepository::get`.
         settings: settings.get().await?,
+        // Likewise absent row => `None` => nobody has chosen a default PHP, so
+        // the catch-all keeps serving the first discovered runtime exactly as
+        // it did before this field existed. The PREFERENCE is what travels;
+        // `render_set` resolves it against `runtimes` itself.
+        default_php: php_settings.get().await?.default_major,
     })
 }
 

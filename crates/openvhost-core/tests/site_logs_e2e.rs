@@ -299,6 +299,9 @@ async fn per_site_logs_capture_the_real_request_and_the_fatal() {
         // this test proves what the logs pipeline does for a normal apply,
         // not that any particular setting renders.
         settings: WebServerSettings::default(),
+        // No preference, likewise: the fixture describes the machine it always
+        // described, so what this test proves is unchanged.
+        default_php: None,
     };
 
     let site_plan = plan(&input).unwrap_or_else(|e| panic!("plan() failed: {e}"));

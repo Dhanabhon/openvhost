@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO php_settings (id, default_major, updated_at) VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET default_major = excluded.default_major, updated_at = excluded.updated_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "d7bc62450756fa9da7e294ac3fb3af032a45c09c2facc01e28854021542edf98"
+}

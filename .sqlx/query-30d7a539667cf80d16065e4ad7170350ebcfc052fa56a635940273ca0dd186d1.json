@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT default_major FROM php_settings WHERE id = 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "default_major",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "php_settings",
+            "name": "default_major"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "30d7a539667cf80d16065e4ad7170350ebcfc052fa56a635940273ca0dd186d1"
+}
