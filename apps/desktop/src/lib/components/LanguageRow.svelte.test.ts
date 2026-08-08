@@ -85,6 +85,11 @@ function renderRow(props: {
 		props: {
 			row: props.row,
 			cataloged: props.cataloged ?? true,
+			// Required by the component; every test in this file predates the
+			// default-PHP setting and asserts nothing about it, so the row renders
+			// exactly as it did before — which is also what proves the badge and
+			// the control are opt-in rather than always-on.
+			onMakeDefault: () => {},
 			brewFound: props.brewFound ?? true,
 			serviceState: props.serviceState ?? null,
 			installing: props.installing ?? '',

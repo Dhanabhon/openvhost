@@ -16,6 +16,12 @@
 		phpSourceBadge
 	} from '../php-install.derive';
 	import {
+		DEFAULT_BADGE_LABEL,
+		DEFAULT_BADGE_TITLE,
+		makeDefaultLabel,
+		makeDefaultTitle
+	} from '../php-default.derive';
+	import {
 		offersUninstall,
 		outOfCatalogueNote,
 		uninstallActionDisabled,
@@ -37,8 +43,12 @@
 		outcome = null,
 		installProgress = null,
 		installTotal = null,
+		isDefault = false,
+		offersDefault = false,
+		settingDefault = '',
 		onInstall,
 		onUninstall,
+		onMakeDefault,
 		onStart,
 		onStop
 	}: {
@@ -112,11 +122,28 @@
 		/** The length the server declared for this download, `null` when it
 		 *  declared none. Read only alongside {@link installProgress}. */
 		installTotal?: number | null;
+		/** Whether THIS major is the one the user chose. Computed page-side by
+		 *  `isChosenDefault`, never derived here from `row`: the answer depends on
+		 *  a resolution the row cannot see, and a row that guessed would badge the
+		 *  major that merely sorted first — the accident this whole slice exists
+		 *  to stop presenting as a decision. */
+		isDefault?: boolean;
+		/** Whether the page offers a way to choose at all (`offersDefaultChoice`).
+		 *  Passed in rather than inferred from `isDefault`, because "no badge" and
+		 *  "no choice on this machine" are different facts: a two-PHP machine with
+		 *  nothing chosen shows no badge on any row and must still offer the
+		 *  control on both. */
+		offersDefault?: boolean;
+		/** The major whose choice is in flight, or `''`. Same shape as
+		 *  `installing`/`uninstalling` above, so one row's pending write disables
+		 *  the control on every row rather than only its own. */
+		settingDefault?: string;
 		onInstall: (major: string) => void;
 		/** Opens the uninstall confirmation (package-uninstall design D6). Never
 		 *  uninstalls anything on its own — nothing is spawned until the dialog's
 		 *  own confirm, and the plan it shows is a pure query. */
 		onUninstall: (major: string) => void;
+		onMakeDefault: (major: string) => void;
 		onStart: (serviceId: string) => void;
 		onStop: (serviceId: string) => void;
 	} = $props();
@@ -197,6 +224,16 @@
 				class="badge source source-{row.source?.kind}"
 				title={sourceBadge.title}
 				data-testid="php-source-{row.major}">{sourceBadge.label}</span
+			>
+		{/if}
+		<!-- WHICH major the catch-all serves, and only when it was CHOSEN. Never
+		     rendered for `unset`'s serving major or for what a missing preference
+		     falls back to — see `isChosenDefault`, which is where that rule lives
+		     and is matched exhaustively. Beside the version like the source chip,
+		     never beside the status pill, so it cannot read as a second status. -->
+		{#if isDefault}
+			<span class="badge default" title={DEFAULT_BADGE_TITLE} data-testid="php-default-{row.major}"
+				>{DEFAULT_BADGE_LABEL}</span
 			>
 		{/if}
 	</div>
@@ -284,6 +321,23 @@
 					onclick={() => onUninstall(row.major)}
 				>
 					{uninstallConfirmLabel(uninstalling === row.major)}
+				</Button>
+			{/if}
+			<!-- Offered only on an installed row that is not already the default,
+			     and only when the page offers the choice at all. The row that IS
+			     the default carries the badge instead: a control whose only effect
+			     is to store what is already stored is the affordance-that-changes-
+			     nothing this page keeps having to delete. -->
+			{#if offersDefault && !isDefault}
+				<Button
+					variant="quiet"
+					size="sm"
+					testId="make-default-{row.major}"
+					ariaLabel={makeDefaultTitle(row.major)}
+					disabled={settingDefault !== ''}
+					onclick={() => onMakeDefault(row.major)}
+				>
+					{makeDefaultLabel(settingDefault === row.major)}
 				</Button>
 			{/if}
 		{/if}
@@ -499,6 +553,21 @@
 		color: var(--vh-link);
 		border-color: color-mix(in oklab, var(--vh-link) 35%, transparent);
 		background: color-mix(in oklab, var(--vh-link) 8%, transparent);
+	}
+	/* A CHOICE the user made, so it borrows `--vh-accent` — the same token
+	   `.recommended` uses, because both say "this one is singled out" — but at
+	   the quieter `.badge.source` weight, since it sits beside the version as
+	   metadata rather than announcing itself. Deliberately NOT `--vh-link`: the
+	   source chip means "we built this one" and can appear on the same row, so
+	   two chips sharing a colour would blur two unrelated facts. Disjoint from
+	   every colour StatusPill paints (`--vh-run`/`--vh-start`/`--vh-fail`/
+	   `--vh-stop`) and carries no dot, so it cannot read as a status. */
+	.badge.default {
+		font-weight: 500;
+		letter-spacing: 0.01em;
+		color: var(--vh-accent);
+		border: 1px solid color-mix(in oklab, var(--vh-accent) 35%, transparent);
+		background: color-mix(in oklab, var(--vh-accent) 8%, transparent);
 	}
 	.meta {
 		color: var(--vh-text-2);

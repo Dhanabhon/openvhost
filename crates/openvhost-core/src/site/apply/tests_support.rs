@@ -63,5 +63,10 @@ pub(crate) fn input_with_home(home: &Path, sites: Vec<Site>, majors: &[&str]) ->
         // care about a specific value overwrite this field on the returned
         // struct.
         settings: WebServerSettings::default(),
+        // No preference — what every machine looks like today, so every test
+        // written before this field existed keeps describing the same machine
+        // and asserting on the same bytes. Tests about the preference set this
+        // field on the returned struct.
+        default_php: None,
     }
 }

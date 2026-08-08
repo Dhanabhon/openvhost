@@ -1,19 +1,52 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { onPhpInstallLog, onPhpInstallProgress, openHomebrewSite } from '$lib/ipc';
+	import {
+		applyConfig,
+		onPhpInstallLog,
+		onPhpInstallProgress,
+		openHomebrewSite,
+		planConfigApply
+	} from '$lib/ipc';
+	import { ApplyStore } from '$lib/apply.svelte';
 	import { subscribeLanguageEvents } from '$lib/languages.listeners';
 	import { languagesStore as store } from '$lib/languages.shared.svelte';
 	import { servicesStore } from '$lib/services.shared.svelte';
 	import { uninstallStore } from '$lib/uninstall.shared.svelte';
 	import { runningCount } from '$lib/services.derive';
 	import AppShell from '$lib/components/AppShell.svelte';
+	import ApplyDialog from '$lib/components/ApplyDialog.svelte';
 	import Button from '$lib/components/Button.svelte';
+	import DefaultPhpNotice from '$lib/components/DefaultPhpNotice.svelte';
+	import { isChosenDefault } from '$lib/php-default.derive';
 	import LanguageRow from '$lib/components/LanguageRow.svelte';
 	import LanguagesEmpty from '$lib/components/LanguagesEmpty.svelte';
 	import UninstallDialog from '$lib/components/UninstallDialog.svelte';
 
 	const running = $derived(runningCount(servicesStore.services));
+
+	// The same pair the Sites and Web server pages wire, for the same pipeline:
+	// the default major is part of ONE config set, so this page reaches
+	// `plan_config_apply`/`apply_config` rather than growing an apply path of
+	// its own.
+	const applyStore = new ApplyStore({ planConfigApply, applyConfig });
+
+	let applyDialogOpen = $state(false);
+
+	/**
+	 * Store the choice, then show what it changes. The dialog is not decoration:
+	 * `set_default_php` writes a preference and rewrites nothing, so without this
+	 * the badge would move while `localhost:8080` kept serving the old major
+	 * until some later, unrelated Apply — and the button's own tooltip promises a
+	 * diff. Mirrors `web-server/+page.svelte`'s `onSave`, whose comment gives the
+	 * general form of the reason: otherwise you leave a control that visibly does
+	 * nothing on the page the user is actually on.
+	 */
+	async function onMakeDefault(major: string): Promise<void> {
+		if (!(await store.setDefault(major))) return;
+		await applyStore.refresh();
+		applyDialogOpen = true;
+	}
 
 	/**
 	 * Which major the on-screen error belongs to. `LanguagesStore.installing`
@@ -176,6 +209,13 @@
 					{store.error}
 				</div>
 			{/if}
+			<!-- A default that cannot be honoured, said once for the page rather than
+			     on a row — the major it names may have NO row at all (a
+			     hand-installed `php@7.4` since removed appears in neither the
+			     catalogue nor the installed list), and that user is exactly the one
+			     who needs telling. Renders nothing in every other state, which is
+			     what keeps this invisible until someone chooses. -->
+			<DefaultPhpNotice resolved={store.defaultPhp} />
 			<LanguagesEmpty
 				brewFound={store.brewFound}
 				noRouteToAnyPhp={store.noRouteToAnyPhp}
@@ -234,8 +274,12 @@
 							outcome={store.outcome}
 							installProgress={store.progressFor(runtime.major)}
 							installTotal={store.installTotal}
+							isDefault={isChosenDefault(store.env.defaultPhp, runtime.major)}
+							offersDefault={store.offersDefaultChoice && runtime.installed}
+							settingDefault={store.settingDefault}
 							onInstall={(major) => void onInstall(major)}
 							onUninstall={(major) => void onUninstall(major)}
+							onMakeDefault={(major) => void onMakeDefault(major)}
 							onStart={(id) => void servicesStore.start(id)}
 							onStop={(id) => void servicesStore.stop(id)}
 						/>
@@ -250,6 +294,16 @@
      this app: `uninstallStore` is shared with the Databases page, and only one
      of the two routes is ever mounted, so this can never double up. -->
 {#if uninstallStore.isOpen}
+	{#if applyDialogOpen}
+		<ApplyDialog
+			changes={applyStore.changes}
+			applying={applyStore.applying}
+			error={applyStore.error}
+			outcome={applyStore.outcome}
+			onApply={() => void applyStore.run()}
+			onClose={() => (applyDialogOpen = false)}
+		/>
+	{/if}
 	<UninstallDialog
 		plan={uninstallStore.plan}
 		planning={uninstallStore.planning}

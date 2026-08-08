@@ -7,13 +7,29 @@
 // rather than only on a button's `disabled` attribute — deleting that attribute
 // must leave a test failing, not just a UI regression nothing catches.
 import { errorMessage } from './errors';
-import type { PhpEnvironmentDto, PhpInstallOutcomeDto, PhpInstallProgressDto } from './ipc';
+import type {
+	DefaultPhpDto,
+	PhpEnvironmentDto,
+	PhpInstallOutcomeDto,
+	PhpInstallProgressDto
+} from './ipc';
+import { offersDefaultChoice } from './php-default.derive';
 import { noRouteToAnyPhp, phpInstallDeclaredTotal } from './php-install.derive';
 
 export interface LanguagesApi {
 	phpEnvironment(): Promise<PhpEnvironmentDto>;
 	rescanPhpRuntimes(): Promise<PhpEnvironmentDto>;
 	installPhp(major: string): Promise<PhpInstallOutcomeDto>;
+	/**
+	 * Store which major the catch-all serves, or clear the choice with `null`.
+	 *
+	 * **Storing only.** The generated config changes on the user's next Apply —
+	 * this page does not open a diff, and an earlier version of this comment
+	 * claimed it did. Same shape as `save_web_server_settings`: validate on
+	 * save (there, a candidate render through `nginx -t`; here, refusing a
+	 * major that is not installed), then let Apply do the rewrite.
+	 */
+	setDefaultPhp(major: string | null): Promise<void>;
 }
 
 /** Same shape `LogPane.svelte` already renders (`services.svelte.ts`'s `UiLog`),
@@ -71,6 +87,15 @@ export class LanguagesStore {
 	 *  ever read alongside a progress state for the same run, and {@link install}
 	 *  clears both together. */
 	installTotal = $state<number | null>(null);
+	/**
+	 * '' when idle, otherwise the major whose "Make default" is in flight.
+	 *
+	 * A state, not a boolean, for the reason `installing` is one and the reason
+	 * this UI has now shipped the boolean-collapse bug five times: a row has to
+	 * tell "somebody else is busy" (disabled) from "it is me" (disabled AND
+	 * labelled), and a boolean can express only one of those.
+	 */
+	settingDefault = $state('');
 
 	constructor(private api: LanguagesApi) {}
 
@@ -80,6 +105,37 @@ export class LanguagesStore {
 
 	get anyInstalled(): boolean {
 		return this.env?.runtimes.some((r) => r.installed) ?? false;
+	}
+
+	/**
+	 * How the catch-all's PHP was resolved — which major serves `localhost:8080`
+	 * AND why (design D2).
+	 *
+	 * `null` until the first environment read settles, which the page already
+	 * gates on. Deliberately NOT defaulted to `{ kind: 'unset' }`: `unset` is a
+	 * claim about this machine ("nobody has chosen"), and asserting it before we
+	 * have looked would let a page painted mid-load contradict a stored
+	 * preference for one frame — the same reason `noRouteToAnyPhp` refuses to
+	 * guess before `env` arrives.
+	 */
+	get defaultPhp(): DefaultPhpDto | null {
+		return this.env?.defaultPhp ?? null;
+	}
+
+	/**
+	 * Whether the page offers a way to choose the default at all — see
+	 * {@link offersDefaultChoice} for the rule and why it is not simply
+	 * "more than one installed".
+	 *
+	 * `false` before `env` arrives: the affordance is a claim about what this
+	 * machine can do, and we have not looked yet.
+	 */
+	get offersDefaultChoice(): boolean {
+		if (this.env === null) return false;
+		return offersDefaultChoice(
+			this.env.defaultPhp,
+			this.env.runtimes.filter((r) => r.installed).length
+		);
 	}
 
 	/**
@@ -215,6 +271,47 @@ export class LanguagesStore {
 	 * Homebrew route silent forever: cleared here, never written by anything on
 	 * that route.
 	 */
+	/**
+	 * Choose `major` as the default the catch-all serves — or clear the choice
+	 * with `null`.
+	 *
+	 * **Stores; does not apply.** Resolving `true` means the preference is in
+	 * `state.db` and the caller should now show the user the diff: the page
+	 * re-plans and opens the same `ApplyDialog` the Sites and Web server pages
+	 * use, so the generated config still changes only through
+	 * `plan_config_apply` → `apply_config` — diff preview, `nginx -t`, rollback
+	 * (spec claim 6). Nothing here writes a config file, and nothing here
+	 * restarts a service.
+	 *
+	 * Re-reads the environment on success rather than assuming the new value
+	 * took, for the same reason {@link install} does: what the page renders must
+	 * be what was stored, and the resolution is computed server-side against the
+	 * installed set — a preference for a major that vanished between the click
+	 * and the write comes back as `preferredMissing`, which the page then
+	 * renders honestly instead of showing a badge on a lie.
+	 *
+	 * The re-entrancy guard lives here, not only on the button's `disabled`
+	 * attribute: deleting that attribute must still leave a second concurrent
+	 * call refused.
+	 */
+	async setDefault(major: string | null): Promise<boolean> {
+		if (this.settingDefault !== '') return false;
+		// `null` clears; the marker still has to be non-empty for the guard
+		// above to hold, so it names the operation rather than a major.
+		this.settingDefault = major ?? 'clear';
+		this.error = '';
+		try {
+			await this.api.setDefaultPhp(major);
+		} catch (e) {
+			this.error = errorMessage(e);
+			return false;
+		} finally {
+			this.settingDefault = '';
+		}
+		await this.refresh();
+		return true;
+	}
+
 	async install(major: string): Promise<boolean> {
 		if (this.installing !== '') return false;
 		this.installing = major;

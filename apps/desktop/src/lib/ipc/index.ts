@@ -14,6 +14,7 @@ import type {
 	ApplyPlanDto,
 	CoreInfo,
 	CreateSiteResult,
+	DefaultPhpDto,
 	FileChangeDto,
 	HomeUsageDto,
 	IpcError,
@@ -89,6 +90,7 @@ export type {
 	ApplyPlanDto,
 	CoreInfo,
 	CreateSiteResult,
+	DefaultPhpDto,
 	FileChangeDto,
 	HomeUsageDto,
 	IpcError,
@@ -454,6 +456,26 @@ export async function rescanPhpRuntimes(): Promise<PhpEnvironmentDto> {
  */
 export async function installPhp(major: string): Promise<PhpInstallOutcomeDto> {
 	return unwrap(commands.installPhp(major));
+}
+
+/**
+ * Choose which PHP major the catch-all (`localhost:8080`) serves, or clear the
+ * choice with `null` so the historical first-discovered rule applies again.
+ *
+ * **Stores only — it does not apply.** The generated config changes on the next
+ * explicit {@link applyConfig}, which shows a diff first, validates with
+ * `nginx -t` and rolls back if that fails. This is the same two-step
+ * {@link saveWebServerSettings} follows, and for the same reason: a second way
+ * for the live config to change would be a change nobody saw a diff for.
+ *
+ * A major that is not installed is refused with an `IpcError` of kind
+ * `validation` naming `default_major`, and nothing is written. "Your default is
+ * no longer installed" is a state you ARRIVE at by uninstalling it — never one
+ * you can choose — so it is always the report of something that really
+ * happened.
+ */
+export async function setDefaultPhp(major: string | null): Promise<void> {
+	await unwrap(commands.setDefaultPhp(major));
 }
 
 /**

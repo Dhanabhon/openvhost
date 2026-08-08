@@ -179,6 +179,21 @@ export const commands = {
 	 */
 	rescanPhpRuntimes: () => typedError<PhpEnvironmentDto, IpcError>(__TAURI_INVOKE("rescan_php_runtimes")),
 	/**
+	 *  Choose which PHP major the catch-all (`localhost:8080`) serves, or clear the
+	 *  choice with `null`.
+	 * 
+	 *  **Stores only.** The live config changes on the user's next explicit Apply,
+	 *  through the same `plan_config_apply` / `apply_config` pipeline the sites and
+	 *  the nginx settings go through — so the change is previewed as a diff,
+	 *  validated by `nginx -t`, and rolled back if that fails. The Languages page
+	 *  opens that dialog itself the moment this resolves, the same way the Web
+	 *  server page does after a settings save.
+	 * 
+	 *  A major that is not installed is refused, naming `default_major` — see
+	 *  [`write_default_php`].
+	 */
+	setDefaultPhp: (major: string | null) => typedError<null, IpcError>(__TAURI_INVOKE("set_default_php", { major })),
+	/**
 	 *  Install a PHP major — from OpenVHost's own package tree when this build
 	 *  publishes one for that major on this host, and via Homebrew otherwise
 	 *  (off-Homebrew slice 5C design D4).
@@ -608,6 +623,45 @@ export type CreateSiteResult = {
 	site: SiteDto,
 	scaffold: ScaffoldOutcomeDto | null,
 };
+
+/**
+ *  Which PHP major the catch-all serves and **why** — the wire copy of
+ *  [`openvhost_core::DefaultPhp`] (default-PHP design D2).
+ * 
+ *  Four variants because there are four distinct outcomes, and the whole point
+ *  of the type is that they stay distinct: "nobody chose" and "your choice is
+ *  no longer installed" agree on what gets served and must never be rendered
+ *  the same way. Collapsing them is the defect shape this project has now
+ *  shipped four times (a boolean that could not express `Failed`; an offer
+ *  union that could not express `awaitingRelease`; a `fallback_brew()` that
+ *  invented a path; a `brewFound` bool answering a per-major question).
+ * 
+ *  [`From<&DefaultPhp>`] below is a full match with **no wildcard arm**, so a
+ *  fifth core outcome fails to compile here rather than arriving on the wire
+ *  as whichever variant happened to come last.
+ */
+export type DefaultPhpDto = 
+/**  No preference, and no PHP installed: the catch-all gets no PHP block. */
+{ kind: "nothingInstalled" } | 
+/**
+ *  No preference stored, so the historical first-discovered rule applies.
+ *  **This is every machine that predates the preference**, and the state
+ *  the Languages page must render exactly as it did before this slice.
+ */
+{ kind: "unset"; serving: string } | 
+/**  A preference is stored and that major is installed. */
+{ kind: "preferred"; major: string } | 
+/**
+ *  A preference is stored and that major is **not** installed — uninstalled
+ *  since, or a keg that disappeared. Carries BOTH what was asked for and
+ *  what is being served instead, which is what lets the page say "your
+ *  default was 8.4, which is no longer installed" (spec claim 4) rather
+ *  than silently showing 8.1.
+ * 
+ *  `serving` is `None` in the one case where the fallback has nothing to
+ *  fall back to: a stored preference with nothing installed at all.
+ */
+{ kind: "preferredMissing"; requested: string; serving: string | null };
 
 export type FileChangeDto = {
 	path: string,
@@ -1332,6 +1386,19 @@ export type PhpEnvironmentDto = {
 	brewFound: boolean,
 	brewSearched: string[],
 	runtimes: PhpRuntimeDto[],
+	/**
+	 *  Which major the catch-all serves, resolved from the stored preference
+	 *  against `runtimes` in the same pass that built them (default-PHP design
+	 *  D2/D6).
+	 * 
+	 *  Rides on the ENVIRONMENT rather than on a row, unlike
+	 *  [`PhpRuntimeDto::offer`], and the reason is [`DefaultPhpDto::PreferredMissing`]:
+	 *  the major it names may have no row at all (a hand-installed `php@7.4`
+	 *  that was then removed leaves neither a catalogue entry nor an installed
+	 *  runtime). A per-row field could not carry that state anywhere, which is
+	 *  exactly the fact the user most needs told.
+	 */
+	defaultPhp: DefaultPhpDto,
 };
 
 /**

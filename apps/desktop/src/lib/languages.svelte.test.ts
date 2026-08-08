@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, expect, it } from 'vitest';
 import { LanguagesStore, type LanguagesApi } from './languages.svelte';
-import type { PhpEnvironmentDto, PhpInstallOutcomeDto, PhpRuntimeDto } from './ipc';
+import type { DefaultPhpDto, PhpEnvironmentDto, PhpInstallOutcomeDto, PhpRuntimeDto } from './ipc';
 
 /** One catalogue/installed row, with sensible installed-shape defaults so most
  *  tests only need to state `major` and `installed`. */
@@ -33,8 +33,26 @@ function row(
 	};
 }
 
-function env(runtimes: PhpRuntimeDto[]): PhpEnvironmentDto {
-	return { brewFound: true, brewSearched: ['/opt/homebrew/bin/brew'], runtimes };
+/** What `defaultPhp` is on a machine that has never set a preference — which is
+ *  every fixture in this file, all of which predate the setting. Derived rather
+ *  than hardcoded so a fixture cannot claim a `serving` major it does not have:
+ *  `unset` names the first installed runtime, exactly as the resolution does,
+ *  and no runtimes means `nothingInstalled`. */
+function noPreference(runtimes: PhpRuntimeDto[]): DefaultPhpDto {
+	const first = runtimes.find((r) => r.installed);
+	return first ? { kind: 'unset', serving: first.major } : { kind: 'nothingInstalled' };
+}
+
+function env(
+	runtimes: PhpRuntimeDto[],
+	brew: { found?: boolean; searched?: string[] } = {}
+): PhpEnvironmentDto {
+	return {
+		brewFound: brew.found ?? true,
+		brewSearched: brew.searched ?? ['/opt/homebrew/bin/brew'],
+		runtimes,
+		defaultPhp: noPreference(runtimes)
+	};
 }
 
 /** A clean Homebrew install of `major` — the route every real machine takes
@@ -54,7 +72,11 @@ function api(
 	return {
 		phpEnvironment: async () => overrides.env ?? env([]),
 		rescanPhpRuntimes: async () => overrides.env ?? env([]),
-		installPhp: async () => overrides.outcome ?? brewOutcome('')
+		installPhp: async () => overrides.outcome ?? brewOutcome(''),
+		// Accepts and forgets: every test in this file predates the preference
+		// and asserts nothing about it. A test that means to exercise setting a
+		// default builds its own api rather than leaning on this.
+		setDefaultPhp: async () => {}
 	};
 }
 
@@ -68,16 +90,12 @@ describe('LanguagesStore', () => {
 	it('knows the difference between no PHP and no Homebrew', async () => {
 		// Different states, different remedies — the page cannot infer the second
 		// from an empty list.
-		const noPhp = new LanguagesStore(
-			api({ env: { brewFound: true, brewSearched: [], runtimes: [row('8.4', false)] } })
-		);
+		const noPhp = new LanguagesStore(api({ env: env([row('8.4', false)], { searched: [] }) }));
 		await noPhp.refresh();
 		expect(noPhp.brewFound).toBe(true);
 		expect(noPhp.anyInstalled).toBe(false);
 
-		const noBrew = new LanguagesStore(
-			api({ env: { brewFound: false, brewSearched: ['/opt/homebrew/bin/brew'], runtimes: [] } })
-		);
+		const noBrew = new LanguagesStore(api({ env: env([], { found: false }) }));
 		await noBrew.refresh();
 		expect(noBrew.brewFound).toBe(false);
 	});
@@ -98,9 +116,7 @@ describe('LanguagesStore', () => {
 
 		// …and it still answers honestly once a snapshot with nothing in it
 		// arrives, so the guard above is not just suppressing the state.
-		const dead = new LanguagesStore(
-			api({ env: { brewFound: false, brewSearched: [], runtimes: [] } })
-		);
+		const dead = new LanguagesStore(api({ env: env([], { found: false, searched: [] }) }));
 		await dead.refresh();
 		expect(dead.noRouteToAnyPhp).toBe(true);
 	});
@@ -110,11 +126,9 @@ describe('LanguagesStore', () => {
 		// own tree. Neither is a dead end, and both used to render one.
 		const installed = new LanguagesStore(
 			api({
-				env: {
-					brewFound: false,
-					brewSearched: ['/opt/homebrew/bin/brew'],
-					runtimes: [row('8.4', true, { source: { kind: 'packaged', version: '8.4.24' } })]
-				}
+				env: env([row('8.4', true, { source: { kind: 'packaged', version: '8.4.24' } })], {
+					found: false
+				})
 			})
 		);
 		await installed.refresh();
@@ -122,14 +136,13 @@ describe('LanguagesStore', () => {
 
 		const offered = new LanguagesStore(
 			api({
-				env: {
-					brewFound: false,
-					brewSearched: ['/opt/homebrew/bin/brew'],
-					runtimes: [
+				env: env(
+					[
 						row('8.1', false),
 						row('8.4', false, { offer: { kind: 'available', version: '8.4.24' } })
-					]
-				}
+					],
+					{ found: false }
+				)
 			})
 		);
 		await offered.refresh();
@@ -149,6 +162,8 @@ describe('LanguagesStore', () => {
 		const s = new LanguagesStore({
 			phpEnvironment: async () => env([]),
 			rescanPhpRuntimes: async () => env([]),
+			// Unused here; present because LanguagesApi requires it.
+			setDefaultPhp: async () => {},
 			installPhp: async () => {
 				calls += 1;
 				await new Promise((r) => setTimeout(r, 5));
@@ -163,6 +178,8 @@ describe('LanguagesStore', () => {
 		const s = new LanguagesStore({
 			phpEnvironment: async () => env([]),
 			rescanPhpRuntimes: async () => env([]),
+			// Unused here; present because LanguagesApi requires it.
+			setDefaultPhp: async () => {},
 			installPhp: async () => {
 				throw { kind: 'core', message: 'brew: no such formula' };
 			}
@@ -180,6 +197,8 @@ describe('LanguagesStore', () => {
 		const s = new LanguagesStore({
 			phpEnvironment: async () => env([row('8.3', false), row('8.4', false)]),
 			rescanPhpRuntimes: async () => env([]),
+			// Unused here; present because LanguagesApi requires it.
+			setDefaultPhp: async () => {},
 			installPhp: async () => {
 				throw { kind: 'core', message: 'boom' };
 			}
@@ -218,6 +237,8 @@ describe('LanguagesStore', () => {
 				throw { kind: 'core', message: 'transient' };
 			},
 			rescanPhpRuntimes: async () => env([]),
+			// Unused here; present because LanguagesApi requires it.
+			setDefaultPhp: async () => {},
 			installPhp: async () => brewOutcome('8.3')
 		});
 		await s.refresh();
@@ -238,7 +259,9 @@ describe('LanguagesStore', () => {
 				if (calls === 1) return env([row('8.3', true)]);
 				throw { kind: 'core', message: 'transient' };
 			},
-			installPhp: async () => brewOutcome('8.3')
+			installPhp: async () => brewOutcome('8.3'),
+			// Unused here; present because LanguagesApi requires it.
+			setDefaultPhp: async () => {}
 		});
 		await s.rescan();
 		await s.rescan();
@@ -339,6 +362,8 @@ describe('LanguagesStore', () => {
 				return env([row('8.4', calls > 1)]);
 			},
 			rescanPhpRuntimes: async () => env([row('8.4', true)]),
+			// Unused here; present because LanguagesApi requires it.
+			setDefaultPhp: async () => {},
 			installPhp: async () => brewOutcome('8.4')
 		});
 		await s.refresh();
@@ -346,5 +371,102 @@ describe('LanguagesStore', () => {
 		await s.install('8.4');
 		expect(calls).toBe(2);
 		expect(s.env?.runtimes[0].installed).toBe(true);
+	});
+});
+
+// `setDefault` shipped with NO test at all, and the whole-branch review proved
+// it was a real gap rather than a style nit: deleting both the re-entrancy
+// guard and the refresh-on-success left 1391/1391 green. Its own reviewer drew
+// the conclusion worth keeping — that absence is very likely why the missing
+// apply-dialog wiring went unnoticed, because a test that actually invoked this
+// method and looked at what followed would have had to notice.
+describe('LanguagesStore.setDefault', () => {
+	it('refuses a second write while one is in flight', async () => {
+		let calls = 0;
+		const s = new LanguagesStore({
+			phpEnvironment: async () => env([row('8.1', true), row('8.3', true)]),
+			rescanPhpRuntimes: async () => env([row('8.1', true), row('8.3', true)]),
+			installPhp: async () => brewOutcome(''),
+			setDefaultPhp: async () => {
+				calls += 1;
+				await new Promise((r) => setTimeout(r, 5));
+			}
+		});
+		const [first, second] = await Promise.all([s.setDefault('8.1'), s.setDefault('8.3')]);
+		expect(calls).toBe(1);
+		// The refused one reports refusal rather than pretending it stored
+		// something — the caller opens a diff on `true`, so a lie here would open
+		// a dialog for a write that never happened.
+		expect([first, second].filter(Boolean).length).toBe(1);
+	});
+
+	it('marks which choice is in flight and clears it afterwards', async () => {
+		let seen = 'not-set';
+		const s = new LanguagesStore({
+			phpEnvironment: async () => env([row('8.1', true)]),
+			rescanPhpRuntimes: async () => env([row('8.1', true)]),
+			installPhp: async () => brewOutcome(''),
+			setDefaultPhp: async () => {
+				seen = s.settingDefault;
+			}
+		});
+		await s.setDefault('8.1');
+		expect(seen).toBe('8.1');
+		expect(s.settingDefault).toBe('');
+	});
+
+	it('names the operation, not a major, when clearing', async () => {
+		// `null` clears, and the marker still has to be non-empty or the
+		// re-entrancy guard above stops holding.
+		let seen = 'not-set';
+		const s = new LanguagesStore({
+			phpEnvironment: async () => env([row('8.1', true)]),
+			rescanPhpRuntimes: async () => env([row('8.1', true)]),
+			installPhp: async () => brewOutcome(''),
+			setDefaultPhp: async () => {
+				seen = s.settingDefault;
+			}
+		});
+		await s.setDefault(null);
+		expect(seen).not.toBe('');
+	});
+
+	it('re-reads the environment on success, so the badge reflects the store', async () => {
+		let reads = 0;
+		const s = new LanguagesStore({
+			phpEnvironment: async () => {
+				reads += 1;
+				return env([row('8.1', true)]);
+			},
+			rescanPhpRuntimes: async () => env([row('8.1', true)]),
+			installPhp: async () => brewOutcome(''),
+			setDefaultPhp: async () => {}
+		});
+		expect(await s.setDefault('8.1')).toBe(true);
+		// Without this the row would keep rendering the pre-write resolution and
+		// the user would see their choice not take.
+		expect(reads).toBe(1);
+	});
+
+	it('surfaces the error, reads nothing, and stays usable when the write fails', async () => {
+		let reads = 0;
+		const s = new LanguagesStore({
+			phpEnvironment: async () => {
+				reads += 1;
+				return env([row('8.1', true)]);
+			},
+			rescanPhpRuntimes: async () => env([row('8.1', true)]),
+			installPhp: async () => brewOutcome(''),
+			setDefaultPhp: async () => {
+				throw { kind: 'validation', field: 'default_major', message: 'PHP 9.9 is not installed' };
+			}
+		});
+		expect(await s.setDefault('9.9')).toBe(false);
+		expect(s.error).toContain('not installed');
+		// No refresh on failure: nothing changed, and a re-read would only be a
+		// chance to overwrite the error the user has not read yet.
+		expect(reads).toBe(0);
+		// And the guard released, so a corrected second attempt is possible.
+		expect(s.settingDefault).toBe('');
 	});
 });

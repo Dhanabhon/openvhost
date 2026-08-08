@@ -17,11 +17,12 @@
 // `services.shared.svelte.ts`: that module stays a pure, api-injected store
 // class (its unit tests hand it a fake `LanguagesApi`), and this is the one
 // place that binds it to the real Tauri commands.
-import { installPhp, phpEnvironment, rescanPhpRuntimes } from './ipc';
+import { installPhp, phpEnvironment, rescanPhpRuntimes, setDefaultPhp } from './ipc';
 import { LanguagesStore } from './languages.svelte';
 
 export const languagesStore = new LanguagesStore({
 	phpEnvironment,
 	rescanPhpRuntimes,
-	installPhp
+	installPhp,
+	setDefaultPhp
 });

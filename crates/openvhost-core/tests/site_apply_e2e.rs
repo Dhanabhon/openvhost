@@ -177,6 +177,9 @@ async fn site_apply_serves_a_real_site_end_to_end() {
         // The defaults, deliberately: this test proves the pipeline serves a
         // real request end to end, not that any particular setting renders.
         settings: WebServerSettings::default(),
+        // No preference, for the same reason: this fixture describes the
+        // machine it always described, so what this test proves is unchanged.
+        default_php: None,
     };
 
     let site_plan = plan(&input).unwrap_or_else(|e| panic!("plan() failed: {e}"));

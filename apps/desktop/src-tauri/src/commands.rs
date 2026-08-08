@@ -13,8 +13,8 @@ use openvhost_conf::WebServerAdapter;
 
 use openvhost_core::{
     ApplyError, ApplyInput, ChangeKind, CoreInfo, Db, Docroot, Domain, InstalledRuntimes, NewSite,
-    PhpVersion, Site, SiteId, SiteName, SiteRepository, SqliteSiteRepository,
-    SqliteWebServerSettings, WebServer, WebServerSettingsRepository,
+    PhpSettingsRepository, PhpVersion, Site, SiteId, SiteName, SiteRepository, SqlitePhpSettings,
+    SqliteSiteRepository, SqliteWebServerSettings, WebServer, WebServerSettingsRepository,
 };
 // Not re-exported at the crate root like the flat types above: `scaffold`'s
 // home is the `site` submodule (Tasks 2-3), and it stays that way rather than
@@ -722,7 +722,8 @@ pub struct ApplyLock(pub(crate) tokio::sync::Mutex<()>);
 
 /// Build the apply input from state.db plus the runtimes probed at startup.
 ///
-/// The nginx settings are read here, alongside the sites, so BOTH entry points
+/// The nginx settings and the default-PHP preference are read here, alongside
+/// the sites, so BOTH entry points
 /// to the pipeline (`plan_config_apply` for the pending-changes banner and
 /// `apply_config` for the apply itself) see the same stored values. Reading them
 /// per call rather than caching is deliberate: `apply_config` recomputes its plan
@@ -744,6 +745,7 @@ async fn apply_input(
     };
     let repo = SqliteSiteRepository::new(db);
     let settings = SqliteWebServerSettings::new(db);
+    let php_settings = SqlitePhpSettings::new(db);
     Ok(ApplyInput {
         home: paths.home.clone(),
         sites: repo.list().await?,
@@ -751,6 +753,11 @@ async fn apply_input(
         // Absent row => documented defaults, and nothing is written. See
         // `WebServerSettingsRepository::get`.
         settings: settings.get().await?,
+        // Likewise absent row => `None` => nobody has chosen a default PHP, so
+        // the catch-all keeps serving the first discovered runtime exactly as
+        // it did before this field existed. The PREFERENCE is what travels;
+        // `render_set` resolves it against `runtimes` itself.
+        default_php: php_settings.get().await?.default_major,
     })
 }
 
@@ -1829,6 +1836,64 @@ pub struct PhpRuntimeDto {
     pub offer: PhpPackageOfferDto,
 }
 
+/// Which PHP major the catch-all serves and **why** — the wire copy of
+/// [`openvhost_core::DefaultPhp`] (default-PHP design D2).
+///
+/// Four variants because there are four distinct outcomes, and the whole point
+/// of the type is that they stay distinct: "nobody chose" and "your choice is
+/// no longer installed" agree on what gets served and must never be rendered
+/// the same way. Collapsing them is the defect shape this project has now
+/// shipped four times (a boolean that could not express `Failed`; an offer
+/// union that could not express `awaitingRelease`; a `fallback_brew()` that
+/// invented a path; a `brewFound` bool answering a per-major question).
+///
+/// [`From<&DefaultPhp>`] below is a full match with **no wildcard arm**, so a
+/// fifth core outcome fails to compile here rather than arriving on the wire
+/// as whichever variant happened to come last.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum DefaultPhpDto {
+    /// No preference, and no PHP installed: the catch-all gets no PHP block.
+    NothingInstalled,
+    /// No preference stored, so the historical first-discovered rule applies.
+    /// **This is every machine that predates the preference**, and the state
+    /// the Languages page must render exactly as it did before this slice.
+    Unset { serving: String },
+    /// A preference is stored and that major is installed.
+    Preferred { major: String },
+    /// A preference is stored and that major is **not** installed — uninstalled
+    /// since, or a keg that disappeared. Carries BOTH what was asked for and
+    /// what is being served instead, which is what lets the page say "your
+    /// default was 8.4, which is no longer installed" (spec claim 4) rather
+    /// than silently showing 8.1.
+    ///
+    /// `serving` is `None` in the one case where the fallback has nothing to
+    /// fall back to: a stored preference with nothing installed at all.
+    PreferredMissing {
+        requested: String,
+        serving: Option<String>,
+    },
+}
+
+impl From<&openvhost_core::DefaultPhp> for DefaultPhpDto {
+    fn from(d: &openvhost_core::DefaultPhp) -> Self {
+        use openvhost_core::DefaultPhp as D;
+        match d {
+            D::NothingInstalled => Self::NothingInstalled,
+            D::Unset { serving } => Self::Unset {
+                serving: serving.clone(),
+            },
+            D::Preferred { major } => Self::Preferred {
+                major: major.clone(),
+            },
+            D::PreferredMissing { requested, serving } => Self::PreferredMissing {
+                requested: requested.clone(),
+                serving: serving.clone(),
+            },
+        }
+    }
+}
+
 /// What the Languages page needs to decide which state to show (spec §6.1).
 ///
 /// `brew_found` means exactly one thing — **we looked for Homebrew and did not
@@ -1848,6 +1913,17 @@ pub struct PhpEnvironmentDto {
     pub brew_found: bool,
     pub brew_searched: Vec<String>,
     pub runtimes: Vec<PhpRuntimeDto>,
+    /// Which major the catch-all serves, resolved from the stored preference
+    /// against `runtimes` in the same pass that built them (default-PHP design
+    /// D2/D6).
+    ///
+    /// Rides on the ENVIRONMENT rather than on a row, unlike
+    /// [`PhpRuntimeDto::offer`], and the reason is [`DefaultPhpDto::PreferredMissing`]:
+    /// the major it names may have no row at all (a hand-installed `php@7.4`
+    /// that was then removed leaves neither a catalogue entry nor an installed
+    /// runtime). A per-row field could not carry that state anywhere, which is
+    /// exactly the fact the user most needs told.
+    pub default_php: DefaultPhpDto,
 }
 
 /// One line of `brew install`'s output, forwarded live while an install runs.
@@ -2252,6 +2328,162 @@ fn brew_searched_paths() -> Vec<String> {
         .collect()
 }
 
+/// Resolve the stored default-PHP preference against `installed`.
+///
+/// Over a plain `&Db` and a slice rather than `tauri::State`, the same split
+/// `read_settings`/`write_settings` use above and for the same reason: the
+/// behaviour that matters — that an uninstalled preference resolves to
+/// `PreferredMissing` and not to `Unset` — is then reachable from a test with
+/// an in-memory database instead of needing a mock Tauri app.
+///
+/// Reads a fresh row every call. `php_environment` is the Languages page's own
+/// mount/refresh read, so caching would mean a default set in one place and a
+/// page rendered in another could disagree about which major is served.
+/// **Takes `Option<&Db>`, and neither absence is an error on this path.**
+/// `state.db` is opened best-effort (`lib.rs`: "a missing/unreadable state.db
+/// must never stop the supervisor from starting"), and this is the Languages
+/// page's own mount read. A hard dependency here would take the whole page
+/// down — no rows, no Install, no Homebrew guidance — on a machine where it
+/// used to work fine, which is the failure `install_php` was deliberately
+/// written to avoid. No database means no stored preference, which is exactly
+/// what `None` already means.
+///
+/// An **unreadable** stored value is treated the same way, and that is a
+/// judgement rather than laziness: the only in-app route to clear a bad
+/// preference is the control on this very page, so failing here would brick
+/// the one surface that can fix it. The apply pipeline still fails closed on
+/// the same value (`apply_input`), so nothing is generated from a value we
+/// could not parse — the fallback is for *rendering*, not for serving.
+async fn read_default_php(
+    db: Option<&Db>,
+    installed: &[openvhost_core::PhpRuntime],
+) -> Result<DefaultPhpDto, IpcError> {
+    let Some(db) = db else {
+        return Ok(DefaultPhpDto::from(&openvhost_core::DefaultPhp::resolve(
+            None, installed,
+        )));
+    };
+    // Absent row => `None` => nobody has chosen. See `PhpSettingsRepository::get`:
+    // reading never writes one.
+    let stored = match SqlitePhpSettings::new(db).get().await {
+        Ok(stored) => stored,
+        Err(e) => {
+            // Deliberately not surfaced as a resolution state: naming it would
+            // need a fifth `DefaultPhp` variant, and the value is unbounded
+            // text that would then have to reach a user-facing sentence. The
+            // gap this leaves — the user is not TOLD why their choice stopped
+            // applying, only that it is not in effect — is recorded in the
+            // spec as owed.
+            eprintln!(
+                "openvhost: stored default PHP could not be read ({e}); \
+                 falling back to no preference"
+            );
+            return Ok(DefaultPhpDto::from(&openvhost_core::DefaultPhp::resolve(
+                None, installed,
+            )));
+        }
+    };
+    Ok(DefaultPhpDto::from(&openvhost_core::DefaultPhp::resolve(
+        stored.default_major.as_ref(),
+        installed,
+    )))
+}
+
+/// Store the default-PHP preference (`Some`) or clear it (`None`).
+///
+/// **Two guards, and they answer different questions.**
+///
+///  1. [`PhpVersion::parse`] is THE IPC ingress guard, the same shape
+///     `TryFrom<SiteInput>` and `TryFrom<WebServerSettingsDto>` are: the value
+///     reaches `state.db`, and from there a php-fpm socket filename, so nothing
+///     unvalidated may pass. The error names `default_major`, matching the
+///     column and the repository's own re-validate-on-read relabel.
+///  2. **The major must be installed.** A preference for something absent is a
+///     state you ARRIVE at — by uninstalling the major you chose — never one
+///     you choose; the app has no reason to help a caller manufacture it, and
+///     the Languages page only ever offers installed rows. Refusing it here
+///     means the only route to `PreferredMissing` is the real one, so the state
+///     the page renders always describes something that actually happened.
+///
+/// Storing is deliberately NOT applying. The generated config changes only
+/// through `plan_config_apply` / `apply_config` — diff preview, `nginx -t`,
+/// rollback — exactly like `save_web_server_settings` (default-PHP spec claim
+/// 6). A second write path to the live config would be a change the user never
+/// saw a diff for.
+///
+/// No `nginx -t` pre-check, unlike `write_settings`, and the asymmetry is
+/// structural rather than an omission: that check exists because a stored nginx
+/// value nginx refuses makes EVERY later apply fail and roll back. A stored
+/// major cannot do that. `DefaultPhp::resolve` takes the served major from the
+/// **installed runtime** it matched and falls back to the first installed one
+/// when it matches nothing, so the stored string never reaches
+/// `socket_path` — there is no value here that could poison a later apply.
+async fn write_default_php(
+    db: &Db,
+    major: Option<String>,
+    installed: &[openvhost_core::PhpRuntime],
+) -> Result<(), IpcError> {
+    let default_major = match major {
+        None => None,
+        Some(raw) => {
+            let parsed = PhpVersion::parse(&raw).map_err(|e| match e {
+                openvhost_core::CoreError::Validation { reason, .. } => IpcError::Validation {
+                    field: "default_major".to_string(),
+                    message: reason,
+                },
+                other => IpcError::from(other),
+            })?;
+            if !installed.iter().any(|rt| rt.major == parsed.as_str()) {
+                return Err(IpcError::Validation {
+                    field: "default_major".to_string(),
+                    message: format!(
+                        "PHP {} is not installed, so it cannot be made the default",
+                        parsed.as_str()
+                    ),
+                });
+            }
+            Some(parsed)
+        }
+    };
+    SqlitePhpSettings::new(db)
+        .save(&openvhost_core::PhpSettings { default_major })
+        .await?;
+    Ok(())
+}
+
+/// Choose which PHP major the catch-all (`localhost:8080`) serves, or clear the
+/// choice with `null`.
+///
+/// **Stores only.** The live config changes on the user's next explicit Apply,
+/// through the same `plan_config_apply` / `apply_config` pipeline the sites and
+/// the nginx settings go through — so the change is previewed as a diff,
+/// validated by `nginx -t`, and rolled back if that fails. The Languages page
+/// opens that dialog itself the moment this resolves, the same way the Web
+/// server page does after a settings save.
+///
+/// A major that is not installed is refused, naming `default_major` — see
+/// [`write_default_php`].
+#[tauri::command]
+#[specta::specta]
+pub async fn set_default_php(
+    db: tauri::State<'_, Db>,
+    runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
+    major: Option<String>,
+) -> Result<(), IpcError> {
+    // Cloned out of the guard and dropped before the `.await`, like every other
+    // command reading this lock: holding a `std::sync::RwLockReadGuard` across
+    // an await point makes the future non-`Send`, which fails to compile.
+    let installed = runtimes
+        .read()
+        .map_err(|_| IpcError::Core {
+            message: "runtime list is poisoned".into(),
+        })?
+        .as_ref()
+        .map(|r| r.php.clone())
+        .unwrap_or_default();
+    write_default_php(db.inner(), major, &installed).await
+}
+
 /// Read-only environment summary for the Languages page: whether Homebrew was
 /// found, where it looked, and one row per PHP version (spec §6.1).
 ///
@@ -2264,6 +2496,7 @@ fn brew_searched_paths() -> Vec<String> {
 #[tauri::command]
 #[specta::specta]
 pub async fn php_environment(
+    db: tauri::State<'_, Db>,
     runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
     paths: tauri::State<'_, Option<StackPaths>>,
 ) -> Result<PhpEnvironmentDto, IpcError> {
@@ -2284,6 +2517,11 @@ pub async fn php_environment(
     Ok(PhpEnvironmentDto {
         brew_found: openvhost_core::find_brew().is_some(),
         brew_searched: brew_searched_paths(),
+        // Resolved against THE SAME `installed` slice the rows are built from,
+        // so the major the page marks as default is always one of the rows it
+        // rendered in the same response — the seam `render_set` keeps on its
+        // own side by resolving against the very list its pool loop iterates.
+        default_php: read_default_php(Some(db.inner()), &installed).await?,
         runtimes: php_rows(&p.home, &installed, &[]),
     })
 }
@@ -2306,6 +2544,7 @@ pub async fn php_environment(
 #[tauri::command]
 #[specta::specta]
 pub async fn rescan_php_runtimes(
+    db: tauri::State<'_, Db>,
     runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
     paths: tauri::State<'_, Option<StackPaths>>,
     sup: tauri::State<'_, Arc<Supervisor>>,
@@ -2327,6 +2566,13 @@ pub async fn rescan_php_runtimes(
     Ok(PhpEnvironmentDto {
         brew_found: openvhost_core::find_brew().is_some(),
         brew_searched: brew_searched_paths(),
+        // Re-resolved against the NEWLY discovered set, not the pre-rescan one:
+        // a rescan is exactly when a major can appear or disappear, so this is
+        // the call that turns "your default is gone" into "your default is back"
+        // (and the reverse) without a relaunch. Spec claim 5 — the preference
+        // survives a rescan — is this line plus the fact that nothing on the
+        // rescan path writes to `php_settings`.
+        default_php: read_default_php(Some(db.inner()), &installed.runtimes).await?,
         runtimes: php_rows(&p.home, &installed.runtimes, &[]),
     })
 }
@@ -3855,6 +4101,12 @@ mod php_ipc_tests {
         }));
         app.manage(Arc::new(Supervisor::new(openvhost_proc::default_driver())));
         app.manage(InstallLock::default());
+        // Managed since the rescan started reporting the resolved default PHP
+        // alongside the rows (default-PHP T2). A fresh in-memory database has
+        // no preference row, which is what this test's machine looks like and
+        // what every real machine looks like — the state under test here is
+        // still the LOCK, not the preference.
+        app.manage(Db::open_in_memory().await.expect("in-memory db"));
 
         // Hold the guard the way `install_php`'s `try_lock` would while a
         // build is running.
@@ -3864,6 +4116,7 @@ mod php_ipc_tests {
         let handle = app.handle().clone();
         let task = tokio::spawn(async move {
             rescan_php_runtimes(
+                handle.state::<Db>(),
                 handle.state::<RwLock<Option<InstalledRuntimes>>>(),
                 handle.state::<Option<StackPaths>>(),
                 handle.state::<Arc<Supervisor>>(),
@@ -5915,6 +6168,320 @@ pub async fn verify_mysql_connection(
             ),
         },
     })
+}
+
+/// The default-PHP command surface (default-PHP design D1/D2, spec claims
+/// 3/4/5/6).
+///
+/// Drives `read_default_php`/`write_default_php` over an in-memory database
+/// rather than the two `#[tauri::command]` wrappers, the same split
+/// `web_server_settings_ipc_tests` uses for `read_settings`/`write_settings`:
+/// the commands add nothing but a `State` unwrap and a lock read, and requiring
+/// a mock Tauri app to reach the behaviour would put the interesting assertions
+/// behind machinery that has nothing to do with them.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod default_php_ipc_tests {
+    use super::*;
+
+    fn installed(majors: &[&str]) -> Vec<openvhost_core::PhpRuntime> {
+        majors
+            .iter()
+            .map(|m| openvhost_core::PhpRuntime {
+                major: (*m).to_string(),
+                fpm_bin: PathBuf::from(format!("/opt/homebrew/opt/php@{m}/sbin/php-fpm")),
+                source: openvhost_core::PhpRuntimeSource::Homebrew,
+            })
+            .collect()
+    }
+
+    fn expect_validation(e: IpcError) -> (String, String) {
+        match e {
+            IpcError::Validation { field, message } => (field, message),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Reading. VACUITY: replacing `read_default_php`'s body with a constant
+    // `Ok(DefaultPhpDto::Unset { serving: installed.first()… })` — i.e. never
+    // consulting the stored row at all, the shape this slice exists to end —
+    // reddens `a_stored_preference_reaches_the_wire_as_preferred` and
+    // `an_uninstalled_preference_reaches_the_wire_as_preferred_missing` while
+    // leaving `a_fresh_database_reports_unset…` green. Restored afterwards.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_fresh_database_reports_unset() {
+        // Every real machine today (design D3). The page must be able to tell
+        // this from "you chose 8.3 and 8.3 is what you get", which is the next
+        // test. That reading this does not CREATE a row is pinned one layer
+        // down, where the SQL lives
+        // (`php::settings::tests::a_fresh_database_reads_no_preference_without_writing_a_row`)
+        // — this crate has no sqlx dependency to re-count rows with, and
+        // adding one to restate someone else's guarantee would be worse than
+        // pointing at it.
+        let db = Db::open_in_memory().await.unwrap();
+        assert_eq!(
+            read_default_php(Some(&db), &installed(&["8.1", "8.3"]))
+                .await
+                .unwrap(),
+            DefaultPhpDto::Unset {
+                serving: "8.1".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_database_with_no_php_reports_nothing_installed() {
+        let db = Db::open_in_memory().await.unwrap();
+        assert_eq!(
+            read_default_php(Some(&db), &[]).await.unwrap(),
+            DefaultPhpDto::NothingInstalled
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stored_preference_reaches_the_wire_as_preferred() {
+        let db = Db::open_in_memory().await.unwrap();
+        let rt = installed(&["8.1", "8.3"]);
+        write_default_php(&db, Some("8.3".into()), &rt)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_default_php(Some(&db), &rt).await.unwrap(),
+            DefaultPhpDto::Preferred {
+                major: "8.3".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn choosing_the_first_discovered_major_is_still_reported_as_a_choice() {
+        // Same served major as `Unset` would give, DIFFERENT wire state. If the
+        // two collapsed, the page could not tell "you chose 8.1" from "8.1 is
+        // what you happen to get" — the conflation D2 forbids, one layer up
+        // from where `DefaultPhp`'s own test pins it.
+        let db = Db::open_in_memory().await.unwrap();
+        let rt = installed(&["8.1", "8.3"]);
+        write_default_php(&db, Some("8.1".into()), &rt)
+            .await
+            .unwrap();
+        let read = read_default_php(Some(&db), &rt).await.unwrap();
+        assert_eq!(
+            read,
+            DefaultPhpDto::Preferred {
+                major: "8.1".to_string()
+            }
+        );
+        assert_ne!(
+            read,
+            DefaultPhpDto::Unset {
+                serving: "8.1".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn an_uninstalled_preference_reaches_the_wire_as_preferred_missing() {
+        // Spec claim 4, at the command boundary: uninstalling the default must
+        // leave the state LEGIBLE. Nothing on the uninstall path touches
+        // `php_settings`, so the row outlives the runtime — and this is the
+        // shape the page reads to say "your default was 8.3, which is no longer
+        // installed" instead of quietly serving 8.1.
+        let db = Db::open_in_memory().await.unwrap();
+        write_default_php(&db, Some("8.3".into()), &installed(&["8.1", "8.3"]))
+            .await
+            .unwrap();
+
+        // …and now 8.3 is gone.
+        assert_eq!(
+            read_default_php(Some(&db), &installed(&["8.1"]))
+                .await
+                .unwrap(),
+            DefaultPhpDto::PreferredMissing {
+                requested: "8.3".to_string(),
+                serving: Some("8.1".to_string()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_preference_that_comes_back_resolves_again_without_being_reset() {
+        // The other half of spec claim 5: a rescan that rediscovers the major
+        // must restore `Preferred` on its own. If anything cleared the row when
+        // it went missing, this would come back `Unset` and the user's choice
+        // would have been silently discarded by an uninstall.
+        let db = Db::open_in_memory().await.unwrap();
+        write_default_php(&db, Some("8.3".into()), &installed(&["8.1", "8.3"]))
+            .await
+            .unwrap();
+        let _gone = read_default_php(Some(&db), &installed(&["8.1"]))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_default_php(Some(&db), &installed(&["8.1", "8.3"]))
+                .await
+                .unwrap(),
+            DefaultPhpDto::Preferred {
+                major: "8.3".to_string()
+            }
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Writing. VACUITY: deleting `write_default_php`'s installed-set check
+    // reddens `a_major_that_is_not_installed_is_refused_and_names_its_field`
+    // and `a_refused_choice_leaves_the_previous_one_exactly_as_it_was`;
+    // deleting the `PhpVersion::parse` call reddens
+    // `a_malformed_major_is_refused_at_ingress`. Both restored afterwards.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_malformed_major_is_refused_at_ingress_naming_its_column() {
+        let db = Db::open_in_memory().await.unwrap();
+        let (field, _) = expect_validation(
+            write_default_php(&db, Some("../../etc".into()), &installed(&["8.1"]))
+                .await
+                .expect_err("a traversal-shaped major must be refused"),
+        );
+        assert_eq!(
+            field, "default_major",
+            "the error must name the column the form and the repository both use"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_major_that_is_not_installed_is_refused_and_names_its_field() {
+        // `PreferredMissing` is a state you ARRIVE at, never one you choose.
+        let db = Db::open_in_memory().await.unwrap();
+        let (field, message) = expect_validation(
+            write_default_php(&db, Some("8.4".into()), &installed(&["8.1", "8.3"]))
+                .await
+                .expect_err("an uninstalled major must be refused"),
+        );
+        assert_eq!(field, "default_major");
+        assert!(message.contains("8.4"), "got {message}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_choice_leaves_the_previous_one_exactly_as_it_was() {
+        // All-or-nothing, like the settings guard: a rejected write must not
+        // take the stored preference down with it.
+        let db = Db::open_in_memory().await.unwrap();
+        let rt = installed(&["8.1", "8.3"]);
+        write_default_php(&db, Some("8.3".into()), &rt)
+            .await
+            .unwrap();
+        let _ = write_default_php(&db, Some("8.4".into()), &rt)
+            .await
+            .expect_err("an uninstalled major must be refused");
+        assert_eq!(
+            read_default_php(Some(&db), &rt).await.unwrap(),
+            DefaultPhpDto::Preferred {
+                major: "8.3".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_preference_can_be_cleared_back_to_no_preference() {
+        // `None` is a value a caller can mean, and clearing has to stay
+        // expressible or "give me the old behaviour back" becomes unreachable
+        // once a default has ever been set.
+        let db = Db::open_in_memory().await.unwrap();
+        let rt = installed(&["8.1", "8.3"]);
+        write_default_php(&db, Some("8.3".into()), &rt)
+            .await
+            .unwrap();
+        write_default_php(&db, None, &rt).await.unwrap();
+        assert_eq!(
+            read_default_php(Some(&db), &rt).await.unwrap(),
+            DefaultPhpDto::Unset {
+                serving: "8.1".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_is_allowed_even_with_nothing_installed() {
+        // The installed-set guard must gate a CHOICE, never a clear: a machine
+        // whose only PHP has just been removed still has to be able to drop the
+        // preference, and `None` names no major for the guard to check.
+        let db = Db::open_in_memory().await.unwrap();
+        write_default_php(&db, None, &[]).await.unwrap();
+        assert_eq!(
+            read_default_php(Some(&db), &[]).await.unwrap(),
+            DefaultPhpDto::NothingInstalled
+        );
+    }
+
+    #[test]
+    fn every_core_outcome_has_its_own_wire_shape() {
+        // EXHAUSTIVENESS, from the other end: `From<&DefaultPhp>` is a full
+        // match, so a fifth core variant fails to compile there — but a match
+        // that compiles could still map two outcomes onto one wire value. This
+        // pins that it does not.
+        use openvhost_core::DefaultPhp as D;
+        let dtos = [
+            DefaultPhpDto::from(&D::NothingInstalled),
+            DefaultPhpDto::from(&D::Unset {
+                serving: "8.1".into(),
+            }),
+            DefaultPhpDto::from(&D::Preferred {
+                major: "8.1".into(),
+            }),
+            DefaultPhpDto::from(&D::PreferredMissing {
+                requested: "8.4".into(),
+                serving: Some("8.1".into()),
+            }),
+        ];
+        for (i, a) in dtos.iter().enumerate() {
+            for (j, b) in dtos.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "wire states {i} and {j} collapsed into one");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_wire_tags_are_the_ones_the_frontend_switches_on() {
+        // The frontend's `switch (defaultPhp.kind)` ends in
+        // `const unreachable: never`, so a renamed tag would fail TS typecheck
+        // — but only after the bindings are regenerated. This fails here first,
+        // in the crate that owns the name.
+        use openvhost_core::DefaultPhp as D;
+        let cases = [
+            (
+                DefaultPhpDto::from(&D::NothingInstalled),
+                "nothingInstalled",
+            ),
+            (
+                DefaultPhpDto::from(&D::Unset {
+                    serving: "8.1".into(),
+                }),
+                "unset",
+            ),
+            (
+                DefaultPhpDto::from(&D::Preferred {
+                    major: "8.1".into(),
+                }),
+                "preferred",
+            ),
+            (
+                DefaultPhpDto::from(&D::PreferredMissing {
+                    requested: "8.4".into(),
+                    serving: None,
+                }),
+                "preferredMissing",
+            ),
+        ];
+        for (dto, tag) in cases {
+            let json = serde_json::to_value(&dto).unwrap();
+            assert_eq!(json.get("kind").and_then(|k| k.as_str()), Some(tag));
+        }
+    }
 }
 
 #[cfg(test)]
