@@ -169,6 +169,31 @@ report, not a spec decision.
    button's own user-visible tooltip.
 7. Exhaustive matching on any new state; a throwaway variant must fail to compile.
 
+## 7b. Known and deferred, by owner decision
+
+The security audit found two defects this slice **introduces** and one it inherits, all of the
+same shape, and the owner chose to fix the family together rather than this instance alone.
+
+- **`php_environment` and `rescan_php_runtimes` gained `db: State<'_, Db>`.** `state.db` is opened
+  best-effort — `lib.rs` says *"a missing/unreadable state.db must never stop the supervisor from
+  starting"* — but a required Tauri `State` makes the runtime refuse the **whole command**. On such
+  a machine the Languages page now renders nothing at all: no rows, no Install, no Homebrew
+  guidance. It worked fine there before this slice.
+- **An unparseable stored `default_major` propagates as a hard error** into that same page *and*
+  into the apply pipeline — and the only in-app way to clear a bad preference is the control on the
+  page the error disables. Failing closed on the *apply* path is right; failing on the *render*
+  path removes the escape hatch.
+
+Two fixes were attempted and both dead-ended: `AppHandle` + `try_state` collides with a test that
+builds a `MockRuntime` app, and making the command generic over `R: Runtime` fails at
+`#[specta::specta]` with `E0283`. The remaining shape — managing `Option<Db>`, for which
+`Option<StackPaths>` is a working precedent in the same file — touches every command that takes
+`State<'_, Db>` today.
+
+That is why it is filed rather than forced: `install_mysql` and `install_mariadb` carry the
+identical defect (a broken `state.db` makes databases uninstallable), so one shape should settle
+all four. `install_php` already avoids it and is the precedent to copy.
+
 ## 8. Out of scope
 
 Making the no-preference order numeric rather than byte-lexicographic (§5 — it stops mattering
