@@ -269,6 +269,17 @@ describe('neither installed (spec §7.3)', () => {
 		expect(bannerCount()).toBe(1);
 	});
 
+	it('says nothing about a failed read, because neither read failed', async () => {
+		// Symmetry with §7.4's own assertion. Structurally guaranteed here — the
+		// handlers in this block never reject — but stated anyway, because
+		// "absent" and "could not tell" are the distinction this whole slice
+		// turns on, and the state where BOTH are absent is where confusing them
+		// would be least visible.
+		await mountPage();
+		expect(hasTestId('php-env-error-banner')).toBe(false);
+		expect(hasTestId('web-servers-error-banner')).toBe(false);
+	});
+
 	it('names both requirements inside it, with both remedies', async () => {
 		await mountPage();
 		expect(hasTestId('readiness-php')).toBe(true);
