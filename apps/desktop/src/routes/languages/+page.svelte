@@ -9,6 +9,8 @@
 	import { runningCount } from '$lib/services.derive';
 	import AppShell from '$lib/components/AppShell.svelte';
 	import Button from '$lib/components/Button.svelte';
+	import DefaultPhpNotice from '$lib/components/DefaultPhpNotice.svelte';
+	import { isChosenDefault } from '$lib/php-default.derive';
 	import LanguageRow from '$lib/components/LanguageRow.svelte';
 	import LanguagesEmpty from '$lib/components/LanguagesEmpty.svelte';
 	import UninstallDialog from '$lib/components/UninstallDialog.svelte';
@@ -176,6 +178,13 @@
 					{store.error}
 				</div>
 			{/if}
+			<!-- A default that cannot be honoured, said once for the page rather than
+			     on a row — the major it names may have NO row at all (a
+			     hand-installed `php@7.4` since removed appears in neither the
+			     catalogue nor the installed list), and that user is exactly the one
+			     who needs telling. Renders nothing in every other state, which is
+			     what keeps this invisible until someone chooses. -->
+			<DefaultPhpNotice resolved={store.defaultPhp} />
 			<LanguagesEmpty
 				brewFound={store.brewFound}
 				noRouteToAnyPhp={store.noRouteToAnyPhp}
@@ -234,8 +243,12 @@
 							outcome={store.outcome}
 							installProgress={store.progressFor(runtime.major)}
 							installTotal={store.installTotal}
+							isDefault={isChosenDefault(store.env.defaultPhp, runtime.major)}
+							offersDefault={store.offersDefaultChoice && runtime.installed}
+							settingDefault={store.settingDefault}
 							onInstall={(major) => void onInstall(major)}
 							onUninstall={(major) => void onUninstall(major)}
+							onMakeDefault={(major) => void store.setDefault(major)}
 							onStart={(id) => void servicesStore.start(id)}
 							onStop={(id) => void servicesStore.stop(id)}
 						/>

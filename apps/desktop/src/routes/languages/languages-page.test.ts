@@ -42,7 +42,16 @@ function row(
 }
 
 function env(brewFound: boolean, runtimes: PhpRuntimeDto[]): PhpEnvironmentDto {
-	return { brewFound, brewSearched: ['/opt/homebrew/bin/brew'], runtimes };
+	// No preference: every fixture in this file predates the setting, and
+	// `unset`/`nothingInstalled` is what the resolution returns for that. Derived
+	// rather than hardcoded so a fixture cannot name a `serving` major it lacks.
+	const first = runtimes.find((r) => r.installed);
+	return {
+		brewFound,
+		brewSearched: ['/opt/homebrew/bin/brew'],
+		runtimes,
+		defaultPhp: first ? { kind: 'unset', serving: first.major } : { kind: 'nothingInstalled' }
+	};
 }
 
 function svc(id: string, state: ServiceStatus['state']): ServiceStatus {
@@ -613,5 +622,81 @@ describe('the /languages route — a packaged install in flight', () => {
 		// nothing either. The positive control is the test above, which proves
 		// this page does paint when the two majors agree.
 		expect(body).not.toContain('php-install-progress-8.3');
+	});
+});
+
+// The page → row seam for the chosen default. The RULES are
+// `php-default.derive.test.ts`'s; what only exists here is the wiring — that
+// the page asks `isChosenDefault` per row rather than badging whatever sorted
+// first, that it gates the control on `offersDefaultChoice`, and that the
+// page-level notice renders at all. Every one of those shipped once with the
+// helpers present and nothing calling them.
+describe('the languages page and the chosen default', () => {
+	it('badges only the major that was chosen', () => {
+		languagesStore.env = {
+			...env(true, [row('8.1', true), row('8.4', true)]),
+			defaultPhp: { kind: 'preferred', major: '8.4' }
+		};
+		const body = render(LanguagesPage).body;
+		expect(body).toContain('data-testid="php-default-8.4"');
+		// The negative half, and the one that matters: 8.1 is what the old
+		// `.first()` rule served, so a page that badged the sort order rather
+		// than the choice would light this up.
+		expect(body).not.toContain('data-testid="php-default-8.1"');
+	});
+
+	it('badges nothing when no one has chosen', () => {
+		// Every machine that predates the setting. `unset` HAS a serving major,
+		// so a page deriving the badge from "what is being served" would badge it.
+		languagesStore.env = env(true, [row('8.1', true), row('8.4', true)]);
+		const body = render(LanguagesPage).body;
+		expect(body).not.toContain('data-testid="php-default-8.1"');
+		expect(body).not.toContain('data-testid="php-default-8.4"');
+	});
+
+	it('offers the choice on installed rows once there is a real choice', () => {
+		languagesStore.env = env(true, [row('8.1', true), row('8.4', true), row('8.5', false)]);
+		const body = render(LanguagesPage).body;
+		expect(body).toContain('data-testid="make-default-8.1"');
+		expect(body).toContain('data-testid="make-default-8.4"');
+		// Not on a row with nothing installed to choose.
+		expect(body).not.toContain('data-testid="make-default-8.5"');
+	});
+
+	it('offers nothing on a one-PHP machine that has not chosen', () => {
+		// The spec's own words: the answer is not in doubt, and this is what keeps
+		// the common case pixel-identical to before the slice.
+		languagesStore.env = env(true, [row('8.4', true), row('8.5', false)]);
+		const body = render(LanguagesPage).body;
+		expect(body).not.toContain('data-testid="make-default-8.4"');
+	});
+
+	it('hides the control on the row that already is the default', () => {
+		// A button whose only effect is to store what is already stored.
+		languagesStore.env = {
+			...env(true, [row('8.1', true), row('8.4', true)]),
+			defaultPhp: { kind: 'preferred', major: '8.4' }
+		};
+		const body = render(LanguagesPage).body;
+		expect(body).not.toContain('data-testid="make-default-8.4"');
+		expect(body).toContain('data-testid="make-default-8.1"');
+	});
+
+	it('says so, page-wide, when the chosen default is gone', () => {
+		// `requested` has no row here at all — 7.4 is neither installed nor in the
+		// catalogue — which is exactly why the notice cannot live on a row.
+		languagesStore.env = {
+			...env(true, [row('8.1', true)]),
+			defaultPhp: { kind: 'preferredMissing', requested: '7.4', serving: '8.1' }
+		};
+		const body = render(LanguagesPage).body;
+		expect(body).toContain('7.4');
+		expect(body).toMatch(/no longer installed/i);
+	});
+
+	it('says nothing about defaults on a machine that has not chosen', () => {
+		languagesStore.env = env(true, [row('8.1', true)]);
+		const body = render(LanguagesPage).body;
+		expect(body).not.toMatch(/no longer installed/i);
 	});
 });

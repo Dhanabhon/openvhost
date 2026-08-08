@@ -99,6 +99,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::save_web_server_settings,
             commands::php_environment,
             commands::rescan_php_runtimes,
+            commands::set_default_php,
             commands::install_php,
             php_pkg::cancel_php_install,
             commands::pending_install,
