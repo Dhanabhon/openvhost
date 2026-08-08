@@ -10,13 +10,38 @@ source of truth for architecture, roadmap, and agent ownership.
 2. Security-sensitive paths (helper, cert, download-verify, hosts, IPC
    ACLs, signing workflows) are MERGE-BLOCKED without a security-auditor
    APPROVE.
-3. New cross-platform abstractions: get BOTH platform specialists to
-   confirm feasibility BEFORE implementing (Windows has no PHP-FPM, no
-   easy symlinks; design for the constraint, don't discover it later).
+3. **Windows is CUT from development for now — build for macOS** (owner
+   decision, 2026-08-08, restating and strengthening the macOS-first scope
+   of 2026-07-22). Do not seek Windows-specialist confirmation, do not
+   chase Windows parity, and do not treat a Windows gap as a blocker.
+   Existing `#[cfg(windows)]` code is **deferred, not deleted**: keep it
+   compiling, and let a new Windows arm be an honest
+   `Unsupported`-style refusal rather than a silent no-op or a guess.
+   *(Original: get BOTH platform specialists to confirm feasibility BEFORE
+   implementing — Windows has no PHP-FPM, no easy symlinks; design for the
+   constraint, don't discover it later.)*
+
+   **Still keep the seam.** Putting platform-specific work behind a facade
+   costs nothing now and is what makes the later Windows phase possible —
+   it is the *sign-off*, not the *structure*, that is suspended. Measured
+   answers to the old rule's own examples are recorded in the
+   `servbay-measured-directly` memory (Windows really does use `php-cgi`
+   over a TCP port, and `.cmd` shims where macOS uses symlinks), so the
+   constraint is documented rather than forgotten.
 4. openvhost-core must never depend on tauri. All child processes go
    through openvhost-proc. All file writes are atomic. No unwrap outside
    tests.
-5. Both OSes green in CI or it doesn't merge.
+5. **macOS green or it doesn't merge** (see rule 3 — Windows is cut for
+   now). Note GitHub Actions is disabled to save minutes, so **the local
+   gate is the merge gate**: `cargo fmt --check`, `cargo clippy
+   --workspace --all-targets -- -D warnings`, `cargo test --workspace`,
+   `pnpm -C apps/desktop test` and `check`.
+   Two traps that have made a gate lie, both measured in this repo:
+   **never pipe a gate through `tail`** (you read `tail`'s exit code), and
+   **a shared `CARGO_TARGET_DIR` across worktrees silently links a stale
+   crate** without invalidating dependents — which can make a gate falsely
+   **green**. Run from a clean fingerprint or an isolated target dir.
+   *(Original: both OSes green in CI or it doesn't merge.)*
 6. Never bundle service binaries into the installer — runtime download
    with SHA-256 verification only (license + security).
 7. **DEFERRED until after v1.0.0 ships — do not act on this rule or raise
