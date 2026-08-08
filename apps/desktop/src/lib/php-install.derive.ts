@@ -11,7 +11,99 @@
 // install result fails TYPECHECK here rather than silently rendering as
 // whichever branch happened to come last — or, worse, as nothing at all.
 
-import type { PhpInstallResultDto, PhpPackageOfferDto, PhpRuntimeSourceDto } from './ipc';
+import { formatBytes } from './logs.derive';
+import type {
+	PhpInstallProgressDto,
+	PhpInstallResultDto,
+	PhpPackageOfferDto,
+	PhpRuntimeSourceDto
+} from './ipc';
+
+/**
+ * One line describing the pipeline step the user is currently watching on the
+ * PACKAGED route — the mirror of `mysqlInstallProgressLabel`.
+ *
+ * `total` is the length the server declared, carried forward from the `started`
+ * event because no later event repeats it. `null` when the server declared
+ * none, which is a real case and renders as an honest "so far" rather than a
+ * fabricated percentage.
+ *
+ * MANDATORY, inherited verbatim from MySQL's own copy because the reason is
+ * identical: `verified` and `extracted` must never render the same sentence.
+ * They are the difference between a download that was checked against the
+ * compiled-in SHA-256 and one that merely arrived, which is precisely what
+ * golden rule 6 buys — and a guarantee nobody can see is a guarantee nobody
+ * has. `php-install.derive.test.ts` asserts every pair of these five is
+ * distinct, not merely that each is non-empty.
+ *
+ * A SEPARATE function from `mysqlInstallProgressLabel` rather than a reuse of
+ * it, for the reason `mariadb-install.derive.ts`'s header already states about
+ * its own copies: the two DTOs are structurally identical today, so TypeScript
+ * would happily accept one function for both — and that is the trap, not the
+ * saving. A wording change made for MySQL's Oracle download would silently
+ * become PHP's, and this codebase has already shipped the mirror-image bug four
+ * times in one slice (a "generalized" component still saying MySQL).
+ */
+export function phpInstallProgressLabel(
+	progress: PhpInstallProgressDto,
+	total: number | null
+): string {
+	switch (progress.kind) {
+		case 'started':
+			return progress.total === null
+				? 'Starting the download — the server did not say how large it is'
+				: `Starting the download — ${formatBytes(progress.total)} to fetch`;
+		case 'downloaded':
+			return total === null
+				? `Downloading — ${formatBytes(progress.bytes)} so far`
+				: `Downloading — ${formatBytes(progress.bytes)} of ${formatBytes(total)}`;
+		case 'verified':
+			return 'Checksum verified — the download matches the SHA-256 built into OpenVHost';
+		case 'extracted':
+			return 'Extracted — the archive was unpacked into a staging folder';
+		case 'linked':
+			return "Installed — the files are in place in OpenVHost's own packages folder";
+		default: {
+			const unreachable: never = progress;
+			return unreachable;
+		}
+	}
+}
+
+/**
+ * How far along the transfer is, 0–100, or `null` when there is nothing honest
+ * to draw: before the first byte, when the server declared no length, and for
+ * every step after the download (which are moments, not durations, and would
+ * otherwise animate a bar that is really just waiting).
+ */
+export function phpInstallProgressPercent(
+	progress: PhpInstallProgressDto,
+	total: number | null
+): number | null {
+	switch (progress.kind) {
+		case 'started':
+			return null;
+		case 'downloaded': {
+			if (total === null || total <= 0) return null;
+			return Math.min(100, Math.round((progress.bytes / total) * 100));
+		}
+		case 'verified':
+		case 'extracted':
+		case 'linked':
+			return null;
+		default: {
+			const unreachable: never = progress;
+			return unreachable;
+		}
+	}
+}
+
+/** The declared total a `started` event carries, for the store to hold on to —
+ *  every later `downloaded` event needs it as a denominator and none of them
+ *  repeats it. */
+export function phpInstallDeclaredTotal(progress: PhpInstallProgressDto): number | null {
+	return progress.kind === 'started' ? progress.total : null;
+}
 
 /**
  * The small provenance badge beside an installed row's version — which install

@@ -8,7 +8,12 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { render } from 'svelte/server';
 import LanguageRow from './LanguageRow.svelte';
-import type { PhpInstallOutcomeDto, PhpRuntimeDto, ServiceStatus } from '$lib/ipc';
+import type {
+	PhpInstallOutcomeDto,
+	PhpInstallProgressDto,
+	PhpRuntimeDto,
+	ServiceStatus
+} from '$lib/ipc';
 import type { UiLog } from '$lib/languages.svelte';
 
 /** A settled Homebrew install — the route every real machine still takes, and
@@ -68,6 +73,13 @@ function renderRow(props: {
 	log?: UiLog[];
 	error?: string;
 	outcome?: PhpInstallOutcomeDto | null;
+	/** Defaults to NULL — the only value a Homebrew machine can ever produce
+	 *  (spec §8.6), since `php-install-progress` is emitted solely by
+	 *  `run_package_install`. Defaulting it this way is what makes "a brew
+	 *  install paints no pipeline" something every EXISTING assertion in this
+	 *  file keeps proving rather than something one new test claims. */
+	installProgress?: PhpInstallProgressDto | null;
+	installTotal?: number | null;
 }): string {
 	return render(LanguageRow, {
 		props: {
@@ -80,6 +92,8 @@ function renderRow(props: {
 			log: props.log ?? [],
 			error: props.error ?? '',
 			outcome: props.outcome ?? null,
+			installProgress: props.installProgress ?? null,
+			installTotal: props.installTotal ?? null,
 			onInstall: () => {},
 			onUninstall: () => {},
 			onStart: () => {},
@@ -766,5 +780,123 @@ describe('the narrow-width layout', () => {
 			`the row costs ${oneLineCost}px on one line but only wraps below ${wrapsBelow}px — ` +
 				`raise the @container threshold above ${oneLineCost}`
 		).toBeGreaterThanOrEqual(oneLineCost);
+	});
+
+	// ------------------------------------------------------------------
+	// The packaged route's progress, wired in the 5C fix wave.
+	//
+	// Vacuity: every "renders it" test asserts a testid the fixture does not
+	// otherwise produce, and each is paired with a negative case on the same
+	// testid. Proven by mutation against the row's one guard, once per half:
+	// narrowing `{#if isInstalling && installProgress !== null}` to
+	// `{#if isInstalling}` reddened 'paints nothing at all while a Homebrew
+	// install runs' (and, at the route level, its page-wide twin); narrowing it
+	// to `{#if installProgress !== null}` reddened 'stops painting the pipeline
+	// once the run settles' and 'paints nothing while another major is the one
+	// installing'. Neither half is redundant, which is why the condition is
+	// written once inline rather than behind a named derived that could go
+	// quietly half-dead.
+	// ------------------------------------------------------------------
+	describe('the packaged install pipeline', () => {
+		const notInstalled = () => r('8.4', false, { offer: { kind: 'available', version: '8.4.24' } });
+
+		// SPEC §8.6, and the single most important assertion in this block. A brew
+		// install sets `installing` to this major and emits no progress event
+		// EVER — `php-install-progress` has one emitter, `run_package_install` —
+		// so a gate on `installing` alone would put a download line under every
+		// Install press on every real machine today.
+		it('paints nothing at all while a Homebrew install runs', () => {
+			const body = renderRow({
+				row: notInstalled(),
+				installing: '8.4',
+				installProgress: null
+			});
+			expect(body).not.toContain('php-install-progress-8.4');
+			expect(body).not.toContain('php-install-bar-8.4');
+			expect(body).not.toContain('progressbar');
+			// And the button still says what it always said mid-install.
+			expect(body).toContain('Installing…');
+		});
+
+		it('names the step the packaged pipeline is on', () => {
+			const body = renderRow({
+				row: notInstalled(),
+				installing: '8.4',
+				installProgress: { kind: 'verified' }
+			});
+			expect(body).toContain('php-install-progress-8.4');
+			expect(body).toMatch(/checksum/i);
+		});
+
+		// The bar is drawn only where a percentage is honest: bytes arriving
+		// against a length the server actually declared.
+		it('draws a bar with the real percentage while bytes are arriving', () => {
+			const body = renderRow({
+				row: notInstalled(),
+				installing: '8.4',
+				installProgress: { kind: 'downloaded', bytes: 512 },
+				installTotal: 2048
+			});
+			expect(body).toContain('php-install-bar-8.4');
+			expect(body).toContain('aria-valuenow="25"');
+			expect(body).toContain('width: 25%');
+		});
+
+		it('draws no bar when the server declared no length, rather than one on a guess', () => {
+			const body = renderRow({
+				row: notInstalled(),
+				installing: '8.4',
+				installProgress: { kind: 'downloaded', bytes: 512 },
+				installTotal: null
+			});
+			// The line still renders — it just reads "so far" instead of a share.
+			expect(body).toContain('php-install-progress-8.4');
+			expect(body).toContain('so far');
+			expect(body).not.toContain('php-install-bar-8.4');
+		});
+
+		it('draws no bar for the steps that are moments rather than durations', () => {
+			for (const progress of [
+				{ kind: 'started', total: 4096 },
+				{ kind: 'verified' },
+				{ kind: 'extracted' },
+				{ kind: 'linked' }
+			] satisfies PhpInstallProgressDto[]) {
+				const body = renderRow({
+					row: notInstalled(),
+					installing: '8.4',
+					installProgress: progress,
+					installTotal: 4096
+				});
+				expect(body, progress.kind).toContain('php-install-progress-8.4');
+				expect(body, progress.kind).not.toContain('php-install-bar-8.4');
+			}
+		});
+
+		// `install()` resets `installing` to '' before the settled outcome renders,
+		// so without this half a finished "Extracted…" would sit above the success
+		// message for the rest of the page's life.
+		it('stops painting the pipeline once the run settles', () => {
+			const body = renderRow({
+				row: notInstalled(),
+				installing: '',
+				installProgress: { kind: 'linked' }
+			});
+			expect(body).not.toContain('php-install-progress-8.4');
+			expect(body).not.toContain('php-install-bar-8.4');
+		});
+
+		// Progress arriving for a DIFFERENT row must not paint this one. The
+		// caller already scopes it (`LanguagesStore.progressFor`), and this is the
+		// row's own half of that contract: it paints only while IT is the major
+		// installing.
+		it('paints nothing while another major is the one installing', () => {
+			const body = renderRow({
+				row: notInstalled(),
+				installing: '8.3',
+				installProgress: { kind: 'verified' }
+			});
+			expect(body).not.toContain('php-install-progress-8.4');
+		});
 	});
 });

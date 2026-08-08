@@ -10,11 +10,14 @@
 // `routes/languages/languages-page.test.ts` cover that seam, at three levels.
 
 import { describe, expect, it } from 'vitest';
-import type { PhpInstallResultDto, PhpPackageOfferDto } from './ipc';
+import type { PhpInstallProgressDto, PhpInstallResultDto, PhpPackageOfferDto } from './ipc';
 import {
 	noRouteToAnyPhp,
+	phpInstallDeclaredTotal,
 	phpInstallInvite,
 	phpInstallOffered,
+	phpInstallProgressLabel,
+	phpInstallProgressPercent,
 	phpNoRouteNote,
 	phpOutcomeRender,
 	phpSourceBadge
@@ -25,6 +28,25 @@ import {
 const AVAILABLE: PhpPackageOfferDto = { kind: 'available', version: '8.4.24' };
 const AWAITING: PhpPackageOfferDto = { kind: 'awaitingRelease', tag: 'php-8.4.24' };
 const UNAVAILABLE: PhpPackageOfferDto = { kind: 'unavailable', target: 'macos-arm64' };
+
+/** Every state the packaged pipeline can report, in the order it reports them. */
+const EVERY_PROGRESS: PhpInstallProgressDto[] = [
+	{ kind: 'started', total: 4096 },
+	{ kind: 'downloaded', bytes: 1024 },
+	{ kind: 'verified' },
+	{ kind: 'extracted' },
+	{ kind: 'linked' }
+];
+
+/** Every unordered pair of indices into `xs`, so a "these all differ" claim is
+ *  actually checked rather than asserted one item at a time. */
+function pairs<T>(xs: readonly T[]): [T, T][] {
+	const out: [T, T][] = [];
+	for (let i = 0; i < xs.length; i += 1) {
+		for (let j = i + 1; j < xs.length; j += 1) out.push([xs[i], xs[j]]);
+	}
+	return out;
+}
 
 describe('phpSourceBadge', () => {
 	it('names the exact patch level for a runtime OpenVHost installed', () => {
@@ -397,5 +419,104 @@ describe('phpOutcomeRender', () => {
 			const out = phpOutcomeRender(result, '8.4');
 			expect(out.alert !== null && out.warning !== null, result.kind).toBe(false);
 		}
+	});
+});
+
+// The packaged route's five pipeline states, whose consumer landed in the 5C
+// fix wave.
+//
+// Vacuity: the distinctness claims are checked pairwise rather than one item at
+// a time, and the rest assert exact strings or exact numbers rather than
+// non-emptiness. Proven by mutation — making the `verified` arm return the
+// `extracted` sentence reddened three tests here (pairwise, by-name, and the
+// "says the checksum was checked" wording) plus the row test that renders it.
+describe('phpInstallProgressLabel', () => {
+	it('renders all five pipeline states pairwise-distinctly', () => {
+		const labels = EVERY_PROGRESS.map((p) => phpInstallProgressLabel(p, 1024));
+		for (const [a, b] of pairs(labels)) expect(a).not.toBe(b);
+	});
+
+	// Stated on its own as well as pairwise: this is the pair that carries the
+	// verification guarantee golden rule 6 buys, and it should fail by name if it
+	// ever collapses.
+	it('never says the same thing for a verified download as for an extracted one', () => {
+		expect(phpInstallProgressLabel({ kind: 'verified' }, null)).not.toBe(
+			phpInstallProgressLabel({ kind: 'extracted' }, null)
+		);
+	});
+
+	it('says the checksum was checked, in words a user can act on', () => {
+		const label = phpInstallProgressLabel({ kind: 'verified' }, null);
+		expect(label).toMatch(/checksum/i);
+		expect(label).toMatch(/SHA-256/);
+	});
+
+	it('names the declared size when the server gave one', () => {
+		expect(phpInstallProgressLabel({ kind: 'started', total: 1536 }, null)).toContain('1.50 KiB');
+	});
+
+	it('says so honestly when the server declared no size, and invents no number', () => {
+		const label = phpInstallProgressLabel({ kind: 'started', total: null }, null);
+		expect(label).toMatch(/did not say how large/i);
+		expect(label).not.toMatch(/\d/);
+	});
+
+	it('shows progress against the total carried forward from the started event', () => {
+		expect(phpInstallProgressLabel({ kind: 'downloaded', bytes: 512 }, 2048)).toBe(
+			'Downloading — 512 B of 2.00 KiB'
+		);
+	});
+
+	it('falls back to a "so far" reading rather than a fabricated denominator', () => {
+		const label = phpInstallProgressLabel({ kind: 'downloaded', bytes: 512 }, null);
+		expect(label).toContain('so far');
+		expect(label).not.toContain(' of ');
+	});
+
+	// The one claim no packaged label may make: this route never runs a child
+	// process, so nothing here may borrow the vocabulary of one — and it is not
+	// MySQL's download either, so it must not name Oracle.
+	it('mentions neither Homebrew nor Oracle on any step', () => {
+		for (const p of EVERY_PROGRESS) {
+			const label = phpInstallProgressLabel(p, 4096);
+			expect(label, p.kind).not.toMatch(/brew|homebrew|oracle/i);
+		}
+	});
+});
+
+describe('phpInstallProgressPercent', () => {
+	it('is a real percentage only while bytes are arriving against a known total', () => {
+		expect(phpInstallProgressPercent({ kind: 'downloaded', bytes: 512 }, 2048)).toBe(25);
+	});
+
+	it('is null with no declared total, so no bar is drawn on a guess', () => {
+		expect(phpInstallProgressPercent({ kind: 'downloaded', bytes: 512 }, null)).toBeNull();
+	});
+
+	it('is null for a zero or negative total rather than dividing by it', () => {
+		expect(phpInstallProgressPercent({ kind: 'downloaded', bytes: 512 }, 0)).toBeNull();
+		expect(phpInstallProgressPercent({ kind: 'downloaded', bytes: 512 }, -1)).toBeNull();
+	});
+
+	it('never exceeds 100 even if more bytes arrive than the server declared', () => {
+		expect(phpInstallProgressPercent({ kind: 'downloaded', bytes: 4096 }, 2048)).toBe(100);
+	});
+
+	it('is null for the steps that are moments rather than durations', () => {
+		expect(phpInstallProgressPercent({ kind: 'started', total: 10 }, 10)).toBeNull();
+		expect(phpInstallProgressPercent({ kind: 'verified' }, 10)).toBeNull();
+		expect(phpInstallProgressPercent({ kind: 'extracted' }, 10)).toBeNull();
+		expect(phpInstallProgressPercent({ kind: 'linked' }, 10)).toBeNull();
+	});
+});
+
+describe('phpInstallDeclaredTotal', () => {
+	it('carries the declared length off the started event and nothing else', () => {
+		expect(phpInstallDeclaredTotal({ kind: 'started', total: 4096 })).toBe(4096);
+		expect(phpInstallDeclaredTotal({ kind: 'started', total: null })).toBeNull();
+		expect(phpInstallDeclaredTotal({ kind: 'downloaded', bytes: 4096 })).toBeNull();
+		expect(phpInstallDeclaredTotal({ kind: 'verified' })).toBeNull();
+		expect(phpInstallDeclaredTotal({ kind: 'extracted' })).toBeNull();
+		expect(phpInstallDeclaredTotal({ kind: 'linked' })).toBeNull();
 	});
 });

@@ -1,7 +1,8 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { onPhpInstallLog, openHomebrewSite } from '$lib/ipc';
+	import { onPhpInstallLog, onPhpInstallProgress, openHomebrewSite } from '$lib/ipc';
+	import { subscribeLanguageEvents } from '$lib/languages.listeners';
 	import { languagesStore as store } from '$lib/languages.shared.svelte';
 	import { servicesStore } from '$lib/services.shared.svelte';
 	import { uninstallStore } from '$lib/uninstall.shared.svelte';
@@ -90,28 +91,27 @@
 	}
 
 	onMount(() => {
-		let unlisten: (() => void) | null = null;
+		// Every subscription lives in `languages.listeners.ts`, NOT inline here —
+		// the same move `routes/databases/+page.svelte` made and for the identical
+		// reason: `onMount` does not run under `svelte/server`, so anything written
+		// in this closure is untestable by construction, and a severed callback
+		// leaves the whole suite green. That is not hypothetical here — the
+		// packaged-install progress event shipped with no subscriber at all, and
+		// nothing in the suite could have said so. What remains here is only the
+		// part a DOM would be needed to test anyway: calling the subscriber, and
+		// calling its own disposer.
+		let release: (() => void) | null = null;
 		let disposed = false;
 
 		void (async () => {
 			try {
-				// One channel, two operations: `uninstall_package` streams on the
-				// SAME `php-install-log` event `install_php` uses (design D1 — one
-				// lock, one output surface), so the line is routed by whichever
-				// operation currently holds that lock. `UninstallStore.appendLog`
-				// re-checks the same condition itself, so this routing is a
-				// convenience, not the guard.
-				const stop = await onPhpInstallLog((ev) => {
-					if (uninstallStore.uninstalling !== '') uninstallStore.appendLog(ev.major, ev.line);
-					else store.appendLog(ev.major, ev.line);
-				});
-				// Mirrors services/+page.svelte's onServiceLog wiring: this page can
-				// unmount while the listener registration is still in flight.
-				if (disposed) {
-					stop();
-					return;
-				}
-				unlisten = stop;
+				const stop = await subscribeLanguageEvents(
+					{ onPhpInstallLog, onPhpInstallProgress },
+					store,
+					uninstallStore,
+					() => disposed
+				);
+				release = stop;
 				await store.refresh();
 			} catch (e) {
 				store.fail(e);
@@ -120,8 +120,8 @@
 
 		return () => {
 			disposed = true;
-			unlisten?.();
-			unlisten = null;
+			release?.();
+			release = null;
 		};
 	});
 </script>
@@ -232,6 +232,8 @@
 							log={store.logFor(runtime.major)}
 							error={runtime.major === lastAttempted ? store.error : ''}
 							outcome={store.outcome}
+							installProgress={store.progressFor(runtime.major)}
+							installTotal={store.installTotal}
 							onInstall={(major) => void onInstall(major)}
 							onUninstall={(major) => void onUninstall(major)}
 							onStart={(id) => void servicesStore.start(id)}

@@ -246,6 +246,89 @@ describe('LanguagesStore', () => {
 		expect(s.env?.runtimes.length).toBe(1);
 	});
 
+	// ------------------------------------------------------------------
+	// The packaged route's progress, whose subscriber landed in the 5C fix wave.
+	//
+	// Vacuity: every assertion below is against a field the constructor leaves
+	// `null`, and each is paired with a negative case on the same field. Proven
+	// by mutation — dropping the `installProgress = null` line from `install()`
+	// reddened 'clears a previous run's progress…', and dropping the `major`
+	// from `applyInstallProgress`'s stored value reddened 'attributes progress
+	// to the major it arrived for'.
+	// ------------------------------------------------------------------
+
+	it('has no progress at all until an event arrives', () => {
+		const s = new LanguagesStore(api());
+		expect(s.installProgress).toBeNull();
+		expect(s.installTotal).toBeNull();
+		expect(s.progressFor('8.4')).toBeNull();
+	});
+
+	it('records each pipeline state as it arrives', () => {
+		const s = new LanguagesStore(api());
+		s.applyInstallProgress('8.4', { kind: 'started', total: 4096 });
+		expect(s.progressFor('8.4')).toEqual({ kind: 'started', total: 4096 });
+		s.applyInstallProgress('8.4', { kind: 'verified' });
+		expect(s.progressFor('8.4')).toEqual({ kind: 'verified' });
+	});
+
+	// No later event repeats the declared length, so losing it here leaves every
+	// `downloaded` reading with no denominator and the bar undrawable.
+	it('captures the declared total off the started event and keeps it', () => {
+		const s = new LanguagesStore(api());
+		s.applyInstallProgress('8.4', { kind: 'started', total: 4096 });
+		expect(s.installTotal).toBe(4096);
+		s.applyInstallProgress('8.4', { kind: 'downloaded', bytes: 1024 });
+		expect(s.installTotal).toBe(4096);
+		s.applyInstallProgress('8.4', { kind: 'linked' });
+		expect(s.installTotal).toBe(4096);
+	});
+
+	it('leaves the total null when the server declared none, rather than inventing one', () => {
+		const s = new LanguagesStore(api());
+		s.applyInstallProgress('8.4', { kind: 'started', total: null });
+		s.applyInstallProgress('8.4', { kind: 'downloaded', bytes: 1024 });
+		expect(s.installTotal).toBeNull();
+	});
+
+	// The progress twin of `logFor`, and there for the same reason: this store
+	// has already shipped the untagged version of this bug once, rendering a
+	// failed 8.4 install's output under the 8.3 row.
+	it('attributes progress to the major it arrived for, and to no other row', () => {
+		const s = new LanguagesStore(api());
+		s.applyInstallProgress('8.4', { kind: 'verified' });
+		expect(s.progressFor('8.4')).toEqual({ kind: 'verified' });
+		expect(s.progressFor('8.3')).toBeNull();
+		expect(s.progressFor('8.5')).toBeNull();
+	});
+
+	it("clears a previous run's progress as the next run starts, not when it ends", async () => {
+		// A stale "Checksum verified" sitting above this attempt's first byte is
+		// exactly the confusion this rule prevents.
+		const s = new LanguagesStore(api({ outcome: brewOutcome('8.3') }));
+		s.applyInstallProgress('8.4', { kind: 'verified' });
+		s.applyInstallProgress('8.4', { kind: 'started', total: 4096 });
+		expect(s.installTotal).toBe(4096);
+		await s.install('8.3');
+		expect(s.installProgress).toBeNull();
+		expect(s.installTotal).toBeNull();
+		expect(s.progressFor('8.4')).toBeNull();
+	});
+
+	// Spec §8.6, at the level the state actually lives. `php-install-progress` is
+	// emitted only by `run_package_install`; `run_brew_install` streams
+	// `php-install-log` instead. So on a machine with Homebrew and no package
+	// tree a whole install runs and this field is still `null` — which is what
+	// makes every consumer of it render nothing.
+	it('stays null through a whole Homebrew install, which emits no progress at all', async () => {
+		const s = new LanguagesStore(api({ outcome: brewOutcome('8.4') }));
+		await s.install('8.4');
+		expect(s.outcome).toEqual(brewOutcome('8.4'));
+		expect(s.installProgress).toBeNull();
+		expect(s.installTotal).toBeNull();
+		expect(s.progressFor('8.4')).toBeNull();
+	});
+
 	it('re-reads the environment after a successful install rather than assuming', async () => {
 		// Assuming would show the version as installed even when the rescan did
 		// not find it — the exact case `detected` exists to report.

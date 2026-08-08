@@ -1,9 +1,16 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <script lang="ts">
-	import type { PhpInstallOutcomeDto, PhpRuntimeDto, ServiceStatus } from '../ipc';
+	import type {
+		PhpInstallOutcomeDto,
+		PhpInstallProgressDto,
+		PhpRuntimeDto,
+		ServiceStatus
+	} from '../ipc';
 	import type { UiLog } from '../languages.svelte';
 	import {
 		phpInstallOffered,
+		phpInstallProgressLabel,
+		phpInstallProgressPercent,
 		phpNoRouteNote,
 		phpOutcomeRender,
 		phpSourceBadge
@@ -28,6 +35,8 @@
 		log = [],
 		error = '',
 		outcome = null,
+		installProgress = null,
+		installTotal = null,
 		onInstall,
 		onUninstall,
 		onStart,
@@ -88,6 +97,21 @@
 		 *  result since design D4: only the `brew` arm carries an `exitCode`,
 		 *  because only that route runs a child process. */
 		outcome?: PhpInstallOutcomeDto | null;
+		/** This row's own live pipeline state on the PACKAGED route, already
+		 *  scoped to this major by `LanguagesStore.progressFor`.
+		 *
+		 *  `null` is the only value a Homebrew machine can ever see (spec §8.6):
+		 *  `php-install-progress` is emitted solely by `run_package_install`, and
+		 *  `run_brew_install` streams `php-install-log` instead. So the block this
+		 *  prop gates renders nothing at all on every real machine today — which
+		 *  is why it is a display prop with a truthful `null` default rather than
+		 *  a required one like `brewFound`: nothing DECIDES on it, and forgetting
+		 *  to pass it degrades to exactly the behaviour that shipped before it
+		 *  existed. */
+		installProgress?: PhpInstallProgressDto | null;
+		/** The length the server declared for this download, `null` when it
+		 *  declared none. Read only alongside {@link installProgress}. */
+		installTotal?: number | null;
 		onInstall: (major: string) => void;
 		/** Opens the uninstall confirmation (package-uninstall design D6). Never
 		 *  uninstalls anything on its own — nothing is spawned until the dialog's
@@ -141,6 +165,12 @@
 	const installOffered = $derived(phpInstallOffered(row.offer, brewFound));
 	/** …and why not, when it could not. Absent affordance, present explanation. */
 	const noRouteNote = $derived(phpNoRouteNote(row.offer, row.major, brewFound));
+	/** `null` whenever there is nothing honest to draw — before the first byte,
+	 *  with no declared length, and for the three steps after the download, which
+	 *  are moments rather than durations. */
+	const installPercent = $derived(
+		installProgress === null ? null : phpInstallProgressPercent(installProgress, installTotal)
+	);
 </script>
 
 <div class="row lang-row" data-testid="lang-row-{row.major}">
@@ -281,6 +311,49 @@
 	<p class="note" data-testid="php-out-of-catalogue-{row.major}">
 		{outOfCatalogueNote('php', row.major)}
 	</p>
+{/if}
+
+{#if isInstalling && installProgress !== null}
+	<!-- The packaged route's pipeline, the only progress feedback that route has:
+	     it spawns no child process, so `LogPane` below stays empty for the whole
+	     of it — brew's output is a different channel entirely. Without this the
+	     day a release is published a user presses Install and watches nothing
+	     happen for the length of a download.
+
+	     `verified` and `extracted` are SEPARATE sentences on purpose (see
+	     `phpInstallProgressLabel`): a download that was checked against the
+	     built-in SHA-256 and one that merely arrived must never look identical,
+	     which is the whole of what golden rule 6 buys.
+
+	     BOTH HALVES OF THIS CONDITION ARE LOAD-BEARING, for different reasons,
+	     and it is written once rather than split into a named derived precisely
+	     so neither can go quietly redundant:
+
+	      * `installProgress !== null` is what keeps spec §8.6 true. A brew
+	        install sets `installing` to this major and never emits a single
+	        progress event — `php-install-progress` has one emitter,
+	        `run_package_install` — so gating on `isInstalling` alone would put a
+	        download line under every Install press on every real machine today.
+	      * `isInstalling` is what makes the line go away when the run settles.
+	        `install()`'s `finally` clears `installing` before the settled outcome
+	        renders, so without it a finished "Installed —…" would sit above the
+	        success message for the rest of the page's life. -->
+	<p class="note progress" data-testid="php-install-progress-{row.major}">
+		{phpInstallProgressLabel(installProgress, installTotal)}
+	</p>
+	{#if installPercent !== null}
+		<div
+			class="bar"
+			role="progressbar"
+			aria-label="Downloading PHP {row.major}"
+			aria-valuemin={0}
+			aria-valuemax={100}
+			aria-valuenow={installPercent}
+			data-testid="php-install-bar-{row.major}"
+		>
+			<span class="fill" style="width: {installPercent}%"></span>
+		</div>
+	{/if}
 {/if}
 
 {#if log.length > 0}
@@ -460,6 +533,32 @@
 		margin: 0 var(--vh-space-4) var(--vh-space-3);
 		color: var(--vh-text-2);
 		font-size: var(--vh-text-table);
+	}
+	/* The live pipeline line. Tabular numerals so a byte counter ticking up does
+	   not shuffle the words after it left and right on every event. Transcribed
+	   line-for-line from `MysqlRow.svelte`'s own `.note.progress`/`.bar`/`.fill`
+	   rather than approximated — the same discipline the source badge above
+	   followed, and for the same reason: Svelte scopes styles per component, so a
+	   literal copy is the only way two components can share one look without
+	   changing the markup of an already-shipped, already-tested row. */
+	.note.progress {
+		font-variant-numeric: tabular-nums;
+	}
+	.bar {
+		margin: 0 var(--vh-space-4) var(--vh-space-3);
+		height: 4px;
+		border-radius: 2px;
+		background: var(--vh-surface-2);
+		overflow: hidden;
+	}
+	.bar .fill {
+		display: block;
+		height: 100%;
+		background: var(--vh-link);
+		/* Width only — a transform-based fill would need a wrapper to avoid
+		   scaling the rounded ends, and 4px of bar is not worth that. The
+		   transition is short enough to read as "it moved", not as animation. */
+		transition: width var(--vh-dur-fast) linear;
 	}
 	.pool-stderr {
 		margin: 0 var(--vh-space-4) var(--vh-space-3);

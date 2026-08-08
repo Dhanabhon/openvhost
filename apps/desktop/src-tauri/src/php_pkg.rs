@@ -496,14 +496,19 @@ pub(crate) async fn run_package_install(
     // absent, including the Homebrew route, which today is every real machine's
     // only route — turning a degraded state.db into "PHP cannot be installed at
     // all". Read here instead, on the one route that needs a ledger.
-    let Some(db) = app.try_state::<Db>() else {
-        return Ok(PhpInstallResultDto::Failed {
-            reason: "state.db is unavailable, so an install could not be recorded; \
-                     restart OpenVHost and try again"
-                .into(),
-        });
-    };
-    let ledger = openvhost_core::mysql::InstallLedger::new(&db);
+    //
+    // AND A MISSING ONE DOES NOT REFUSE THIS ROUTE EITHER (audit LOW-4). This
+    // used to return `Failed { reason: "state.db is unavailable…" }` before
+    // spawning anything, which conceded on the packaged route the exact point
+    // the paragraph above wins on the Homebrew one — and contradicted
+    // `PhpLedgerWriteDto`'s own contract, that the package is installed either
+    // way and a failed row costs provenance, never correctness. So the install
+    // runs with `None` and reports `ledger: Failed`, which is the state that
+    // type was built for. `openvhost_core::install_php_package` owns the
+    // reason; nothing is retyped here.
+    let ledger = app
+        .try_state::<Db>()
+        .map(|db| openvhost_core::mysql::InstallLedger::new(&db));
     let emitter = app.clone();
     let for_event = major.as_str().to_string();
     let spawn_major = major.clone();
@@ -514,16 +519,21 @@ pub(crate) async fn run_package_install(
         // apply, reused directly rather than copied a third time: `openvhost-pkg`
         // emits one `Downloaded` per stream chunk, unthrottled.
         let mut throttle = ProgressThrottle::new();
-        openvhost_core::install_php_package(&spawn_major, &spawn_root, &ledger, move |progress| {
-            for progress in throttle.admit(progress, std::time::Instant::now()) {
-                let _ = PhpInstallProgressEvent {
-                    major: for_event.clone(),
-                    ts_ms: now_ms(),
-                    progress: progress.into(),
+        openvhost_core::install_php_package(
+            &spawn_major,
+            &spawn_root,
+            ledger.as_ref(),
+            move |progress| {
+                for progress in throttle.admit(progress, std::time::Instant::now()) {
+                    let _ = PhpInstallProgressEvent {
+                        major: for_event.clone(),
+                        ts_ms: now_ms(),
+                        progress: progress.into(),
+                    }
+                    .emit(&emitter);
                 }
-                .emit(&emitter);
-            }
-        })
+            },
+        )
         .await
     });
 
@@ -1186,6 +1196,17 @@ mod tests {
     /// nothing. Checked over every state of every new wire type here rather
     /// than only the one that bit, because the next multi-word field will not
     /// announce itself.
+    ///
+    /// **At every depth, not only the top level** (audit LOW-1). This walked
+    /// `value.as_object().keys()` and stopped there, so a nested type's keys
+    /// were never inspected — and [`PhpLedgerWriteDto`] is nested by
+    /// construction: it is never returned on its own, only ever as
+    /// `Installed.ledger`. The auditor proved the gap rather than inferring it,
+    /// by renaming that type's `reason` to `failure_reason` and watching this
+    /// test stay green while the regenerated bindings correctly declared the
+    /// snake_case key. Both halves of the fix are load-bearing: the walk
+    /// recurses, AND the ledger's own states are in the value list, since the
+    /// only ledger this list held before was field-less `Recorded`.
     #[test]
     fn the_wire_uses_camel_case_keys_everywhere() {
         let mut values = vec![
@@ -1215,13 +1236,52 @@ mod tests {
                 .unwrap(),
             );
         }
+        for ledger in every_ledger_write_state() {
+            // Standalone AND nested. Nested is the shape that actually crosses
+            // the wire; standalone keeps the check meaningful if a later
+            // `Installed` stops carrying one.
+            values.push(serde_json::to_value(&ledger).unwrap());
+            values.push(
+                serde_json::to_value(PhpInstallResultDto::Installed {
+                    version: "8.4.24".into(),
+                    detected: true,
+                    ledger,
+                })
+                .unwrap(),
+            );
+        }
         for value in &values {
-            for key in value.as_object().unwrap().keys() {
-                assert!(
-                    !key.contains('_'),
-                    "{key} is snake_case on the wire: {value:?}"
-                );
+            // Kept from the `as_object().unwrap()` this replaced: every value in
+            // the list is a struct or a tagged enum, so one that serialized to a
+            // bare scalar would have nothing to walk and would pass silently.
+            assert!(value.is_object(), "not an object on the wire: {value:?}");
+            assert_camel_case_keys(value);
+        }
+    }
+
+    /// Assert `value` and everything under it uses camelCase keys.
+    ///
+    /// Recurses through objects and arrays; scalars carry no keys. Arrays are
+    /// walked even though no wire type here holds one — a `Vec<T>` field is one
+    /// edit away, and a walker that stopped at the first array would go quiet
+    /// exactly then.
+    fn assert_camel_case_keys(value: &serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    assert!(
+                        !key.contains('_'),
+                        "{key} is snake_case on the wire: {value:?}"
+                    );
+                    assert_camel_case_keys(child);
+                }
             }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    assert_camel_case_keys(item);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1260,6 +1320,36 @@ mod tests {
                 reason: "boom".into(),
             },
         ]
+    }
+
+    /// Every state of the ledger write, for the same reason
+    /// [`every_install_result_state`] exists: the walk above needs a value for
+    /// each, and an explicit list means a third state is added here
+    /// deliberately. Pinned to the type by
+    /// `every_ledger_write_state_carries_its_own_tag`.
+    fn every_ledger_write_state() -> Vec<PhpLedgerWriteDto> {
+        vec![
+            PhpLedgerWriteDto::Recorded,
+            PhpLedgerWriteDto::Failed {
+                reason: "database is locked".into(),
+            },
+        ]
+    }
+
+    /// The compile-time site that keeps the list above in step with the type —
+    /// exhaustive, no wildcard — and the reason it matters here rather than
+    /// being ceremony: a third ledger state absent from that list would never
+    /// have its keys walked by `the_wire_uses_camel_case_keys_everywhere`, which
+    /// is precisely the hole that test was just fixed for.
+    #[test]
+    fn every_ledger_write_state_carries_its_own_tag() {
+        for state in every_ledger_write_state() {
+            let carried = match state {
+                PhpLedgerWriteDto::Recorded => "recorded",
+                PhpLedgerWriteDto::Failed { .. } => "failed",
+            };
+            assert_eq!(tag_of(&state), carried, "{state:?}");
+        }
     }
 
     /// The nine states must not be confusable on the wire. `Brew` in

@@ -194,6 +194,24 @@ confinement (already filed).
   depends on a page that does not exist until packaged installs actually work.
   **This is a decision owed before any `availability` flips to `Published`**, alongside the
   hash-confirmation obligation.
+- **The packaged route has no already-installed pre-check, and the Homebrew route does.**
+  `run_brew_install` refuses up front — `if before.iter().any(|m| m == major.as_str())` →
+  *"PHP 8.4 is already installed"* — before it looks for `brew`. `run_package_install` has no
+  counterpart. `openvhost-pkg` refuses a packaged tree that is already at the pinned version
+  (`PkgError::AlreadyInstalled`), but a **Homebrew keg is invisible to that check**: it is a
+  formula directory, not a package tree. So once `availability` flips, a direct
+  `install_php("8.4")` on a machine where 8.4 is a brew keg downloads and installs the packaged
+  tree over the top, with no refusal and no mention that another 8.4 already exists. The UI hides
+  the button in that state; **the IPC does not**, and the CLI reaches the same command.
+
+  That is arguably the *intended* migration behaviour under packaged-first discovery — 5B already
+  prefers the packaged tree per major, so installing one over a keg is how a user moves — but it
+  should be a **decision rather than an inheritance**. Three shapes are open: refuse it the way
+  brew's route does; allow it and say plainly in the confirmation that the packaged build will
+  take precedence over the existing keg; or allow it silently, as today. **Owed before any
+  `availability` flips to `Published`**, alongside the hash-confirmation obligation in D4 and the
+  §8.2b page-level gap above.
+
 - **`Availability` is declared once per engine, with the doc comments duplicated verbatim** —
   `mariadb/package/catalogue.rs:112`, `nginx/package/catalogue.rs:154`, and PHP's own from 5A.
   Same family as the four-way packaged-resolver duplication already filed. Do **not** unify it in

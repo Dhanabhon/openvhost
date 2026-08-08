@@ -75,6 +75,8 @@ beforeEach(() => {
 	languagesStore.log = [];
 	languagesStore.error = '';
 	languagesStore.outcome = null;
+	languagesStore.installProgress = null;
+	languagesStore.installTotal = null;
 	servicesStore.services = [];
 	servicesStore.error = null;
 	uninstallStore.target = null;
@@ -549,5 +551,67 @@ describe('the /languages route — a service that disappears', () => {
 		servicesStore.applyUnregistered('mysql-8.4');
 		const body = render(LanguagesPage).body;
 		expect(body).toContain('data-testid="lang-pill-8.3"');
+	});
+});
+
+// The page → row seam for the packaged install's progress. `onMount` never runs
+// under `svelte/server`, so the subscription itself is covered by
+// `lib/languages.listeners.test.ts`; what this block covers is the half that
+// lives in the template — that the page hands each row the store's progress
+// SCOPED TO THAT ROW, and hands a Homebrew machine nothing at all.
+//
+// Vacuity: every assertion is on a testid the page does not otherwise emit, and
+// each is paired with a negative case. Proven by mutation — replacing
+// `store.progressFor(runtime.major)` with `null` reddened 'hands the installing
+// row its own live pipeline state', and replacing it with the UNSCOPED
+// `store.installProgress?.progress` reddened 'ignores an event belonging to a
+// major other than the one installing'. The second mutation is the one worth
+// recording: it survived the first version of that test, because with
+// `installing` set to 8.4 only the 8.4 row paints either way. See the test's own
+// comment for what had to change to make it discriminate.
+describe('the /languages route — a packaged install in flight', () => {
+	it('paints no pipeline anywhere while a Homebrew install runs', () => {
+		// Every real machine today. `php-install-progress` has one emitter,
+		// `run_package_install`, so this store field stays null for the whole of a
+		// brew install (spec §8.6).
+		languagesStore.env = env(true, [row('8.4', false)]);
+		languagesStore.installing = '8.4';
+		const { body } = render(LanguagesPage);
+		expect(body).toContain('data-testid="lang-row-8.4"');
+		expect(body).not.toContain('php-install-progress-8.4');
+		expect(body).not.toContain('progressbar');
+	});
+
+	it('hands the installing row its own live pipeline state', () => {
+		languagesStore.env = env(true, [row('8.4', false)]);
+		languagesStore.installing = '8.4';
+		languagesStore.applyInstallProgress('8.4', { kind: 'downloaded', bytes: 512 });
+		languagesStore.installTotal = 2048;
+		const { body } = render(LanguagesPage);
+		expect(body).toContain('php-install-progress-8.4');
+		expect(body).toContain('aria-valuenow="25"');
+	});
+
+	// The ONE thing `progressFor` buys that the row's own `isInstalling` guard
+	// does not, and the first version of this test could not tell the two apart:
+	// with `installing` set to 8.4, only the 8.4 row paints either way, so a page
+	// handing every row the unscoped `store.installProgress` passed happily.
+	//
+	// What discriminates is an event for a major that is NOT the one installing —
+	// a late throttled flush from a previous 8.3 attempt landing after the 8.4
+	// run started, which `install()`'s clear cannot prevent because it happens
+	// first. Unscoped, that paints 8.3's pipeline under the 8.4 row, which is the
+	// same attribution bug this page already had to fix once for the log.
+	it('ignores an event belonging to a major other than the one installing', () => {
+		languagesStore.env = env(true, [row('8.3', false), row('8.4', false)]);
+		languagesStore.installing = '8.4';
+		languagesStore.applyInstallProgress('8.3', { kind: 'verified' });
+		const { body } = render(LanguagesPage);
+		// The row that is installing must not borrow another major's state…
+		expect(body).not.toContain('php-install-progress-8.4');
+		// …and the row the state belongs to is not installing, so it paints
+		// nothing either. The positive control is the test above, which proves
+		// this page does paint when the two majors agree.
+		expect(body).not.toContain('php-install-progress-8.3');
 	});
 });
