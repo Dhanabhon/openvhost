@@ -97,7 +97,18 @@ pub use nginx::{
 /// dependency on `openvhost-pkg`. Nothing here lets a caller choose a URL or a
 /// hash: [`PackagesRoot`] is minted from a resolved home, and
 /// [`install_mysql_package`] takes a [`MysqlMajor`].
-pub use openvhost_pkg::{ArchiveFormat, InstalledPackage, PackagesRoot, PkgError, Progress};
+///
+/// [`remove_current_link`] is the one WRITE in that list, and it is the
+/// narrowest one available: it removes a `current` symlink and refuses
+/// anything that is not one, so it cannot be turned into a recursive delete.
+/// It is here because an uninstall lives outside `openvhost-pkg` while the
+/// per-OS shape of a link removal (unix `remove_file`, Windows `remove_dir` on
+/// a junction) belongs to that crate's platform facade — see off-Homebrew
+/// slice 5D, where a removed version directory would otherwise leave `current`
+/// dangling and discovery reporting an install it cannot identify.
+pub use openvhost_pkg::{
+    ArchiveFormat, InstalledPackage, PackagesRoot, PkgError, Progress, remove_current_link,
+};
 /// PHP's package-tree install surface, alongside its existing Homebrew
 /// surface. Nothing here is wired to a Tauri command, a CLI subcommand or a
 /// UI control, and the install path may not be until the owner publishes the

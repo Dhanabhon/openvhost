@@ -8,16 +8,25 @@
 //! brew failure therefore changes no local state at all, which is what makes
 //! "nothing was destroyed" checkable rather than merely intended.
 //!
-//! [`perform_uninstall`] itself makes exactly two kinds of filesystem call:
-//! `remove_file` on a path `inventory` produced under `config/generated/`
-//! (PHP's generated pool config), and — P1 MariaDB UI design D5/D7 —
-//! `remove_dir_all` on the ONE package-tree path `inventory` produces for
-//! [`super::Target::Mariadb`] (`<home>/packages/mariadb/11.4/`, built entirely
-//! from compile-time constants; see [`super::Removal::PackageTree`]'s own doc
-//! comment). Neither recurses through a symlink to a target outside the tree
-//! it names — `remove_file` never follows one at all, and `remove_dir_all`
-//! removes a symlink entry it meets rather than descending into it — and
-//! nothing here touches `<home>/data`, `<home>/logs` or state.db's credential
+//! [`perform_uninstall`] itself makes exactly three kinds of filesystem call:
+//!
+//! * `remove_file` on a path `inventory` produced under `config/generated/`
+//!   (PHP's generated pool config). It never follows a symlink at all: on one
+//!   it removes the LINK, and on a directory it fails loudly.
+//! * `remove_dir_all` on a [`super::Removal::PackageTree`] path — MariaDB's
+//!   series directory (P1 MariaDB UI design D5/D7) and, since off-Homebrew
+//!   slice 5D, a packaged PHP's version directory. **That call is guarded**
+//!   (see [`confine`]): the path is required to resolve inside
+//!   `<home>/packages` before it is made, because a symlinked intermediate
+//!   component redirects the delete and there is no signal afterwards to
+//!   interpret — measured on this toolchain, a redirected `remove_dir_all`
+//!   deletes the real contents it reached and returns `Ok(())`.
+//! * `openvhost_core::remove_current_link` on the per-major `current` link,
+//!   and only when it has been left pointing at nothing. That is a `remove_file`
+//!   on a symlink behind `openvhost-pkg`'s platform facade (a junction needs
+//!   `remove_dir` on Windows), and it refuses anything that is not a link.
+//!
+//! Nothing here touches `<home>/data`, `<home>/logs` or state.db's credential
 //! rows on ANY path, including error paths.
 //!
 //! That is a statement about the EXECUTOR, not about this file, and the
@@ -36,7 +45,7 @@
 //!   registering a pool — a creation, never a removal.
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
@@ -206,38 +215,81 @@ pub(crate) async fn perform_uninstall(run: UninstallRun<'_>) -> Result<Uninstall
             }
             super::Removal::PackageTree { path, what } => {
                 // `remove_dir_all`, not `remove_file`: this names a whole
-                // package tree THIS app's own installer created (MariaDB has
-                // no Homebrew formula to spawn `brew uninstall` for at all —
-                // see `Target::formula`), and `path` is built entirely from
-                // compile-time constants (`MARIADB_PACKAGE_NAME`/
-                // `MARIADB_SERIES`) joined onto the resolved home in
-                // `inventory` — no IPC or client input ever reaches a
-                // component of it.
+                // package tree THIS app's own installer created, for a target
+                // with no Homebrew formula to spawn `brew uninstall` for at all
+                // (MariaDB always; a packaged PHP major since off-Homebrew
+                // slice 5D — see `Target::formula`).
                 //
-                // That does NOT make this call traversal-proof: verified on
-                // this toolchain (security-auditor), `remove_dir_all` DOES
-                // resolve a symlinked INTERMEDIATE component — replacing
-                // `<home>/packages` or `<home>/packages/mariadb` with a
-                // symlink redirects the delete to the link's target. That
-                // needs write access inside the OpenVHost home already —
-                // this app's own privilege level — so it crosses no
-                // boundary and is not a regression; it is simply not a
-                // property this call provides. What DOES hold: `path`'s own
-                // LAST component is one of the compile-time constants above,
-                // and a symlink planted AT that exact target is unlinked
-                // rather than followed — its target survives. Mirrors
-                // `openvhost_core::mysql::sweep_stale_staging`'s own
-                // `remove_dir_all` under the package/data tree
-                // (security-auditor reviewed).
-                match std::fs::remove_dir_all(path) {
-                    Ok(()) => {}
+                // THE call this module has to justify, and it validates its own
+                // target rather than trusting a check made three layers up by a
+                // caller it cannot see (spec 5D D4). Two measured facts drive
+                // the shape of that guard:
+                //
+                //  * `remove_dir_all` FOLLOWS a symlinked INTERMEDIATE
+                //    component and deletes the real contents behind it. Replace
+                //    `<home>/packages/php/8.4` with a link and the delete lands
+                //    wherever that link goes.
+                //  * neither that case nor a symlink at the leaf returns an
+                //    error. A redirected delete is indistinguishable from a
+                //    correct one by its return value, so the check has to
+                //    happen BEFORE the call — there is nothing afterwards to
+                //    interpret.
+                //
+                // `path` itself is well-formed by construction (see
+                // `Removal::PackageTree`'s doc), and that is exactly what is
+                // NOT sufficient: every component of it can be a plain, legal
+                // name while the path resolves somewhere else entirely.
+                let root = openvhost_core::PackagesRoot::from_home(&run.home);
+                match confine(root.as_path(), path) {
                     // Already gone — same "the post-state is what was asked
-                    // for" reasoning as `GeneratedFile` above.
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => problems.push(format!(
-                        "{what} at {} could not be removed: {e}",
-                        path.display()
-                    )),
+                    // for" reasoning as `GeneratedFile` above. Note this is
+                    // "nothing is there at all", not "it did not resolve":
+                    // `confine` tells those two apart.
+                    Confinement::Absent => {}
+                    // A REFUSAL, not a problem to collect. The program-files
+                    // removal is the first step of every inventory that has
+                    // one, so returning here means nothing has been removed
+                    // and nothing will be — the same shape `run_brew`'s `?`
+                    // gives a brew that refused, and for the same reason: the
+                    // local cleanup below must not run while the version is
+                    // still installed.
+                    Confinement::Refused { reason } => {
+                        return Err(IpcError::Core {
+                            message: format!(
+                                "{} was not removed. {what} at {} {reason}. Nothing was removed.",
+                                run.target.display(),
+                                path.display(),
+                            ),
+                        });
+                    }
+                    Confinement::Contained => match std::fs::remove_dir_all(path) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => problems.push(format!(
+                            "{what} at {} could not be removed: {e}",
+                            path.display()
+                        )),
+                    },
+                }
+                // The tree is gone; the link that selected it must not be left
+                // pointing at it. A dangling `current` is not cosmetic:
+                // `looks_like_a_broken_install` counts ANY entry in the major
+                // directory, so leaving the link behind makes discovery report
+                // the major as an install it could not identify — a successful
+                // uninstall that renders as a broken one.
+                //
+                // Reached on the `Absent` path too, deliberately: a link left
+                // over from a previous attempt that removed the tree and then
+                // failed is exactly the state this closes.
+                //
+                // MariaDB needs nothing here and gets nothing: its `current`
+                // lives INSIDE the series directory that was just removed, so
+                // there is no link left to dangle. That is decided by looking,
+                // not by an arm remembering it — see `Target::packaged_current_link`.
+                if let Some(problem) =
+                    clear_dangling_current(&run.target.packaged_current_link(&run.home))
+                {
+                    problems.push(problem);
                 }
             }
             super::Removal::ServiceRow { id } => {
@@ -279,6 +331,154 @@ pub(crate) async fn perform_uninstall(run: UninstallRun<'_>) -> Result<Uninstall
     } else {
         UninstallOutcome::Incomplete(problems)
     })
+}
+
+/// Whether a [`super::Removal::PackageTree`] path may be handed to
+/// `remove_dir_all`.
+///
+/// Three states, not a `bool` with an error on the side. "Nothing is there"
+/// and "something is there that I could not prove is ours" are opposite
+/// answers — the first means the uninstall is already done, the second means
+/// it must not proceed — and a boolean would have to collapse one into the
+/// other. (This codebase has now shipped three defects whose shape was a
+/// boolean standing where a state belonged.)
+#[derive(Debug, PartialEq, Eq)]
+enum Confinement {
+    /// Nothing exists at the path — not a directory, not a file, not even a
+    /// dangling symlink. There is nothing to remove and nothing to confine.
+    Absent,
+    /// The path resolves to a location strictly inside the packages root, so
+    /// removing it cannot reach anything the package tree does not own.
+    Contained,
+    /// Something is there, and it is not provably ours. `reason` is a verb
+    /// phrase whose subject is the removal's own `what` — "The PHP 8.4 program
+    /// files at `<path>` **resolve to …**" — so the caller composes one
+    /// sentence rather than concatenating two.
+    Refused { reason: String },
+}
+
+/// Require `path` to resolve strictly inside `packages_root` before anything
+/// recursive is pointed at it (off-Homebrew slice 5D design D4).
+///
+/// **Both sides are canonicalized, and canonicalizing the ROOT is
+/// load-bearing rather than symmetry.** `openvhost_core::keg_provenance` makes
+/// the identical point in its own containment check: on macOS `/var` resolves
+/// to `/private/var`, so comparing a resolved path against an unresolved
+/// prefix fails for every tempdir — which reads as a broken check rather than
+/// a strict one, and would be "fixed" by deleting it.
+///
+/// [`Path::starts_with`] rather than a string prefix, and that is also
+/// load-bearing: it compares whole components, so a sibling named
+/// `packages-elsewhere` is outside `packages`, where `str::starts_with` would
+/// call it inside.
+///
+/// Equality is refused as well as escape. `starts_with` is true of the root
+/// itself, and the root resolving to the root is reachable — a symlinked
+/// series directory plus a `current` naming `packages` lands exactly there —
+/// and would authorise a recursive delete of every engine's package tree at
+/// once.
+///
+/// **What this does NOT claim**, stated because a comment that outruns its
+/// code is worse than none:
+///
+/// * it is a check, not a lock. A component swapped between this call and the
+///   `remove_dir_all` would defeat it. That needs write access inside the
+///   OpenVHost home — this app's own privilege level — so it crosses no
+///   boundary; it is simply not a property a path check can provide.
+/// * relocating the packages root ITSELF (making `<home>/packages` a symlink)
+///   is accepted, because the root is canonicalized: the tree moves, and the
+///   removal stays inside the moved tree. That is the honest reading — a
+///   redirected root is not an escape from the package tree, it *is* the
+///   package tree, and everything the installer writes goes there too.
+///   Refusing it would break a user who put their packages on another volume.
+///   What is caught is any component BELOW the root diverging from it.
+fn confine(packages_root: &Path, path: &Path) -> Confinement {
+    // `symlink_metadata`, never `exists()`: a dangling symlink where the
+    // version directory belongs is something rather than nothing, and reading
+    // it as "already gone" would leave it behind for discovery to trip over.
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Confinement::Absent,
+        Err(e) => {
+            return Confinement::Refused {
+                reason: format!("could not be examined: {e}"),
+            };
+        }
+        Ok(_) => {}
+    }
+    let real_path = match std::fs::canonicalize(path) {
+        Ok(p) => p,
+        // Reached by a dangling symlink at the leaf, among other things. We
+        // cannot establish where this would land, so we do not remove it —
+        // "could not tell" must never collapse into "proceed" on the way to a
+        // recursive delete.
+        Err(e) => {
+            return Confinement::Refused {
+                reason: format!("could not be resolved: {e}"),
+            };
+        }
+    };
+    let real_root = match std::fs::canonicalize(packages_root) {
+        Ok(p) => p,
+        Err(e) => {
+            return Confinement::Refused {
+                reason: format!(
+                    "could not be checked against OpenVHost's package directory {}, which could \
+                     not be resolved: {e}",
+                    packages_root.display()
+                ),
+            };
+        }
+    };
+    if real_path.starts_with(&real_root) && real_path != real_root {
+        Confinement::Contained
+    } else {
+        Confinement::Refused {
+            reason: format!(
+                "resolve to {}, which is not inside OpenVHost's package directory {}",
+                real_path.display(),
+                real_root.display()
+            ),
+        }
+    }
+}
+
+/// Remove a `current` link that has been left pointing at nothing, and only
+/// that. Returns the problem to report, or `None` when there was nothing to do.
+///
+/// Exhaustive over the three answers `metadata` can give, because they mean
+/// three different things:
+///
+/// * `Ok` — whatever is at `link` resolves to something that still exists. A
+///   `current` pointing at a version directory that survived is none of this
+///   function's business, and removing it would break a live install.
+/// * `NotFound` — either there is no link at all, or there is one and it
+///   resolves to nothing. Both are handed to the platform facade, which tells
+///   them apart itself (an absent link is `Ok(())`) and refuses anything that
+///   is not a link, so this does not have to duplicate either rule.
+/// * anything else — we cannot tell whether it dangles, so nothing is removed.
+///   Reported rather than swallowed: a `current` left pointing at a removed
+///   tree is the difference between a clean uninstall and a major that
+///   discovery reports as an install it cannot identify.
+fn clear_dangling_current(link: &Path) -> Option<String> {
+    match std::fs::metadata(link) {
+        Ok(_) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            openvhost_core::remove_current_link(link).err().map(|e| {
+                format!(
+                    "the version directory is gone, but the {} link to it could not be removed: \
+                     {e}. Delete it by hand; until then this version still appears as an install \
+                     OpenVHost cannot identify.",
+                    link.display()
+                )
+            })
+        }
+        Err(e) => Some(format!(
+            "the version directory is gone, but the {} link to it could not be examined: {e}. If \
+             it is still pointing at the removed version, delete it by hand; until then this \
+             version still appears as an install OpenVHost cannot identify.",
+            link.display()
+        )),
+    }
 }
 
 /// The refusal a racing execute returns. Names every obstacle, not just the
@@ -630,6 +830,10 @@ mod tests {
     };
 
     use super::super::tests::{own_keg, php, site};
+    // The packaged fixtures are symlink-shaped, so every test that uses them
+    // is `#[cfg(unix)]` and so is the import.
+    #[cfg(unix)]
+    use super::super::tests::{install_packaged_php, point_current};
     use super::*;
 
     /// Records every spawn it is asked for and answers with a scripted exit
@@ -1839,5 +2043,619 @@ mod tests {
         );
 
         let _ = sup.stop("mariadb-11.4");
+    }
+
+    // ======================================================================
+    // Off-Homebrew slice 5D T2 — the executor for a PHP major THIS app
+    // packaged: a `remove_dir_all` that validates its own target.
+    // ======================================================================
+
+    /// `provisioned_home` plus a packaged PHP 8.4 laid down exactly the way
+    /// `openvhost-pkg` lays one down — the version directory holding
+    /// `bin/php-fpm`, and `current` a RELATIVE symlink naming the bare version.
+    ///
+    /// Built with `uninstall::tests`' own fixtures rather than a second
+    /// spelling: the executor's job is to remove what the resolver found, so
+    /// both halves have to be looking at the same tree.
+    #[cfg(unix)]
+    fn packaged_php_home(version: &str) -> tempfile::TempDir {
+        let tmp = provisioned_home();
+        install_packaged_php(tmp.path(), "8.4", version);
+        point_current(tmp.path(), "8.4", version);
+        tmp
+    }
+
+    /// [`run_for`] for a packaged target: no keg to resolve (`Target::formula`
+    /// is `None`, so `uninstall_package` never looks one up) and the resolved
+    /// packaged state threaded in.
+    fn run_for_packaged<'a>(
+        target: Target,
+        home: &std::path::Path,
+        sup: &'a Supervisor,
+        lock: &'a InstallLock,
+        runner: Arc<dyn BrewRunner>,
+        packaged: PackagedPhp,
+    ) -> UninstallRun<'a> {
+        UninstallRun {
+            target,
+            home: home.to_path_buf(),
+            brew: PathBuf::new(),
+            sup,
+            lock,
+            sites: Vec::new(),
+            keg: None,
+            packaged: Some(packaged),
+            runner,
+            log: silent(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn packages_root(home: &std::path::Path) -> PathBuf {
+        openvhost_core::PackagesRoot::from_home(home)
+            .as_path()
+            .to_path_buf()
+    }
+
+    /// A directory outside the packages root holding one identifiable file, so
+    /// "it survived" is checked on CONTENT rather than on the directory entry
+    /// still being listed.
+    #[cfg(unix)]
+    fn outside_tree(root: &std::path::Path, rel: &str) -> PathBuf {
+        let dir = root.join(rel);
+        std::fs::create_dir_all(dir.join("bin")).expect("mkdir");
+        std::fs::write(dir.join("bin/php-fpm"), b"someone else's fpm").expect("write");
+        std::fs::write(dir.join("precious"), b"not ours").expect("write");
+        dir
+    }
+
+    #[cfg(unix)]
+    fn assert_outside_survived(dir: &std::path::Path) {
+        assert_eq!(
+            std::fs::read(dir.join("precious")).unwrap_or_else(|e| panic!(
+                "{} was destroyed: {e}",
+                dir.join("precious").display()
+            )),
+            b"not ours",
+            "{} was rewritten",
+            dir.display()
+        );
+        assert!(
+            dir.join("bin/php-fpm").is_file(),
+            "{}/bin/php-fpm was destroyed",
+            dir.display()
+        );
+    }
+
+    // ---- the guard, in isolation -----------------------------------------
+    //
+    // VACUITY for this whole group: weakening `confine` to
+    // `Confinement::Contained` unconditionally left `..._is_contained` and
+    // `..._is_absent...` passing and failed every refusal test — so the group
+    // is discriminating in both directions rather than agreeing with a guard
+    // that never refuses. Measured; see the task report.
+
+    #[cfg(unix)]
+    #[test]
+    fn a_real_version_directory_under_the_packages_root_is_contained() {
+        let home = packaged_php_home("8.4.24");
+        assert_eq!(
+            confine(
+                &packages_root(home.path()),
+                &home.path().join("packages/php/8.4/8.4.24")
+            ),
+            Confinement::Contained
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_with_nothing_at_it_is_absent_rather_than_refused() {
+        // The distinction the three-state answer exists for: "already gone" is
+        // a finished uninstall, "could not be resolved" is a refusal.
+        let home = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            confine(
+                &packages_root(home.path()),
+                &home.path().join("packages/php/8.4/8.4.24")
+            ),
+            Confinement::Absent
+        );
+    }
+
+    /// SHAPE 1 of the two the security audit reproduced live. A symlinked
+    /// SERIES directory: every component of the path is a plain legal name, the
+    /// lexical direct-child check discovery uses passes, and the path resolves
+    /// somewhere else entirely.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_series_directory_is_refused() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        outside_tree(elsewhere.path(), "8.4.24");
+        let php_tree = home.path().join("packages/php");
+        std::fs::create_dir_all(&php_tree).expect("mkdir");
+        std::os::unix::fs::symlink(elsewhere.path(), php_tree.join("8.4")).expect("symlink");
+
+        let target = home.path().join("packages/php/8.4/8.4.24");
+        // The lexical checks this does NOT rely on both pass on this path —
+        // which is the point: without the guard below, nothing refuses it.
+        assert_eq!(target.parent(), Some(php_tree.join("8.4").as_path()));
+        assert!(target.starts_with(packages_root(home.path())));
+
+        assert!(matches!(
+            confine(&packages_root(home.path()), &target),
+            Confinement::Refused { .. }
+        ));
+    }
+
+    /// SHAPE 2. A symlinked VERSION directory — the leaf. `remove_dir_all`
+    /// would unlink this one rather than follow it (measured on this
+    /// toolchain), so the guard is not what stops a delete here; it is what
+    /// stops the uninstall reporting success having removed a link while the
+    /// program files it named are somewhere we never looked.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_version_directory_is_refused() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let real = outside_tree(elsewhere.path(), "realtree");
+        let major = home.path().join("packages/php/8.4");
+        std::fs::create_dir_all(&major).expect("mkdir");
+        std::os::unix::fs::symlink(&real, major.join("8.4.24")).expect("symlink");
+
+        let target = major.join("8.4.24");
+        assert_eq!(target.parent(), Some(major.as_path()));
+        assert!(target.starts_with(packages_root(home.path())));
+
+        assert!(matches!(
+            confine(&packages_root(home.path()), &target),
+            Confinement::Refused { .. }
+        ));
+    }
+
+    /// The reason `starts_with` alone is not the predicate. `current` may name
+    /// any single plain component — `packages` among them — so a symlinked
+    /// series directory pointing at the home makes the target resolve to the
+    /// packages root ITSELF, which `starts_with` calls contained. A
+    /// `remove_dir_all` there takes every engine's tree at once.
+    #[cfg(unix)]
+    #[test]
+    fn a_target_resolving_to_the_packages_root_itself_is_refused() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let root = packages_root(home.path());
+        std::fs::create_dir_all(root.join("mysql/8.4")).expect("mkdir");
+        std::fs::create_dir_all(root.join("php")).expect("mkdir");
+        // `packages/php/8.4` -> the home, so `packages/php/8.4/packages` IS
+        // `packages`.
+        std::os::unix::fs::symlink(home.path(), root.join("php/8.4")).expect("symlink");
+        let target = root.join("php/8.4/packages");
+        assert_eq!(
+            std::fs::canonicalize(&target).expect("resolves"),
+            std::fs::canonicalize(&root).expect("resolves"),
+            "the fixture must actually resolve to the root, or this proves nothing"
+        );
+
+        assert!(matches!(
+            confine(&root, &target),
+            Confinement::Refused { .. }
+        ));
+    }
+
+    /// `Path::starts_with` compares whole components; `str::starts_with` would
+    /// call `<home>/packages-elsewhere/...` inside `<home>/packages`.
+    #[cfg(unix)]
+    #[test]
+    fn a_sibling_directory_whose_name_merely_begins_with_the_root_is_refused() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let root = packages_root(home.path());
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let target = home.path().join("packages-elsewhere/php/8.4/8.4.24");
+        std::fs::create_dir_all(&target).expect("mkdir");
+        // The string comparison this must not be.
+        assert!(
+            target
+                .display()
+                .to_string()
+                .starts_with(&root.display().to_string())
+        );
+
+        assert!(matches!(
+            confine(&root, &target),
+            Confinement::Refused { .. }
+        ));
+    }
+
+    /// The accepted case, stated as a test so it is a decision rather than an
+    /// oversight: canonicalizing the ROOT means a user who put
+    /// `<home>/packages` on another volume keeps working. The tree moves; the
+    /// removal stays inside the moved tree — and a component below it that
+    /// diverges is still refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_relocated_packages_root_is_accepted_and_still_confines_what_is_below_it() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let volume = tempfile::tempdir().expect("tempdir");
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let real_root = volume.path().join("openvhost-packages");
+        std::fs::create_dir_all(real_root.join("php/8.4/8.4.24")).expect("mkdir");
+        std::os::unix::fs::symlink(&real_root, packages_root(home.path())).expect("symlink");
+        // A tempdir under /var canonicalizes to /private/var: the root check
+        // would fail for EVERY test here if only the target were resolved.
+        assert_ne!(
+            std::fs::canonicalize(packages_root(home.path())).expect("resolves"),
+            packages_root(home.path()),
+            "the fixture must exercise a root that does not equal its own canonical form"
+        );
+
+        assert_eq!(
+            confine(
+                &packages_root(home.path()),
+                &home.path().join("packages/php/8.4/8.4.24")
+            ),
+            Confinement::Contained
+        );
+
+        // …and the relocation is not a blanket pass: a series directory that
+        // leaves the RELOCATED root is refused exactly as it would be at home.
+        outside_tree(elsewhere.path(), "8.5.0");
+        std::os::unix::fs::symlink(elsewhere.path(), real_root.join("php/8.5")).expect("symlink");
+        assert!(matches!(
+            confine(
+                &packages_root(home.path()),
+                &home.path().join("packages/php/8.5/8.5.0")
+            ),
+            Confinement::Refused { .. }
+        ));
+    }
+
+    /// A dangling symlink where the version directory belongs is SOMETHING,
+    /// and reading it as "already gone" would leave it on disk for discovery
+    /// to trip over. It cannot be resolved, so it is refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_where_the_version_directory_belongs_is_refused_not_absent() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let major = home.path().join("packages/php/8.4");
+        std::fs::create_dir_all(&major).expect("mkdir");
+        std::os::unix::fs::symlink(home.path().join("gone"), major.join("8.4.24"))
+            .expect("symlink");
+
+        assert!(matches!(
+            confine(&packages_root(home.path()), &major.join("8.4.24")),
+            Confinement::Refused { .. }
+        ));
+    }
+
+    // ---- the executor, end to end ----------------------------------------
+
+    /// The whole packaged path: the tree goes, `current` goes with it,
+    /// everything the brew path already keeps is kept, and Homebrew is never
+    /// asked.
+    ///
+    /// The last assertion is the one that makes the `current` cleanup matter
+    /// rather than being tidiness: discovery counts ANY entry left in the major
+    /// directory as an install it could not identify, so a leftover link would
+    /// make a successful uninstall render as a broken install.
+    ///
+    /// VACUITY: deleting the `clear_dangling_current` call left every other
+    /// assertion passing and failed the two about `current` and
+    /// `is_complete()`. Measured; see the task report.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_successful_packaged_php_uninstall_removes_the_tree_and_the_current_link() {
+        let home = packaged_php_home("8.4.24");
+        let before = untouched_fingerprint(home.path());
+        let sup = supervisor_with("php-fpm-8.4");
+        let lock = InstallLock::default();
+        let runner = RecordingRunner::ok();
+
+        let packaged = php("8.4").packaged(home.path()).expect("a packaged 8.4");
+        let outcome = perform_uninstall(run_for_packaged(
+            php("8.4"),
+            home.path(),
+            &sup,
+            &lock,
+            runner.clone(),
+            packaged,
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, UninstallOutcome::Done);
+        assert!(
+            !home.path().join("packages/php/8.4/8.4.24").exists(),
+            "the version directory must be gone"
+        );
+        assert!(
+            std::fs::symlink_metadata(home.path().join("packages/php/8.4/current")).is_err(),
+            "`current` must not be left pointing at a tree that is gone"
+        );
+        assert!(
+            !home
+                .path()
+                .join("config/generated/php/8.4/php-fpm.conf")
+                .exists(),
+            "the generated pool config must be gone"
+        );
+        assert!(sup.snapshot().is_empty(), "the service row must be gone");
+        assert_untouched(&before);
+        // Never Homebrew (D2): a packaged inventory has no `BrewFormula` step,
+        // so this runner — which WOULD record one — must have recorded nothing.
+        assert!(
+            runner.spawns().is_empty(),
+            "a packaged uninstall must spawn NOTHING, recorded {:?}",
+            runner.spawns()
+        );
+        // The user-visible consequence, asserted through the same discovery
+        // that built the row they pressed Uninstall on.
+        let found = openvhost_core::discover_php(
+            &openvhost_core::PackagesRoot::from_home(home.path()),
+            &[],
+            &|_| None,
+        );
+        assert!(found.runtimes.is_empty(), "got {found:?}");
+        assert!(
+            found.is_complete(),
+            "an uninstalled major must not be reported as an install we cannot identify: {found:?}"
+        );
+    }
+
+    /// SHAPE 1, end to end. The escape the guard exists for: a symlinked
+    /// SERIES directory, where `remove_dir_all` follows the intermediate
+    /// component and deletes the real contents behind it — returning `Ok(())`,
+    /// so nothing after the fact could tell.
+    ///
+    /// Asserted on the outside tree STILL EXISTING, not on the call having
+    /// returned an error: with this call an error is not evidence and a success
+    /// is not evidence either.
+    ///
+    /// VACUITY: with `confine`'s result ignored (`remove_dir_all` called
+    /// unconditionally), this test failed on `precious` being destroyed —
+    /// i.e. the escape is real and this fixture reaches it. Measured; see the
+    /// task report.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_series_directory_refuses_the_removal_and_the_outside_tree_survives() {
+        let home = provisioned_home();
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let real = outside_tree(elsewhere.path(), "8.4.24");
+        let php_tree = home.path().join("packages/php");
+        std::fs::create_dir_all(&php_tree).expect("mkdir");
+        std::os::unix::fs::symlink(elsewhere.path(), php_tree.join("8.4")).expect("symlink");
+        point_current(home.path(), "8.4", "8.4.24");
+
+        // The resolver still finds it — every check it makes is satisfied —
+        // so the path really does reach the executor.
+        let packaged = php("8.4")
+            .packaged(home.path())
+            .expect("the lexical checks pass on this tree");
+        assert_eq!(
+            packaged.version_dir,
+            home.path().join("packages/php/8.4/8.4.24")
+        );
+        assert!(packaged.version_dir.starts_with(packages_root(home.path())));
+
+        let sup = supervisor_with("php-fpm-8.4");
+        let lock = InstallLock::default();
+        let runner = RecordingRunner::ok();
+        let outcome = perform_uninstall(run_for_packaged(
+            php("8.4"),
+            home.path(),
+            &sup,
+            &lock,
+            runner.clone(),
+            packaged,
+        ))
+        .await;
+
+        // FIRST, and deliberately before the `Result` is even looked at: with
+        // this call an error is not evidence and a success is not evidence
+        // either, so what the outside tree looks like afterwards is the only
+        // thing that can be. Asserting the refusal first would make the
+        // reported failure "expected Err, got Ok" for a run that had just
+        // deleted somebody else's directory.
+        assert_outside_survived(&real);
+
+        let text = format!("{}", outcome.expect_err("the removal must be refused"));
+        assert!(
+            text.contains("PHP 8.4 was not removed") && text.contains("Nothing was removed"),
+            "the refusal must say the version is still installed: {text}"
+        );
+        // And nothing local moved either: the refusal returns before the pool
+        // config and the service row are touched.
+        assert!(
+            home.path()
+                .join("config/generated/php/8.4/php-fpm.conf")
+                .exists(),
+            "a refusal must not delete the pool config"
+        );
+        assert_eq!(sup.snapshot().len(), 1, "nor the service row");
+        assert!(runner.spawns().is_empty(), "recorded {:?}", runner.spawns());
+    }
+
+    /// SHAPE 2, end to end: a symlinked VERSION directory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_version_directory_refuses_the_removal_and_the_outside_tree_survives() {
+        let home = provisioned_home();
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let real = outside_tree(elsewhere.path(), "realtree");
+        let major = home.path().join("packages/php/8.4");
+        std::fs::create_dir_all(&major).expect("mkdir");
+        std::os::unix::fs::symlink(&real, major.join("8.4.24")).expect("symlink");
+        point_current(home.path(), "8.4", "8.4.24");
+
+        let packaged = php("8.4")
+            .packaged(home.path())
+            .expect("the lexical checks pass on this tree");
+        assert_eq!(packaged.version_dir, major.join("8.4.24"));
+
+        let sup = supervisor_with("php-fpm-8.4");
+        let lock = InstallLock::default();
+        let outcome = perform_uninstall(run_for_packaged(
+            php("8.4"),
+            home.path(),
+            &sup,
+            &lock,
+            RecordingRunner::ok(),
+            packaged,
+        ))
+        .await;
+
+        // Disk first, `Result` second — see the SHAPE 1 test for why. Here the
+        // link itself surviving is the discriminating half: `remove_dir_all`
+        // would UNLINK this leaf and report success, leaving the outside tree
+        // intact and the program files still installed under a name the
+        // uninstall claimed to have removed.
+        assert_outside_survived(&real);
+        assert!(
+            std::fs::symlink_metadata(major.join("8.4.24"))
+                .expect("the link survives")
+                .file_type()
+                .is_symlink(),
+            "this refused; it did not half-remove"
+        );
+        assert!(std::fs::read_link(major.join("current")).is_ok());
+
+        let err = outcome.expect_err("the removal must be refused");
+        assert!(
+            format!("{err}").contains("PHP 8.4 was not removed"),
+            "{err}"
+        );
+    }
+
+    /// The discriminating half of the `current` handling: the link is removed
+    /// because it DANGLES, not because an uninstall ran. One still pointing at
+    /// a version directory that survived must be left exactly where it is —
+    /// removing it would break a working install.
+    ///
+    /// The state is built by hand rather than resolved: `Target::packaged`
+    /// reads the removal path OFF `current`, so a resolved fixture can never
+    /// have the link naming a different version than the one being removed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_current_link_pointing_at_a_surviving_version_is_left_alone() {
+        let home = packaged_php_home("8.4.23");
+        install_packaged_php(home.path(), "8.4", "8.4.24");
+        // `current` selects 8.4.23; the executor is told to remove 8.4.24.
+        let sup = supervisor_with("php-fpm-8.4");
+        let lock = InstallLock::default();
+
+        let outcome = perform_uninstall(run_for_packaged(
+            php("8.4"),
+            home.path(),
+            &sup,
+            &lock,
+            RecordingRunner::ok(),
+            PackagedPhp {
+                version_dir: home.path().join("packages/php/8.4/8.4.24"),
+                brew_keg: None,
+            },
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, UninstallOutcome::Done);
+        assert!(!home.path().join("packages/php/8.4/8.4.24").exists());
+        assert_eq!(
+            std::fs::read_link(home.path().join("packages/php/8.4/current")).expect("still linked"),
+            PathBuf::from("8.4.23"),
+            "a `current` that still resolves must not be removed"
+        );
+        assert!(
+            home.path()
+                .join("packages/php/8.4/8.4.23/bin/php-fpm")
+                .is_file(),
+            "nor may the version it names be touched"
+        );
+    }
+
+    /// A tree already removed by a previous attempt that then failed: the
+    /// removal is `Absent`, and the link it left behind is still cleared.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_already_removed_tree_still_gets_its_dangling_current_cleared() {
+        let home = packaged_php_home("8.4.24");
+        std::fs::remove_dir_all(home.path().join("packages/php/8.4/8.4.24")).expect("remove");
+        let sup = supervisor_with("php-fpm-8.4");
+        let lock = InstallLock::default();
+
+        let outcome = perform_uninstall(run_for_packaged(
+            php("8.4"),
+            home.path(),
+            &sup,
+            &lock,
+            RecordingRunner::ok(),
+            PackagedPhp {
+                version_dir: home.path().join("packages/php/8.4/8.4.24"),
+                brew_keg: None,
+            },
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, UninstallOutcome::Done);
+        assert!(
+            std::fs::symlink_metadata(home.path().join("packages/php/8.4/current")).is_err(),
+            "the leftover link must be cleared even when the tree was already gone"
+        );
+    }
+
+    /// The promise the brew path already makes, checked on the packaged path:
+    /// logs, pool overrides and every site's saved PHP version survive.
+    ///
+    /// The site row is read back from state.db rather than trusted from the
+    /// `sites` vector the executor was handed — a repo call that silently
+    /// dropped it would return `Ok` all the same. Asserted on `updated_at` as
+    /// well as on the version, for the reason
+    /// `the_stored_mariadb_root_password_survives_the_uninstall` gives: a row
+    /// deleted and rewritten with identical content carries a fresh timestamp,
+    /// which a content-only comparison cannot see.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn logs_overrides_and_every_sites_saved_php_version_survive_a_packaged_uninstall() {
+        let home = packaged_php_home("8.4.24");
+        let before = untouched_fingerprint(home.path());
+        let db = Db::open(home.path()).await.expect("state.db");
+        let repo = SqliteSiteRepository::new(&db);
+        // Pinned to a DIFFERENT major: a site pinned to 8.4 would block the
+        // uninstall outright (`Blocker::SitesPinned`), so the surviving-setting
+        // promise is only observable on a site that does not block.
+        let pinned = site("shop", "shop.localhost", "8.3");
+        let saved = repo
+            .create(openvhost_core::NewSite {
+                name: pinned.name,
+                domain: pinned.domain,
+                docroot: pinned.docroot,
+                web_server: pinned.web_server,
+                php_version: pinned.php_version,
+                enabled: pinned.enabled,
+            })
+            .await
+            .expect("create site");
+
+        let sup = supervisor_with("php-fpm-8.4");
+        let lock = InstallLock::default();
+        let packaged = php("8.4").packaged(home.path()).expect("a packaged 8.4");
+        perform_uninstall(run_for_packaged(
+            php("8.4"),
+            home.path(),
+            &sup,
+            &lock,
+            RecordingRunner::ok(),
+            packaged,
+        ))
+        .await
+        .unwrap();
+
+        assert_untouched(&before);
+        let after = repo.list().await.expect("list");
+        assert_eq!(after.len(), 1, "got {after:?}");
+        assert_eq!(after[0].php_version.as_str(), "8.3");
+        assert_eq!(
+            after[0].updated_at, saved.updated_at,
+            "the row was rewritten even though its content came back the same"
+        );
     }
 }

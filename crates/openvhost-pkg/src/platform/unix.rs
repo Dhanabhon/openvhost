@@ -49,6 +49,35 @@ pub(crate) fn update_current(link: &Path, version: &str) -> Result<(), PkgError>
     Ok(())
 }
 
+/// Unlink `current` itself. Used when the version directory it selected has
+/// been removed, so the link would otherwise be left dangling (off-Homebrew
+/// slice 5D) — a dangling `current` is not cosmetic: `looks_like_a_broken_
+/// install` counts any entry in the major directory, so discovery would report
+/// the major as an install it could not identify.
+///
+/// `remove_file`, never `remove_dir_all`, and the same S22 refusal
+/// [`update_current`] makes: if something that is NOT a symlink sits where
+/// `current` belongs, this refuses rather than deleting it. `current`'s blast
+/// radius is the real package payload, and the one call that must never be
+/// pointed at it is a recursive delete.
+///
+/// An absent link is `Ok(())`: the post-state is exactly what was asked for.
+pub(crate) fn remove_current(link: &Path) -> Result<(), PkgError> {
+    match fs::symlink_metadata(link) {
+        Ok(meta) if !meta.file_type().is_symlink() => Err(PkgError::Unsupported(
+            "existing 'current' is not a symlink; refusing to remove".to_string(),
+        )),
+        // On unix `remove_file` on a symlink removes the LINK and never
+        // follows it, so the directory it named — if it still exists at all —
+        // is untouched by this call.
+        Ok(_) => fs::remove_file(link).map_err(|e| PkgError::io("remove_file", link, e)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        // A stat error other than NotFound is not a safe "assume absent" —
+        // surface it, exactly as `update_current` does.
+        Err(e) => Err(PkgError::io("stat", link, e)),
+    }
+}
+
 fn bad(m: &'static str) -> PkgError {
     PkgError::UnsafeArchive(m.to_string())
 }

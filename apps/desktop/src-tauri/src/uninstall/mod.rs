@@ -477,6 +477,35 @@ impl Target {
         }
     }
 
+    /// Where this target's per-major `current` link lives in OpenVHost's own
+    /// package tree.
+    ///
+    /// Every arm answers, and none is `None`: the question "where would this
+    /// target's `current` link be" has an answer for all three, independently
+    /// of whether this slice ever removes that target's package tree. An
+    /// `Option` here would have to encode a *second* fact — "…and it happens to
+    /// sit inside the tree the executor is about to delete", for MariaDB —
+    /// which is the executor's business and is decided there, by whether the
+    /// link is left dangling. (A boolean standing in for a state has now been
+    /// the shape of three defects in this codebase; this is the same trap one
+    /// level down.)
+    ///
+    /// Through [`openvhost_core::PackagesRoot`]'s facade, never
+    /// `major_dir.join("current")` spelled by hand: `openvhost-pkg`'s installer
+    /// swings this link through that facade, and a second spelling here is how
+    /// the writer and the reader end up naming different files.
+    pub(crate) fn packaged_current_link(&self, home: &Path) -> PathBuf {
+        let root = openvhost_core::PackagesRoot::from_home(home);
+        match self {
+            Target::Php(m) => root.current_link(openvhost_core::PHP_PACKAGE_NAME, m.as_str()),
+            Target::Mysql(m) => root.current_link(openvhost_core::MYSQL_PACKAGE_NAME, m.as_str()),
+            Target::Mariadb => root.current_link(
+                openvhost_core::MARIADB_PACKAGE_NAME,
+                openvhost_core::MARIADB_SERIES,
+            ),
+        }
+    }
+
     /// `brew uninstall <formula>`, composed entirely inside `openvhost-core`.
     ///
     /// The MariaDB arm is unreachable in normal operation — [`inventory`]
@@ -526,9 +555,17 @@ pub(crate) enum Removal {
     /// `remove_dir_all` this feeds:
     ///
     /// * every component is produced inside `openvhost-core`, through
-    ///   `PackagesRoot`'s layout facade, from a resolved home — **no IPC or
-    ///   client input reaches any of them**, which is the guarantee the old
-    ///   sentence was really making;
+    ///   `PackagesRoot`'s layout facade, from a resolved home. The precise
+    ///   claim is **not** that IPC never gets near this path — IPC *selects*
+    ///   `<major>`. What holds is that the selection is a choice from a fixed
+    ///   set rather than a string that becomes a path component:
+    ///   [`Target::parse`] accepts only a `PhpMajor`, whose `parse` is gated on
+    ///   the compile-time `CATALOGUE`, so the `<major>` values reachable over
+    ///   IPC are exactly the ones this build compiled in and **no client byte
+    ///   is ever concatenated into a component**. (The looser sentence this
+    ///   replaces — "no IPC or client input reaches any of them" — was right
+    ///   about the substance and wrong as written, which is the class of
+    ///   imprecision that has cost this project a comment audit before.);
     /// * `<major>` is a validated `PhpMajor` (catalogue-gated at
     ///   [`Target::parse`]) or a compile-time constant;
     /// * `<version>` has passed `openvhost_core::mysql::current_version`'s
@@ -1037,8 +1074,12 @@ mod tests {
     /// Mirrors `openvhost_core::php::discover`'s own fixtures deliberately: the
     /// property under test is that [`Target::packaged`] answers what discovery
     /// answered, so it has to be built the way discovery's tests build it.
+    ///
+    /// `pub(super)` so the executor's tests build the tree the SAME way: two
+    /// spellings of "install a packaged PHP" are two spellings that will
+    /// disagree, and the executor's whole job is to remove what this produces.
     #[cfg(unix)]
-    fn install_packaged_php(home: &Path, major: &str, version: &str) {
+    pub(super) fn install_packaged_php(home: &Path, major: &str, version: &str) {
         let root = openvhost_core::PackagesRoot::from_home(home);
         let bin = root
             .package_dir(openvhost_core::PHP_PACKAGE_NAME, major, version)
@@ -1048,8 +1089,9 @@ mod tests {
     }
 
     /// Point (or re-point) `packages/php/<major>/current` at `version`.
+    /// `pub(super)` for the reason [`install_packaged_php`] is.
     #[cfg(unix)]
-    fn point_current(home: &Path, major: &str, version: &str) {
+    pub(super) fn point_current(home: &Path, major: &str, version: &str) {
         let root = openvhost_core::PackagesRoot::from_home(home);
         let link = root.current_link(openvhost_core::PHP_PACKAGE_NAME, major);
         std::fs::create_dir_all(link.parent().expect("major dir")).expect("create major dir");
