@@ -2233,21 +2233,41 @@ mod tests {
         }
     }
 
-    /// Exactly one removal provides the program files, and never both shapes.
-    /// Two would remove the version twice over; zero would report success
-    /// having left the binaries in place.
+    /// Exactly one removal provides the program files, it is always the FIRST
+    /// step, and never both shapes. Two would remove the version twice over;
+    /// zero would report success having left the binaries in place.
+    ///
+    /// The index is asserted because the executor's refusals SAY SO. A
+    /// `Confinement::Refused` returns "Nothing was removed." and a non-zero
+    /// `brew uninstall` returns early on the same reasoning: no step can have
+    /// run before the one that provides the program files, because there is no
+    /// step before it. That holds for every shape today and nothing pinned it —
+    /// a future edit putting a `GeneratedFile` first would make a destructive
+    /// operation's error message state a falsehood with every test still green.
+    ///
+    /// VACUITY: that is the exact edit measured — `GeneratedFile` moved ahead
+    /// of the program files in the PHP arm fails this on the FIRST shape,
+    /// quoting the reordered list. The count assertion beside it still passed,
+    /// so the index is the half that catches it.
     #[test]
     fn exactly_one_removal_provides_the_program_files_in_every_shape() {
         for (target, packaged) in every_shape() {
-            let count = inventory(&target, Path::new("/tmp/ovh"), packaged.as_ref())
-                .removes
-                .iter()
-                .filter(|r| matches!(r, Removal::BrewFormula { .. } | Removal::PackageTree { .. }))
-                .count();
+            let removes = inventory(&target, Path::new("/tmp/ovh"), packaged.as_ref()).removes;
+            let provides_program_files = |r: &Removal| {
+                matches!(r, Removal::BrewFormula { .. } | Removal::PackageTree { .. })
+            };
+            let count = removes.iter().filter(|r| provides_program_files(r)).count();
             assert_eq!(
                 count,
                 1,
                 "{} (packaged: {}) has {count} program-files removals",
+                target.display(),
+                packaged.is_some()
+            );
+            assert!(
+                removes.first().is_some_and(provides_program_files),
+                "{} (packaged: {}) does not remove the program files FIRST, so a refusal there \
+                 would say \"Nothing was removed\" after something already had: {removes:?}",
                 target.display(),
                 packaged.is_some()
             );

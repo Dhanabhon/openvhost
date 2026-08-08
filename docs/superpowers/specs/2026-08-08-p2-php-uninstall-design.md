@@ -104,6 +104,25 @@ a caller it cannot see. Defence in depth at the destructive call is standard, an
 size of its siblings. The shared resolver, when it lands, replaces the *lexical* checks in
 discovery; this guard stays.
 
+**Corrected in the fix wave — canonicalise-and-compare is necessary and not sufficient.** The
+security audit reproduced live what the sentence above misses: `canonicalize` follows a symlink at
+the **leaf** and `remove_dir_all` does not, so the predicate judged one object while the call acted
+on another. A leaf link pointing back *inside* the packages root passes the comparison, while the
+directory entry actually unlinked is wherever that link lives — outside the root, if an
+intermediate component left it. There is a plain-correctness half with no attacker in it at all:
+the uninstall unlinks the link, reports success, and leaves the program files installed. **A
+symlink at the leaf is therefore refused before anything is resolved**; `openvhost-pkg`'s installer
+creates a version directory by renaming a staged tree, never as a link, so the refused set is
+exactly the set that was never ours.
+
+**And containment is not only the `remove_dir_all`'s.** The `current`-link cleanup is a
+`remove_file`, which does not follow the final component but does follow every component above it;
+with a series directory symlinked out of the tree it unlinked an entry outside the root and
+reported nothing. It runs through the same predicate, applied to the link's parent. The rule this
+generalises to, for whoever writes the shared resolver: **a path check must be made on the same
+object the call resolves** — which for `remove_dir_all` and `remove_file` is the parent chain, not
+the leaf.
+
 ## 8. What this slice must prove
 
 1. A packaged PHP is removed: version directory gone, `current` gone or repointed, the pool config
@@ -113,8 +132,11 @@ discovery; this guard stays.
 3. A packaged-only major produces **no `BrewFormula` step**.
 4. A brew-only major is **unchanged** — byte-for-byte the same inventory as today.
 5. With both installed, the packaged tree goes, the keg stays, and the confirmation **says so**.
-6. **`remove_dir_all` cannot escape the packages root**, proven by construction with a symlinked
-   series directory and a symlinked version directory — the two shapes the audit reproduced live.
+6. **No filesystem call in the executor can escape the packages root**, proven by construction —
+   a symlinked series directory, a symlinked version directory, a leaf symlink resolving back
+   *into* the tree (the fix wave's escape), and a dangling `current` beyond a symlinked series
+   directory (the fix wave's unconfined `remove_file`). Every one of those asserts the outside
+   entry **still exists**, before the `Result` is looked at: a redirected call returns `Ok(())`.
 7. Logs, pool overrides and every site's saved PHP version are kept, exactly as the brew path
    already promises.
 8. **Nothing changes on a machine with no package tree** — every real machine today.
