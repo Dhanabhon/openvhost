@@ -21,6 +21,14 @@ function row(
 		path: installed ? `/opt/homebrew/opt/php@${major}/sbin/php-fpm` : null,
 		socketPath: installed ? `/Users/x/.openvhost/run/php-fpm-${major}.sock` : null,
 		serviceId: installed ? `php-fpm-${major}` : null,
+		// A Homebrew keg, matching the `path` above — the shape every fixture
+		// in this file already described (off-Homebrew slice 5C). Pass a
+		// `packaged` source for a row installed from our own tree.
+		source: installed ? { kind: 'homebrew' } : null,
+		// What four of the five catalogue majors report on a real machine
+		// today: this build has no artifact of its own for them. 8.4's
+		// `awaitingRelease` is stated explicitly by the tests that mean it.
+		offer: { kind: 'unavailable', target: 'macos-arm64' },
 		...overrides
 	};
 }

@@ -1295,8 +1295,19 @@ export type PendingInstallDto = {
 };
 
 /**
- *  What the Languages page needs to decide which of the three states to show
- *  (spec §6.1). `brew_found` false means the page must guide, not list.
+ *  What the Languages page needs to decide which state to show (spec §6.1).
+ * 
+ *  `brew_found` means exactly one thing — **we looked for Homebrew and did not
+ *  find it** — and `brew_searched` lists the paths verbatim so a user can check
+ *  the right place on their own machine. That is honest and it stays.
+ * 
+ *  What it is NOT is the page's first and highest-priority state (off-Homebrew
+ *  slice 5C design D5). A machine with no Homebrew is not a machine with no
+ *  PHP: it may already have a packaged runtime listed in `runtimes`, or a major
+ *  whose `offer` is installable from our own tree. Whether the page has a route
+ *  to any PHP at all is a question about the ROWS, and answering it from this
+ *  bool alone is what made the page tell a user it could not install PHP while
+ *  simultaneously not listing the PHP they already had.
  */
 export type PhpEnvironmentDto = {
 	brewFound: boolean,
@@ -1317,6 +1328,28 @@ export type PhpInstallLogEvent = {
 	stream: string,
 	line: string,
 };
+
+/**
+ *  Whether this build can install a given PHP major from its own package tree
+ *  on THIS host, and what it would install — the three states
+ *  `MariadbPackageOfferDto` spells (`mariadb_pkg.rs`), mirrored exactly.
+ * 
+ *  Matched exhaustively wherever it is consumed, with **no wildcard arm**: a
+ *  fourth state must be decided about rather than silently folded into one of
+ *  the first three.
+ * 
+ *  `AwaitingRelease`'s own meaning is the one that matters today: the next
+ *  action belongs to the **maintainer, not the user**, so a row in that state
+ *  must say what it is waiting for rather than offer a button that would 404.
+ */
+export type PhpPackageOfferDto = { kind: "available"; version: string } | 
+/**
+ *  The pinned build exists and was audited, but the GitHub release that
+ *  would serve it has not been published — the next action belongs to the
+ *  maintainer, not the user. `tag` is the release to publish, e.g.
+ *  `"php-8.4.24"`.
+ */
+{ kind: "awaitingRelease"; tag: string } | { kind: "unavailable"; target: string };
 
 /**
  *  One row on the Languages page: a catalogue version (installed or not), or
@@ -1346,11 +1379,23 @@ export type PhpRuntimeDto = {
 	/**
 	 *  A more precise version string than `major` (e.g. a patch level), when
 	 *  one is known. `None` does NOT mean anything is wrong with this row —
-	 *  it means we do not know the patch level. The only prober we have,
-	 *  `openvhost_conf::probe_php_fpm_version`, returns `major.minor` and
-	 *  never a patch level, so today this is `None` for every row. Echoing
-	 *  `major` back into this field instead would render "8.3" twice next to
-	 *  each other and imply a patch level was fetched when it was not.
+	 *  it means we do not know the patch level.
+	 * 
+	 *  **A packaged row knows it; a Homebrew row still does not**, and that
+	 *  asymmetry is the point (PHP-discovery design D1, off-Homebrew slice
+	 *  5B). OpenVHost's own install writes the exact version down as a
+	 *  directory name — `packages/php/8.4/8.4.24/` — so a packaged row reports
+	 *  `8.4.24` with **nothing executed** to find out. Homebrew's would have to
+	 *  be probed, and the only prober we have,
+	 *  `openvhost_conf::probe_php_fpm_version`, returns `major.minor` and never
+	 *  a patch level, so a Homebrew row stays `None` — which is what every row
+	 *  carried before there was a package tree to read.
+	 * 
+	 *  **Never echo `major` back into this field.** It would render "8.3" twice
+	 *  next to each other and imply a patch level was fetched when it was not.
+	 *  A packaged 8.4 row shows `8.4` and `8.4.24`; a brew 8.5 row shows `8.5`
+	 *  and nothing. If those look wrong side by side the fix is the layout, not
+	 *  an invented patch level.
 	 */
 	fullVersion: string | null,
 	path: string | null,
@@ -1361,7 +1406,56 @@ export type PhpRuntimeDto = {
 	 *  start/stop from the row without inventing the id itself.
 	 */
 	serviceId: string | null,
+	/**
+	 *  Where this row's binaries came from — OpenVHost's own package tree or a
+	 *  Homebrew keg (off-Homebrew slice 5C design D3). `None` when nothing is
+	 *  installed for this major, which is the ONLY reason it is optional: an
+	 *  installed runtime always knows its own source.
+	 * 
+	 *  Two install sources coexist by design during the migration, so "which
+	 *  php-fpm am I actually running" has to be answerable without the user
+	 *  reading a path — the same question `MysqlInstanceDto::source` answers
+	 *  for mysqld.
+	 */
+	source: PhpRuntimeSourceDto | null,
+	/**
+	 *  Whether THIS BUILD publishes a verified package for this major on THIS
+	 *  host, and which version it would install (design D1).
+	 * 
+	 *  Distinct from `cataloged`: that says "this build manages the major", and
+	 *  is what gates the Homebrew Install/Uninstall affordances; this says "and
+	 *  there are bytes of our own for your architecture". The two disagree on
+	 *  every real machine today — 8.4 is pinned but its release is unpublished
+	 *  (`AwaitingRelease`) and no other major has a built artifact at all
+	 *  (`Unavailable`) — which is exactly why this is a state and not a bool.
+	 * 
+	 *  Not an `Option`: "no package for this major" is `Unavailable`, which
+	 *  names the target it looked for. A `None` beside it would be a second
+	 *  spelling of the same absence.
+	 */
+	offer: PhpPackageOfferDto,
 };
+
+/**
+ *  Where a listed PHP runtime's binaries came from — the wire copy of
+ *  `openvhost_core::PhpRuntimeSource` (PHP-discovery design D1, slice 5B).
+ * 
+ *  Transcribed from `NginxRuntimeSourceDto`/`MysqlRuntimeSourceDto` rather than
+ *  reinvented: all three ask the identical question — "which install put these
+ *  bytes here" — and nothing about PHP's answer needs a different shape.
+ *  `PhpRuntimeSource::as_str()` stays the one machine-facing spelling for each
+ *  source; `the_wire_tag_is_php_runtime_source_as_str` below pins this type's
+ *  serialized `kind` to it for every variant, so the two cannot drift into
+ *  different words for the same fact.
+ * 
+ *  `Homebrew` carries **no version, on purpose**, and this is the field that
+ *  makes the asymmetry visible: a packaged runtime's exact version is a
+ *  directory name chosen at install time, so reporting it costs nothing, while
+ *  Homebrew's would have to be probed — and the only prober we have returns
+ *  `major.minor`, never a patch level. Reporting the major as though it were
+ *  the full version would be a lie no caller could detect.
+ */
+export type PhpRuntimeSourceDto = { kind: "packaged"; version: string } | { kind: "homebrew" };
 
 /**
  *  Emitted to the webview when a quit has been requested and prevented. The UI

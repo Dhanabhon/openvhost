@@ -29,6 +29,10 @@ function r(
 		path: installed ? `/opt/homebrew/opt/php@${major}/sbin/php-fpm` : null,
 		socketPath: installed ? `/Users/x/.openvhost/run/php-fpm-${major}.sock` : null,
 		serviceId: installed ? `php-fpm-${major}` : null,
+		// See `row()` in languages.svelte.test.ts — a Homebrew keg matching
+		// `path` above, and the absence four of five majors report today.
+		source: installed ? { kind: 'homebrew' } : null,
+		offer: { kind: 'unavailable', target: 'macos-arm64' },
 		...overrides
 	};
 }
