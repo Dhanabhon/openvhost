@@ -125,6 +125,22 @@ pub fn mariadb_service_id(series: &str) -> String {
     format!("{MARIADB_ID_PREFIX}{series}")
 }
 
+/// The root of the tree THIS app generates: `<home>/config/generated`.
+///
+/// Everything under it is re-derivable output of the apply pipeline, which is
+/// what makes it the region an uninstall may delete from — and `config/custom`
+/// beside it, the user's own overrides, is deliberately NOT under it.
+///
+/// One function rather than a prefix spelled at each site, because
+/// `uninstall::run`'s executor confines its generated-config delete to this
+/// root: the gate is only a gate while the root really is an ancestor of the
+/// path the inventory produced. Two spellings that drifted apart would turn
+/// every uninstall into a refusal in one direction, and into no gate at all in
+/// the other.
+pub fn generated_config_root(home: &Path) -> PathBuf {
+    home.join("config/generated")
+}
+
 /// The generated php-fpm pool config for one major: the file `php_fpm_spec`
 /// spawns against, and the file an uninstall removes.
 ///
@@ -133,7 +149,8 @@ pub fn mariadb_service_id(series: &str) -> String {
 /// drift this function's own test pins shut — see
 /// `the_pool_config_path_matches_the_confs_independent_render`.
 pub fn php_pool_config_path(home: &Path, major: &str) -> PathBuf {
-    home.join("config/generated/php")
+    generated_config_root(home)
+        .join("php")
         .join(major)
         .join("php-fpm.conf")
 }

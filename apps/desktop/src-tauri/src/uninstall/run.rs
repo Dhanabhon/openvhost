@@ -11,8 +11,16 @@
 //! [`perform_uninstall`] itself makes exactly three kinds of filesystem call:
 //!
 //! * `remove_file` on a path `inventory` produced under `config/generated/`
-//!   (PHP's generated pool config). It never follows a symlink at all: on one
-//!   it removes the LINK, and on a directory it fails loudly.
+//!   (PHP's generated pool config — the only [`super::Removal::GeneratedFile`]
+//!   any inventory emits today). It does not follow a symlink at the LEAF: on
+//!   one it removes the LINK, and on a directory it fails loudly. It does
+//!   follow every component ABOVE the leaf, so **that call is guarded**
+//!   (see [`confine`], applied to the file's parent by
+//!   [`remove_generated_file`]) — and against `<home>/config/generated`, not
+//!   the packages root, because `config/custom` and `data/` sit beside it and
+//!   are things an uninstall KEEPS. Measured before the guard existed: a
+//!   symlinked major directory sent the unlink into an unrelated tree and the
+//!   uninstall reported `Done`.
 //! * `remove_dir_all` on a [`super::Removal::PackageTree`] path — MariaDB's
 //!   series directory (P1 MariaDB UI design D5/D7) and, since off-Homebrew
 //!   slice 5D, a packaged PHP's version directory. **That call is guarded**
@@ -31,6 +39,11 @@
 //!   parent**: `remove_file` does not follow the final component but does
 //!   follow every component above it, so without that check this one call
 //!   could reach outside the region the other two are confined to.
+//!
+//! All three are gated by that one predicate — two against `<home>/packages`,
+//! one against `<home>/config/generated` — so no filesystem write this executor
+//! makes is checked by nothing. The regions differ; the check does not, which
+//! is why [`confine`] takes its root as a parameter instead of knowing one.
 //!
 //! Nothing here touches `<home>/data`, `<home>/logs` or state.db's credential
 //! rows on ANY path, including error paths.
@@ -202,21 +215,16 @@ pub(crate) async fn perform_uninstall(run: UninstallRun<'_>) -> Result<Uninstall
                 run_brew(&run).await?;
             }
             super::Removal::GeneratedFile { path, what } => {
-                // `remove_file`, never `remove_dir_all`: on a symlink this
-                // removes the LINK and never the target, and on a directory it
-                // fails loudly instead of recursing. Both matter — the
-                // generated tree is exactly where a hostile or accidental
-                // symlink would be planted to get a delete out of it.
-                match std::fs::remove_file(path) {
-                    Ok(()) => {}
-                    // Already gone (a previous attempt, a manual tidy-up, an
-                    // apply that swept it). The post-state is what was asked
-                    // for, so this is done, not failed.
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => problems.push(format!(
-                        "{what} at {} could not be removed: {e}",
-                        path.display()
-                    )),
+                // Same `root`-then-`confine` shape as the two calls below, and
+                // the same reason: what `remove_file` FOLLOWS on the way to
+                // this file is checked rather than assumed from the fact that
+                // `inventory` built the path out of well-formed components.
+                if let Some(problem) = remove_generated_file(
+                    &crate::stack::generated_config_root(&run.home),
+                    path,
+                    what,
+                ) {
+                    problems.push(problem);
                 }
             }
             super::Removal::PackageTree { path, what } => {
@@ -367,8 +375,17 @@ enum Confinement {
     Refused { reason: String },
 }
 
-/// Require `path` to resolve strictly inside `packages_root` before anything
-/// recursive is pointed at it (off-Homebrew slice 5D design D4).
+/// Require `path` to resolve strictly inside `root` before a delete is pointed
+/// at it (off-Homebrew slice 5D design D4).
+///
+/// **`root` is a parameter, not `<home>/packages`.** This is the one
+/// containment predicate the module has, asked about three different objects
+/// against two different regions: a package tree and a `current` link's parent
+/// against `<home>/packages`, a generated config file's parent against
+/// `<home>/config/generated`. A second spelling for the second region is how
+/// two checks that are meant to agree stop agreeing, so there is one. Nothing
+/// below reads the root's ROLE — only its resolved path — which is what makes
+/// that reuse honest rather than convenient.
 ///
 /// **A symlink at the leaf is refused outright, before anything is resolved.**
 /// That is not extra strictness, it is what makes the rest of this function
@@ -404,14 +421,14 @@ enum Confinement {
 ///   `remove_dir_all` would defeat it. That needs write access inside the
 ///   OpenVHost home — this app's own privilege level — so it crosses no
 ///   boundary; it is simply not a property a path check can provide.
-/// * relocating the packages root ITSELF (making `<home>/packages` a symlink)
-///   is accepted, because the root is canonicalized: the tree moves, and the
+/// * relocating the root ITSELF (making `<home>/packages` a symlink) is
+///   accepted, because the root is canonicalized: the tree moves, and the
 ///   removal stays inside the moved tree. That is the honest reading — a
 ///   redirected root is not an escape from the package tree, it *is* the
 ///   package tree, and everything the installer writes goes there too.
 ///   Refusing it would break a user who put their packages on another volume.
 ///   What is caught is any component BELOW the root diverging from it.
-fn confine(packages_root: &Path, path: &Path) -> Confinement {
+fn confine(root: &Path, path: &Path) -> Confinement {
     // `symlink_metadata`, never `exists()`: a dangling symlink where the
     // version directory belongs is something rather than nothing, and reading
     // it as "already gone" would leave it behind for discovery to trip over.
@@ -459,14 +476,13 @@ fn confine(packages_root: &Path, path: &Path) -> Confinement {
             };
         }
     };
-    let real_root = match std::fs::canonicalize(packages_root) {
+    let real_root = match std::fs::canonicalize(root) {
         Ok(p) => p,
         Err(e) => {
             return Confinement::Refused {
                 reason: format!(
-                    "could not be checked against OpenVHost's package directory {}, which could \
-                     not be resolved: {e}",
-                    packages_root.display()
+                    "could not be checked against {}, which could not be resolved: {e}",
+                    root.display()
                 ),
             };
         }
@@ -474,13 +490,105 @@ fn confine(packages_root: &Path, path: &Path) -> Confinement {
     if real_path.starts_with(&real_root) && real_path != real_root {
         Confinement::Contained
     } else {
+        // The root is named by PATH rather than described ("OpenVHost's package
+        // directory"), because this reason is composed for whichever region the
+        // caller passed and there is now more than one. The caller that splices
+        // it names the object; this half names where it had to stay.
         Confinement::Refused {
             reason: format!(
-                "resolve to {}, which is not inside OpenVHost's package directory {}",
+                "resolve to {}, which is outside {}",
                 real_path.display(),
                 real_root.display()
             ),
         }
+    }
+}
+
+/// Remove one file THIS app generated, and only if `remove_file` cannot leave
+/// the generated tree on the way to it. Returns the problem to report, or
+/// `None` when there was nothing left to do.
+///
+/// `remove_file`, never `remove_dir_all`: on a symlink this removes the LINK
+/// and never the target, and on a directory it fails loudly instead of
+/// recursing. Both matter — the generated tree is exactly where a hostile or
+/// accidental symlink would be planted to get a delete out of it.
+///
+/// **Confined by [`confine`], applied to the file's PARENT**, for exactly the
+/// reason [`clear_dangling_current`] is: `remove_file` does not follow the
+/// final component, but it does follow every component above it, so a major
+/// directory that is a symlink out of the generated tree puts this unlink
+/// wherever that link points. Measured before the check was written: with
+/// `<home>/config/generated/php/8.4` replaced by a link, the call unlinked a
+/// `php-fpm.conf` in an unrelated tree and the uninstall reported `Done` — so
+/// there is nothing after the fact to interpret, and the parent, being the part
+/// `remove_file` resolves, is the part to check.
+///
+/// Reusing [`confine`] rather than spelling a third predicate is deliberate,
+/// and it is why that function takes its root as a parameter: the packages root
+/// and the generated root are different regions, the question asked about them
+/// is the same one, and two containment checks that could disagree is how one
+/// guarded call and one unguarded call ended up in the same module.
+///
+/// The root is `<home>/config/generated` rather than `<home>` or
+/// `<home>/config`, and that choice is the whole value of the check:
+/// `config/custom` (the user's own overrides) and `data/` (their databases) sit
+/// beside it and are listed under an uninstall's KEEPS, so a redirect into
+/// either has to be refused rather than permitted by a root wide enough to
+/// contain them. It is not narrowed to `config/generated/php` either, because
+/// [`super::Removal::GeneratedFile`] names no engine — PHP's pool config is the
+/// only one emitted today, and a per-engine root would have to be widened by
+/// the next one rather than simply holding. The one shape it does not admit is
+/// a generated file sitting DIRECTLY in the root — [`confine`] refuses the root
+/// itself, so `<home>/config/generated/foo.conf` would be reported rather than
+/// removed. Everything generated today lives one engine directory down, and a
+/// future emitter that did not would be told so by its own test rather than
+/// silently skipped.
+///
+/// A refusal is a PROBLEM, not an early return. Unlike
+/// [`super::Removal::PackageTree`], this step is never an inventory's first: by
+/// the time it runs the program files are already gone, so returning here would
+/// skip the service row and leave the Services page listing a version that no
+/// longer exists.
+fn remove_generated_file(generated_root: &Path, path: &Path, what: &str) -> Option<String> {
+    // Not `.expect("a parent")`: unreachable for a path `inventory` built is
+    // still not a reason to panic in the module that deletes things.
+    let Some(parent) = path.parent() else {
+        return Some(format!(
+            "{what} at {} was left alone: it names no directory to check. Delete it by hand.",
+            path.display()
+        ));
+    };
+    match confine(generated_root, parent) {
+        Confinement::Contained => {}
+        // Nothing above the file exists, so the file does not either — the same
+        // "the post-state is what was asked for" reading as the `NotFound` arm
+        // below, reached one level earlier.
+        Confinement::Absent => return None,
+        // `reason` is deliberately not spliced in, for the reason
+        // `clear_dangling_current` gives: it is a verb phrase written for the
+        // removal's own `what`, and this sentence's subject is the file's
+        // DIRECTORY rather than the file itself.
+        Confinement::Refused { .. } => {
+            return Some(format!(
+                "{what} at {} was left alone: its directory {} could not be shown to be inside \
+                 the config directory OpenVHost generates, {}, and nothing outside that \
+                 directory is removed. Delete it by hand.",
+                path.display(),
+                parent.display(),
+                generated_root.display()
+            ));
+        }
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => None,
+        // Already gone (a previous attempt, a manual tidy-up, an apply that
+        // swept it). The post-state is what was asked for, so this is done,
+        // not failed.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => Some(format!(
+            "{what} at {} could not be removed: {e}",
+            path.display()
+        )),
     }
 }
 
@@ -1599,6 +1707,33 @@ mod tests {
         assert_eq!(outcome, UninstallOutcome::Done);
     }
 
+    /// The arm the containment check ADDED to this path: with the major
+    /// directory itself gone, `confine` answers `Absent` and the removal is
+    /// finished before `remove_file` is ever called. Before the check it was
+    /// `remove_file` returning `NotFound`. Same verdict, different route — and
+    /// the route is new, so a future edit that made "could not tell" report a
+    /// problem would turn an ordinary second uninstall into a failure.
+    #[tokio::test]
+    async fn a_missing_generated_directory_is_not_an_error_either() {
+        let home = provisioned_home();
+        std::fs::remove_dir_all(home.path().join("config/generated/php/8.4")).expect("remove");
+        let sup = supervisor_with("php-fpm-8.4");
+        let lock = InstallLock::default();
+
+        let outcome = perform_uninstall(run_for(
+            php("8.4"),
+            home.path(),
+            &sup,
+            &lock,
+            RecordingRunner::ok(),
+            vec![],
+        ))
+        .await
+        .unwrap();
+        assert_eq!(outcome, UninstallOutcome::Done);
+        assert!(sup.snapshot().is_empty(), "the service row must be gone");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn a_symlinked_pool_config_removes_the_link_and_never_its_target() {
@@ -1628,6 +1763,104 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&outside).expect("target must survive"),
             "not ours\n"
+        );
+    }
+
+    /// The generated-config delete, and the reach it had until this slice.
+    ///
+    /// `remove_file` does not follow the FINAL component — which is what makes
+    /// it safe on a symlinked pool config (the test above) — but it does follow
+    /// every component ABOVE it. A major directory that is a symlink out of the
+    /// generated tree therefore puts the unlink wherever that link points,
+    /// while every component of the path `inventory` produced is still a plain,
+    /// legal name.
+    ///
+    /// Asserted on the DISK before the `Result` is looked at: a redirected
+    /// unlink returns `Ok(())`, so the outcome cannot tell the two apart.
+    /// Measured on the unguarded code, which is where that ordering came from:
+    /// this fixture unlinked the outside file and the run returned
+    /// `Ok(Done)` — a clean success report for a delete that left the tree.
+    ///
+    /// VACUITY, in a disposable worktree with its own target directory:
+    /// deleting only [`remove_generated_file`]'s `confine` call failed this
+    /// test and left all four of the slice's other symlink tests green;
+    /// deleting only `confine`'s leaf-symlink arm failed three of those and
+    /// left this one green; deleting only [`clear_dangling_current`]'s call
+    /// failed the fourth and left this one green. The three gates are pinned
+    /// separately — none of them rides on another's fix.
+    ///
+    /// The positive control is the whole rest of the module: a `confine` that
+    /// refused everything would fail
+    /// `a_successful_php_uninstall_removes_the_pool_config_and_keeps_everything_else`,
+    /// so this cannot pass by the guard having become unconditional.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_major_directory_does_not_unlink_the_config_beyond_it() {
+        let home = provisioned_home();
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        // Somebody else's file, outside the generated tree, carrying the name
+        // the removal is about to ask for.
+        let outside = elsewhere.path().join("php-fpm.conf");
+        std::fs::write(&outside, b"not ours\n").expect("write");
+
+        let major_dir = home.path().join("config/generated/php/8.4");
+        std::fs::remove_dir_all(&major_dir).expect("remove");
+        std::os::unix::fs::symlink(elsewhere.path(), &major_dir).expect("symlink");
+        // The path the executor is handed really does run through the link,
+        // and it is the path the real builder produces — not one spelled here.
+        assert_eq!(
+            crate::stack::php_pool_config_path(home.path(), "8.4"),
+            major_dir.join("php-fpm.conf")
+        );
+
+        let sup = supervisor_with("php-fpm-8.4");
+        let lock = InstallLock::default();
+        let outcome = perform_uninstall(run_for(
+            php("8.4"),
+            home.path(),
+            &sup,
+            &lock,
+            RecordingRunner::ok(),
+            vec![],
+        ))
+        .await;
+
+        // DISK FIRST, deliberately before the `Result` is even looked at:
+        // `remove_file` returns `Ok(())` whether it unlinked our file or
+        // somebody else's, so asserting the refusal first would report
+        // "expected Incomplete, got Done" for a run that had just deleted
+        // someone else's config.
+        assert_eq!(
+            std::fs::read(&outside).unwrap_or_else(|e| panic!(
+                "{} was unlinked: the generated-config delete reached outside {}: {e}",
+                outside.display(),
+                home.path().join("config/generated").display()
+            )),
+            b"not ours\n",
+            "{} was rewritten",
+            outside.display()
+        );
+
+        // …and it is REPORTED rather than swallowed: a file the confirmation
+        // promised to remove and the executor walked past is exactly the
+        // "the dialog promises what the executor never does" failure.
+        match outcome.expect("the run itself does not fail") {
+            UninstallOutcome::Incomplete(problems) => assert!(
+                problems.iter().any(|p| p.contains("php-fpm.conf")),
+                "got {problems:?}"
+            ),
+            UninstallOutcome::Done => {
+                panic!("a pool config that could not be removed must not report success")
+            }
+        }
+        // A PROBLEM, not an early return — the distinction from
+        // `Removal::PackageTree`'s refusal. brew has already removed the
+        // program files by the time this step runs, so bailing here would
+        // leave the Services page listing a version that no longer exists.
+        assert!(
+            sup.snapshot().is_empty(),
+            "the service row must still be cleared: {:?}",
+            sup.snapshot()
         );
     }
 

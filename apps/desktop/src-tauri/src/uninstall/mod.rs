@@ -534,9 +534,13 @@ impl Target {
 pub(crate) enum Removal {
     /// `brew uninstall <formula>` — the program files.
     BrewFormula { formula: String, what: String },
-    /// A file THIS app generated. Never a directory, never recursive: see
-    /// `run`'s executor for why `remove_file` is the only filesystem call an
-    /// uninstall makes.
+    /// A file THIS app generated, under `<home>/config/generated/`. Never a
+    /// directory, never recursive — a `remove_file`, which the executor
+    /// confines to that root by checking the file's PARENT, since that is the
+    /// part `remove_file` resolves. See `run`'s module header for what all
+    /// three of its filesystem calls can and cannot reach; the sentence that
+    /// stood here ("the only filesystem call an uninstall makes") stopped being
+    /// true when MariaDB's `PackageTree` arrived.
     GeneratedFile { path: PathBuf, what: String },
     /// A package tree THIS APP's OWN installer created under
     /// `<home>/packages/` — never a Homebrew keg. Emitted whenever
