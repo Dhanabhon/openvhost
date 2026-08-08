@@ -274,7 +274,7 @@ pub const NGINX_PACKAGES: [NginxPackage; 1] = [NginxPackage {
     version: "1.30.4",
     target: PackageTarget::MacosArm64,
     url: "https://github.com/Dhanabhon/openvhost/releases/download/nginx-1.30.4/nginx-1.30.4-macos-arm64.tar.gz",
-    sha256: "a29e7d61004e7d2ce4fb2615b649e0839e6097c15893798171bf78006ea2b702",
+    sha256: "bc4c42a2618f2ac51145f7c23959421a8d019bde67e0d71946548d9cc9ac4563",
     format: ArchiveFormat::TarGz,
     availability: Availability::AwaitingRelease {
         tag: "nginx-1.30.4",
@@ -374,7 +374,7 @@ mod tests {
         );
         assert_eq!(
             e.sha256,
-            "a29e7d61004e7d2ce4fb2615b649e0839e6097c15893798171bf78006ea2b702"
+            "bc4c42a2618f2ac51145f7c23959421a8d019bde67e0d71946548d9cc9ac4563"
         );
         assert_eq!(e.format, ArchiveFormat::TarGz);
     }
