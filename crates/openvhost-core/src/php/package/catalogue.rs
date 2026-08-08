@@ -275,12 +275,36 @@ pub struct PhpPackage {
 /// `crate::php::install_php_package` refuses before any network work, naming
 /// the tag to publish.
 ///
+/// **This pin's manifest predates the `dependencies` block** that
+/// `build/build.sh` now writes, and it is not being backfilled: a `--from
+/// pack` run digests whatever prefix is on disk at manifest time, so a late
+/// regeneration would record today's state as though this artifact had been
+/// built against it. The `sha256` would come back identical either way — a
+/// sidecar cannot change a tarball — so that check would pass while the
+/// manifest gained a confident, wrong claim. The driver now refuses to make
+/// it, recording `"not_observed"` instead. This entry gains a real dependency
+/// record when it is next built from source.
+///
+/// **What that record would and would not cover is worth knowing before
+/// anyone reads its absence as a gap in linkage.** `build/recipes/php.sh`
+/// declares exactly one `RECIPE_DEPENDS` entry, `nginx`, and it is not a build
+/// input: nothing links it and no byte of it reaches this tarball — it is
+/// contract check 6's FastCGI client. PHP's OpenSSL is the one `spc` compiles
+/// inside its own closure from `PHP_PINS_LIBS` (see the recipe's D5 note on
+/// why a borrowed prefix will not do there), pinned by digest in
+/// `_php-pins.sh`. So unlike MariaDB, nothing about *this* artifact's
+/// static linkage rides on the missing block; what is missing is a record of
+/// which nginx build proved it serves.
+///
 /// **To publish:**
 ///
 /// 1. Confirm the tarball at `build/out/php-8.4.24-macos-arm64.tar.gz` still
 ///    hashes to `sha256` below — this module's own test
 ///    `the_catalogue_pins_exactly_one_php_build_today` pins the same digest
 ///    as a literal, so a mismatch there is the first signal something moved.
+///    Do not reach for `--from pack` to produce that confirmation: it would
+///    overwrite the manifest beside the tarball, dropping `configure_flags`
+///    (it starts past `configure`) as well as the dependency record.
 /// 2. Create release `php-8.4.24` carrying the tarball, its `.sha256`
 ///    sidecar and `php-8.4.24-macos-arm64.manifest.json`, confirm the served
 ///    bytes still hash to the pin, then flip `availability` to

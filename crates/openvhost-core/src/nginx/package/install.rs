@@ -708,12 +708,15 @@ mod tests {
     // gitignored build output rather than a committed fixture. It is checked in
     // rather than run by hand so the proof is repeatable:
     //
-    //   # NOT this worktree's build/out: that tarball is a repack of a prefix
-    //   # relinked against a rebuilt OpenSSL, so it hashes to other bytes. See
-    //   # the publish note on `NGINX_PACKAGES` for why, and for where it lives.
-    //   OPENVHOST_NGINX_TARBALL=.claude/worktrees/nginx-build/build/out/nginx-1.30.4-macos-arm64.tar.gz \
+    //   OPENVHOST_NGINX_TARBALL=$PWD/build/out/nginx-1.30.4-macos-arm64.tar.gz \
     //     cargo test -p openvhost-core --lib -- --ignored --nocapture \
-    //     the_real_artifact_installs_and_runs_from_the_package_tree
+    //     nginx::package::install::tests::the_real_artifact_installs_and_runs_from_the_package_tree
+    //
+    // Module-qualified, and that is not decoration: a cargo test filter is a
+    // SUBSTRING match on the full test path, and MariaDB and PHP have twins of
+    // this test under the identical name. The bare name selects all three, and
+    // the other two panic on their own unset tarball variable — so the command
+    // as it read here exited 101 while the nginx test itself passed.
     //
     // Vacuity: it asserts the version string out of the binary's own output.
     // Proven by mutation: expecting "1.30.3" failed it against the real
@@ -814,12 +817,12 @@ mod tests {
     // Same gate as the group above: needs the real build artifact, ignored by
     // default, run with:
     //
-    //   # NOT this worktree's build/out: that tarball is a repack of a prefix
-    //   # relinked against a rebuilt OpenSSL, so it hashes to other bytes. See
-    //   # the publish note on `NGINX_PACKAGES` for why, and for where it lives.
-    //   OPENVHOST_NGINX_TARBALL=.claude/worktrees/nginx-build/build/out/nginx-1.30.4-macos-arm64.tar.gz \
+    //   OPENVHOST_NGINX_TARBALL=$PWD/build/out/nginx-1.30.4-macos-arm64.tar.gz \
     //     cargo test -p openvhost-core --lib -- --ignored --nocapture \
-    //     the_tree_derived_version_agrees_with_what_the_binary_itself_prints
+    //     nginx::package::install::tests::the_tree_derived_version_agrees_with_what_the_binary_itself_prints
+    //
+    // Qualified for the same reason as the group above, though this name has
+    // no twin today: it had none when that one was written either.
     //
     // Vacuity: the two sides are read through genuinely different mechanisms
     // — `packaged_nginx_runtime` only ever reads a directory name via

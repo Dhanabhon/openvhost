@@ -878,7 +878,12 @@ mod tests {
     //
     //   OPENVHOST_PHP_TARBALL=$PWD/build/out/php-8.4.24-macos-arm64.tar.gz \
     //     cargo test -p openvhost-core --lib -- --ignored --nocapture \
-    //     the_real_artifact_installs_and_runs_from_the_package_tree
+    //     php::package::install::tests::the_real_artifact_installs_and_runs_from_the_package_tree
+    //
+    // Module-qualified because a cargo test filter is a SUBSTRING match and
+    // MariaDB and nginx carry twins of this test under the identical name: the
+    // bare name selects all three, and the other two panic on their own unset
+    // tarball variable, so the command exits 101 with this test itself passing.
     //
     // Vacuity: it asserts the version string out of the binary's own output,
     // AND (unlike nginx's twin, which cannot) that `php-fpm --version` exits

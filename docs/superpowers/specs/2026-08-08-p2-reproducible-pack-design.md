@@ -74,6 +74,11 @@ So: repack all three from their staged prefixes, re-pin all three, and confirm e
 | nginx 1.30.4 | `a29e7d61…` | present, matches |
 | PHP 8.4.24 | `9fecd3a2…` | **gone** — the worktree holding it was cleaned up |
 
+> **Superseded 2026-08-09 (nginx row only).** nginx's `a29e7d61…` was never re-cut by this slice —
+> see the postscript below — and has since been replaced by `bc4c42a2…`, cut from an observed
+> rebuild of OpenSSL and nginx rather than from a repack. The row stands as the state this slice
+> found. MariaDB's and PHP's rows are unaffected.
+
 PHP is the reason this cannot wait: its pinned artifact no longer exists, so PHP **cannot be
 released at all** until the pin is re-cut against something reproducible.
 
@@ -135,3 +140,20 @@ the current prefix without a documented OpenSSL rebuild first, which is separate
 does not do, and re-cutting it anyway would trade an audited artifact for an undocumented one. The
 obligation stands, still open, and the full account lives next to nginx's `sha256` field in
 `crates/openvhost-core/src/nginx/package/catalogue.rs`.
+
+### Closed, 2026-08-09
+
+The separate work happened: `docs/superpowers/specs/2026-08-08-p2-nginx-rebuild-design.md` rebuilt
+OpenSSL and nginx from verified source in one observed run and re-pinned nginx to `bc4c42a2…`, so
+**the obligation above is met and this deviation is no longer open.** The paragraphs above are kept
+as written rather than edited into agreement with the outcome — the deviation was real while it
+lasted, and a document that quietly matches what happened is the failure mode this line of work
+keeps finding.
+
+Two things that slice measured are worth carrying, because they are why the deviation was the right
+call rather than merely a defensible one. The drift had a cause nothing could have seen: OpenSSL's
+prefix and nginx's binary were written 49 seconds apart on 2026-08-07, and `build.sh` recorded only
+`"version": "3.5.7"` for the dependency — a line two different builds of 3.5.7 write identically.
+And the old pin was cut from an in-progress revision of its own recipe, hours before the recipe
+gained a field its manifest therefore lacks. Its provenance was stale in a second way nobody was
+looking for.

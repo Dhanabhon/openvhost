@@ -235,6 +235,31 @@ pub struct MariadbPackage {
 /// check 7 rejects an artifact carrying such a path even if one appeared.
 /// **"A neutral prefix is not an inert one"** is the sentence worth keeping.
 ///
+/// # What this pin's manifest does not say
+///
+/// Its manifest **predates** the `dependencies` block `build/build.sh` now
+/// writes, so for its one `RECIPE_DEPENDS` entry it records `"version":
+/// "3.5.7"` and nothing else — and a version string cannot tell one build of
+/// OpenSSL 3.5.7 from another. nginx drifted 611 bytes from its own pin
+/// exactly that way, invisibly.
+///
+/// What is honestly known here: the staged prefix these bytes are packed from
+/// dates to 2026-08-03 and nothing has rebuilt it since, which is why
+/// repacking it still reproduces this `sha256`. What is **not** known is which
+/// build of OpenSSL is statically inside it. That shared `openssl-3.5.7`
+/// prefix has been rebuilt at least twice since — once on 2026-08-07,
+/// silently, and once deliberately for nginx's re-pin — so the prefix standing
+/// on the builder today is certainly not the one these bytes link against.
+///
+/// **Regenerating this manifest would not answer that; it would guess.** A
+/// `--from pack` run digests whatever prefix is on disk at manifest time, so
+/// it would write today's OpenSSL into a record of an August 3 build — and
+/// because a sidecar cannot change a tarball, the `sha256` would come back
+/// identical and the check would pass while the manifest acquired a precise,
+/// confident, wrong claim. The driver now refuses to make it, recording
+/// `"not_observed"` instead. This entry gains a real dependency digest when it
+/// is next built from source, and not before.
+///
 /// # To publish
 ///
 /// 1. Confirm the pin below still reproduces: `build/build.sh mariadb 11.4.9`
