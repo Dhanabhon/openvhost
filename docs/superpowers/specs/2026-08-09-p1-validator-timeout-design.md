@@ -109,6 +109,22 @@ crates/openvhost-core/tests/macos_stack.rs
 apps/desktop/src-tauri/src/{mysql_admin.rs, commands.rs, clitool/shell.rs}
 ```
 
+> **Corrected during implementation and review: six files, not ten.** Four on that list do not
+> qualify, and the reason matters more than the count — **writing an executable fixture is not the
+> condition; running it through a `PROBE_TIMEOUT`-bounded call is.**
+>
+> - `webserver.rs`, `mysql.rs` and `phpruntime.rs` call `Command::output()` **with no timeout at
+>   all**, so they cannot produce a `ValidatorTimeout`. `phpruntime.rs` was on neither this list nor
+>   the implementer's correction and was found by the reviewer's own workspace sweep — recorded here
+>   so the next reader does not have to re-derive why an identically-shaped file is absent.
+> - `site/apply/commit.rs`'s `0o755` is on a **directory**.
+> - `tests/macos_stack.rs` spawns no process at all; its module doc describes a retired version.
+>
+> Two fixtures are deliberately left **cold**, and warming either would delete its test's entire
+> point: `php/discover.rs`'s sentinel and — differently — `commands.rs`'s `fake_nginx`, which *is*
+> warmed but whose guard is what keeps `!argv_out.exists()` true. A sweep for this class must ask
+> what a fixture is *for*, not just whether it is executable.
+
 ## 8. D6 — One production caveat, recorded rather than fixed
 
 The single product path that touches this cost is golden rule 6's runtime-download model: the **first**
@@ -130,6 +146,10 @@ parallelises them meets it there rather than discovering it in the field.
    load-bearing: the `.await` must stay in the `match` scrutinee so the group leader is alive and
    unreaped when `-pgid` fires. The comment names the exact refactor that breaks it.
 4. The suite is no slower in aggregate — one extra exec per fixture, against a 5 s cliff avoided.
+   Measured at **+6 %** (41.33 s → 43.88 s, 60 warm-ups). Recorded: `warm_up` is itself **unbounded**,
+   so under the same build churn its aggregate cost can grow past that. Structurally it can only ever
+   make the suite slower, never fail it — nothing about a warm-up is time-asserted, which is the
+   point of D3.
 5. D6's caveat is recorded at `PROBE_TIMEOUT`.
 
 ## 10. Out of scope
