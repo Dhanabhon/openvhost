@@ -35,9 +35,16 @@ different thing.
 
 ## Four runs produced each of these artifacts, byte-identical
 
-Each committed manifest is **one of four**. The other three differ **only** in
-`built_at`: four independent runs, at four different times, produced
-byte-identical output for the same pin.
+Each committed manifest is **one of four**: four independent runs, at four
+different times, produced byte-identical output for the same pin.
+
+For `mariadb` and `php` the other three differ **only** in `built_at` — every
+other field, `output.sha256` included, is identical, so the four are the same
+account of the same bytes written at four moments. For `nginx` the other three
+also differ in `resumed_from`, `configure_flags` and `recipe`, because one of
+the four was the complete build and the rest were repacks of it; that is a
+difference in what each run *observed*, not in what it produced, and it is why
+the complete run is the one committed (see below).
 
 That is a stronger provenance statement than any single manifest makes, and it is
 exactly what PR #67 set out to prove when it found the only non-determinism was
