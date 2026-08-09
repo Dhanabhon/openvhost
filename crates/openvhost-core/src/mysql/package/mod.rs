@@ -24,5 +24,9 @@ pub use catalogue::{
     MYSQL_PACKAGE_NAME, MYSQL_PACKAGES, MYSQL_WARMUP_BINARY, MysqlPackage, PackageTarget,
     mysql_package_for_host, mysql_package_for_target,
 };
+/// Crate-internal: the `reason` a [`LedgerWrite::Failed`] carries when there was
+/// no store to write to. Shared with [`crate::mariadb`] and [`crate::php`] so
+/// the three engines' `None` arms say one sentence rather than three.
+pub(crate) use install::NO_LEDGER_REASON;
 pub use install::{LedgerWrite, MysqlPackageInstall, install_mysql_package};
 pub use ledger::{InstallLedger, LedgerEntry};

@@ -42,6 +42,7 @@ pub use init::{
     finalize_staging, generate_root_password, mysql_runtime_dirs, remove_staging_dir,
     staging_dir_path, write_generated_config,
 };
+pub(crate) use package::NO_LEDGER_REASON;
 pub use package::{
     InstallLedger, LedgerEntry, LedgerWrite, MYSQL_PACKAGE_NAME, MYSQL_PACKAGES,
     MYSQL_WARMUP_BINARY, MysqlPackage, MysqlPackageInstall, PackageTarget, install_mysql_package,

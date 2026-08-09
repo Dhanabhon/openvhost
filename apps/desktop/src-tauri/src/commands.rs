@@ -103,21 +103,17 @@ impl From<openvhost_core::CoreError> for IpcError {
 /// never a bare `Db`.
 ///
 /// ONE helper rather than the ~21 `app.manage(...)` calls it replaces, so what
-/// a test app manages is decided in a single place — including the interim
-/// below, which is one line to delete rather than twenty-one to find.
+/// a test app manages is decided in a single place — and so a test app cannot
+/// drift from production into managing something `lib.rs` does not.
 ///
-/// INTERIM (T2): the DEGRADE and SPLIT commands still take `State<'_, Db>`, so
-/// the bare `Db` is managed alongside the handle until they migrate. Note the
-/// asymmetry, because it is deliberate: production `lib.rs` manages ONLY the
-/// handle, so those commands are refused on every machine until T2 lands —
-/// which is design D6's property doing exactly what it was chosen for, and the
-/// reason this shim is confined to test setup instead of being papered over in
-/// `lib.rs`.
+/// A bare `Db` is managed nowhere now, in production or in tests, which is what
+/// makes design D6's property hold: a new `db: State<'_, Db>` parameter fails
+/// on every machine, including this harness, rather than only on one whose
+/// store is broken.
 #[cfg(test)]
 fn manage_db(app: &tauri::App<tauri::test::MockRuntime>, db: Db) {
     use tauri::Manager;
-    app.manage(DbHandle::Ready(db.clone()));
-    app.manage(db);
+    app.manage(DbHandle::Ready(db));
 }
 
 /// The reason a test's store is down.
@@ -2647,8 +2643,14 @@ pub async fn set_default_php(
 /// is the one that actually probes.
 #[tauri::command]
 #[specta::specta]
+// DEGRADE (optional-state.db design D2): the rows, the Homebrew probe and the
+// search paths are all filesystem facts, so a store that never opened costs
+// this command exactly one field — a STORED default reads as "no preference"
+// (`read_default_php`'s own `None` arm). Refusing instead would empty a page
+// whose every other value is still true. D5's banner is what stops that one
+// silently-wrong field being dishonest.
 pub async fn php_environment(
-    db: tauri::State<'_, Db>,
+    db: tauri::State<'_, DbHandle>,
     runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
     paths: tauri::State<'_, Option<StackPaths>>,
 ) -> Result<PhpEnvironmentDto, IpcError> {
@@ -2673,7 +2675,7 @@ pub async fn php_environment(
         // so the major the page marks as default is always one of the rows it
         // rendered in the same response — the seam `render_set` keeps on its
         // own side by resolving against the very list its pool loop iterates.
-        default_php: read_default_php(Some(db.inner()), &installed).await?,
+        default_php: read_default_php(db.optional(), &installed).await?,
         runtimes: php_rows(&p.home, &installed, &[]),
     })
 }
@@ -2695,8 +2697,11 @@ pub async fn php_environment(
 /// the apply pipeline no longer knows the version exists.
 #[tauri::command]
 #[specta::specta]
+// DEGRADE, for the same reason and with the same one-field cost as
+// `php_environment` above — the probing this command adds needs no store at
+// all.
 pub async fn rescan_php_runtimes(
-    db: tauri::State<'_, Db>,
+    db: tauri::State<'_, DbHandle>,
     runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
     paths: tauri::State<'_, Option<StackPaths>>,
     sup: tauri::State<'_, Arc<Supervisor>>,
@@ -2724,7 +2729,7 @@ pub async fn rescan_php_runtimes(
         // (and the reverse) without a relaunch. Spec claim 5 — the preference
         // survives a rescan — is this line plus the fact that nothing on the
         // rescan path writes to `php_settings`.
-        default_php: read_default_php(Some(db.inner()), &installed.runtimes).await?,
+        default_php: read_default_php(db.optional(), &installed.runtimes).await?,
         runtimes: php_rows(&p.home, &installed.runtimes, &[]),
     })
 }
@@ -4268,7 +4273,7 @@ mod php_ipc_tests {
         let handle = app.handle().clone();
         let task = tokio::spawn(async move {
             rescan_php_runtimes(
-                handle.state::<Db>(),
+                handle.state::<DbHandle>(),
                 handle.state::<RwLock<Option<InstalledRuntimes>>>(),
                 handle.state::<Option<StackPaths>>(),
                 handle.state::<Arc<Supervisor>>(),
@@ -4290,6 +4295,186 @@ mod php_ipc_tests {
             .expect("rescan did not unblock after the install lock was released")
             .expect("rescan task panicked");
         assert!(result.is_ok(), "got {result:?}");
+    }
+
+    // ---- DEGRADE: the Languages page still has its data with no store ----
+    //
+    // Optional-state.db design D2. `php_environment` is what the Languages
+    // page mounts on, and it is where the slice's motivating screenshot came
+    // from: with the bare `Db` unmanaged, Tauri refused the whole command and
+    // the page rendered "You must call `.manage()` before using this command."
+    //
+    // Vacuity for this pair: `read_default_php`'s `None` arm is the ONLY
+    // difference between them, and the two tests disagree on `default_php`
+    // while agreeing on every other field. Proven by mutation — swapping
+    // `db.optional()` for `db.require()?` reddens the store-down test (an
+    // `IpcError::Core`, no rows at all) and leaves the stored-default one
+    // green; hardcoding `read_default_php(None, …)` does the reverse.
+
+    #[tokio::test]
+    async fn php_environment_still_lists_its_runtimes_with_the_store_down() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app");
+        manage_store_down(&app);
+        app.manage(Some(StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: Some(home.path().join("nginx")),
+            nginx_conf: home.path().join("nginx.conf"),
+        }));
+        app.manage(RwLock::new(Some(InstalledRuntimes {
+            nginx_bin: Some(home.path().join("nginx")),
+            php: vec![openvhost_core::PhpRuntime {
+                major: "8.3".into(),
+                fpm_bin: home.path().join("php-fpm"),
+                source: openvhost_core::PhpRuntimeSource::Homebrew,
+            }],
+        })));
+
+        let env = php_environment(
+            app.state::<DbHandle>(),
+            app.state::<RwLock<Option<InstalledRuntimes>>>(),
+            app.state::<Option<StackPaths>>(),
+        )
+        .await
+        .expect("a degraded store must not cost the page its rows");
+
+        // The real work, all of which is a filesystem fact rather than a
+        // stored one, and all of which survives.
+        assert_eq!(
+            env.runtimes.len(),
+            openvhost_core::CATALOGUE.len(),
+            "the page lost its rows: {:?}",
+            env.runtimes
+        );
+        let three = env
+            .runtimes
+            .iter()
+            .find(|r| r.major == "8.3")
+            .expect("a row for the installed major");
+        assert!(
+            three.installed,
+            "the installed runtime must still report as installed"
+        );
+        assert_eq!(
+            three.path.as_deref(),
+            Some(home.path().join("php-fpm").display().to_string().as_str())
+        );
+        assert!(
+            !env.brew_searched.is_empty(),
+            "the search paths are a probe"
+        );
+
+        // The one field a degraded store costs, and it costs it in the shape
+        // `read_default_php`'s own `None` arm documents: no preference, so the
+        // first installed major is what gets served. D5's banner is what makes
+        // that honest rather than quiet.
+        assert_eq!(
+            env.default_php,
+            DefaultPhpDto::Unset {
+                serving: "8.3".to_string()
+            }
+        );
+    }
+
+    /// The discriminating twin: the SAME command against a store that holds a
+    /// preference must report that preference, so the test above is measuring
+    /// the `None` arm rather than a `default_php` that never depended on the
+    /// store at all.
+    #[tokio::test]
+    async fn php_environment_reports_a_stored_default_when_the_store_is_up() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app");
+        let db = Db::open_in_memory().await.expect("in-memory db");
+        let php = vec![
+            openvhost_core::PhpRuntime {
+                major: "8.3".into(),
+                fpm_bin: home.path().join("php-fpm-8.3"),
+                source: openvhost_core::PhpRuntimeSource::Homebrew,
+            },
+            openvhost_core::PhpRuntime {
+                major: "8.4".into(),
+                fpm_bin: home.path().join("php-fpm-8.4"),
+                source: openvhost_core::PhpRuntimeSource::Homebrew,
+            },
+        ];
+        write_default_php(&db, Some("8.4".into()), &php)
+            .await
+            .expect("store a preference");
+        manage_db(&app, db);
+        app.manage(Some(StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: Some(home.path().join("nginx")),
+            nginx_conf: home.path().join("nginx.conf"),
+        }));
+        app.manage(RwLock::new(Some(InstalledRuntimes {
+            nginx_bin: Some(home.path().join("nginx")),
+            php,
+        })));
+
+        let env = php_environment(
+            app.state::<DbHandle>(),
+            app.state::<RwLock<Option<InstalledRuntimes>>>(),
+            app.state::<Option<StackPaths>>(),
+        )
+        .await
+        .expect("a healthy store answers");
+
+        assert_eq!(
+            env.default_php,
+            DefaultPhpDto::Preferred {
+                major: "8.4".to_string()
+            },
+            "the stored preference must reach the page when there IS a store"
+        );
+    }
+
+    /// The other one-line DEGRADE, and the one that actually probes. Asserts
+    /// nothing about WHICH runtimes are found — this test's machine may have
+    /// Homebrew PHP on it, which is why `rescan_blocks_while_an_install_holds_the_lock`
+    /// above asserts only `is_ok()` too. What it does assert is
+    /// machine-independent and is the whole claim: the command answers, it
+    /// answers with the catalogue, and with no store to read a preference from
+    /// it can never report one.
+    #[tokio::test]
+    async fn rescan_php_runtimes_still_answers_with_the_store_down() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app");
+        manage_store_down(&app);
+        app.manage(Some(StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: Some(home.path().join("nginx")),
+            nginx_conf: home.path().join("nginx.conf"),
+        }));
+        app.manage(RwLock::new(None::<InstalledRuntimes>));
+        app.manage(Arc::new(Supervisor::new(openvhost_proc::default_driver())));
+        app.manage(InstallLock::default());
+
+        let env = rescan_php_runtimes(
+            app.state::<DbHandle>(),
+            app.state::<RwLock<Option<InstalledRuntimes>>>(),
+            app.state::<Option<StackPaths>>(),
+            app.state::<Arc<Supervisor>>(),
+            app.state::<InstallLock>(),
+        )
+        .await
+        .expect("\"Check again\" must still work when the store is down");
+
+        assert!(
+            env.runtimes.len() >= openvhost_core::CATALOGUE.len(),
+            "every catalogued major must still get a row: {:?}",
+            env.runtimes
+        );
+        assert!(
+            !matches!(env.default_php, DefaultPhpDto::Preferred { .. }),
+            "with no store there is no preference to report, got {:?}",
+            env.default_php
+        );
     }
 
     /// A2 audit finding: `RunningInstallGuard::drop` used to clear
@@ -11478,9 +11663,25 @@ impl TryFrom<LogSourceDto> for LogSource {
 /// through unconditionally too: it is rejected later, structurally, by
 /// `derive_path` (it has no on-disk path at all), not by a catalogue rule
 /// here.
+///
+/// **`db` is `None` when `state.db` did not open, and only the site arm fails
+/// closed** (optional-state.db design D2's SPLIT). That asymmetry is the whole
+/// decision, so it is stated rather than left to be read out of the arms:
+///
+/// - nginx's globals, a php-fpm pool and a ring are all named by a catalogue
+///   that does not live in `state.db`, so a missing store tells us nothing
+///   about them and they **proceed**. Failing the whole function closed would
+///   look safer and produce the opposite of the design — the nginx error log
+///   would become unreadable exactly when the app is broken, which is the one
+///   thing a user needs then.
+/// - the site arm **refuses**, because for a site this check IS the
+///   path-confinement gate: the domain arrives over IPC, and `state.db` is the
+///   only thing that says which domains exist. With no store there is nothing
+///   to check it against, and degrading would derive
+///   `<home>/logs/sites/<domain>/…` for a domain nothing vetted.
 async fn check_catalogue(
     source: &LogSource,
-    db: &Db,
+    db: Option<&Db>,
     runtimes: &RwLock<Option<InstalledRuntimes>>,
 ) -> Result<(), IpcError> {
     match source {
@@ -11503,6 +11704,17 @@ async fn check_catalogue(
             }
         }
         LogSource::SiteAccess(domain) | LogSource::SiteError(domain) => {
+            // Fail closed. `IpcError::Core`, not `Validation` on `domain`: the
+            // domain is not what is wrong, and a page that renders this must
+            // not read it as "no such site".
+            let Some(db) = db else {
+                return Err(IpcError::Core {
+                    message: format!(
+                        "{}, so no site's log can be confirmed as one of yours",
+                        crate::db_state::STORE_UNAVAILABLE
+                    ),
+                });
+            };
             let repo = SqliteSiteRepository::new(db);
             let known = repo
                 .list()
@@ -11580,7 +11792,7 @@ fn derive_path(source: &LogSource, paths: &openvhost_core::LogPaths) -> Result<P
 /// PHP major is rejected without a single filesystem call.
 async fn resolve_log_path(
     dto: LogSourceDto,
-    db: &Db,
+    db: Option<&Db>,
     runtimes: &RwLock<Option<InstalledRuntimes>>,
     paths: &openvhost_core::LogPaths,
 ) -> Result<PathBuf, IpcError> {
@@ -11802,8 +12014,13 @@ async fn file_row(
 /// (spec D7).
 #[tauri::command]
 #[specta::specta]
+// DEGRADE (optional-state.db design D2): with no store the catalogue keeps
+// every row `state.db` was not the source of — nginx's globals, one per
+// installed php-fpm major, one per supervised service — and loses only the
+// per-site pairs. A shorter list is indistinguishable from "you have no sites",
+// which is why D5's banner is what makes this honest rather than quiet.
 pub async fn list_log_sources(
-    db: tauri::State<'_, Db>,
+    db: tauri::State<'_, DbHandle>,
     runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
     stack: tauri::State<'_, Option<StackPaths>>,
     sup: tauri::State<'_, Arc<Supervisor>>,
@@ -11857,29 +12074,34 @@ pub async fn list_log_sources(
         }
     }
 
-    let repo = SqliteSiteRepository::new(db.inner());
-    for site in repo.list().await? {
-        let domain = site.domain.as_str().to_string();
-        rows.push(
-            file_row(
-                LogSourceDto::SiteAccess {
-                    domain: domain.clone(),
-                },
-                format!("{domain} access log"),
-                log_paths.site_access(&site.domain),
-            )
-            .await,
-        );
-        rows.push(
-            file_row(
-                LogSourceDto::SiteError {
-                    domain: domain.clone(),
-                },
-                format!("{domain} error log"),
-                log_paths.site_error(&site.domain),
-            )
-            .await,
-        );
+    // The only rows `state.db` is the source of, and so the only ones a
+    // degraded store costs. Every other row above and below is a filesystem or
+    // supervisor fact and is unaffected.
+    if let Some(db) = db.optional() {
+        let repo = SqliteSiteRepository::new(db);
+        for site in repo.list().await? {
+            let domain = site.domain.as_str().to_string();
+            rows.push(
+                file_row(
+                    LogSourceDto::SiteAccess {
+                        domain: domain.clone(),
+                    },
+                    format!("{domain} access log"),
+                    log_paths.site_access(&site.domain),
+                )
+                .await,
+            );
+            rows.push(
+                file_row(
+                    LogSourceDto::SiteError {
+                        domain: domain.clone(),
+                    },
+                    format!("{domain} error log"),
+                    log_paths.site_error(&site.domain),
+                )
+                .await,
+            );
+        }
     }
 
     for status in sup.snapshot() {
@@ -11903,15 +12125,17 @@ pub async fn list_log_sources(
 /// path is derived or any filesystem call is made.
 #[tauri::command]
 #[specta::specta]
+// SPLIT (optional-state.db design D2): the store reaches only `check_catalogue`,
+// which refuses a site source and lets the other three through — see its doc.
 pub async fn read_log_window(
-    db: tauri::State<'_, Db>,
+    db: tauri::State<'_, DbHandle>,
     runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
     stack: tauri::State<'_, Option<StackPaths>>,
     input: LogWindowQuery,
 ) -> Result<LogWindowDto, IpcError> {
     let p = stack_paths(&stack)?;
     let log_paths = openvhost_core::LogPaths::new(&p.home);
-    let path = resolve_log_path(input.source, db.inner(), runtimes.inner(), &log_paths).await?;
+    let path = resolve_log_path(input.source, db.optional(), runtimes.inner(), &log_paths).await?;
 
     let cursor = decode_cursor(input.cursor)?;
     let needle = input
@@ -11957,7 +12181,7 @@ pub async fn read_log_window(
 /// the derived path's parent — stays directly testable.
 async fn reveal_log_folder_target(
     source: LogSourceDto,
-    db: &Db,
+    db: Option<&Db>,
     runtimes: &RwLock<Option<InstalledRuntimes>>,
     paths: &openvhost_core::LogPaths,
 ) -> Result<PathBuf, IpcError> {
@@ -11979,9 +12203,11 @@ async fn reveal_log_folder_target(
 /// `open_site`/`open_homebrew_site` above.
 #[tauri::command]
 #[specta::specta]
+// SPLIT, through the same `check_catalogue` seam `read_log_window` goes
+// through — see its doc for which arms proceed with no store and which refuses.
 pub async fn reveal_log_folder(
     app: tauri::AppHandle,
-    db: tauri::State<'_, Db>,
+    db: tauri::State<'_, DbHandle>,
     runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
     stack: tauri::State<'_, Option<StackPaths>>,
     source: LogSourceDto,
@@ -11989,7 +12215,8 @@ pub async fn reveal_log_folder(
     use tauri_plugin_opener::OpenerExt;
     let p = stack_paths(&stack)?;
     let log_paths = openvhost_core::LogPaths::new(&p.home);
-    let folder = reveal_log_folder_target(source, db.inner(), runtimes.inner(), &log_paths).await?;
+    let folder =
+        reveal_log_folder_target(source, db.optional(), runtimes.inner(), &log_paths).await?;
     app.opener()
         .open_path(folder.display().to_string(), None::<&str>)
         .map_err(|e| IpcError::Core {
@@ -12073,7 +12300,7 @@ mod log_ipc_tests {
         app.manage(RwLock::new(None::<InstalledRuntimes>));
 
         let err = read_log_window(
-            app.state::<Db>(),
+            app.state::<DbHandle>(),
             app.state::<RwLock<Option<InstalledRuntimes>>>(),
             app.state::<Option<StackPaths>>(),
             query(
@@ -12108,7 +12335,7 @@ mod log_ipc_tests {
         app.manage(RwLock::new(None::<InstalledRuntimes>));
 
         let err = read_log_window(
-            app.state::<Db>(),
+            app.state::<DbHandle>(),
             app.state::<RwLock<Option<InstalledRuntimes>>>(),
             app.state::<Option<StackPaths>>(),
             query(
@@ -12141,7 +12368,7 @@ mod log_ipc_tests {
         })));
 
         let err = read_log_window(
-            app.state::<Db>(),
+            app.state::<DbHandle>(),
             app.state::<RwLock<Option<InstalledRuntimes>>>(),
             app.state::<Option<StackPaths>>(),
             query(
@@ -12183,7 +12410,7 @@ mod log_ipc_tests {
         app.manage(RwLock::new(None::<InstalledRuntimes>));
 
         let err = read_log_window(
-            app.state::<Db>(),
+            app.state::<DbHandle>(),
             app.state::<RwLock<Option<InstalledRuntimes>>>(),
             app.state::<Option<StackPaths>>(),
             query(LogSourceDto::ServiceRing { id: "nginx".into() }, None),
@@ -12206,7 +12433,7 @@ mod log_ipc_tests {
 
         let err = reveal_log_folder_target(
             LogSourceDto::ServiceRing { id: "nginx".into() },
-            &db,
+            Some(&db),
             &runtimes,
             &log_paths,
         )
@@ -12245,7 +12472,7 @@ mod log_ipc_tests {
         std::os::unix::fs::symlink(&victim, site_dir.join("access.log")).unwrap();
 
         let err = read_log_window(
-            app.state::<Db>(),
+            app.state::<DbHandle>(),
             app.state::<RwLock<Option<InstalledRuntimes>>>(),
             app.state::<Option<StackPaths>>(),
             query(
@@ -12284,7 +12511,7 @@ mod log_ipc_tests {
         app.manage(RwLock::new(None::<InstalledRuntimes>));
 
         let err = read_log_window(
-            app.state::<Db>(),
+            app.state::<DbHandle>(),
             app.state::<RwLock<Option<InstalledRuntimes>>>(),
             app.state::<Option<StackPaths>>(),
             LogWindowQuery {
@@ -12372,7 +12599,7 @@ mod log_ipc_tests {
         app.manage(sup);
 
         let rows = list_log_sources(
-            app.state::<Db>(),
+            app.state::<DbHandle>(),
             app.state::<RwLock<Option<InstalledRuntimes>>>(),
             app.state::<Option<StackPaths>>(),
             app.state::<Arc<Supervisor>>(),
@@ -12435,7 +12662,7 @@ mod log_ipc_tests {
         std::fs::write(log_dir.join("nginx.error.log"), contents).unwrap();
 
         let rows = list_log_sources(
-            app.state::<Db>(),
+            app.state::<DbHandle>(),
             app.state::<RwLock<Option<InstalledRuntimes>>>(),
             app.state::<Option<StackPaths>>(),
             app.state::<Arc<Supervisor>>(),
@@ -12471,7 +12698,7 @@ mod log_ipc_tests {
         std::fs::write(log_dir.join("nginx.error.log"), b"line one\n").unwrap();
 
         let first = read_log_window(
-            app.state::<Db>(),
+            app.state::<DbHandle>(),
             app.state::<RwLock<Option<InstalledRuntimes>>>(),
             app.state::<Option<StackPaths>>(),
             query(LogSourceDto::NginxError, None),
@@ -12490,7 +12717,7 @@ mod log_ipc_tests {
         drop(f);
 
         let second = read_log_window(
-            app.state::<Db>(),
+            app.state::<DbHandle>(),
             app.state::<RwLock<Option<InstalledRuntimes>>>(),
             app.state::<Option<StackPaths>>(),
             query(LogSourceDto::NginxError, Some(cursor)),
@@ -12525,7 +12752,7 @@ mod log_ipc_tests {
             LogSourceDto::SiteError {
                 domain: "ghost.localhost".into(),
             },
-            &db,
+            Some(&db),
             &runtimes,
             &log_paths,
         )
@@ -12550,7 +12777,7 @@ mod log_ipc_tests {
             LogSourceDto::SiteAccess {
                 domain: "shop.localhost".into(),
             },
-            &db,
+            Some(&db),
             &runtimes,
             &log_paths,
         )
@@ -12558,5 +12785,290 @@ mod log_ipc_tests {
         .unwrap();
 
         assert_eq!(folder, home.path().join("logs/sites/shop.localhost"));
+    }
+
+    // ---- SPLIT: which arms survive a store that never opened --------------
+    //
+    // Optional-state.db design D2. `check_catalogue` is NOT uniform, and that
+    // is the whole decision: making all of it fail closed looks safer and
+    // produces the opposite of the design — the nginx error log would become
+    // unreadable exactly when the app is broken, which is the one thing a user
+    // needs then. Every test in this group would still pass under that
+    // mistake, so the two directions are proven separately and explicitly.
+    //
+    // Vacuity, measured by mutation on the ONE arm that decides it:
+    //
+    //  * `check_catalogue`'s site arm returning `Ok(())` on `None` instead of
+    //    refusing reddens `a_site_log_is_refused_…` and
+    //    `reveal_log_folder_target_refuses_a_site_…` (the read then SUCCEEDS
+    //    and hands back the planted file's contents, which is precisely the
+    //    leak the gate exists to stop) and leaves this group's other three
+    //    tests green.
+    //  * Making the whole function refuse on `None` — the plausible
+    //    over-correction — reddens `the_nginx_error_log_is_still_readable_…`,
+    //    `a_php_pool_log_is_still_readable_…` and
+    //    `a_ring_source_is_still_rejected_…` and leaves the two site tests
+    //    green. Neither mutation is detectable by the group's other half,
+    //    which is why both halves are here.
+
+    /// The store's own fixture: down, with the log files a user would want to
+    /// read at that exact moment already on disk.
+    fn store_down_app(home: &Path) -> tauri::App<tauri::test::MockRuntime> {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        manage_store_down(&app);
+        app.manage(stack(home));
+        app.manage(RwLock::new(Some(InstalledRuntimes {
+            nginx_bin: Some(home.join("nginx")),
+            php: vec![openvhost_core::PhpRuntime {
+                major: "8.3".into(),
+                fpm_bin: home.join("php-fpm"),
+                source: openvhost_core::PhpRuntimeSource::Homebrew,
+            }],
+        })));
+        app
+    }
+
+    #[tokio::test]
+    async fn the_nginx_error_log_is_still_readable_with_no_store() {
+        let home = tempfile::tempdir().unwrap();
+        let app = store_down_app(home.path());
+
+        let log_dir = home.path().join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("nginx.error.log"),
+            b"2026/08/09 10:00:00 [emerg] the app is broken\n",
+        )
+        .unwrap();
+
+        let window = read_log_window(
+            app.state::<DbHandle>(),
+            app.state::<RwLock<Option<InstalledRuntimes>>>(),
+            app.state::<Option<StackPaths>>(),
+            query(LogSourceDto::NginxError, None),
+        )
+        .await
+        .expect("nginx's error log must stay readable when the store is down");
+
+        assert!(window.exists);
+        assert_eq!(window.rows.len(), 1, "got {:?}", window.rows);
+        assert!(window.rows[0].text.contains("the app is broken"));
+
+        // …and the same source through the OTHER command, which reaches the
+        // same gate. `reveal_log_folder` itself takes an `AppHandle<Wry>` and
+        // cannot be invoked from this harness at all (see
+        // `reveal_log_folder_target`'s doc); this is its whole decision minus
+        // the OS call.
+        let log_paths = openvhost_core::LogPaths::new(home.path());
+        let folder = reveal_log_folder_target(
+            LogSourceDto::NginxError,
+            None,
+            app.state::<RwLock<Option<InstalledRuntimes>>>().inner(),
+            &log_paths,
+        )
+        .await
+        .expect("revealing nginx's log folder must not need the store either");
+        assert_eq!(folder, log_dir);
+    }
+
+    /// The second arm that needs no store: an installed php-fpm major is named
+    /// by the managed runtime list, not by `state.db`.
+    #[tokio::test]
+    async fn a_php_pool_log_is_still_readable_with_no_store() {
+        let home = tempfile::tempdir().unwrap();
+        let app = store_down_app(home.path());
+
+        let pool_dir = home.path().join("logs/services/php-fpm-8.3");
+        std::fs::create_dir_all(&pool_dir).unwrap();
+        std::fs::write(pool_dir.join("error.log"), b"[09-Aug-2026] NOTICE: ready\n").unwrap();
+
+        let window = read_log_window(
+            app.state::<DbHandle>(),
+            app.state::<RwLock<Option<InstalledRuntimes>>>(),
+            app.state::<Option<StackPaths>>(),
+            query(
+                LogSourceDto::PhpFpm {
+                    major: "8.3".into(),
+                },
+                None,
+            ),
+        )
+        .await
+        .expect("an installed pool's log must stay readable when the store is down");
+
+        assert!(window.exists);
+        assert_eq!(window.rows.len(), 1, "got {:?}", window.rows);
+        assert!(window.rows[0].text.contains("NOTICE: ready"));
+    }
+
+    /// The third arm: a ring source passes the catalogue check with or without
+    /// a store and is rejected one step later by `derive_path`. The assertion
+    /// is that the store being down changes NOTHING here — same refusal, same
+    /// field — rather than that the source is somehow readable.
+    #[tokio::test]
+    async fn a_ring_source_is_still_rejected_by_derive_path_with_no_store() {
+        let home = tempfile::tempdir().unwrap();
+        let app = store_down_app(home.path());
+
+        let err = read_log_window(
+            app.state::<DbHandle>(),
+            app.state::<RwLock<Option<InstalledRuntimes>>>(),
+            app.state::<Option<StackPaths>>(),
+            query(LogSourceDto::ServiceRing { id: "nginx".into() }, None),
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            IpcError::Validation { field, .. } => assert_eq!(
+                field, "source",
+                "a ring source must still be refused by derive_path, not by the store gate"
+            ),
+            other => panic!("expected Validation on source, got {other:?}"),
+        }
+    }
+
+    /// The direction that must NOT degrade. `state.db` is the only thing that
+    /// says which domains are the user's, so with no store there is nothing to
+    /// check an IPC-supplied domain against — and this check is the
+    /// path-confinement gate that stands between that domain and
+    /// `<home>/logs/sites/<domain>/…`.
+    ///
+    /// The planted file is what makes the assertion discriminating rather than
+    /// decorative: if the gate degraded open, the derived path would exist and
+    /// this call would return its contents instead of an error.
+    #[tokio::test]
+    async fn a_site_log_is_refused_with_no_store_by_the_confinement_gate() {
+        let home = tempfile::tempdir().unwrap();
+        let app = store_down_app(home.path());
+
+        let site_dir = home.path().join("logs/sites/ghost.localhost");
+        std::fs::create_dir_all(&site_dir).unwrap();
+        std::fs::write(site_dir.join("access.log"), b"a line nothing vetted\n").unwrap();
+
+        let err = read_log_window(
+            app.state::<DbHandle>(),
+            app.state::<RwLock<Option<InstalledRuntimes>>>(),
+            app.state::<Option<StackPaths>>(),
+            query(
+                LogSourceDto::SiteAccess {
+                    domain: "ghost.localhost".into(),
+                },
+                None,
+            ),
+        )
+        .await
+        .unwrap_err();
+
+        // `Core`, and specifically NOT `Validation { field: "domain" }`: the
+        // domain is not what is wrong, and a page that read this as "no such
+        // site" would be told a second untruth on top of the first.
+        match err {
+            IpcError::Core { message } => {
+                assert!(
+                    message.contains(crate::db_state::STORE_UNAVAILABLE),
+                    "the refusal must name the store, got {message:?}"
+                );
+                assert!(
+                    !message.contains(".manage()"),
+                    "the user must never be told to call a Rust API: {message:?}"
+                );
+            }
+            other => panic!("expected the store refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reveal_log_folder_target_refuses_a_site_with_no_store() {
+        let home = tempfile::tempdir().unwrap();
+        let runtimes = RwLock::new(None::<InstalledRuntimes>);
+        let log_paths = openvhost_core::LogPaths::new(home.path());
+
+        let err = reveal_log_folder_target(
+            LogSourceDto::SiteError {
+                domain: "ghost.localhost".into(),
+            },
+            None,
+            &runtimes,
+            &log_paths,
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            IpcError::Core { message } => assert!(
+                message.contains(crate::db_state::STORE_UNAVAILABLE),
+                "the refusal must name the store, got {message:?}"
+            ),
+            other => panic!("expected the store refusal, got {other:?}"),
+        }
+    }
+
+    // ---- DEGRADE: list_log_sources keeps every non-site row ---------------
+    //
+    // Vacuity: swapping `db.optional()` for `db.require()?` makes this test's
+    // call return `Err` and reddens it, while
+    // `list_log_sources_enumerates_every_kind_for_a_fixture_home` — which
+    // manages a healthy store — stays green. That pair is what separates
+    // "degrades" from "refuses", and the positive assertions below are what
+    // separate "degrades" from "returns an empty list".
+
+    #[tokio::test]
+    async fn list_log_sources_degrades_to_the_rows_the_store_was_not_the_source_of() {
+        let home = tempfile::tempdir().unwrap();
+        let app = store_down_app(home.path());
+        let sup = Arc::new(Supervisor::new(openvhost_proc::default_driver()));
+        sup.register(openvhost_proc::ServiceSpec {
+            id: "nginx".into(),
+            display_name: "nginx".into(),
+            endpoint: None,
+            spawn: openvhost_proc::SpawnSpec {
+                program: PathBuf::from("/usr/bin/true"),
+                args: vec![],
+                cwd: None,
+                env: vec![],
+            },
+            readiness: openvhost_proc::ReadinessProbe::default(),
+            grace: openvhost_proc::DEFAULT_GRACE,
+        });
+        app.manage(sup);
+
+        let rows = list_log_sources(
+            app.state::<DbHandle>(),
+            app.state::<RwLock<Option<InstalledRuntimes>>>(),
+            app.state::<Option<StackPaths>>(),
+            app.state::<Arc<Supervisor>>(),
+        )
+        .await
+        .expect("a degraded store must shorten the catalogue, not error it");
+
+        assert!(
+            rows.iter().any(|r| r.source == LogSourceDto::NginxError),
+            "got {:?}",
+            rows.iter().map(|r| &r.source).collect::<Vec<_>>()
+        );
+        assert!(rows.iter().any(|r| r.source == LogSourceDto::NginxAccess));
+        assert!(
+            rows.iter().any(
+                |r| matches!(&r.source, LogSourceDto::PhpFpm { major } if major.as_str() == "8.3")
+            ),
+            "an installed pool row comes from the runtime list, not the store"
+        );
+        assert!(
+            rows.iter().any(|r| matches!(
+                &r.source,
+                LogSourceDto::ServiceRing { id } if id.as_str() == "nginx"
+            )),
+            "a ring row comes from the supervisor, not the store"
+        );
+        assert!(
+            !rows.iter().any(|r| matches!(
+                r.source,
+                LogSourceDto::SiteAccess { .. } | LogSourceDto::SiteError { .. }
+            )),
+            "a site row can only come from state.db, so none can be listed"
+        );
     }
 }
