@@ -4,7 +4,9 @@
 	import Rail from './Rail.svelte';
 	import ErrorBanner from './ErrorBanner.svelte';
 	import StoreUnavailableBanner from './StoreUnavailableBanner.svelte';
+	import BootCheckFailedBanner from './BootCheckFailedBanner.svelte';
 	import StatusBar from './StatusBar.svelte';
+	import { bootStatusStore } from '$lib/boot-status.shared.svelte';
 	import { servicesStore } from '$lib/services.shared.svelte';
 	import { statsStore } from '$lib/stats.shared.svelte';
 	import { storeStatusStore } from '$lib/store-status.shared.svelte';
@@ -47,6 +49,18 @@
 			     and status strip out of the window; the LOAD is in the layout,
 			     which is the component that outlives navigation. -->
 			<StoreUnavailableBanner reason={storeStatusStore.reason} />
+			<!-- Here rather than as a sibling of `{@render children()}` in
+			     `routes/+layout.svelte`, for the reason StoreUnavailableBanner
+			     gives one line up and no other: `.window` is a `height: 100%`
+			     grid, and a banner rendered beside it would push the titlebar and
+			     status strip out of the window. The layout still owns the ASK and
+			     the gating decision — this is only where the answer's quietest
+			     outcome becomes visible.
+
+			     Reaching this component at all means the children ARE rendering,
+			     which is the whole point: `boot_status` failing is not a reason to
+			     blank a working app. -->
+			<BootCheckFailedBanner error={bootStatusStore.askFailed} />
 			{@render children()}
 		</main>
 	</div>

@@ -25,6 +25,7 @@ import WebServerPage from './web-server/+page.svelte';
 import LanguagesPage from './languages/+page.svelte';
 import DatabasesPage from './databases/+page.svelte';
 import LogsPage from './logs/+page.svelte';
+import { bootStatusStore } from '$lib/boot-status.shared.svelte';
 import { servicesStore } from '$lib/services.shared.svelte';
 import { storeStatusStore } from '$lib/store-status.shared.svelte';
 import { webServersStore } from '$lib/webservers.svelte';
@@ -74,6 +75,8 @@ beforeEach(() => {
 	servicesStore.error = null;
 	storeStatusStore.reason = null;
 	storeStatusStore.lastError = null;
+	bootStatusStore.status = null;
+	bootStatusStore.askFailed = null;
 	webServersStore.servers = [];
 	webServersStore.error = null;
 	webServersStore.configText = {};
@@ -181,6 +184,70 @@ describe('an unopened state.db', () => {
 		const { body } = render(SitesPage);
 		expect(body).toContain('data-testid="error-banner"');
 		expect(body).toContain('data-testid="store-unavailable-banner"');
+	});
+});
+
+// A `boot_status` ask that itself failed (degraded-boot design D2). Reaching a
+// route at ALL means the layout chose to render the children rather than a
+// takeover — that is the whole rule: never blank a healthy app over an
+// unanswered question. What is left to prove here is the other half of it, that
+// the app then SAYS SO, on whichever route the user happens to be on.
+//
+// `onMount` does not run under SSR, so nothing here reaches Tauri IPC; the
+// shared store is seeded directly. The ASK itself, and the gate that decides
+// children-versus-takeover, are `layout-boot-status.dom.test.ts`, which cannot
+// be done here.
+//
+// Vacuity, measured by mutation on the one line that wires them together:
+// changing AppShell's `error={bootStatusStore.askFailed}` to `error={null}` —
+// the banner mounted but reading nothing, which is exactly how UI glue goes
+// missing here — reddened all six `is announced on …`, the count test and the
+// coexistence test, and left all six `is silent on …` green. Making the banner
+// render unconditionally reddened those six instead. Neither half detects the
+// other's mutation.
+describe('a boot check that could not be answered', () => {
+	const failure = { kind: 'core' as const, message: 'transport died' };
+	const routes: Array<[string, typeof SitesPage]> = [
+		['/', SitesPage],
+		['/services', ServicesPage],
+		['/web-server', WebServerPage],
+		['/languages', LanguagesPage],
+		['/databases', DatabasesPage],
+		['/logs', LogsPage]
+	];
+
+	it.each(routes)('is announced on %s', (_route, page) => {
+		bootStatusStore.askFailed = failure;
+		const { body } = render(page);
+		expect(body).toContain('data-testid="boot-check-failed-banner"');
+		// The transport's own words, on the page itself — a banner that could only
+		// say "something failed" leaves the user nothing to point at.
+		expect(body).toContain('transport died');
+	});
+
+	it.each(routes)('is silent on %s when the boot check answered', (_route, page) => {
+		const { body } = render(page);
+		expect(body).not.toContain('data-testid="boot-check-failed-banner"');
+	});
+
+	it('renders exactly once per page, never once per panel', () => {
+		bootStatusStore.askFailed = failure;
+		for (const [, page] of routes) {
+			const { body } = render(page);
+			expect(body.match(/data-testid="boot-check-failed-banner"/g)).toHaveLength(1);
+		}
+	});
+
+	// Three independent conditions, and none may hide another: a boot check that
+	// could not be answered says nothing about the store or the supervisor.
+	it('sits alongside the other two app-level banners rather than replacing them', () => {
+		bootStatusStore.askFailed = failure;
+		storeStatusStore.reason = 'unable to open database file (os error 14)';
+		servicesStore.error = { kind: 'core', message: 'supervisor unreachable' };
+		const { body } = render(SitesPage);
+		expect(body).toContain('data-testid="error-banner"');
+		expect(body).toContain('data-testid="store-unavailable-banner"');
+		expect(body).toContain('data-testid="boot-check-failed-banner"');
 	});
 });
 

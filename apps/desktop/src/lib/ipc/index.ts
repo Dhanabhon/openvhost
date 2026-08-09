@@ -12,6 +12,7 @@ import type { PackageKind, UninstallPlan } from '../uninstall.derive';
 import type {
 	ApplyOutcomeDto,
 	ApplyPlanDto,
+	BootStatusDto,
 	CoreInfo,
 	CreateSiteResult,
 	DefaultPhpDto,
@@ -88,6 +89,7 @@ import type {
 export type {
 	ApplyOutcomeDto,
 	ApplyPlanDto,
+	BootStatusDto,
 	CoreInfo,
 	CreateSiteResult,
 	DefaultPhpDto,
@@ -223,6 +225,25 @@ async function unwrap<T>(
  */
 export async function stateStoreStatus(): Promise<string | null> {
 	return unwrap(commands.stateStoreStatus());
+}
+
+/**
+ * How far this launch actually got (degraded-boot design D1).
+ *
+ * The one input to the takeover screen, and the one command that answers on
+ * EVERY boot path: it extracts only `BootState`, which `setup` manages exactly
+ * once at the top level, outside every bail arm. `stateStoreStatus` above does
+ * NOT answer on a degraded arm — the `DbHandle` it reads is managed inside the
+ * one arm that succeeded — so the banner it feeds cannot cover these states and
+ * the takeover is what covers them instead.
+ *
+ * `home`, `path` and `reason` are rendered verbatim: `reason` is raw OS text
+ * (*Permission denied (os error 13)*), and on `runDirUnusable` the path and the
+ * errno ARE the payload — that is the whole of what makes it a user-fixable
+ * permissions problem rather than a mystery.
+ */
+export async function bootStatus(): Promise<BootStatusDto> {
+	return unwrap(commands.bootStatus());
 }
 export async function listServices(): Promise<ServiceStatus[]> {
 	return unwrap(commands.listServices());

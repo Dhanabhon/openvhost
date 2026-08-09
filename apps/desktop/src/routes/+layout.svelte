@@ -15,10 +15,13 @@
 		type PendingInstallDto
 	} from '$lib/ipc';
 	import { errorMessage } from '$lib/errors';
+	import { bootStatusStore } from '$lib/boot-status.shared.svelte';
+	import { bootRendering } from '$lib/boot-status.svelte';
 	import { servicesStore } from '$lib/services.shared.svelte';
 	import { statsStore } from '$lib/stats.shared.svelte';
 	import { storeStatusStore } from '$lib/store-status.shared.svelte';
 	import { pendingServiceNames } from '$lib/services.derive';
+	import BootTakeover from '$lib/components/BootTakeover.svelte';
 	import QuitDialog from '$lib/components/QuitDialog.svelte';
 
 	let { children } = $props();
@@ -32,6 +35,11 @@
 	// Read live, not snapshotted when the dialog opened: a service that stops while
 	// the user reads the dialog should drop out of the sentence.
 	const pending = $derived(pendingServiceNames(servicesStore.services));
+	// What this window should be showing at all (degraded-boot design D2). The
+	// decision is a pure function of the two things the store knows, so the four
+	// cases can be argued in `boot-status.svelte.ts` and tested without a DOM;
+	// the template below only routes them.
+	const rendering = $derived(bootRendering(bootStatusStore.status, bootStatusStore.askFailed));
 	// An install (PHP or MySQL alike — review fix wave, Important 1) in
 	// progress is invisible to `pending` — it is not a supervised service —
 	// so it is fetched separately, once, at the moment the dialog is about
@@ -131,6 +139,24 @@
 		};
 	});
 
+	// How far this launch got — asked HERE, once, and it is the question that
+	// decides whether there is an app to show at all (degraded-boot design D2).
+	//
+	// Its own `onMount`, separate from every other one in this file, for the
+	// reason they are all separate: no failure may take another down. That
+	// matters more here than anywhere else — this is the one ask that still
+	// answers when almost nothing else does, so it must not be sequenced behind
+	// a supervisor subscription that cannot succeed on the very boots this
+	// exists to describe.
+	//
+	// Asked once and never re-asked: `BootState` is managed once in `setup` and
+	// never replaced, so the answer cannot change while the app is running.
+	// `load()` resolves rather than rejects — a failed ask becomes `askFailed`,
+	// which renders the children plus a banner rather than a takeover.
+	onMount(() => {
+		void bootStatusStore.load();
+	});
+
 	// Whether `state.db` opened this run — asked HERE, once, for the same reason the
 	// supervisor snapshot is: the answer is app-level rather than page-level (the
 	// store is down everywhere, not on one route), and the layout is the one
@@ -214,7 +240,28 @@
 </script>
 
 <svelte:head><link rel="icon" href={favicon} /></svelte:head>
-{@render children()}
+<!-- The gate (design D2). All four `BootRendering` kinds are named here rather
+     than three plus a fallthrough: an unnamed branch is how a fifth state comes
+     to inherit a fourth's screen, which is the failure `bootRendering`'s own
+     `never` arm exists to stop at compile time. -->
+{#if rendering.kind === 'pending'}
+	<!-- Nothing yet, and that is a THIRD answer rather than a shortcut to one of
+	     the other two. Rendering the children here would mount the real pages on
+	     a degraded launch, fire the commands that cannot answer, and leave spec
+	     §9.1 — no page shows Tauri's `.manage()` string — depending on
+	     `boot_status` winning a race against them. Rendering the takeover here
+	     would put a failure screen in front of every healthy launch for a frame.
+	     A local IPC round trip is what this waits on, not a network. -->
+{:else if rendering.kind === 'takeover'}
+	<BootTakeover boot={rendering.boot} {quitting} {quitError} onQuit={onConfirmQuit} />
+{:else if rendering.kind === 'app' || rendering.kind === 'appDespiteFailedAsk'}
+	<!-- Both kinds render the children, and only `appDespiteFailedAsk` also owes
+	     a banner — which AppShell renders, because `.window` is a `height: 100%`
+	     grid and a banner beside it would push the titlebar out of the window.
+	     They stay two kinds rather than one so that debt cannot be dropped
+	     silently. -->
+	{@render children()}
+{/if}
 {#if quitOpen}
 	<QuitDialog
 		{pending}
