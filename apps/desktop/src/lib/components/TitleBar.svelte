@@ -2,7 +2,15 @@
 <script lang="ts">
 	import StatusPill from './StatusPill.svelte';
 
-	let { runningCount }: { runningCount: number } = $props();
+	// `null` means "this window has no supervisor to report on", and renders NO
+	// pill at all. It exists for the degraded-boot takeover (design D6), which
+	// reuses this titlebar for its traffic-light inset and drag region but has
+	// no `Arc<Supervisor>` behind it — `0 running` there would be a plausible
+	// lie of exactly the kind this project keeps getting burned by: on the
+	// `alreadyRunning` screen the other instance IS serving the user's sites,
+	// and a pill claiming zero would send them looking for damage that is not
+	// there. Every ordinary route still passes a number and is unaffected.
+	let { runningCount }: { runningCount: number | null } = $props();
 </script>
 
 <!-- `data-tauri-drag-region="deep"` (NOT the bare attribute): tauri's drag script only starts a
@@ -13,7 +21,9 @@
      See titlebar.drag.test.ts for the full contract. -->
 <div class="titlebar" data-tauri-drag-region="deep">
 	<div class="titlebar-name"><b>OpenVHost</b></div>
-	<StatusPill kind="running" label="{runningCount} running" />
+	{#if runningCount !== null}
+		<StatusPill kind="running" label="{runningCount} running" />
+	{/if}
 </div>
 
 <style>

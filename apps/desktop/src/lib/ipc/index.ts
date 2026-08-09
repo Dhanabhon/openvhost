@@ -12,6 +12,7 @@ import type { PackageKind, UninstallPlan } from '../uninstall.derive';
 import type {
 	ApplyOutcomeDto,
 	ApplyPlanDto,
+	BootStatusDto,
 	CoreInfo,
 	CreateSiteResult,
 	DefaultPhpDto,
@@ -88,6 +89,7 @@ import type {
 export type {
 	ApplyOutcomeDto,
 	ApplyPlanDto,
+	BootStatusDto,
 	CoreInfo,
 	CreateSiteResult,
 	DefaultPhpDto,
@@ -223,6 +225,49 @@ async function unwrap<T>(
  */
 export async function stateStoreStatus(): Promise<string | null> {
 	return unwrap(commands.stateStoreStatus());
+}
+
+/**
+ * How far this launch actually got (degraded-boot design D1).
+ *
+ * The one input to the takeover screen, and the one command that answers on
+ * EVERY boot path: it extracts only `BootState`, which `setup` manages exactly
+ * once at the top level, outside every bail arm. `stateStoreStatus` above does
+ * NOT answer on a degraded arm — the `DbHandle` it reads is managed inside the
+ * one arm that succeeded — so the banner it feeds cannot cover these states and
+ * the takeover is what covers them instead.
+ *
+ * `home`, `path` and `reason` are rendered verbatim: `reason` is raw OS text
+ * (*Permission denied (os error 13)*), and on `runDirUnusable` the path and the
+ * errno ARE the payload — that is the whole of what makes it a user-fixable
+ * permissions problem rather than a mystery.
+ */
+export async function bootStatus(): Promise<BootStatusDto> {
+	return unwrap(commands.bootStatus());
+}
+
+/**
+ * Show the unusable run directory in Finder (degraded-boot design D3).
+ *
+ * **Takes no path, and that is the point.** Rust reads the same `BootState`
+ * `bootStatus` reports and reveals only `runDirUnusable`'s own directory; every
+ * other state refuses. So this is not a "reveal any folder" primitive the
+ * renderer gained — it can only ask for the folder it was already told about.
+ * The same reason `openHomebrewSite` takes no URL.
+ *
+ * **Can reject, and the caller must render it — but it does not always.** On
+ * macOS the only fallible step is the `canonicalize` `reveal_item_in_dir` does
+ * first; the AppKit call after it returns `Ok(())` unconditionally. So the route
+ * that produced `runDirUnusable` decides, and both were measured: a read-only
+ * `<home>` with `run` absent, or a dangling symlink at the `run` path, leaves
+ * nothing to resolve and comes back *could not show `<home>/run` in Finder: No
+ * such file or directory (os error 2)*, while a plain FILE at the `run` path
+ * resolves fine and the button simply opens Finder. See `reveal_run_dir`'s own
+ * doc comment for the errnos. The screen shows the path as copyable text
+ * regardless — that half never fails.
+ */
+export async function revealRunDir(): Promise<void> {
+	await unwrap(commands.revealRunDir());
 }
 export async function listServices(): Promise<ServiceStatus[]> {
 	return unwrap(commands.listServices());

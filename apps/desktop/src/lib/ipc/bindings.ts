@@ -27,6 +27,60 @@ export const commands = {
 	 *  renders.
 	 */
 	stateStoreStatus: () => typedError<string | null, IpcError>(__TAURI_INVOKE("state_store_status")),
+	/**
+	 *  How far the boot got — what `+layout.svelte` gates the whole app on.
+	 * 
+	 *  Zero-arg: there is nothing to validate, and a caller learns only what the app
+	 *  already renders. `Result` with an error that never occurs, like
+	 *  `state_store_status` and `pending_install`: this is a status read with
+	 *  nothing to fail, and every command on this surface shares the one envelope
+	 *  the frontend's `unwrap` understands.
+	 * 
+	 *  **This command answers on every boot path**, which is the whole point — it
+	 *  extracts only [`BootState`], and `lib.rs` manages that outside every arm.
+	 */
+	bootStatus: () => typedError<BootStatusDto, IpcError>(__TAURI_INVOKE("boot_status")),
+	/**
+	 *  Show the unusable run directory in Finder — the other half of the run-dir
+	 *  takeover screen's action row (design D3), beside Quit.
+	 * 
+	 *  **Zero arguments, and the path comes from managed state.** That is the whole
+	 *  security posture, and it is the same one `open_homebrew_site` and `open_site`
+	 *  are built on: granting the webview `opener:allow-open-url` (or
+	 *  `opener:allow-reveal-item-in-dir`) would hand the renderer a general "open any
+	 *  path" primitive, so `capabilities/default.json` grants no `opener:*` at all
+	 *  and every opener call in this app goes through the plugin's **Rust** API
+	 *  instead — which the ACL does not gate because the ACL gates the JS-to-plugin
+	 *  path. The renderer names nothing here: it can ask *"reveal the folder you
+	 *  already told me about"* and nothing else, so it gains no primitive it did not
+	 *  have.
+	 * 
+	 *  `reveal_item_in_dir`, not `open_path`: this selects `run` **inside its
+	 *  parent**, which is where the fix usually is — the screen's own copy says the
+	 *  problem may be *"this folder, or the folder containing it"* — whereas opening
+	 *  the run directory itself would show the user an empty window.
+	 * 
+	 *  **This can fail, and the screen must say so — but it does not always fail,
+	 *  and an earlier draft of this comment implied it did.** Measured against the
+	 *  plugin's own source: on macOS `reveal_item_in_dir`'s ONLY fallible step is
+	 *  `std::fs::canonicalize`; the AppKit call it then makes
+	 *  (`NSWorkspace::activateFileViewerSelectingURLs`) returns `Ok(())`
+	 *  unconditionally. So the route that produced [`BootState::RunDirUnusable`]
+	 *  decides, and the two measured routes differ:
+	 * 
+	 *  - A read-only `<home>` with `run` **absent** — *Permission denied (os error
+	 *    13)* — leaves nothing on disk, `canonicalize` fails, and this returns
+	 *    *could not show `<home>/run` in Finder: No such file or directory (os error
+	 *    2)*. A dangling symlink at the `run` path — *File exists (os error 17)* —
+	 *    fails the same way.
+	 *  - A **plain file** at the `run` path — also *File exists (os error 17)* —
+	 *    canonicalises fine, so the button **succeeds and opens Finder** with `run`
+	 *    selected beside its siblings, which is exactly where the fix is.
+	 * 
+	 *  Either way the screen keeps the path as selectable text: the button is a
+	 *  convenience, and the text is the thing that always works.
+	 */
+	revealRunDir: () => typedError<null, IpcError>(__TAURI_INVOKE("reveal_run_dir")),
 	listServices: () => typedError<ServiceStatus[], IpcError>(__TAURI_INVOKE("list_services")),
 	startService: (id: string) => typedError<null, IpcError>(__TAURI_INVOKE("start_service", { id })),
 	stopService: (id: string) => typedError<null, IpcError>(__TAURI_INVOKE("stop_service", { id })),
@@ -616,6 +670,35 @@ keg: string } |
  *  rather than merely discouraging.
  */
 searched: string[] };
+
+/**
+ *  [`BootState`] on the wire — what `+layout.svelte` gates the whole app on.
+ * 
+ *  A 1:1 copy rather than a reuse, for two reasons that are both load-bearing:
+ *  `BootState` holds a live `PathBuf` (not serializable as the UI wants to read
+ *  it), and the wire field names have to survive a trap this repo has already
+ *  been bitten by — **`rename_all` on an enum renames its VARIANTS, not its
+ *  fields.** Every tagged enum on this command surface therefore uses
+ *  single-word fields, and so does this one: `path`, not `run_dir`, is what
+ *  keeps the wire shape honest without an untested serde attribute.
+ */
+export type BootStatusDto = 
+/**  The app is the app. `+layout.svelte` renders its children. */
+{ kind: "ready" } | 
+/**  Another instance holds the run lock on `home`. */
+{ kind: "alreadyRunning"; 
+/**  The contended `OPENVHOST_HOME`, for the screen to name. */
+home: string } | 
+/**  `<home>/run` is unusable; `path` and `reason` are both the payload. */
+{ kind: "runDirUnusable"; 
+/**  The `<home>/run` directory — also what "Reveal in Finder" opens. */
+path: string; 
+/**  The OS error, **verbatim**. Render it; do not summarise it. */
+reason: string } | 
+/**  `OPENVHOST_HOME` would not resolve, so there is no path to reveal. */
+{ kind: "homeUnresolvable"; 
+/**  Why it would not resolve, verbatim. */
+reason: string };
 
 /**
  *  Basic environment facts, assembled by core (not by the Tauri command —

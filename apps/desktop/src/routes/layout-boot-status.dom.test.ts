@@ -1,0 +1,671 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The wiring nothing else can see: that the LAYOUT actually asks how far this
+// launch got, and that the answer decides whether there is an app on screen at
+// all.
+//
+// This file exists because the parts passing is not the same as the product
+// working — a lesson this project paid for once already (five UI-glue defects
+// that every per-part test was blind to), and once more since (a store with no
+// tests at all is how a whole feature's wiring went missing).
+// `boot-status.svelte.test.ts` proves the decision, `BootTakeover.svelte.
+// test.ts` proves the markup; only this one can fail when nobody ever asks the
+// question, or when the answer reaches nothing.
+//
+// It is also the only place that can prove the children are GENUINELY GATED
+// rather than visually covered: SSR markup would show a takeover drawn over a
+// page that is still there, and "still there" means every command on it has
+// already been fired at a backend that cannot answer.
+//
+// The seam is mocked at `@tauri-apps/api/core`'s `invoke`, NOT at `$lib/ipc`
+// (the pattern `lib/ipc/ipc.test.ts` established), so everything above the wire
+// is the real thing: a layout that called the wrong command name fails here.
+//
+// Runs under the `dom` (jsdom) vitest project — `svelte/server` never runs
+// `onMount`, so no SSR test can reach this state at all.
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+let handlers: Record<string, () => unknown> = {};
+/** Every command the layout invoked, in order. */
+let asked: string[] = [];
+
+const invokeMock = vi.fn(async (cmd: string) => {
+	asked.push(cmd);
+	const handler = handlers[cmd];
+	// A plain object, not an Error: the generated `typedError` rethrows real
+	// `Error`s and would escape the caller's own catch.
+	if (handler === undefined) throw { kind: 'core', message: `no handler for ${cmd}` };
+	return handler();
+});
+
+vi.mock('@tauri-apps/api/core', () => ({
+	invoke: (...args: unknown[]) => invokeMock(...(args as [string]))
+}));
+vi.mock('@tauri-apps/api/event', () => ({
+	listen: vi.fn(async () => () => {}),
+	once: vi.fn(async () => () => {}),
+	emit: vi.fn(async () => {})
+}));
+
+import { createRawSnippet, mount, tick, unmount } from 'svelte';
+import Layout from './+layout.svelte';
+import { bootStatusStore } from '$lib/boot-status.shared.svelte';
+import { servicesStore } from '$lib/services.shared.svelte';
+import { statsStore } from '$lib/stats.shared.svelte';
+import { storeStatusStore } from '$lib/store-status.shared.svelte';
+import type { BootStatusDto } from '$lib/ipc';
+
+const HOME = '/Users/tom/.openvhost';
+const RUN_DIR = '/Users/tom/.openvhost/run';
+const ERRNO_13 = 'Permission denied (os error 13)';
+
+/** A stand-in for whatever page the layout happens to be wrapping. The layout's
+ *  own behaviour is what is under test, so the child is deliberately inert —
+ *  and its ABSENCE is what proves the gate really gates. */
+const children = createRawSnippet(() => ({ render: () => '<div data-testid="page"></div>' }));
+
+let host: HTMLElement;
+let instance: object | null = null;
+
+beforeEach(async () => {
+	// Discard `ServicesStore`'s memoized snapshot FIRST. `loadServices()` dedupes
+	// on a module singleton (`this.snapshot ??= …`) that nothing here resets, so
+	// without this only the very first test in the file would ever see
+	// `list_services` on the wire — and every `asked` assertion about it,
+	// including the negative ones that prove the degraded gate, would be reading
+	// the memo rather than the layout. Driven through the public API with no
+	// handler registered, because a rejected fetch is exactly what clears the memo
+	// (`fetchServices`'s catch sets `snapshot = null`); everything it dirties is
+	// reset immediately below.
+	handlers = {};
+	await servicesStore.reload();
+
+	asked = [];
+	// `list_services` succeeds so a supervisor failure can never be the reason
+	// something below is or is not true. Everything else is left unhandled on
+	// purpose: those stores capture their own failures, and this test is about
+	// one command.
+	handlers = { list_services: () => [] };
+	servicesStore.services = [];
+	servicesStore.error = null;
+	storeStatusStore.reason = null;
+	storeStatusStore.lastError = null;
+	bootStatusStore.status = null;
+	bootStatusStore.askFailed = null;
+	host = document.createElement('div');
+	document.body.appendChild(host);
+});
+
+afterEach(() => {
+	if (instance !== null) unmount(instance);
+	instance = null;
+	host.remove();
+	// The stats store is a module singleton with live `setInterval` timers. The
+	// layout's own teardown stops them, but this makes it unconditional: a test
+	// that mounted a POLLING layout must not leave a timer running into the next
+	// one, where it would show up as a `services_memory` nobody in that test asked
+	// for.
+	statsStore.stop();
+	invokeMock.mockClear();
+});
+
+/** Lets every already-resolved read land. Several turns, because the reads chain
+ *  through `typedError` → `unwrap` → the store's own assignment before Svelte
+ *  re-renders — and, for anything gated on the boot answer, before the effect
+ *  that reads it re-runs. */
+async function settle(): Promise<void> {
+	for (let i = 0; i < 6; i++) {
+		await Promise.resolve();
+		await tick();
+	}
+}
+
+/** Mounts the layout and lets every already-resolved read settle. */
+async function mountLayout(): Promise<void> {
+	instance = mount(Layout, { target: host, props: { children } });
+	await settle();
+}
+
+function answer(dto: BootStatusDto): void {
+	handlers.boot_status = () => dto;
+}
+
+/** Whether the wrapped page is in the DOM at all — not whether it is visible. */
+function pageIsRendered(): boolean {
+	return host.querySelector('[data-testid="page"]') !== null;
+}
+
+function takeover(): HTMLElement | null {
+	return host.querySelector('[data-testid="boot-takeover"]');
+}
+
+describe('the layout’s boot ask', () => {
+	// Vacuity, measured: emptying the layout's `onMount(() => { void
+	// bootStatusStore.load(); })` — the whole of the wiring — reddened twelve of
+	// this file's tests. The two that survived it were both assertions that could
+	// not fail on a layout rendering no takeover at all, and both were rewritten
+	// to state their premise first rather than left as measured.
+
+	it('really does ask the backend how far the boot got', async () => {
+		answer({ kind: 'ready' });
+		await mountLayout();
+		expect(asked).toContain('boot_status');
+	});
+
+	it('asks once, not once per settle turn', async () => {
+		answer({ kind: 'ready' });
+		await mountLayout();
+		expect(asked.filter((c) => c === 'boot_status')).toHaveLength(1);
+	});
+});
+
+describe('a ready boot', () => {
+	it('renders the app, and no takeover at all', async () => {
+		answer({ kind: 'ready' });
+		await mountLayout();
+		expect(pageIsRendered()).toBe(true);
+		expect(takeover()).toBeNull();
+	});
+});
+
+describe('a boot whose answer has not arrived yet', () => {
+	// The transient state, and the ONLY place it can be observed: every other
+	// test in this file asserts after the answer has landed.
+	//
+	// It is here because of a measured hole. Collapsing the layout's four-way
+	// chain to the obvious two-way one —
+	//
+	//     {#if rendering.kind === 'takeover'} … {:else} {@render children()} {/if}
+	//
+	// which is the simplification any reader would reach for, and which renders
+	// the app for a launch that has not answered yet — left the ENTIRE suite
+	// green before this test existed. It is now the only test that fails on it.
+	//
+	// It matters because it is what makes "no page shows Tauri's `.manage()`
+	// string" structural rather than a race: children rendered here would mount
+	// the real pages and fire every command they load on before `boot_status` had
+	// said whether any of them can answer.
+
+	it('shows neither the app nor a takeover while the ask is still in flight', async () => {
+		let release: (dto: BootStatusDto) => void = () => {};
+		handlers.boot_status = () =>
+			new Promise<BootStatusDto>((resolve) => {
+				release = resolve;
+			});
+		await mountLayout();
+		expect(asked).toContain('boot_status');
+		expect(pageIsRendered()).toBe(false);
+		expect(takeover()).toBeNull();
+
+		// …and it is WAITING, not wedged. Without this half the test above would
+		// also pass on a layout that renders nothing ever.
+		release({ kind: 'ready' });
+		for (let i = 0; i < 6; i++) {
+			await Promise.resolve();
+			await tick();
+		}
+		expect(pageIsRendered()).toBe(true);
+	});
+});
+
+describe('each degraded state renders its own screen', () => {
+	// Vacuity, measured: changing the layout's `{:else if rendering.kind ===
+	// 'takeover'}` branch to render `{@render children()}` reddened all three
+	// screens and all three gating tests here, and left `a ready boot` green.
+	//
+	// Each screen assertion binds `takeover()` and asserts THAT first, for the
+	// reason spelled out at `keeps the window movable …` below: written as
+	// `expect(takeover()?.querySelector(…)).not.toBeNull()`, optional chaining on
+	// a missing takeover yields `undefined` and `expect(undefined).not.toBeNull()`
+	// PASSES, so the first assertion of each test was dead weight. (Only the
+	// first: the `.textContent` assertions that follow do fail on `undefined`, so
+	// no regression was ever going unseen — review fix wave, Medium 1.)
+	//
+	// Measured after the change: under the mutation above, all three now fail on
+	// `expect(screen).not.toBeNull()` — the premise itself — rather than several
+	// lines later on a stringified `undefined`.
+
+	it('says another instance holds the lock, and names the folder', async () => {
+		answer({ kind: 'alreadyRunning', home: HOME });
+		await mountLayout();
+		const screen = takeover();
+		expect(screen).not.toBeNull();
+		expect(screen?.querySelector('[data-testid="boot-already-running"]')).not.toBeNull();
+		expect(host.textContent).toContain('OpenVHost is already running');
+		expect(host.textContent).toContain(HOME);
+	});
+
+	it('names the run directory and the OS error, verbatim', async () => {
+		answer({ kind: 'runDirUnusable', path: RUN_DIR, reason: ERRNO_13 });
+		await mountLayout();
+		const screen = takeover();
+		expect(screen).not.toBeNull();
+		expect(screen?.querySelector('[data-testid="boot-run-dir-unusable"]')).not.toBeNull();
+		expect(host.querySelector('[data-testid="boot-run-dir"]')?.textContent).toBe(RUN_DIR);
+		expect(host.querySelector('[data-testid="boot-reason"]')?.textContent).toBe(ERRNO_13);
+	});
+
+	it('passes a different path and errno all the way through the wire', async () => {
+		// The control: a screen printing one canned string would satisfy the test
+		// above just as well. The store slice's own technique — `os error 13`
+		// present, a different errno absent — carried across the whole seam this
+		// time rather than one component.
+		answer({
+			kind: 'runDirUnusable',
+			path: '/Volumes/Data/openvhost/run',
+			reason: 'Read-only file system (os error 30)'
+		});
+		await mountLayout();
+		expect(host.querySelector('[data-testid="boot-run-dir"]')?.textContent).toBe(
+			'/Volumes/Data/openvhost/run'
+		);
+		expect(host.querySelector('[data-testid="boot-reason"]')?.textContent).toBe(
+			'Read-only file system (os error 30)'
+		);
+		expect(host.textContent).not.toContain('os error 13');
+	});
+
+	it('says where the files should go when the home would not resolve', async () => {
+		answer({ kind: 'homeUnresolvable', reason: 'home directory unavailable' });
+		await mountLayout();
+		const screen = takeover();
+		expect(screen).not.toBeNull();
+		expect(screen?.querySelector('[data-testid="boot-home-unresolvable"]')).not.toBeNull();
+		expect(host.querySelector('[data-testid="boot-reason"]')?.textContent).toBe(
+			'home directory unavailable'
+		);
+		expect(host.textContent).toContain('OPENVHOST_HOME');
+	});
+});
+
+describe('the gate really gates', () => {
+	// The distinction SSR cannot draw. A takeover drawn OVER a page that is still
+	// mounted has already let that page fire every command it loads on, at a
+	// backend where almost none of them can answer — which is how Tauri's
+	// `.manage()` string reaches a user in the first place.
+	const degraded: Array<[string, BootStatusDto]> = [
+		['alreadyRunning', { kind: 'alreadyRunning', home: HOME }],
+		['runDirUnusable', { kind: 'runDirUnusable', path: RUN_DIR, reason: ERRNO_13 }],
+		['homeUnresolvable', { kind: 'homeUnresolvable', reason: 'home directory unavailable' }]
+	];
+
+	it.each(degraded)('removes the app from the DOM entirely on %s', async (_name, dto) => {
+		answer(dto);
+		await mountLayout();
+		expect(takeover()).not.toBeNull();
+		expect(pageIsRendered()).toBe(false);
+	});
+
+	it('shows Tauri’s own refusal string nowhere on any of the three', async () => {
+		for (const [, dto] of degraded) {
+			answer(dto);
+			await mountLayout();
+			// The premise, asserted first: without it this test passes on a layout
+			// that renders nothing at all, which is not what it claims to prove.
+			expect(takeover()).not.toBeNull();
+			expect(host.textContent).not.toContain('.manage()');
+			if (instance !== null) unmount(instance);
+			instance = null;
+			bootStatusStore.status = null;
+			bootStatusStore.askFailed = null;
+		}
+	});
+
+	it('keeps the window movable on the takeover, not just on the app', async () => {
+		// A degraded window the user can neither move nor position to reach the
+		// close button is worse than the bug this screen exists to fix, and this is
+		// the only assertion that sees the takeover in a real document.
+		answer({ kind: 'runDirUnusable', path: RUN_DIR, reason: ERRNO_13 });
+		await mountLayout();
+		const screen = takeover();
+		// Not `takeover()?.querySelector(…)`: optional chaining on a missing
+		// takeover yields `undefined`, and `expect(undefined).not.toBeNull()`
+		// PASSES — the assertion would survive the takeover disappearing entirely.
+		expect(screen).not.toBeNull();
+		expect(screen?.querySelector('[data-tauri-drag-region="deep"]')).not.toBeNull();
+	});
+});
+
+describe('an ask that itself failed', () => {
+	// Vacuity, measured: making `bootRendering` return `{ kind: 'pending' }` for
+	// a failed ask — copying the store slice's silence into a gate — reddened
+	// `renders the app anyway` here and left every other group in this file
+	// green. `records the failure …` survived it, correctly: it pins the value
+	// the banner reads, not the gate, and those are two different failures.
+
+	it('renders the app anyway, never a blank window', async () => {
+		// No handler for `boot_status` at all, so the invoke rejects.
+		await mountLayout();
+		expect(asked).toContain('boot_status');
+		expect(pageIsRendered()).toBe(true);
+		expect(takeover()).toBeNull();
+	});
+
+	it('records the failure where the app-level banner reads it', async () => {
+		// The banner itself lives in AppShell (a `height: 100%` grid cannot take a
+		// sibling), so what this seam owes is the value it renders from —
+		// `routes.test.ts` proves the banner reaches every page.
+		await mountLayout();
+		expect(bootStatusStore.askFailed).not.toBeNull();
+		expect(bootStatusStore.status).toBeNull();
+	});
+});
+
+describe('the Reveal in Finder button', () => {
+	// The one thing `BootTakeover.svelte.test.ts` structurally cannot prove: that
+	// the button is wired to a command that EXISTS, under the name Rust registered.
+	// The seam is mocked at `invoke`, so a layout calling `revealRunDirectory` or
+	// passing an argument fails here and nowhere else.
+	//
+	// Vacuity, measured over the whole desktop suite: replacing the layout's
+	// `onReveal={onRevealRunDir}` with `onReveal={() => {}}` — a button wired to
+	// nothing, which is precisely the defect a component-level test cannot see —
+	// reddened 2 of 1599, `reaches the backend …` and `says so when the reveal
+	// fails …`, and nothing else anywhere. Emptying the `catch` in
+	// `onRevealRunDir` so the rejection is swallowed reddened `says so when the
+	// reveal fails …` alone (1 of 1599).
+
+	/** The takeover's Reveal button, or `null`. */
+	function revealButton(): HTMLButtonElement | null {
+		return host.querySelector('[data-testid="boot-reveal"]');
+	}
+
+	it('reaches the backend, by the name Rust registered and with no path of its own', async () => {
+		handlers.reveal_run_dir = () => null;
+		answer({ kind: 'runDirUnusable', path: RUN_DIR, reason: ERRNO_13 });
+		await mountLayout();
+
+		const button = revealButton();
+		// The premise, asserted first: `null?.click()` would throw, but an
+		// `expect(asked).toContain(…)` after a missing button would just be a
+		// confusing failure rather than a clear one.
+		expect(button).not.toBeNull();
+		button?.click();
+		await settle();
+
+		expect(asked).toContain('reveal_run_dir');
+		// Zero-argument is the security posture, not a detail: the renderer names
+		// no path, so it gains no "reveal any folder" primitive. `invoke` is called
+		// with the command name and, for a no-arg command, nothing meaningful after
+		// it.
+		const call = invokeMock.mock.calls.find(([cmd]) => cmd === 'reveal_run_dir');
+		expect(call).toBeDefined();
+		expect(call?.slice(1)).toEqual([]);
+	});
+
+	it('says so when the reveal fails, instead of leaving a dead button on an error screen', async () => {
+		// The likeliest real case: the run directory could not be CREATED, so
+		// there is nothing on disk for Finder to select. No handler is registered
+		// for `reveal_run_dir`, so the invoke rejects exactly as it would then.
+		answer({ kind: 'runDirUnusable', path: RUN_DIR, reason: ERRNO_13 });
+		await mountLayout();
+
+		const button = revealButton();
+		expect(button).not.toBeNull();
+		// The error slot must be absent BEFORE the click, or "it appeared" proves
+		// nothing about the click.
+		expect(host.querySelector('[data-testid="boot-reveal-error"]')).toBeNull();
+		button?.click();
+		await settle();
+
+		const shown = host.querySelector('[data-testid="boot-reveal-error"]');
+		expect(shown).not.toBeNull();
+		expect(shown?.textContent).toContain('no handler for reveal_run_dir');
+	});
+
+	it('is absent on the screens that named no folder, so nothing can reveal the wrong one', async () => {
+		for (const dto of [
+			{ kind: 'alreadyRunning', home: HOME } as const,
+			{ kind: 'homeUnresolvable', reason: 'home directory unavailable' } as const
+		]) {
+			answer(dto);
+			await mountLayout();
+			// The premise: without it this passes on a layout rendering no takeover.
+			expect(takeover()).not.toBeNull();
+			expect(revealButton()).toBeNull();
+			if (instance !== null) unmount(instance);
+			instance = null;
+			bootStatusStore.status = null;
+			bootStatusStore.askFailed = null;
+		}
+	});
+});
+
+describe('the app-level asks', () => {
+	// The other half of "no page shows Tauri's `.manage()` string", and the half
+	// that was left to luck. `list_services` extracts `State<Arc<Supervisor>>` and
+	// `state_store_status` extracts a `DbHandle` — both managed inside the ONE
+	// boot arm that succeeded (`db_state.rs`'s module header says so of the
+	// second) — so on a degraded boot both really do come back as *"…You must call
+	// `.manage()` before using this command"*, and `normalizeError` puts that
+	// verbatim into `IpcError.message`. Neither reached a user only because the
+	// stores that render them (the Services page's banner, AppShell's
+	// store-unavailable banner) live inside `children`, which the takeover removes
+	// from the DOM. That made spec §9.1 a property of what happens to be rendered.
+	// These gate it in the code, the same way the status-bar poll below is gated.
+	//
+	// Vacuity, measured over the whole desktop suite. Two mutations:
+	//
+	//   * gate deleted (`if (servicesWired) return;` / `if (storeStatusAsked)
+	//     return;` — the effect then fires on its first run, at mount, exactly as
+	//     the `onMount` this replaced did): the three `asks neither on a degraded
+	//     boot` cases plus `asks neither before the boot answer arrives …` went
+	//     red — 4 of 1607.
+	//   * gate inverted (`|| appIsOnScreen(rendering)`): the same four, plus three
+	//     in `layout-store-status.dom.test.ts` — 7 of 1607.
+	//
+	// Read the survivors honestly, because they are the point. An inverted gate
+	// asks BOTH commands — during `pending`, at mount — so `asks both once the app
+	// is on screen`, `asks both anyway when the ask itself failed` and `asks each
+	// exactly once` all still found them in `asked` and passed. Only `asks neither
+	// before the boot answer arrives …` distinguishes "asked at the right time"
+	// from "asked at all", which is why it is written holding the answer back
+	// rather than asserting against a settled mount — the same trap the poll group
+	// below documents, and the same shape of answer.
+	//
+	// The positive tests are not thereby redundant, and a third mutation is what
+	// shows it: `appIsOnScreen` pinned to `false` — a gate that never opens —
+	// reddened all four of them and left all three `asks neither on a degraded
+	// boot` cases green (15 of 1607 across the suite, the rest of them the poll
+	// group below and `layout-store-status.dom.test.ts`). The two halves fail on
+	// opposite mutations and neither covers the other.
+
+	/** Every app-level ask that cannot answer on a degraded boot. */
+	function appAsks(): string[] {
+		return asked.filter((c) => c === 'list_services' || c === 'state_store_status');
+	}
+
+	it('asks both once the app is on screen', async () => {
+		answer({ kind: 'ready' });
+		await mountLayout();
+		expect(pageIsRendered()).toBe(true);
+		expect(asked).toContain('list_services');
+		expect(asked).toContain('state_store_status');
+	});
+
+	it.each([
+		['alreadyRunning', { kind: 'alreadyRunning', home: HOME }],
+		['runDirUnusable', { kind: 'runDirUnusable', path: RUN_DIR, reason: ERRNO_13 }],
+		['homeUnresolvable', { kind: 'homeUnresolvable', reason: 'home directory unavailable' }]
+	] as Array<[string, BootStatusDto]>)('asks neither on a degraded boot (%s)', async (_n, dto) => {
+		answer(dto);
+		await mountLayout();
+		// The premise: this must be the degraded path, not a layout that rendered
+		// nothing and therefore asked for nothing.
+		expect(takeover()).not.toBeNull();
+		expect(appAsks()).toEqual([]);
+	});
+
+	it('asks neither before the boot answer arrives, and both once it does', async () => {
+		let release: (dto: BootStatusDto) => void = () => {};
+		handlers.boot_status = () =>
+			new Promise<BootStatusDto>((resolve) => {
+				release = resolve;
+			});
+		await mountLayout();
+		expect(asked).toContain('boot_status');
+		expect(appAsks()).toEqual([]);
+
+		// …and it is WAITING, not permanently off: without this half the assertion
+		// above would also pass on a layout that never asks at all.
+		release({ kind: 'ready' });
+		await settle();
+		expect(asked).toContain('list_services');
+		expect(asked).toContain('state_store_status');
+	});
+
+	it('asks both anyway when the ask itself failed, rather than crippling a healthy app', async () => {
+		// No handler for `boot_status`, so the ask rejects and the children render.
+		// The machine underneath is probably fine, and a titlebar count stuck at
+		// zero would be a second lie about it — the same reasoning `appIsOnScreen`
+		// gives for tying the gate to "are the children rendered".
+		await mountLayout();
+		expect(pageIsRendered()).toBe(true);
+		expect(asked).toContain('list_services');
+		expect(asked).toContain('state_store_status');
+	});
+
+	it('asks each exactly once, not once per settle turn', async () => {
+		answer({ kind: 'ready' });
+		await mountLayout();
+		expect(asked.filter((c) => c === 'list_services')).toHaveLength(1);
+		expect(asked.filter((c) => c === 'state_store_status')).toHaveLength(1);
+	});
+});
+
+describe('the status-bar poll', () => {
+	// `statsStore` runs a 2 s `services_memory` and a 60 s `home_disk_usage`
+	// interval. On a degraded boot neither command can ever answer — the supervisor
+	// and the stack paths they read are managed inside the one arm that succeeded —
+	// and nothing renders the result, so an ungated poll is a timer that can only
+	// fail, running behind a screen whose whole message is that the app never
+	// started.
+	//
+	// Vacuity, measured over the whole desktop suite. Two mutations, and the FIRST
+	// pass through them is why the two "polls" tests below are written the way they
+	// are — see their own note.
+	//
+	//   * gate deleted (`if (windowIsVisible) statsStore.start()`, the shape this
+	//     replaced): all 7 of this group red.
+	//   * gate inverted (`!appIsOnScreen(rendering)`): all 7 red as well.
+	//
+	// Both mutations redden the same seven, but not on the same assertions, and
+	// that is the honest reading: an ungated poll and an inverted one BOTH sample
+	// during `pending`, so both trip the premise `expect(samples()).toEqual([])`.
+	// What separates them from a gate that never polls at all is `appIsOnScreen`
+	// pinned to `false`, which leaves every `never starts on a degraded boot` case
+	// green (recorded in `boot-status.svelte.test.ts`).
+
+	/** Every sample the layout actually asked for. */
+	function samples(): string[] {
+		return asked.filter((c) => c === 'services_memory' || c === 'home_disk_usage');
+	}
+
+	// Both "polls" tests hold the answer and release it, rather than asserting
+	// against a settled mount. That is not ceremony: an INVERTED gate polls during
+	// `pending` and then stops, so a test that only looked at the end of the run
+	// would find `services_memory` in `asked` and call it a pass. Measured — the
+	// straightforward version of both survived the inversion, which is why they
+	// are written this way.
+
+	it('polls on a ready boot, so a working app still has a status bar', async () => {
+		let release: (dto: BootStatusDto) => void = () => {};
+		handlers.boot_status = () =>
+			new Promise<BootStatusDto>((resolve) => {
+				release = resolve;
+			});
+		await mountLayout();
+		// The premise: nothing sampled yet, so what follows is caused by the answer.
+		expect(samples()).toEqual([]);
+
+		asked = [];
+		release({ kind: 'ready' });
+		await settle();
+		expect(pageIsRendered()).toBe(true);
+		expect(asked).toContain('services_memory');
+	});
+
+	it('polls anyway when the ask itself failed, rather than freezing a healthy strip', async () => {
+		// A rejected ask renders the children plus a banner. The machine underneath
+		// is probably fine, and a status bar stuck on "—" would be a second lie
+		// about it.
+		let fail: (e: unknown) => void = () => {};
+		handlers.boot_status = () =>
+			new Promise<BootStatusDto>((_resolve, reject) => {
+				fail = reject;
+			});
+		await mountLayout();
+		expect(samples()).toEqual([]);
+
+		asked = [];
+		fail({ kind: 'core', message: 'transport died' });
+		await settle();
+		expect(pageIsRendered()).toBe(true);
+		expect(asked).toContain('services_memory');
+	});
+
+	it.each([
+		['alreadyRunning', { kind: 'alreadyRunning', home: HOME }],
+		['runDirUnusable', { kind: 'runDirUnusable', path: RUN_DIR, reason: ERRNO_13 }],
+		['homeUnresolvable', { kind: 'homeUnresolvable', reason: 'home directory unavailable' }]
+	] as Array<[string, BootStatusDto]>)('never starts on a degraded boot (%s)', async (_n, dto) => {
+		answer(dto);
+		await mountLayout();
+		// The premise: this must be the degraded path, not a layout that rendered
+		// nothing and therefore asked for nothing.
+		expect(takeover()).not.toBeNull();
+		expect(samples()).toEqual([]);
+	});
+
+	it('does not poll before the boot answer arrives', async () => {
+		// The transient state. Starting here and stopping again would still have
+		// fired one `services_memory` at a backend that may be unable to answer —
+		// and the effect is what makes "not yet" different from "no".
+		let release: (dto: BootStatusDto) => void = () => {};
+		handlers.boot_status = () =>
+			new Promise<BootStatusDto>((resolve) => {
+				release = resolve;
+			});
+		await mountLayout();
+		expect(asked).toContain('boot_status');
+		expect(samples()).toEqual([]);
+
+		// …and it is WAITING, not permanently off: without this half the assertion
+		// above would also pass on a poll that never starts at all.
+		release({ kind: 'ready' });
+		for (let i = 0; i < 6; i++) {
+			await Promise.resolve();
+			await tick();
+		}
+		expect(asked).toContain('services_memory');
+	});
+
+	it('polls exactly when the app is on screen, state for state', async () => {
+		// The tie between the gate and the render condition. Two places encode
+		// "the children are rendered" — `appIsOnScreen` and the layout's `{#if}`
+		// chain — and this is what fails if they ever disagree.
+		const cases: Array<[string, BootStatusDto | null]> = [
+			['ready', { kind: 'ready' }],
+			['alreadyRunning', { kind: 'alreadyRunning', home: HOME }],
+			['runDirUnusable', { kind: 'runDirUnusable', path: RUN_DIR, reason: ERRNO_13 }],
+			['homeUnresolvable', { kind: 'homeUnresolvable', reason: 'home directory unavailable' }],
+			// `null` means no handler at all, so the ask rejects.
+			['a failed ask', null]
+		];
+		for (const [name, dto] of cases) {
+			asked = [];
+			if (dto === null) delete handlers.boot_status;
+			else answer(dto);
+			await mountLayout();
+			expect(samples().length > 0, `${name}: polled without the app on screen, or vice versa`).toBe(
+				pageIsRendered()
+			);
+			if (instance !== null) unmount(instance);
+			instance = null;
+			statsStore.stop();
+			bootStatusStore.status = null;
+			bootStatusStore.askFailed = null;
+		}
+	});
+});
