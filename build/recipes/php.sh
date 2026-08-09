@@ -56,8 +56,18 @@
 # the missing source (spc's build path has no download fallback —
 # SourceManager::initSource throws).
 
+_PHP_PINS_FILE="$(dirname -- "${BASH_SOURCE[0]}")/_php-pins.sh"
 # shellcheck source=/dev/null
-. "$(dirname -- "${BASH_SOURCE[0]}")/_php-pins.sh"
+. "$_PHP_PINS_FILE"
+# ...and record it as an input of this recipe, so the manifest's "pipeline"
+# block digests the file all 41 pins live in rather than only this one, which
+# names none of them. Appended, never assigned: build.sh defaults the array to
+# this recipe's own path and refuses a set that has dropped it.
+#
+# The SAME string that was sourced, not a second expression that ought to
+# produce it — a check made on a different object than the call acts on is how
+# PR #63's remove_dir_all guard was got wrong.
+RECIPE_SOURCE_FILES+=("$_PHP_PINS_FILE")
 
 # ---------------------------------------------------------------- provenance --
 

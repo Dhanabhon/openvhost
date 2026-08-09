@@ -402,6 +402,35 @@ mod tests {
     /// THREE php-src releases, not one.
     const PHP_PINS: &str = include_str!("../../../../../build/recipes/_php-pins.sh");
 
+    /// The build manifest the driver wrote beside the tarball this entry pins,
+    /// committed under `build/manifests/` and read at compile time. The pin set
+    /// above says what a build *would* use; this says what one *did*, and it is
+    /// the only thing in the repository that ties `sha256` below to an account
+    /// of how those bytes were produced. Test-only, like `PHP_PINS`.
+    ///
+    /// This one is a repack (`resumed_from: "pack"`, `configure_flags: []`) —
+    /// how PR #67 re-cut this pin. Its consequence is recorded rather than
+    /// papered over: PHP's `spc build` flags reach **no** manifest at all and
+    /// live only in `php.sh`'s `_php_spc_build_args`, so this file cannot be
+    /// asked about them.
+    ///
+    /// It also carries no `dependencies` block, which is a **separate fact with
+    /// a separate cause**: being a repack does not lose that block — the driver
+    /// emits it unconditionally, with `"tree_sha256": null`, for any recipe
+    /// declaring `RECIPE_DEPENDS`, and `php.sh` has declared one since PR #60.
+    /// This manifest simply **predates** it, exactly as the PROVENANCE note
+    /// above says. See `build/manifests/README.md`.
+    const MANIFEST: &str =
+        include_str!("../../../../../build/manifests/php-8.4.24-macos-arm64.manifest.json");
+
+    /// php-src's pinned source digest and upstream's release-signing key
+    /// fingerprint, restated here so an edit to EITHER side breaks a test. At
+    /// module scope because both the pin-set tripwire and the manifest
+    /// agreement test check them: two literals of one fact is the drift this
+    /// group exists to catch.
+    const PHP_SRC_SHA256: &str = "e127be09a8506f4327c5cfa78a614b00d210714484ec215ce0011b4a03c00731";
+    const PHP_SRC_SIGNING_KEY_FPR: &str = "9D7F99A0CB8F05C8A6958D6256A97AF7600A39A6";
+
     // ------------------------------------------------------------------
     // Group 1 — the pinned entry, byte for byte.
     //
@@ -539,12 +568,6 @@ mod tests {
     #[test]
     fn the_pinned_version_agrees_with_the_php_src_row_the_pin_set_carries() {
         let e = &PHP_PACKAGES[0];
-        // Restated here (not read from the catalogue) so an edit to EITHER
-        // side is what breaks this test — the same shape nginx's twin test
-        // uses for its signing-key fingerprint.
-        const PHP_SRC_SHA256: &str =
-            "e127be09a8506f4327c5cfa78a614b00d210714484ec215ce0011b4a03c00731";
-        const PHP_SRC_SIGNING_KEY_FPR: &str = "9D7F99A0CB8F05C8A6958D6256A97AF7600A39A6";
         let want_row = format!(
             "\"{} {PHP_SRC_SHA256} {PHP_SRC_SIGNING_KEY_FPR} ",
             e.version
@@ -591,6 +614,72 @@ mod tests {
             PHP_PINS.contains("PHP_PINS_PHP_SRC"),
             "that is not the PHP pin set"
         );
+    }
+
+    /// The committed manifest is the record of how the pinned bytes were made,
+    /// and `output.sha256` is what ties that record to them — every other
+    /// assertion here is secondary to it. Until `build/manifests/` existed, no
+    /// file in this repository named this digest except the entry below, so the
+    /// account of its provenance was prose. This makes a pin bumped without its
+    /// manifest, or a manifest swapped for another build's, a test failure.
+    ///
+    /// `upstream.sha256` is checked too: this manifest is a repack and so
+    /// carries no `configure_flags`, which leaves the source digest as the
+    /// strongest statement it makes about what went *into* the artifact.
+    ///
+    /// Vacuity: `serde_json::from_str` is a real parse, so a truncated or
+    /// malformed manifest fails here rather than quietly satisfying a substring
+    /// search, and a missing key deserialises to `Value::Null`, whose `as_str()`
+    /// is `None` and never equals the `Some(_)` expected. No separate
+    /// non-vacuity twin is written: there is no way for this test to pass
+    /// without a real manifest for this artifact, so a twin asserting that
+    /// would be a check whose passing is guaranteed by the same fact that makes
+    /// its failure invisible.
+    #[test]
+    fn the_committed_manifest_describes_the_bytes_this_entry_pins() {
+        let e = &PHP_PACKAGES[0];
+        let m: serde_json::Value = serde_json::from_str(MANIFEST)
+            .expect("build/manifests/php-8.4.24-macos-arm64.manifest.json is not valid JSON");
+        assert_eq!(
+            m["output"]["sha256"].as_str(),
+            Some(e.sha256),
+            "the committed manifest records output.sha256 {:?}, but this entry pins {:?}; \
+             either the pin moved without its manifest, or the manifest is another \
+             build's",
+            m["output"]["sha256"].as_str(),
+            e.sha256
+        );
+        for (field, got, want) in [
+            ("name", m["name"].as_str(), PHP_PACKAGE_NAME),
+            ("version", m["version"].as_str(), e.version),
+            (
+                "upstream.release_date",
+                m["upstream"]["release_date"].as_str(),
+                e.upstream_released_on,
+            ),
+            (
+                "upstream.last_checked",
+                m["upstream"]["last_checked"].as_str(),
+                e.last_checked_on,
+            ),
+            (
+                "upstream.signing_key_fingerprint",
+                m["upstream"]["signing_key_fingerprint"].as_str(),
+                PHP_SRC_SIGNING_KEY_FPR,
+            ),
+            (
+                "upstream.sha256",
+                m["upstream"]["sha256"].as_str(),
+                PHP_SRC_SHA256,
+            ),
+        ] {
+            assert_eq!(
+                got,
+                Some(want),
+                "the committed manifest and this catalogue disagree about {field}: \
+                 manifest {got:?}, catalogue {want:?}"
+            );
+        }
     }
 
     // ------------------------------------------------------------------

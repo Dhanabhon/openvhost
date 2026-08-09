@@ -1,0 +1,24 @@
+{
+  "name": "mariadb",
+  "version": "11.4.9",
+  "arch": "arm64",
+  "built_at": "2026-08-08T14:23:08Z",
+  "upstream": {
+    "url": "https://archive.mariadb.org/mariadb-11.4.9/source/mariadb-11.4.9.tar.gz",
+    "sha256": "8e481ca29b5a740444d45451c8ea2d93711cf525d6fa5d27bc9512cf8973b075",
+    "release_date": "2025-11-05",
+    "last_checked": "2026-08-02",
+    "signing_key_fingerprint": "177F4010FE56CA3336300305F1656F24C74CD1D8",
+    "signing_key_expiry": "none",
+    "signing_key_verified_on": "2026-08-02"
+  },
+  "build_prefix": "/opt/openvhost-build/mariadb-11.4.9",
+  "resumed_from": "pack",
+  "configure_flags": [],
+  "toolchain": ["cmake: cmake version 4.4.2", "gpg: gpg (GnuPG) 2.5.21", "clang: Apple clang version 21.0.0 (clang-2100.1.1.101)", "macos-sdk: 26.5", "macos: 26.5.2"],
+  "output": {
+    "file": "mariadb-11.4.9-macos-arm64.tar.gz",
+    "sha256": "854c34dcafef29dc72af2bcbd6d66271ae2e6167ab45e33c4f744d163675aeb0"
+  },
+  "recipe": {"openssl": {"version": "3.5.7", "linkage": "static"}, "bison": {"path": "", "version": ""}, "vendored_last_checked": "2026-08-03", "vendored": [{"name": "pcre2", "version": "10.45", "url": "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.45/pcre2-10.45.zip", "sha256": "59c8556fd45e68599897cd5d74efad9c4a43f85e981fe7ac3ac5fd7aa70672ac", "release_date": "2025-02-05", "verified": "gpg+sha256", "signing_key_fingerprint": "A95536204A3BB489715231282A98E77EB6F24CA8"}, {"name": "fmt", "version": "12.0.0", "url": "https://github.com/fmtlib/fmt/releases/download/12.0.0/fmt-12.0.0.zip", "sha256": "1c32293203449792bf8e94c7f6699c643887e826f2d66a80869b4f279fb07d25", "release_date": "2025-09-17", "verified": "sha256", "signature": "none published upstream; sha256 pin only"}], "vendored_on_disk": []}
+}

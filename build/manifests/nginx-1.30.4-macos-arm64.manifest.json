@@ -1,0 +1,25 @@
+{
+  "name": "nginx",
+  "version": "1.30.4",
+  "arch": "arm64",
+  "built_at": "2026-08-08T17:03:03Z",
+  "upstream": {
+    "url": "https://nginx.org/download/nginx-1.30.4.tar.gz",
+    "sha256": "4261dc90e9e47c1c4041276e9aaa3d48ebe2e664f728e14fa95ae6c67d57a08b",
+    "release_date": "2026-07-15",
+    "last_checked": "2026-08-06",
+    "signing_key_fingerprint": "43387825DDB1BB97EC36BA5D007C8D7C15D87369",
+    "signing_key_expiry": "none",
+    "signing_key_verified_on": "2026-08-06"
+  },
+  "build_prefix": "/opt/openvhost-build/nginx-1.30.4",
+  "resumed_from": "",
+  "configure_flags": ["--prefix=/opt/openvhost-build/nginx-1.30.4", "--sbin-path=/opt/openvhost-build/nginx-1.30.4/bin/nginx", "--conf-path=/opt/openvhost-build/nginx-1.30.4/conf/nginx.conf", "--error-log-path=/opt/openvhost-build/nginx-1.30.4/logs/error.log", "--pid-path=/opt/openvhost-build/nginx-1.30.4/logs/nginx.pid", "--lock-path=/opt/openvhost-build/nginx-1.30.4/logs/nginx.lock", "--http-log-path=/opt/openvhost-build/nginx-1.30.4/logs/access.log", "--http-client-body-temp-path=/opt/openvhost-build/nginx-1.30.4/client_body_temp", "--http-proxy-temp-path=/opt/openvhost-build/nginx-1.30.4/proxy_temp", "--http-fastcgi-temp-path=/opt/openvhost-build/nginx-1.30.4/fastcgi_temp", "--http-uwsgi-temp-path=/opt/openvhost-build/nginx-1.30.4/uwsgi_temp", "--http-scgi-temp-path=/opt/openvhost-build/nginx-1.30.4/scgi_temp", "--builddir=/opt/openvhost-build/_work/nginx-1.30.4/obj", "--with-cc-opt=-I/opt/openvhost-build/openssl-3.5.7/include -I/opt/openvhost-build/_work/nginx-1.30.4/pcre2-include", "--with-ld-opt=-L/opt/openvhost-build/openssl-3.5.7/lib", "--with-http_ssl_module", "--with-pcre", "--without-http_charset_module", "--without-http_ssi_module", "--without-http_userid_module", "--without-http_mirror_module", "--without-http_autoindex_module", "--without-http_geo_module", "--without-http_split_clients_module", "--without-http_referer_module", "--without-http_rewrite_module", "--without-http_auth_basic_module", "--without-http_memcached_module", "--without-http_limit_conn_module", "--without-http_limit_req_module", "--without-http_empty_gif_module", "--without-http_browser_module", "--without-http_upstream_hash_module", "--without-http_upstream_ip_hash_module", "--without-http_upstream_least_conn_module", "--without-http_upstream_random_module", "--without-http_upstream_keepalive_module", "--without-http_upstream_zone_module", "--without-http_upstream_sticky", "--without-http_grpc_module"],
+  "toolchain": ["gpg: gpg (GnuPG) 2.5.21", "clang: Apple clang version 21.0.0 (clang-2100.1.1.101)", "macos-sdk: 26.5", "macos: 26.5.2"],
+  "dependencies": {"openssl": {"version": "3.5.7", "prefix": "/opt/openvhost-build/openssl-3.5.7", "tree_sha256": "e486946bb7aa984ce96c37c35c5a3c562a57bcee2e080fdc0b53f0b90d5e1c80"}},
+  "output": {
+    "file": "nginx-1.30.4-macos-arm64.tar.gz",
+    "sha256": "bc4c42a2618f2ac51145f7c23959421a8d019bde67e0d71946548d9cc9ac4563"
+  },
+  "recipe": {"openssl": {"version": "3.5.7", "linkage": "static"}, "pcre2": {"version": "10.45", "sha256": "59c8556fd45e68599897cd5d74efad9c4a43f85e981fe7ac3ac5fd7aa70672ac", "sha256_on_disk": "59c8556fd45e68599897cd5d74efad9c4a43f85e981fe7ac3ac5fd7aa70672ac", "release_date": "2025-02-05", "last_checked": "2026-08-06", "verified": "gpg+sha256", "signing_key_fingerprint": "A95536204A3BB489715231282A98E77EB6F24CA8", "usage": "header only (src/pcre2.h.generic); linked against the system /usr/lib/libpcre2-8.dylib, never compiled or shipped"}, "zlib": {"source": "system (/usr/lib/libz.dylib via the Xcode/CLT SDK)", "note": "no fetch: nginx's own default probe already succeeds against the SDK"}}
+}

@@ -357,6 +357,14 @@ RECIPE_LAST_CHECKED=""
 RECIPE_SOURCE_URL=""
 RECIPE_SOURCE_SHA256=""
 RECIPE_CONFIGURE_FLAGS=()
+# Every file this recipe is assembled from, digested into the manifest's
+# "pipeline" block. Defaulted to the entry file and APPENDED to by a recipe that
+# sources another one: php.sh sources _php-pins.sh, where all 41 of its pins
+# live, so a digest over the entry file alone would name none of them — the
+# single most important thing this block records. Absolute paths only; the
+# default already is one, and a relative path would resolve against whatever
+# directory the manifest stage happens to be standing in.
+RECIPE_SOURCE_FILES=("$RECIPE_FILE")
 
 # A recipe is sourced, not executed: at source time it may only set variables
 # and define functions. Anything it runs would run before the environment has
@@ -376,6 +384,17 @@ done
 if [ "$(type -t recipe_normalize 2>/dev/null || true)" != "function" ]; then
 	recipe_normalize() { :; }
 fi
+# A recipe that ASSIGNS RECIPE_SOURCE_FILES instead of appending to it drops the
+# entry file, and the manifest then records a set of inputs missing the one file
+# that is certainly an input. Nothing downstream could tell: the block would be
+# present, well-formed and short by one. Checked rather than left to the
+# convention the line above states.
+recipe_source_seen=0
+for src in ${RECIPE_SOURCE_FILES[@]+"${RECIPE_SOURCE_FILES[@]}"}; do
+	if [ "$src" = "$RECIPE_FILE" ]; then recipe_source_seen=1; fi
+done
+[ "$recipe_source_seen" -eq 1 ] ||
+	bp_die "recipe $RECIPE_FILE removed itself from RECIPE_SOURCE_FILES: append to that array, never assign it"
 
 # ---------------------------------------------------------- recipe helpers ---
 
@@ -945,11 +964,17 @@ json_dependencies() {
 			reason_key='prefix_missing'
 			reason="$vanished"
 		else
-			# Assigned, never inlined into printf's argument list: under `set -e`
-			# a failed command substitution aborts an assignment, but as an
-			# argument it is printf's own success that decides, and an empty
-			# digest would be written instead.
-			digest="$(prefix_digest "$prefix")"
+			# Assigned rather than inlined into printf's argument list, AND
+			# re-arming `-e` inside the substitution. The assignment alone is
+			# not enough here and the comment that claimed it was is what this
+			# line replaces: `json_dependencies` is only ever reached through
+			# `dependencies="$(json_dependencies)"` below, and bash 3.2 clears
+			# errexit on entering a command substitution — so a `prefix_digest`
+			# that failed part-way through its own `find`/`stat`/`xargs` would
+			# hand back a well-formed 64-hex digest over a PARTIAL tree, and the
+			# run would exit 0. A confident wrong provenance value is the exact
+			# thing this field was added to prevent, so it must abort instead.
+			digest="$(set -e; prefix_digest "$prefix")"
 			printf ', "tree_sha256": "%s"}' "$(json_string "$digest")"
 			continue
 		fi
@@ -959,6 +984,120 @@ json_dependencies() {
 		printf ', "tree_sha256": null, "%s": "%s"}' \
 			"$reason_key" "$(json_string "$reason")"
 	done
+	printf '}'
+}
+
+# Where the manifest names a file of this pipeline. Relative to the directory
+# that holds build/ — the repository checkout in every real invocation — so two
+# builds of the same bytes from two checkouts record the same path, and a
+# manifest committed under build/manifests/ does not carry the builder's home
+# directory. A file outside that tree (`--recipe` pointing elsewhere) is
+# recorded absolute, as what it is, rather than mangled into looking local.
+pipeline_path() {
+	local file="$1" root
+	root="$(dirname -- "$BUILD_DIR")"
+	case "$file" in
+	"$root"/*) printf '%s' "${file#"$root"/}" ;;
+	*) printf '%s' "$file" ;;
+	esac
+}
+
+# `[{"path": …, "sha256": …}, …]` over the files named, in the order named.
+#
+# No path is ever accumulated into a `path<sep>digest` list that something later
+# splits: each goes straight into its own JSON string with its digest beside it.
+# That is how this meets prefix_digest's rule that no field may contain the byte
+# separating its own records, and it has to hold, because a path may carry any
+# byte but NUL — including the newline that forged a collision in prefix_digest's
+# symlink stream.
+#
+# The emission was never the exposure; READING shasum's output was. `shasum -a
+# 256 -- "$file"` prints `<digest>  <path>`, and escapes that whole line with a
+# leading backslash whenever the path contains a backslash or a newline — so
+# splitting it on a space took `\<digest>`: 65 characters, still valid JSON, and
+# not a SHA-256. Measured live through this driver from a real recipe. The file
+# is therefore hashed on STDIN, where no filename is printed and there is
+# nothing left to escape, and the result must still look like a digest before it
+# is recorded. The risk was removed by not naming the file, not by reasoning
+# about the separator.
+#
+# `$what` names the caller's category so a failure says which declaration is
+# wrong, since one of the two lists is the recipe's and the other is not.
+json_file_digests() {
+	local what="$1" first=1 file digest
+	shift
+	printf '['
+	for file in "$@"; do
+		case "$file" in
+		/*) ;;
+		*) bp_die "$what must be an absolute path, got: $file" ;;
+		esac
+		# Fails the whole run rather than recording a sentinel. A block that says
+		# "these are the inputs" with one entry standing in for a file it could not
+		# read is the shape this pipeline keeps rejecting — see json_dependencies
+		# on the string "unknown". Because json_pipeline is called into a variable
+		# BEFORE stage_manifest's redirect opens the file, this abort leaves the
+		# previous manifest whole instead of truncating a new one mid-write.
+		[ -f "$file" ] && [ -r "$file" ] ||
+			bp_die "$what is not a readable file: $file"
+		digest="$(shasum -a 256 <"$file")"
+		# Parameter expansion, not `cut -d' '`: the redirect above means the only
+		# thing after the digest is shasum's own `-` for stdin, so there is no
+		# attacker-influenced text on this line at all.
+		digest="${digest%% *}"
+		# Aborts rather than recording a malformed digest, for the same reason the
+		# unreadable-file arm above does: a block that says "these are the inputs"
+		# is worth nothing if one of its values can be something else wearing a
+		# digest's key. Both halves are checked — 65 characters of otherwise
+		# lowercase hex was exactly the shape that got through before.
+		[ "${#digest}" -eq 64 ] ||
+			bp_die "$what did not hash to 64 characters (got ${#digest}): $file"
+		case "$digest" in
+		*[!0-9a-f]*) bp_die "$what did not hash to lowercase hex: $file" ;;
+		esac
+		if [ "$first" -eq 1 ]; then first=0; else printf ', '; fi
+		printf '{"path": "%s", "sha256": "%s"}' \
+			"$(json_string "$(pipeline_path "$file")")" "$(json_string "$digest")"
+	done
+	printf ']'
+}
+
+# The "pipeline" object: the digest of every file the recipe was assembled from
+# ("sources", recipe-declared) and of the driver and audit gate that ran it
+# ("driver"). Two lists rather than one, so which entries a recipe chose and
+# which the driver added is stated rather than inferred from the paths.
+#
+# RECORDED, NEVER ENFORCED. Nothing compares these digests against anything —
+# not here, not in audit.sh, not in the Rust catalogues — and that is the
+# design's central decision rather than an omission. If you are here to add the
+# comparison, read this first:
+#
+#   nginx.sh mixes ~30 declarable pins with ~600 lines of stage code and prose,
+#   so editing a COMMENT moves its whole-file digest. An alarm that fires on
+#   comment edits is one people learn to override, and an overridden alarm is
+#   worse than none. This project refused a gate that could not fail (PR #68);
+#   a gate that cries wolf fails the same standard from the other side.
+#
+# What it is for is a human reading a diff that changes a pin: the manifest of
+# record beside the artifact says which bytes of which files that artifact was
+# made from, so the question "was this recipe edited after these bytes were
+# cut?" has an answer in committed evidence instead of in memory. The
+# mechanically enforceable version — pins split into their own file, whose
+# digest a catalogue test may hard-assert because it changes only when a pin
+# changes — is designed and deferred (design §6, D4).
+#
+# So: editing a comment in a recipe changes what this records and fails no test.
+# That is the property. It is not an oversight, and turning it into an alarm
+# undoes the decision.
+json_pipeline() {
+	printf '{"driver": '
+	# $BUILD_SELF may be relative to the caller's cwd; $BUILD_DIR is this file's
+	# own physical directory, resolved before anything could chdir.
+	json_file_digests 'a driver file' \
+		"$BUILD_DIR/$(basename -- "$BUILD_SELF")" "$BUILD_DIR/audit.sh"
+	printf ', "sources": '
+	json_file_digests 'a RECIPE_SOURCE_FILES entry' \
+		${RECIPE_SOURCE_FILES[@]+"${RECIPE_SOURCE_FILES[@]}"}
 	printf '}'
 }
 
@@ -974,7 +1113,7 @@ stage_manifest() {
 	# §7. Single-builder trust (D1) is only acceptable because the inputs are
 	# recorded; this file is the whole of that acceptability.
 	local manifest="$OUT_DIR/$BUILD_NAME-$BUILD_VERSION-macos-$BUILD_ARCH.manifest.json"
-	local versions=() tool line dependencies
+	local versions=() tool line dependencies pipeline extra has_extra=0
 	bp_assert_under "$manifest" "$OUT_DIR" "write"
 	if [ -z "$TARBALL_SHA" ] && [ -f "$TARBALL" ]; then
 		TARBALL_SHA="$(shasum -a 256 -- "$TARBALL" | cut -d' ' -f1)"
@@ -987,12 +1126,46 @@ stage_manifest() {
 	versions[${#versions[@]}]="macos-sdk: $(xcrun --show-sdk-version 2>/dev/null || echo unknown)"
 	versions[${#versions[@]}]="macos: $(sw_vers -productVersion 2>/dev/null || echo unknown)"
 
-	# Hashing whole trees is the one thing here that can fail on its own, so it
-	# happens BEFORE the redirect below opens the manifest. Inside that group an
-	# abort under set -e truncates the file mid-write, which would leave a
-	# half-written manifest next to a finished tarball; out here it leaves the
-	# previous one untouched.
+	# Everything that can fail on its own happens BEFORE the redirect below opens
+	# the manifest. Inside that group an abort under set -e truncates the file
+	# mid-write, which would leave a half-written manifest next to a finished
+	# tarball; out here it leaves the previous one untouched. Every assignment is
+	# plain, never `local x="$(...)"`, whose exit status is `local`'s and would
+	# swallow the failure this ordering exists for.
+	#
+	# recipe_manifest_extra is the third and last of them, and it is the one this
+	# ordering was actually written for: nine truncated manifests ending at
+	# `"recipe": ` exist from when it ran inside the group. nginx.sh guards its
+	# own shasum against exactly that, but per-recipe discipline is a rule every
+	# future recipe has to be told about, and the structure costs one variable.
+	#
+	# `set -e;` INSIDE the substitution, and it is not decoration: bash 3.2
+	# clears errexit on entering `$( )`, so a mid-function failure is swallowed
+	# and only the LAST command's status reaches this assignment. Measured on
+	# bash 3.2.57 — a recipe function whose `d="$(shasum …)"` fails then carries
+	# on to its printf, and without this the driver recorded `{"x": ""}` and
+	# exited 0. That is a worse outcome than the truncation this hoist removes:
+	# the run looks clean and the manifest carries a confident, wrong value,
+	# which is the exact failure this whole file keeps being fixed for.
+	#
+	# `set -e` restores errexit ONLY. `pipefail` is never cleared by a command
+	# substitution and is inherited from this script's own `set -euo pipefail`
+	# at the top — which matters, because a recipe hook shaped like nginx's
+	# `shasum … | cut` is caught by pipefail, not by errexit. Delete `-o
+	# pipefail` up there and that shape goes silent again while this comment
+	# still says it is covered.
 	dependencies="$(json_dependencies)"
+	pipeline="$(json_pipeline)"
+	if [ "$(type -t recipe_manifest_extra 2>/dev/null || true)" = "function" ]; then
+		has_extra=1
+		extra="$(set -e; recipe_manifest_extra)"
+		# A hook that exits 0 having printed nothing writes `"recipe": ` and
+		# nothing else — invalid JSON, driver exit 0. Cheap to refuse now that
+		# the hoist put the value in a variable; impossible while it streamed
+		# straight into the redirect.
+		[ -n "$extra" ] ||
+			bp_die "recipe_manifest_extra produced no output; the manifest would be invalid JSON"
+	fi
 
 	{
 		printf '{\n'
@@ -1015,13 +1188,13 @@ stage_manifest() {
 			"$(json_array ${RECIPE_CONFIGURE_FLAGS[@]+"${RECIPE_CONFIGURE_FLAGS[@]}"})"
 		printf '  "toolchain": %s,\n' "$(json_array ${versions[@]+"${versions[@]}"})"
 		printf '  "dependencies": %s,\n' "$dependencies"
+		printf '  "pipeline": %s,\n' "$pipeline"
 		printf '  "output": {\n'
 		printf '    "file": "%s",\n' "$(json_string "$(basename -- "$TARBALL")")"
 		printf '    "sha256": "%s"\n' "$(json_string "$TARBALL_SHA")"
 		printf '  }'
-		if [ "$(type -t recipe_manifest_extra 2>/dev/null || true)" = "function" ]; then
-			printf ',\n  "recipe": '
-			recipe_manifest_extra
+		if [ "$has_extra" -eq 1 ]; then
+			printf ',\n  "recipe": %s' "$extra"
 		fi
 		printf '\n}\n'
 	} >"$manifest"
