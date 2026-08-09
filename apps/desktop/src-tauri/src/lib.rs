@@ -18,6 +18,11 @@ mod commands;
 // over the supervisor and the two bulk locks. Ungated: the handler is
 // portable, and `openvhost_proc::control::bind` is what refuses off-unix.
 mod control;
+/// The one managed handle to `state.db` (optional-state.db design D1): the
+/// `Ready`/`Unavailable` wrapper managed on BOTH arms of the best-effort open,
+/// and the two accessors every command resolves through. See its own module
+/// doc for why the bare `Db` is never managed again.
+mod db_state;
 /// MariaDB from OpenVHost's own package tree over IPC — the DTOs, the
 /// progress event and the two install commands. A sibling of `mysql_pkg`
 /// (P1 MariaDB UI design D3/D7), mirroring its shape deliberately.
@@ -361,19 +366,40 @@ pub fn run() {
                             app.manage(lock);
                             // Open the persistent state store best-effort: a
                             // missing/unreadable state.db must never stop the
-                            // supervisor from starting. Sites features are
-                            // simply unavailable this run (no IPC command
-                            // reads `Db` yet — that lands with the Sites UI).
-                            match tauri::async_runtime::block_on(openvhost_core::Db::open(&home)) {
-                                Ok(db) => {
-                                    app.manage(db);
-                                }
+                            // supervisor from starting. Twenty-seven commands
+                            // read it, so the failed arm is a real state this
+                            // app has to render, not a footnote.
+                            //
+                            // The HANDLE is managed on BOTH arms — unconditionally,
+                            // exactly once, the same shape `stack_paths` uses below
+                            // and for the same `Manager::manage`-never-overwrites
+                            // reason. Extraction therefore always succeeds and each
+                            // command answers for itself (`DbHandle::require` /
+                            // `optional`), instead of Tauri refusing the whole
+                            // command and telling a USER to call `.manage()`.
+                            //
+                            // The bare `Db` is deliberately NOT managed anywhere,
+                            // on either arm: that is what makes a future
+                            // `State<'_, Db>` parameter fail on every machine
+                            // rather than only on a broken one (design D6).
+                            let db = match tauri::async_runtime::block_on(
+                                openvhost_core::Db::open(&home),
+                            ) {
+                                Ok(db) => db_state::DbHandle::Ready(db),
                                 Err(e) => {
+                                    let reason = e.to_string();
+                                    // Kept for the developer running from a
+                                    // terminal, and worded from the same shared
+                                    // sentence the refusals and the banner use —
+                                    // one condition, one wording.
                                     eprintln!(
-                                        "openvhost: state.db unavailable ({e}); Sites features disabled this run"
+                                        "openvhost: {}",
+                                        db_state::unavailable_message(&reason)
                                     );
+                                    db_state::DbHandle::Unavailable { reason }
                                 }
-                            }
+                            };
+                            app.manage(db);
                             let registry = Arc::new(FileRegistry::new(&run_dir));
                             let supervisor = Arc::new(Supervisor::with_orphan_cleanup(
                                 default_driver(),

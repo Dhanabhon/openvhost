@@ -80,6 +80,10 @@ use crate::commands::{
     PhpInstallLogEvent, RunningInstallGuard, now_ms, rescan_into_state, rescan_mariadb_into_state,
     rescan_mysql_into_state, stack_paths,
 };
+// Both commands here take the managed store WRAPPER, never a bare `Db`
+// (optional-state.db design D1) — the concrete `Db` is only ever the `&Db`
+// `require()` hands back, which needs no import.
+use crate::db_state::DbHandle;
 use crate::stack::StackPaths;
 
 /// How many trailing stderr lines are kept to quote back when brew refuses.
@@ -795,6 +799,29 @@ fn brew_failure_message(headline: &str, tail: &VecDeque<String>) -> String {
     }
 }
 
+/// Both uninstall commands' pre-flight: the catalogue gate, then the store.
+///
+/// A named function rather than two inlined pairs, and that is a testability
+/// requirement rather than tidiness: [`uninstall_package`] takes an
+/// `AppHandle<Wry>`, which `tauri::test::mock_builder` cannot produce, so its
+/// body is unreachable from a test and a refusal written there is a decision
+/// **no test can see** — the same reason `initialize_mysql_gate` exists.
+///
+/// The store REFUSES rather than degrading to an empty site list (design D2).
+/// The pinned-sites check is what turns "this PHP major still serves three
+/// sites" into a BLOCKER, so `sites: []` would not produce a shorter plan — it
+/// would produce a plan asserting nothing depends on the package, and in
+/// [`uninstall_package`] that assertion is what authorises the removal.
+fn uninstall_gate<'a>(
+    kind: PackageKind,
+    major: &str,
+    db: &'a DbHandle,
+) -> Result<(Target, &'a Db), IpcError> {
+    let target = Target::parse(kind, major)?;
+    let store = db.require()?;
+    Ok((target, store))
+}
+
 /// What an uninstall of `major` would remove, keep, and refuse to do.
 ///
 /// A PURE QUERY: it spawns nothing and changes nothing. It reads the
@@ -810,13 +837,13 @@ fn brew_failure_message(headline: &str, tail: &VecDeque<String>) -> String {
 pub async fn uninstall_plan(
     kind: PackageKind,
     major: String,
-    db: tauri::State<'_, Db>,
+    db: tauri::State<'_, DbHandle>,
     paths: tauri::State<'_, Option<StackPaths>>,
     sup: tauri::State<'_, Arc<Supervisor>>,
 ) -> Result<UninstallPlan, IpcError> {
-    let target = Target::parse(kind, &major)?;
+    let (target, db) = uninstall_gate(kind, &major, &db)?;
     let p = stack_paths(&paths)?;
-    let sites = SqliteSiteRepository::new(db.inner()).list().await?;
+    let sites = SqliteSiteRepository::new(db).list().await?;
     // Both filesystem reads happen HERE, and their answers are what cross into
     // `build_plan` — see `uninstall::inventory`'s purity invariant. `packaged`
     // is resolved first because `keg_provenance` depends on it: a packaged row
@@ -853,7 +880,7 @@ pub async fn uninstall_package(
     app: tauri::AppHandle,
     kind: PackageKind,
     major: String,
-    db: tauri::State<'_, Db>,
+    db: tauri::State<'_, DbHandle>,
     runtimes: tauri::State<'_, RwLock<Option<openvhost_core::InstalledRuntimes>>>,
     mysql_runtimes: tauri::State<'_, RwLock<Option<Vec<openvhost_core::mysql::MysqlRuntime>>>>,
     mariadb_runtimes: tauri::State<
@@ -864,8 +891,8 @@ pub async fn uninstall_package(
     sup: tauri::State<'_, Arc<Supervisor>>,
     lock: tauri::State<'_, InstallLock>,
 ) -> Result<(), IpcError> {
-    // The catalogue gate, before anything else happens.
-    let target = Target::parse(kind, &major)?;
+    // The catalogue gate and the store, before anything else happens.
+    let (target, db) = uninstall_gate(kind, &major, &db)?;
 
     // One package operation at a time, sharing `install_php`'s lock so an
     // install and an uninstall can never interleave (D1). `try_lock` rather
@@ -919,7 +946,7 @@ pub async fn uninstall_package(
         brew,
         sup: sup.inner(),
         lock: lock.inner(),
-        sites: SqliteSiteRepository::new(db.inner()).list().await?,
+        sites: SqliteSiteRepository::new(db).list().await?,
         // Re-read here, not carried over from whatever plan the dialog was
         // built from: `brew upgrade php` in another terminal can turn a
         // versioned keg into an alias between the two.
@@ -3237,5 +3264,64 @@ mod tests {
             after[0].updated_at, saved.updated_at,
             "the row was rewritten even though its content came back the same"
         );
+    }
+
+    // ---- REFUSE with no store (optional-state.db design D2) --------------
+
+    /// Both uninstall commands refuse, and neither can degrade to an empty
+    /// site list.
+    ///
+    /// The pinned-sites check is what turns "this PHP major still serves three
+    /// sites" into a BLOCKER, so `sites: []` is not a shorter plan — it is a
+    /// plan asserting nothing depends on the package, and in
+    /// `uninstall_package` that assertion is what authorises the removal.
+    ///
+    /// Driven through `uninstall_gate` because that is where both commands'
+    /// refusal lives, and it has to: `uninstall_package` takes an
+    /// `AppHandle<Wry>` and cannot be called from a test at all. The command
+    /// below it covers the `uninstall_plan` half end to end.
+    ///
+    /// VACUITY, and the honest form of it: `let store = db.require()?;` cannot
+    /// be *deleted* from `uninstall_gate`, because it is the only way to
+    /// obtain the `&'a Db` the signature returns — there is no degraded
+    /// version of that function to write, which is design D6 rather than a gap
+    /// in the test. The neuter used instead was `store_down()` handing back a
+    /// real `DbHandle::Ready`, under which BOTH tests below failed. Reverted
+    /// and re-run green. See `crate::commands::assert_store_refusal`'s doc
+    /// comment for the full measurement.
+    #[test]
+    fn the_uninstall_gate_refuses_and_names_why_when_the_store_is_down() {
+        let err = uninstall_gate(PackageKind::Php, "8.4", &crate::commands::store_down())
+            .err()
+            .expect("an unavailable store must refuse");
+        crate::commands::assert_store_refusal(&err, "uninstall_package (via uninstall_gate)");
+    }
+
+    #[tokio::test]
+    async fn uninstall_plan_refuses_and_names_why_when_the_store_is_down() {
+        use tauri::Manager;
+
+        let home = tempfile::tempdir().unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(crate::commands::store_down());
+        app.manage(Some(StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: None,
+            nginx_conf: home.path().join("nginx.conf"),
+        }));
+        app.manage(Arc::new(Supervisor::new(default_driver())));
+
+        let err = uninstall_plan(
+            PackageKind::Php,
+            "8.4".to_string(),
+            app.state(),
+            app.state(),
+            app.state::<Arc<Supervisor>>(),
+        )
+        .await
+        .expect_err("an unavailable store must refuse");
+        crate::commands::assert_store_refusal(&err, "uninstall_plan");
     }
 }
