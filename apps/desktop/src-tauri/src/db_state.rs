@@ -17,12 +17,17 @@
 //! "unconditionally".** `lib.rs`'s `app.manage` for this sits inside
 //! `resolve_home() == Ok(home)` *and* `InstanceLock::acquire() == Ok(Some(_))`.
 //! A second instance, a lock error, or a home that will not resolve all return
-//! `Ok(())` from setup with the window already created and **nothing at all
-//! managed** — so every command, `state_store_status` included, gets Tauri's own
-//! `.manage()` string back, and the banner stays silent because a failed ask
-//! renders as silence by design. That boot path is a separate slice's; this
-//! module only promises what it can, which is that opening the store cannot be
-//! the reason extraction fails.
+//! `Ok(())` from setup with the window already created and **nothing managed
+//! beyond the six values `lib.rs` manages before that match** (`UiReady`,
+//! `ApplyLock`, `InstallLock`, `BulkLock`, `TrayInitiated`, `Quitting`) — so
+//! every command that extracts state managed inside that arm gets Tauri's own
+//! `.manage()` string back, `state_store_status` included because it reads a
+//! `DbHandle`, and the banner stays silent because a failed ask renders as
+//! silence by design. The four commands extracting only `InstallLock`
+//! (`pending_install` and the three `cancel_*_install`) still answer on that
+//! path. That boot path is a separate slice's; this module only promises what
+//! it can, which is that opening the store cannot be the reason extraction
+//! fails.
 //!
 //! Two properties are load-bearing rather than incidental:
 //!
@@ -474,14 +479,24 @@ mod tests {
     /// and the failure message interpolates `attribute` rather than spelling it:
     /// a literal in either place counts as one more definition, which is exactly
     /// how this test first failed at 51 against 50.
+    ///
+    /// Splitting the literal removed that instance without closing the class.
+    /// While the scan merely asked whether a line CONTAINED the attribute, any
+    /// ordinary code line carrying it anywhere in `COMMAND_FILES` counted as a
+    /// definition — and the message below then blamed an unlisted file, which is
+    /// the wrong diagnosis for a self-match and costs the next person more than
+    /// the failure itself does. So the line must now START with the attribute:
+    /// rustfmt always puts it on its own line, neither a comment nor a string
+    /// literal can begin with `#[`, and dropping the closing bracket keeps a
+    /// `#[tauri::command(…)]` with arguments counted as the definition it is.
     #[test]
     fn every_registered_command_lives_in_a_scanned_file() {
-        let attribute = concat!("#[tauri::", "command]");
+        let attribute = concat!("#[tauri::", "command");
         let defined: usize = COMMAND_FILES
             .iter()
             .map(|(_, src)| {
                 src.lines()
-                    .filter(|l| !l.trim_start().starts_with("//") && l.contains(attribute))
+                    .filter(|l| l.trim().starts_with(attribute))
                     .count()
             })
             .sum();
@@ -506,7 +521,7 @@ mod tests {
 
         assert_eq!(
             defined, registered,
-            "{defined} `{attribute}` definitions across COMMAND_FILES but \
+            "{defined} lines starting with `{attribute}` across COMMAND_FILES but \
              {registered} entries in `collect_commands!`. Either a command lives in a \
              file COMMAND_FILES does not list — in which case none of the guards above \
              are looking at it — or one is defined and never registered."

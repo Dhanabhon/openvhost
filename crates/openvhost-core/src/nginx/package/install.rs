@@ -584,6 +584,96 @@ mod tests {
         assert!(fx.ledger.list("mariadb").await.unwrap().is_empty());
     }
 
+    /// The counterpart to the test above, and the reason `ledger` became an
+    /// `Option` (optional-state.db design D4, generalizing 5C audit LOW-4):
+    /// **a degraded `state.db` costs provenance, never correctness.** With no
+    /// ledger to write to, the install must still land in full — tree, warm-up
+    /// and `current` link — and the missing row must surface as
+    /// [`LedgerWrite::Failed`] carrying [`NO_LEDGER_REASON`], not as an error
+    /// and not as a silent success.
+    ///
+    /// Unlike MySQL's, MariaDB's and PHP's twins of this test, nginx's `None`
+    /// arm is not reachable from the app today: `install_nginx_package` has
+    /// exactly one caller in the workspace and it is a test. So this is
+    /// coverage, not behaviour — and it is worth having precisely because the
+    /// argument for widening `ledger` to an `Option` here was "the day an
+    /// `install_nginx` command lands". On that day the arm fires, and without
+    /// this test it would fire untested.
+    ///
+    /// The row count is the half that makes this discriminating. Without it the
+    /// test could not tell "reported failed" from "reported failed and wrote a
+    /// row anyway", which is exactly what a `None` arm bolted onto a working
+    /// writer would do. The fixture's own [`InstallLedger`] is a live writer
+    /// over the same `state.db`, so a row appearing there would be visible.
+    ///
+    /// Vacuity: proven by mutation of THIS arm, twice, because it has two ways
+    /// to be wrong. Returning `Err(CoreError::Validation { .. })` from it —
+    /// i.e. refusing the install rather than degrading it — failed at the
+    /// `unwrap()`; returning `LedgerWrite::Recorded { installed_at: 0 }` failed
+    /// the `Failed` match below. Neither mutation disturbed any other test in
+    /// this module, which is what makes this test the only thing holding that
+    /// arm.
+    #[tokio::test]
+    async fn an_install_with_no_ledger_still_lands_and_reports_the_missing_row() {
+        let fx = Fixture::new().await;
+        let sanctuary = Sanctuary::snapshot(&fx).await;
+        let warmed = fx.evidence.join("nginx-ran");
+        let archive = nginx_shaped_targz(&script(&format!("/usr/bin/touch {}", warmed.display())));
+        let url = serve_once(archive.clone());
+        let entry = entry_for(url, sha_hex(&archive));
+
+        // `None` is precisely what the desktop app passes when `state.db` never
+        // opened: `DbHandle::optional()` is `None` and there is no
+        // `InstallLedger` to construct.
+        let out = install_entry(&entry, &fx.root, None, |_| {}).await.unwrap();
+
+        // The install landed, in full. Asserted first, because every conclusion
+        // below is worthless if nothing ran.
+        assert_eq!(out.package.dir, fx.version_dir());
+        assert_eq!(out.package.version, "1.30.4");
+        assert!(
+            fx.version_dir().join("bin/nginx").is_file(),
+            "a missing ledger cost the package tree, which is the one thing it must never cost"
+        );
+        assert!(
+            warmed.is_file(),
+            "the warm-up was skipped, so macOS's first-execution check lands on the user's Start"
+        );
+        assert_eq!(
+            std::fs::read_link(fx.current_link()).unwrap(),
+            PathBuf::from("1.30.4"),
+            "`current` must point at the version we just installed"
+        );
+        assert!(
+            fx.staging_dirs().is_empty(),
+            "staging survived a ledger-less success"
+        );
+
+        // …and it said so, in the state that exists to say it.
+        match &out.ledger {
+            LedgerWrite::Failed { reason } => assert_eq!(
+                reason.as_str(),
+                NO_LEDGER_REASON,
+                "the missing row must carry the no-database reason, not a database error"
+            ),
+            LedgerWrite::Recorded { .. } => panic!(
+                "no ledger was handed over, so nothing can have recorded this: {:?}",
+                out.ledger
+            ),
+        }
+
+        // "Reported failed" and "recorded it anyway" are different facts, and
+        // only this assertion separates them.
+        assert_eq!(
+            fx.ledger_rows().await,
+            0,
+            "a row appeared for an install that was handed no ledger"
+        );
+        sanctuary
+            .assert_untouched(&fx, "after a ledger-less install")
+            .await;
+    }
+
     /// Golden rule 6, made observable: the bytes are verified BEFORE anything
     /// unpacks them, and a user watching progress can tell a verified download
     /// from one that merely arrived.

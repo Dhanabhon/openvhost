@@ -157,9 +157,11 @@ fn manage_store_down(app: &tauri::App<tauri::test::MockRuntime>) {
 /// VACUITY, measured once here for every caller rather than restated at each
 /// of them. The group is the **13** tests `cargo test store_is_down` selects,
 /// which is deliberately not the same set as this function's callers — 10 of
-/// the 13 call it, and the other three assert the same claims inline because
-/// they are checking a `Failed` DTO or a gate rather than an `IpcError`. Three
-/// mutations, each run against all 13:
+/// the 13 call it, both gate tests among them. Of the other three, two assert
+/// the same claims inline because they check a `Failed` DTO rather than an
+/// `IpcError`; the third reads `unavailable_reason()` and asserts only the
+/// reason, as the mutation below records. Three mutations, each run against
+/// all 13:
 ///
 /// - `unavailable_message` reduced to `format!("{STORE_UNAVAILABLE}")` — the
 ///   reason dropped: **12 of the 13 failed** on the "carries the reason" claim.

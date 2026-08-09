@@ -388,13 +388,21 @@ pub fn run() {
                             // `InstanceLock::acquire() == Ok(Some(lock))`. On a
                             // second instance, a lock error, or an unresolvable
                             // home, setup still returns `Ok(())`, the window is
-                            // still created, and NOTHING is managed — so every
-                            // command that extracts state, `state_store_status`
-                            // included, gets Tauri's `.manage()` string back and
-                            // the banner stays silent, because a failed ask
-                            // renders as silence by design. Closing that is a separate
-                            // slice: what a second instance's window should show
-                            // is a design question, not a fix to make here.
+                            // still created, and nothing beyond the six values
+                            // managed above this match is managed. So every
+                            // command that extracts state managed INSIDE this
+                            // arm fails with Tauri's `.manage()` string — every
+                            // `DbHandle`, `Arc<Supervisor>`, `Option<StackPaths>`
+                            // and runtime-cache reader — while the four that
+                            // extract only the unconditional `InstallLock`
+                            // (`pending_install` and the three
+                            // `cancel_*_install`) still answer normally.
+                            // `state_store_status` is a `DbHandle` reader, so it
+                            // refuses too and the banner stays silent, because a
+                            // failed ask renders as silence by design. Closing
+                            // that is a separate slice: what a second instance's
+                            // window should show is a design question, not a fix
+                            // to make here.
                             //
                             // The bare `Db` is deliberately NOT managed anywhere,
                             // on either arm: that is what makes a future
