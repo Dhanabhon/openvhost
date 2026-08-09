@@ -606,8 +606,8 @@ mod tests {
     /// over the same `state.db`, so a row appearing there would be visible.
     ///
     /// Vacuity: proven by mutation, twice, because the `None` arm has two ways
-    /// to be wrong. Returning `Err(CoreError::Internal(…))` from it failed at
-    /// the `unwrap()`; returning `LedgerWrite::Recorded { installed_at: … }`
+    /// to be wrong. Returning `Err(CoreError::Validation { … })` from it failed
+    /// at the `unwrap()`; returning `LedgerWrite::Recorded { installed_at: … }`
     /// failed the `Failed` match below. Neither mutation disturbed any other
     /// test in this module, which is what makes this test the only thing
     /// holding that arm.

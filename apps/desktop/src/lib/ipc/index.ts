@@ -212,6 +212,18 @@ async function unwrap<T>(
 	}
 }
 
+/**
+ * Why `state.db` is unavailable this run, or `null` when it opened fine.
+ *
+ * The one input to the app-level "data store unavailable" banner. The string is
+ * the underlying failure — *unable to open database file*, *permission denied* —
+ * and is rendered verbatim, never parsed: it is an OS/sqlite sentence nobody
+ * agreed to keep stable, the same discipline `ApplyErrorBanner` applies to its
+ * own `error` prop.
+ */
+export async function stateStoreStatus(): Promise<string | null> {
+	return unwrap(commands.stateStoreStatus());
+}
 export async function listServices(): Promise<ServiceStatus[]> {
 	return unwrap(commands.listServices());
 }

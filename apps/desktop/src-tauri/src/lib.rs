@@ -81,6 +81,10 @@ fn specta_builder() -> Builder<tauri::Wry> {
     Builder::<tauri::Wry>::new()
         .commands(collect_commands![
             commands::core_info,
+            // Sits beside `core_info` because it answers the same kind of
+            // question — "what is true of this app right now?" — for every
+            // route at once, rather than for a page (optional-state.db D5).
+            db_state::state_store_status,
             commands::list_services,
             commands::start_service,
             commands::stop_service,

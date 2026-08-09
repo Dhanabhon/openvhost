@@ -11664,9 +11664,10 @@ impl TryFrom<LogSourceDto> for LogSource {
 /// `derive_path` (it has no on-disk path at all), not by a catalogue rule
 /// here.
 ///
-/// **`db` is `None` when `state.db` did not open, and only the site arm fails
-/// closed** (optional-state.db design D2's SPLIT). That asymmetry is the whole
-/// decision, so it is stated rather than left to be read out of the arms:
+/// **`db` is [`DbHandle::Unavailable`] when `state.db` did not open, and only
+/// the site arm fails closed** (optional-state.db design D2's SPLIT). That
+/// asymmetry is the whole decision, so it is stated rather than left to be read
+/// out of the arms:
 ///
 /// - nginx's globals, a php-fpm pool and a ring are all named by a catalogue
 ///   that does not live in `state.db`, so a missing store tells us nothing
@@ -11679,9 +11680,17 @@ impl TryFrom<LogSourceDto> for LogSource {
 ///   only thing that says which domains exist. With no store there is nothing
 ///   to check it against, and degrading would derive
 ///   `<home>/logs/sites/<domain>/…` for a domain nothing vetted.
+///
+/// The whole [`DbHandle`] rather than an `Option<&Db>`, so this refusal can
+/// carry the REASON the store is missing — *unable to open database file* —
+/// which is the entire point of [`DbHandle::Unavailable`]'s `reason` field. An
+/// `Option` throws that away at the call site, and the inline refusal is what a
+/// user reads at the moment they are blocked; deferring the detail to the
+/// app-level banner is the same "a reader could infer it" reasoning this
+/// codebase keeps rejecting.
 async fn check_catalogue(
     source: &LogSource,
-    db: Option<&Db>,
+    db: &DbHandle,
     runtimes: &RwLock<Option<InstalledRuntimes>>,
 ) -> Result<(), IpcError> {
     match source {
@@ -11707,13 +11716,24 @@ async fn check_catalogue(
             // Fail closed. `IpcError::Core`, not `Validation` on `domain`: the
             // domain is not what is wrong, and a page that renders this must
             // not read it as "no such site".
-            let Some(db) = db else {
-                return Err(IpcError::Core {
-                    message: format!(
-                        "{}, so no site's log can be confirmed as one of yours",
-                        crate::db_state::STORE_UNAVAILABLE
-                    ),
-                });
+            //
+            // Matched exhaustively rather than routed through
+            // `DbHandle::require()`, for the one thing `require` cannot do: keep
+            // the clause that says why THIS refusal follows from the store being
+            // down. The shared sentence and the reason still come from
+            // `unavailable_message`, so only the trailing clause is local — and a
+            // third `DbHandle` variant would fail to compile here rather than
+            // fall into a wildcard.
+            let db = match db {
+                DbHandle::Ready(db) => db,
+                DbHandle::Unavailable { reason } => {
+                    return Err(IpcError::Core {
+                        message: format!(
+                            "{}, so no site's log can be confirmed as one of yours",
+                            crate::db_state::unavailable_message(reason)
+                        ),
+                    });
+                }
             };
             let repo = SqliteSiteRepository::new(db);
             let known = repo
@@ -11792,7 +11812,7 @@ fn derive_path(source: &LogSource, paths: &openvhost_core::LogPaths) -> Result<P
 /// PHP major is rejected without a single filesystem call.
 async fn resolve_log_path(
     dto: LogSourceDto,
-    db: Option<&Db>,
+    db: &DbHandle,
     runtimes: &RwLock<Option<InstalledRuntimes>>,
     paths: &openvhost_core::LogPaths,
 ) -> Result<PathBuf, IpcError> {
@@ -12135,7 +12155,7 @@ pub async fn read_log_window(
 ) -> Result<LogWindowDto, IpcError> {
     let p = stack_paths(&stack)?;
     let log_paths = openvhost_core::LogPaths::new(&p.home);
-    let path = resolve_log_path(input.source, db.optional(), runtimes.inner(), &log_paths).await?;
+    let path = resolve_log_path(input.source, db.inner(), runtimes.inner(), &log_paths).await?;
 
     let cursor = decode_cursor(input.cursor)?;
     let needle = input
@@ -12181,7 +12201,7 @@ pub async fn read_log_window(
 /// the derived path's parent — stays directly testable.
 async fn reveal_log_folder_target(
     source: LogSourceDto,
-    db: Option<&Db>,
+    db: &DbHandle,
     runtimes: &RwLock<Option<InstalledRuntimes>>,
     paths: &openvhost_core::LogPaths,
 ) -> Result<PathBuf, IpcError> {
@@ -12215,8 +12235,7 @@ pub async fn reveal_log_folder(
     use tauri_plugin_opener::OpenerExt;
     let p = stack_paths(&stack)?;
     let log_paths = openvhost_core::LogPaths::new(&p.home);
-    let folder =
-        reveal_log_folder_target(source, db.optional(), runtimes.inner(), &log_paths).await?;
+    let folder = reveal_log_folder_target(source, db.inner(), runtimes.inner(), &log_paths).await?;
     app.opener()
         .open_path(folder.display().to_string(), None::<&str>)
         .map_err(|e| IpcError::Core {
@@ -12433,7 +12452,7 @@ mod log_ipc_tests {
 
         let err = reveal_log_folder_target(
             LogSourceDto::ServiceRing { id: "nginx".into() },
-            Some(&db),
+            &DbHandle::Ready(db),
             &runtimes,
             &log_paths,
         )
@@ -12752,7 +12771,7 @@ mod log_ipc_tests {
             LogSourceDto::SiteError {
                 domain: "ghost.localhost".into(),
             },
-            Some(&db),
+            &DbHandle::Ready(db),
             &runtimes,
             &log_paths,
         )
@@ -12777,7 +12796,7 @@ mod log_ipc_tests {
             LogSourceDto::SiteAccess {
                 domain: "shop.localhost".into(),
             },
-            Some(&db),
+            &DbHandle::Ready(db),
             &runtimes,
             &log_paths,
         )
@@ -12798,18 +12817,24 @@ mod log_ipc_tests {
     //
     // Vacuity, measured by mutation on the ONE arm that decides it:
     //
-    //  * `check_catalogue`'s site arm returning `Ok(())` on `None` instead of
-    //    refusing reddens `a_site_log_is_refused_…` and
+    //  * `check_catalogue`'s site arm returning `Ok(())` on an `Unavailable`
+    //    handle instead of refusing reddens `a_site_log_is_refused_…` and
     //    `reveal_log_folder_target_refuses_a_site_…` (the read then SUCCEEDS
     //    and hands back the planted file's contents, which is precisely the
     //    leak the gate exists to stop) and leaves this group's other three
     //    tests green.
-    //  * Making the whole function refuse on `None` — the plausible
-    //    over-correction — reddens `the_nginx_error_log_is_still_readable_…`,
+    //  * Making the whole function refuse when the store is down — the
+    //    plausible over-correction — reddens
+    //    `the_nginx_error_log_is_still_readable_…`,
     //    `a_php_pool_log_is_still_readable_…` and
     //    `a_ring_source_is_still_rejected_…` and leaves the two site tests
     //    green. Neither mutation is detectable by the group's other half,
     //    which is why both halves are here.
+    //  * Building the refusal from `STORE_UNAVAILABLE` instead of
+    //    `unavailable_message(reason)` — i.e. going back to what an
+    //    `Option<&Db>` could carry — reddens exactly the two `STORE_DOWN_REASON`
+    //    assertions in `a_site_log_is_refused_…` and
+    //    `reveal_log_folder_target_refuses_a_site_…`, and nothing else. Measured.
 
     /// The store's own fixture: down, with the log files a user would want to
     /// read at that exact moment already on disk.
@@ -12864,7 +12889,7 @@ mod log_ipc_tests {
         let log_paths = openvhost_core::LogPaths::new(home.path());
         let folder = reveal_log_folder_target(
             LogSourceDto::NginxError,
-            None,
+            app.state::<DbHandle>().inner(),
             app.state::<RwLock<Option<InstalledRuntimes>>>().inner(),
             &log_paths,
         )
@@ -12971,6 +12996,14 @@ mod log_ipc_tests {
                     message.contains(crate::db_state::STORE_UNAVAILABLE),
                     "the refusal must name the store, got {message:?}"
                 );
+                // The reason, in the message the user is shown at the moment
+                // they are blocked — not left to be inferred from the banner.
+                // Reddens the instant `check_catalogue` goes back to an
+                // `Option<&Db>`, which cannot carry it.
+                assert!(
+                    message.contains(STORE_DOWN_REASON),
+                    "the refusal must carry the reason the store is missing: {message:?}"
+                );
                 assert!(
                     !message.contains(".manage()"),
                     "the user must never be told to call a Rust API: {message:?}"
@@ -12990,7 +13023,7 @@ mod log_ipc_tests {
             LogSourceDto::SiteError {
                 domain: "ghost.localhost".into(),
             },
-            None,
+            &store_down(),
             &runtimes,
             &log_paths,
         )
@@ -12998,10 +13031,16 @@ mod log_ipc_tests {
         .unwrap_err();
 
         match err {
-            IpcError::Core { message } => assert!(
-                message.contains(crate::db_state::STORE_UNAVAILABLE),
-                "the refusal must name the store, got {message:?}"
-            ),
+            IpcError::Core { message } => {
+                assert!(
+                    message.contains(crate::db_state::STORE_UNAVAILABLE),
+                    "the refusal must name the store, got {message:?}"
+                );
+                assert!(
+                    message.contains(STORE_DOWN_REASON),
+                    "and it must carry the reason, not only the shared sentence: {message:?}"
+                );
+            }
             other => panic!("expected the store refusal, got {other:?}"),
         }
     }
