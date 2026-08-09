@@ -363,10 +363,14 @@ mod tests {
     /// the only thing in the repository that ties `sha256` below to an account
     /// of how those bytes were produced. Test-only, like `RECIPE`.
     ///
-    /// This one is a repack (`resumed_from: "pack"`, `configure_flags: []`, no
-    /// `dependencies` block) — how PR #67 re-cut this pin, and a true account
-    /// of that run rather than a degraded copy of a better file. See
-    /// `build/manifests/README.md`.
+    /// This one is a repack (`resumed_from: "pack"`, `configure_flags: []`) —
+    /// how PR #67 re-cut this pin, and a true account of that run rather than a
+    /// degraded copy of a better file. It also carries no `dependencies` block,
+    /// which is a **separate fact with a separate cause**: being a repack does
+    /// not lose that block — the driver emits it unconditionally, with
+    /// `"tree_sha256": null`, for any recipe declaring `RECIPE_DEPENDS`. This
+    /// manifest simply **predates** it, exactly as the PROVENANCE note above
+    /// says. See `build/manifests/README.md`.
     const MANIFEST: &str =
         include_str!("../../../../../build/manifests/mariadb-11.4.9-macos-arm64.manifest.json");
 

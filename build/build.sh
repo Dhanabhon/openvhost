@@ -998,13 +998,22 @@ pipeline_path() {
 
 # `[{"path": …, "sha256": …}, …]` over the files named, in the order named.
 #
-# There is no delimited stream anywhere in here, which is how it meets
-# prefix_digest's rule that no field may contain the byte separating its own
-# records: each path goes straight into its own JSON string with its digest
-# beside it, and is never accumulated into a `path<sep>digest` list that
-# something later splits. A path may hold any byte but NUL — including the
-# newline that forged a collision in prefix_digest's symlink stream — so the
-# cheapest way to keep one out of a separator is to have no separator.
+# No path is ever accumulated into a `path<sep>digest` list that something later
+# splits: each goes straight into its own JSON string with its digest beside it.
+# That is how this meets prefix_digest's rule that no field may contain the byte
+# separating its own records, and it has to hold, because a path may carry any
+# byte but NUL — including the newline that forged a collision in prefix_digest's
+# symlink stream.
+#
+# The emission was never the exposure; READING shasum's output was. `shasum -a
+# 256 -- "$file"` prints `<digest>  <path>`, and escapes that whole line with a
+# leading backslash whenever the path contains a backslash or a newline — so
+# splitting it on a space took `\<digest>`: 65 characters, still valid JSON, and
+# not a SHA-256. Measured live through this driver from a real recipe. The file
+# is therefore hashed on STDIN, where no filename is printed and there is
+# nothing left to escape, and the result must still look like a digest before it
+# is recorded. The risk was removed by not naming the file, not by reasoning
+# about the separator.
 #
 # `$what` names the caller's category so a failure says which declaration is
 # wrong, since one of the two lists is the recipe's and the other is not.
@@ -1025,7 +1034,21 @@ json_file_digests() {
 		# previous manifest whole instead of truncating a new one mid-write.
 		[ -f "$file" ] && [ -r "$file" ] ||
 			bp_die "$what is not a readable file: $file"
-		digest="$(shasum -a 256 -- "$file" | cut -d' ' -f1)"
+		digest="$(shasum -a 256 <"$file")"
+		# Parameter expansion, not `cut -d' '`: the redirect above means the only
+		# thing after the digest is shasum's own `-` for stdin, so there is no
+		# attacker-influenced text on this line at all.
+		digest="${digest%% *}"
+		# Aborts rather than recording a malformed digest, for the same reason the
+		# unreadable-file arm above does: a block that says "these are the inputs"
+		# is worth nothing if one of its values can be something else wearing a
+		# digest's key. Both halves are checked — 65 characters of otherwise
+		# lowercase hex was exactly the shape that got through before.
+		[ "${#digest}" -eq 64 ] ||
+			bp_die "$what did not hash to 64 characters (got ${#digest}): $file"
+		case "$digest" in
+		*[!0-9a-f]*) bp_die "$what did not hash to lowercase hex: $file" ;;
+		esac
 		if [ "$first" -eq 1 ]; then first=0; else printf ', '; fi
 		printf '{"path": "%s", "sha256": "%s"}' \
 			"$(json_string "$(pipeline_path "$file")")" "$(json_string "$digest")"
@@ -1084,7 +1107,7 @@ stage_manifest() {
 	# §7. Single-builder trust (D1) is only acceptable because the inputs are
 	# recorded; this file is the whole of that acceptability.
 	local manifest="$OUT_DIR/$BUILD_NAME-$BUILD_VERSION-macos-$BUILD_ARCH.manifest.json"
-	local versions=() tool line dependencies pipeline
+	local versions=() tool line dependencies pipeline extra has_extra=0
 	bp_assert_under "$manifest" "$OUT_DIR" "write"
 	if [ -z "$TARBALL_SHA" ] && [ -f "$TARBALL" ]; then
 		TARBALL_SHA="$(shasum -a 256 -- "$TARBALL" | cut -d' ' -f1)"
@@ -1097,14 +1120,34 @@ stage_manifest() {
 	versions[${#versions[@]}]="macos-sdk: $(xcrun --show-sdk-version 2>/dev/null || echo unknown)"
 	versions[${#versions[@]}]="macos: $(sw_vers -productVersion 2>/dev/null || echo unknown)"
 
-	# Hashing trees and files is what can fail on its own, so it happens BEFORE
-	# the redirect below opens the manifest. Inside that group an abort under
-	# set -e truncates the file mid-write, which would leave a half-written
-	# manifest next to a finished tarball; out here it leaves the previous one
-	# untouched. Both assignments are plain, never `local x="$(...)"`, whose exit
-	# status is `local`'s and would swallow the failure this ordering exists for.
+	# Everything that can fail on its own happens BEFORE the redirect below opens
+	# the manifest. Inside that group an abort under set -e truncates the file
+	# mid-write, which would leave a half-written manifest next to a finished
+	# tarball; out here it leaves the previous one untouched. Every assignment is
+	# plain, never `local x="$(...)"`, whose exit status is `local`'s and would
+	# swallow the failure this ordering exists for.
+	#
+	# recipe_manifest_extra is the third and last of them, and it is the one this
+	# ordering was actually written for: nine truncated manifests ending at
+	# `"recipe": ` exist from when it ran inside the group. nginx.sh guards its
+	# own shasum against exactly that, but per-recipe discipline is a rule every
+	# future recipe has to be told about, and the structure costs one variable.
+	#
+	# `set -e;` INSIDE the substitution, and it is not decoration: bash 3.2
+	# clears errexit on entering `$( )`, so a mid-function failure is swallowed
+	# and only the LAST command's status reaches this assignment. Measured on
+	# bash 3.2.57 — a recipe function whose `d="$(shasum …)"` fails then carries
+	# on to its printf, and without this the driver recorded `{"x": ""}` and
+	# exited 0. That is a worse outcome than the truncation this hoist removes:
+	# the run looks clean and the manifest carries a confident, wrong value,
+	# which is the exact failure this whole file keeps being fixed for. Re-arming
+	# restores both `-e` and `-o pipefail` for the recipe's own code.
 	dependencies="$(json_dependencies)"
 	pipeline="$(json_pipeline)"
+	if [ "$(type -t recipe_manifest_extra 2>/dev/null || true)" = "function" ]; then
+		has_extra=1
+		extra="$(set -e; recipe_manifest_extra)"
+	fi
 
 	{
 		printf '{\n'
@@ -1132,9 +1175,8 @@ stage_manifest() {
 		printf '    "file": "%s",\n' "$(json_string "$(basename -- "$TARBALL")")"
 		printf '    "sha256": "%s"\n' "$(json_string "$TARBALL_SHA")"
 		printf '  }'
-		if [ "$(type -t recipe_manifest_extra 2>/dev/null || true)" = "function" ]; then
-			printf ',\n  "recipe": '
-			recipe_manifest_extra
+		if [ "$has_extra" -eq 1 ]; then
+			printf ',\n  "recipe": %s' "$extra"
 		fi
 		printf '\n}\n'
 	} >"$manifest"

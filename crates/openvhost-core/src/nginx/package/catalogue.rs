@@ -391,6 +391,14 @@ mod tests {
     /// to catch.
     const SIGNING_KEY_FPR: &str = "43387825DDB1BB97EC36BA5D007C8D7C15D87369";
 
+    /// The pinned digest of upstream's `nginx-1.30.4.tar.gz`, which
+    /// `build/recipes/nginx.sh` verifies the download against
+    /// (`RECIPE_SOURCE_SHA256`) and the manifest records as `upstream.sha256`.
+    /// Bound here so the three records of one fact cannot drift: this was the
+    /// last of the three engines still checking neither its source digest nor
+    /// its configure flags, while MariaDB's and PHP's twins bind theirs.
+    const SOURCE_SHA256: &str = "4261dc90e9e47c1c4041276e9aaa3d48ebe2e664f728e14fa95ae6c67d57a08b";
+
     // ------------------------------------------------------------------
     // Group 1 — the pinned entry, byte for byte.
     //
@@ -609,6 +617,11 @@ mod tests {
                 "upstream.signing_key_fingerprint",
                 m["upstream"]["signing_key_fingerprint"].as_str(),
                 SIGNING_KEY_FPR,
+            ),
+            (
+                "upstream.sha256",
+                m["upstream"]["sha256"].as_str(),
+                SOURCE_SHA256,
             ),
         ] {
             assert_eq!(

@@ -408,11 +408,18 @@ mod tests {
     /// the only thing in the repository that ties `sha256` below to an account
     /// of how those bytes were produced. Test-only, like `PHP_PINS`.
     ///
-    /// This one is a repack (`resumed_from: "pack"`, `configure_flags: []`, no
-    /// `dependencies` block) — how PR #67 re-cut this pin. Its consequence is
-    /// recorded rather than papered over: PHP's `spc build` flags reach **no**
-    /// manifest at all and live only in `php.sh`'s `_php_spc_build_args`, so
-    /// this file cannot be asked about them. See `build/manifests/README.md`.
+    /// This one is a repack (`resumed_from: "pack"`, `configure_flags: []`) —
+    /// how PR #67 re-cut this pin. Its consequence is recorded rather than
+    /// papered over: PHP's `spc build` flags reach **no** manifest at all and
+    /// live only in `php.sh`'s `_php_spc_build_args`, so this file cannot be
+    /// asked about them.
+    ///
+    /// It also carries no `dependencies` block, which is a **separate fact with
+    /// a separate cause**: being a repack does not lose that block — the driver
+    /// emits it unconditionally, with `"tree_sha256": null`, for any recipe
+    /// declaring `RECIPE_DEPENDS`, and `php.sh` has declared one since PR #60.
+    /// This manifest simply **predates** it, exactly as the PROVENANCE note
+    /// above says. See `build/manifests/README.md`.
     const MANIFEST: &str =
         include_str!("../../../../../build/manifests/php-8.4.24-macos-arm64.manifest.json");
 

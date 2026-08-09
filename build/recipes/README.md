@@ -150,6 +150,12 @@ worth stating here because they shape how a recipe must be written:
 If you are ever tempted to relax a contract check to make a build pass, that is
 the moment the pipeline stops being worth having. Report it instead.
 
+**Writing a proof that drives `audit.sh`: give it a real tree or tarball.** It
+validates `TARGET` and dies (`audit.sh:303`, `:306`) *before* it sources the
+recipe (`:340`), so a proof pointed at a path that does not exist exits non-zero
+without the recipe ever being read — green-looking evidence for a line that
+never ran. Check the recipe was reached, not only that the command failed.
+
 ## Start from `_template.sh`
 
 Copy `_template.sh` to `<name>.sh`. Names beginning with `_` are not package

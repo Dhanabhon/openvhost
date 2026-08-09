@@ -28,10 +28,58 @@ every recorded digest below is the original run's.
 
 **Artifacts stay out of git.** `.gitignore` carves `/build/manifests/*.manifest.json`
 back out of the artifact exclusions; `/build/out/` remains ignored outright, so a
-manifest in the driver's own output directory is still untracked, and a stray
-tarball dropped in this directory is still ignored. A 2.7 MB–125 MB tarball is
-what golden rule 6 forbids; a 3.6 KB JSON record of how one was made is a
-different thing.
+manifest in the driver's own output directory is still untracked. A 2.7 MB–125 MB
+tarball is what golden rule 6 forbids; a 1.7–10.1 KB JSON record of how one was
+made is a different thing.
+
+The exclusions this directory sits inside are an **enumeration of four
+suffixes**, not a guarantee about archives: `.tar.gz`, `.tar.xz`, `.tgz` and
+`.sha256` are refused here, and a stray `.tar`, `.zip`, `.tar.zst`, `.tar.bz2`
+or `.txz` is committable — measured with `git check-ignore --no-index`, and
+equally true at `build/` and `build/recipes/`, so nothing about this directory
+widened it. The driver only ever writes `.tar.gz`, so the enumeration covers
+what the pipeline produces and nothing more. Stage manifests by explicit path;
+`git add -A` in here is not backstopped.
+
+## What the tests actually bind, and what they do not
+
+Each catalogue's Group 2 test parses its manifest and asserts on **seven**
+fields. nginx bound six until this slice, which is why `upstream.sha256` is
+listed explicitly below rather than assumed:
+
+| field | nginx | mariadb | php |
+|---|---|---|---|
+| `output.sha256` (against the pin) | ✓ | ✓ | ✓ |
+| `name` | ✓ | ✓ | ✓ |
+| `version` | ✓ | ✓ | ✓ |
+| `upstream.release_date` | ✓ | ✓ | ✓ |
+| `upstream.last_checked` | ✓ | ✓ | ✓ |
+| `upstream.signing_key_fingerprint` | ✓ | ✓ | ✓ |
+| `upstream.sha256` | ✓ | ✓ | ✓ |
+
+**Everything else in a committed manifest is evidence, not an assertion under
+test.** Unbound: `arch`, `built_at`, `build_prefix`, `resumed_from`,
+`configure_flags[*]`, `toolchain[*]`, all of `dependencies.*`, `output.file`,
+`upstream.url`, `upstream.signing_key_expiry`, `upstream.signing_key_verified_on`,
+all of `recipe.*`, and every field of `pipeline.*`. Anyone with commit access can
+edit those and no test notices. That is a deliberate boundary — these files are
+the record a human reads when a pin moves — but it is a boundary, and it is
+stated here rather than inferred from which assertions someone happened to write.
+
+Two of the unbound fields are worth naming, in the same voice this file already
+uses for PHP's absent `spc build` flags and for `sha256_on_disk`'s `unknown`
+sentinel:
+
+* **`upstream.url` is unbound in all three.** The catalogues bind the *download*
+  URL of the OpenVHost release, and the recipe tripwire binds the source digest
+  and the signing key — but nothing ties the manifest's record of *where
+  upstream's tarball came from* to the recipe that fetched it.
+* **`recipe.pinned_sources[*]` is unbound**, and for PHP that is 34 library
+  digests: the single largest provenance claim in this repository, with nothing
+  connecting it to `build/recipes/_php-pins.sh`. The mechanically enforceable
+  version is the same deferred work as `pipeline` (design §6, D4) — a pins-only
+  file whose digest a test may hard-assert because it moves only when a pin
+  moves. Until that exists, `pinned_sources` is read, not checked.
 
 ## Four runs produced each of these artifacts, byte-identical
 
@@ -68,20 +116,39 @@ All times 2026-08-08 UTC. Every row below produced the digest in the table above
 `configure_flags`, and a `dependencies` block carrying openssl 3.5.7's
 `tree_sha256`.
 
-`mariadb`'s and `php`'s are **repacks**: `resumed_from: "pack"`,
-`configure_flags: []`, and no `dependencies` block. That is not a degraded copy
-of a better file that exists somewhere — it is how PR #67 re-cut those two pins,
-re-packing an already-built prefix to obtain deterministic bytes without
-rebuilding. Both catalogues already say so in prose; these files make it
-checkable.
+`mariadb`'s and `php`'s are **repacks**: `resumed_from: "pack"` and
+`configure_flags: []`. That is not a degraded copy of a better file that exists
+somewhere — it is how PR #67 re-cut those two pins, re-packing an already-built
+prefix to obtain deterministic bytes without rebuilding. Both catalogues already
+say so in prose; these files make it checkable. Neither carries a `dependencies`
+block, but that is a **separate fact with a separate cause** — see below.
 
 **A repack manifest legitimately loses `configure_flags`.** The driver records
 flags as `recipe_configure` calls `bp_record_flags`, and a run resumed at `pack`
 never reaches that stage, so an empty list is a true statement that this run
-observed no configure step — not a lost field. The same is why there is no
-`dependencies` block. Do not "repair" these by copying flags in from a recipe:
-the flags in a recipe today are a claim about what a build *would* do, and this
-file records what one *did*.
+observed no configure step — not a lost field. Do not "repair" these by copying
+flags in from a recipe: the flags in a recipe today are a claim about what a
+build *would* do, and this file records what one *did*.
+
+**The missing `dependencies` block is not that, and this file said otherwise
+until it was measured.** Being a repack does not lose the block. `build.sh`
+prints `"dependencies": …` unconditionally, and `json_dependencies` is driven
+off `RECIPE_DEPENDS` — which `mariadb.sh` has declared since PR #51 and `php.sh`
+since PR #60 — so a resumed run emits the block in full, with `"tree_sha256":
+null` and a `not_observed` sentence beside it. Confirmed by running the driver
+`--from manifest` against a recipe with one `RECIPE_DEPENDS` entry: the block is
+there. nginx's own three repacks carry one too.
+
+The real reason is chronological, and it is the one both catalogues give
+correctly two hundred lines above the doc comment that used to give the wrong
+one: **these two manifests predate the block.** `json_dependencies` entered
+`build.sh` in PR #68; `4db29f9^:build/build.sh` emits no `dependencies` key at
+all. mariadb's and php's manifests were cut at 14:23Z on 2026-08-08 and nginx's
+at 17:03Z the same day — and nginx's has the block while the other two do not,
+so the driver gained it inside that window. Backfilling it is refused for the
+reason in *Copied, not regenerated* above: a `--from pack` run today would
+digest today's prefix, so the block it wrote would be a precise, confident,
+wrong claim about an August 3 build.
 
 PHP's real exposure is larger than this and is recorded rather than fixed: because
 its shipping manifest is a repack, its `spc build` flags are in **no manifest at
