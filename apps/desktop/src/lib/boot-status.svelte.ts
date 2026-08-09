@@ -85,6 +85,47 @@ export function bootRendering(
 	}
 }
 
+/**
+ * Whether the app itself is on screen — the gate for anything app-level that
+ * KEEPS running rather than asking once.
+ *
+ * The layout's status-bar sampling is the case this exists for: `statsStore`
+ * polls `services_memory` every 2 s and `home_disk_usage` every 60 s, and on a
+ * degraded boot neither command can ever answer, because the supervisor and the
+ * stack paths they read are managed inside the one arm that succeeded. Nothing
+ * renders the result and the store captures its own errors, so it is invisible —
+ * which is exactly what makes it worth stopping: an interval that can never
+ * succeed, running behind a screen whose whole message is that the app never
+ * started.
+ *
+ * **The predicate is "are the children rendered", not "is the boot `ready`".**
+ * Those differ on one case, `appDespiteFailedAsk`, and the difference is
+ * deliberate: {@link bootRendering} renders the app there precisely because
+ * blanking a working app over an unanswered question is worse than the failure
+ * being reported, and a status bar frozen at "—" on a healthy machine would be
+ * that same mistake one layer down. Tying the poll to the same condition as
+ * `{@render children()}` also means the two cannot drift into a state where the
+ * strip is on screen with nothing feeding it.
+ *
+ * Exhaustive with no wildcard, like every other switch in this file: a fifth
+ * {@link BootRendering} kind must say whether the app is up rather than
+ * inheriting an answer.
+ */
+export function appIsOnScreen(rendering: BootRendering): boolean {
+	switch (rendering.kind) {
+		case 'app':
+		case 'appDespiteFailedAsk':
+			return true;
+		case 'pending':
+		case 'takeover':
+			return false;
+		default: {
+			const unreachable: never = rendering;
+			return unreachable;
+		}
+	}
+}
+
 export interface BootStatusApi {
 	bootStatus: () => Promise<BootStatusDto>;
 }

@@ -95,6 +95,12 @@ fn specta_builder() -> Builder<tauri::Wry> {
             // got before any page asked anything (degraded-boot D1). The only
             // command on this surface that answers on EVERY boot path.
             boot::boot_status,
+            // The one action the run-dir takeover screen offers besides Quit
+            // (degraded-boot D3). Registered beside `boot_status` because it
+            // reads the same managed `BootState` and refuses on every arm that
+            // named no run directory — the renderer supplies no path, exactly
+            // like `open_homebrew_site` below.
+            boot::reveal_run_dir,
             commands::list_services,
             commands::start_service,
             commands::stop_service,

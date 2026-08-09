@@ -11,12 +11,13 @@
 		onServiceUnregistered,
 		pendingInstall,
 		quitDialogReady,
+		revealRunDir,
 		type IpcError,
 		type PendingInstallDto
 	} from '$lib/ipc';
 	import { errorMessage } from '$lib/errors';
 	import { bootStatusStore } from '$lib/boot-status.shared.svelte';
-	import { bootRendering } from '$lib/boot-status.svelte';
+	import { appIsOnScreen, bootRendering } from '$lib/boot-status.svelte';
 	import { servicesStore } from '$lib/services.shared.svelte';
 	import { statsStore } from '$lib/stats.shared.svelte';
 	import { storeStatusStore } from '$lib/store-status.shared.svelte';
@@ -32,6 +33,11 @@
 	let quitOpen = $state(false);
 	let quitting = $state(false);
 	let quitError = $state('');
+	// The takeover's other button (degraded-boot D3). Its failure lives HERE rather
+	// than in the screen for the same reason `quitError` does: the component takes
+	// no IPC, so the layer that made the call is the layer that can say what went
+	// wrong with it.
+	let revealError = $state('');
 	// Read live, not snapshotted when the dialog opened: a service that stops while
 	// the user reads the dialog should drop out of the sentence.
 	const pending = $derived(pendingServiceNames(servicesStore.services));
@@ -64,6 +70,24 @@
 			quitError = errorMessage(e);
 		} finally {
 			quitting = false;
+		}
+	}
+
+	// No busy flag, unlike `onConfirmQuit`. A reveal has no half-finished state to
+	// protect — pressing it twice opens the same Finder window twice — and a
+	// `revealing` flag could only add a way for the button to get stuck disabled on
+	// a screen whose whole point is that the app is already broken.
+	async function onRevealRunDir(): Promise<void> {
+		revealError = '';
+		try {
+			await revealRunDir();
+		} catch (e) {
+			// The likeliest failure by far, and the reason this is rendered rather
+			// than swallowed: the commonest `runDirUnusable` is a run directory that
+			// could not be CREATED, so there is nothing on disk to reveal and this
+			// comes back "No such file or directory (os error 2)". A dead-looking
+			// button on an error screen is the outcome to avoid.
+			revealError = errorMessage(e);
 		}
 	}
 
@@ -225,10 +249,14 @@
 	//
 	// The store owns the timers and the layout owns this listener, so the store
 	// stays DOM-free and unit-testable with fake timers.
+	//
+	// The listener now RECORDS visibility rather than acting on it, because it is
+	// no longer the only input — see the `$effect` below, which is where the two
+	// are combined.
+	let windowIsVisible = $state(true);
 	onMount(() => {
 		const sync = () => {
-			if (document.visibilityState === 'visible') statsStore.start();
-			else statsStore.stop();
+			windowIsVisible = document.visibilityState === 'visible';
 		};
 		sync();
 		document.addEventListener('visibilitychange', sync);
@@ -236,6 +264,33 @@
 			document.removeEventListener('visibilitychange', sync);
 			statsStore.stop();
 		};
+	});
+
+	// …and on a boot that produced no app, sampling never starts at all.
+	//
+	// An `$effect` rather than a line inside the listener above, because there are
+	// now TWO inputs and only one of them is an event: `onMount` runs while the
+	// boot ask is still in flight, so a gate evaluated once there would read
+	// `pending` and never start the poll on a healthy launch either. The effect
+	// re-runs when `boot_status` answers.
+	//
+	// `stop()` on the false branch and not just "skip start": the ask resolves
+	// AFTER mount, so on a degraded boot there is a window in which nothing has
+	// started yet, and this must stay correct if that ordering ever changes.
+	// `start()`/`stop()` are both idempotent — `start()` returns early when the
+	// timer exists — so re-running this effect cannot double the sampling rate.
+	//
+	// No cleanup of its own: teardown stays in the `onMount` above, where it
+	// already was and where it is paired with the listener removal, so unmounting
+	// stops the timers by exactly the same line it always did.
+	//
+	// See `appIsOnScreen` for why the gate is "the children are rendered" rather
+	// than "the boot was ready": they differ only on a FAILED ask, where the app
+	// is on screen and a permanently blank status bar would be a second lie about
+	// a machine that is probably fine.
+	$effect(() => {
+		if (windowIsVisible && appIsOnScreen(rendering)) statsStore.start();
+		else statsStore.stop();
 	});
 </script>
 
@@ -253,7 +308,14 @@
 	     would put a failure screen in front of every healthy launch for a frame.
 	     A local IPC round trip is what this waits on, not a network. -->
 {:else if rendering.kind === 'takeover'}
-	<BootTakeover boot={rendering.boot} {quitting} {quitError} onQuit={onConfirmQuit} />
+	<BootTakeover
+		boot={rendering.boot}
+		{quitting}
+		{quitError}
+		{revealError}
+		onReveal={onRevealRunDir}
+		onQuit={onConfirmQuit}
+	/>
 {:else if rendering.kind === 'app' || rendering.kind === 'appDespiteFailedAsk'}
 	<!-- Both kinds render the children, and only `appDespiteFailedAsk` also owes
 	     a banner — which AppShell renders, because `.window` is a `height: 100%`

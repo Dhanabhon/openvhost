@@ -245,6 +245,25 @@ export async function stateStoreStatus(): Promise<string | null> {
 export async function bootStatus(): Promise<BootStatusDto> {
 	return unwrap(commands.bootStatus());
 }
+
+/**
+ * Show the unusable run directory in Finder (degraded-boot design D3).
+ *
+ * **Takes no path, and that is the point.** Rust reads the same `BootState`
+ * `bootStatus` reports and reveals only `runDirUnusable`'s own directory; every
+ * other state refuses. So this is not a "reveal any folder" primitive the
+ * renderer gained — it can only ask for the folder it was already told about.
+ * The same reason `openHomebrewSite` takes no URL.
+ *
+ * **Rejects, and the caller must render it.** The commonest `runDirUnusable`
+ * is a `<home>/run` that could not be created, in which case there is nothing
+ * on disk to reveal and this comes back *No such file or directory (os error
+ * 2)*. The screen shows the path as copyable text regardless — that half never
+ * fails.
+ */
+export async function revealRunDir(): Promise<void> {
+	await unwrap(commands.revealRunDir());
+}
 export async function listServices(): Promise<ServiceStatus[]> {
 	return unwrap(commands.listServices());
 }

@@ -39,6 +39,22 @@ export interface TakeoverCopy {
 	title: string;
 	details: BootDetail[];
 	lines: string[];
+	/**
+	 * Whether this screen offers **Reveal in Finder** beside Quit (design D3).
+	 *
+	 * A boolean and NOT the path, deliberately — which is the opposite of what
+	 * this file does with every other fact. `revealRunDir` takes no argument: Rust
+	 * reads the same `BootState` and reveals only `runDirUnusable`'s directory, so
+	 * carrying a path through the UI would suggest the renderer supplies one, and
+	 * a later reader wiring that path into the call is exactly how the "reveal any
+	 * folder" primitive this design avoids would get handed over.
+	 *
+	 * Decided in the switch below rather than by a `{#if boot.kind === …}` in the
+	 * component, for the same reason the copy is: a fifth state must answer this
+	 * for itself or fail to compile, instead of inheriting an action pointed at a
+	 * folder it never named.
+	 */
+	revealsRunDir: boolean;
 }
 
 export function takeoverCopy(boot: DegradedBoot): TakeoverCopy {
@@ -57,7 +73,10 @@ export function takeoverCopy(boot: DegradedBoot): TakeoverCopy {
 					'Nothing has gone wrong. The copy that is already running is still serving your sites, ' +
 						'and none of your settings have changed. Switch to it from the Dock or the menu bar, ' +
 						'then quit this window.'
-				]
+				],
+				// Nothing to reveal, and nothing wrong on disk to look at: the folder
+				// named here is the one the OTHER copy is using perfectly well.
+				revealsRunDir: false
 			};
 		case 'runDirUnusable':
 			return {
@@ -76,7 +95,13 @@ export function takeoverCopy(boot: DegradedBoot): TakeoverCopy {
 					'The error above is the part to act on. A permission error means this folder, or the ' +
 						'folder containing it, is not writable by your user account. Fix that and open ' +
 						'OpenVHost again.'
-				]
+				],
+				// The ONE screen with a folder worth opening — and the one whose copy
+				// tells the user to go and change its permissions, which is a thing
+				// they do in Finder. `Folder` above stays selectable text regardless:
+				// the run directory may never have been created, in which case there
+				// is nothing on disk to reveal and the button honestly fails.
+				revealsRunDir: true
 			};
 		case 'homeUnresolvable':
 			// The SAME screen as `runDirUnusable` — same component, same structure,
@@ -94,7 +119,11 @@ export function takeoverCopy(boot: DegradedBoot): TakeoverCopy {
 						'.openvhost inside your home directory.',
 					'Set OPENVHOST_HOME to the full path of a folder you can write to, then open OpenVHost ' +
 						'again.'
-				]
+				],
+				// The state that resolved NO path at all. This is the arm a shared
+				// action would hurt most: offering Reveal here could only reveal some
+				// other state's folder, which is the plausible lie D3 rejects.
+				revealsRunDir: false
 			};
 		default: {
 			// Not a wildcard: nothing reaches this arm, and its only statement is an

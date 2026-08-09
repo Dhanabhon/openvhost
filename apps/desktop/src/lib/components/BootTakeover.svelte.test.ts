@@ -32,7 +32,9 @@ const UNUSABLE: DegradedBoot = { kind: 'runDirUnusable', path: RUN_DIR, reason: 
 const NO_HOME: DegradedBoot = { kind: 'homeUnresolvable', reason: 'home directory unavailable' };
 
 function html(boot: DegradedBoot, extra: Record<string, unknown> = {}): string {
-	return render(BootTakeover, { props: { boot, onQuit: () => {}, ...extra } }).body;
+	return render(BootTakeover, {
+		props: { boot, onQuit: () => {}, onReveal: () => {}, ...extra }
+	}).body;
 }
 
 /** Everything the user can actually read, tags stripped and whitespace
@@ -173,6 +175,79 @@ describe('the window it draws', () => {
 	it('disables Quit while one is already in flight', () => {
 		expect(html(ALREADY, { quitting: true })).toContain('disabled');
 		expect(visible(html(ALREADY, { quitting: true }))).toContain('Stopping…');
+	});
+});
+
+describe('Reveal in Finder', () => {
+	// The action D3 asks for, on the one screen that named a folder. Which screens
+	// get it is `boot-takeover.derive.ts`'s call — asserted there — so what this
+	// group owes is that the component honours that call and that a failed reveal
+	// is visible.
+	//
+	// Vacuity, measured over the whole desktop suite:
+	//
+	//   * `{#if copy.revealsRunDir}` replaced with `{#if true}` — the component
+	//     overriding the derive's call, which is how every screen would end up with
+	//     a button pointed at a folder only one of them named: 2 red, `offers
+	//     Reveal in Finder on no other screen` here and `is absent on the screens
+	//     that named no folder` at the layout seam.
+	//   * the `{#if revealError !== ''}` block deleted — a reveal that fails and
+	//     says nothing, which on an error screen is the worst outcome available: 3
+	//     red, `says so when the reveal fails …` and `keeps the two action failures
+	//     apart …` here, and `says so when the reveal fails …` at the layout seam.
+	//
+	// `offers Reveal in Finder beside Quit …` survived both, and is instead the
+	// test that reddens when the derive's `runDirUnusable` arm is flipped to
+	// `false` (recorded in `boot-takeover.derive.test.ts`).
+
+	it('offers Reveal in Finder beside Quit on the unusable-run-directory screen', () => {
+		const body = html(UNUSABLE);
+		// The premise first: without it, a screen that rendered no actions at all
+		// would satisfy an "and Quit is still there" assertion by accident.
+		expect(body).toContain('data-testid="boot-reveal"');
+		expect(body).toContain('data-testid="boot-quit"');
+		expect(visible(body)).toContain('Reveal in Finder');
+	});
+
+	it('offers Reveal in Finder on no other screen', () => {
+		// `alreadyRunning` names a folder that is working fine for the other copy,
+		// and `homeUnresolvable` resolved no path at all — a button on either could
+		// only open some other state's directory. Quit asserted alongside, so this
+		// cannot pass on a screen that lost its action row entirely.
+		for (const boot of [ALREADY, NO_HOME]) {
+			expect(html(boot)).toContain('data-testid="boot-quit"');
+			expect(html(boot)).not.toContain('data-testid="boot-reveal"');
+		}
+	});
+
+	it('keeps the folder readable as text, so the button is never the only way through', () => {
+		// `reveal_item_in_dir` canonicalises, and the commonest `runDirUnusable` is
+		// a run directory that could not be CREATED — so the button really can fail
+		// and this text is what still works.
+		expect(html(UNUSABLE)).toContain('data-testid="boot-run-dir"');
+		expect(visible(html(UNUSABLE))).toContain(RUN_DIR);
+	});
+
+	it('says so when the reveal fails, rather than looking like a dead button', () => {
+		// The worst available outcome on this screen: a user already stuck on an
+		// error presses a button and nothing whatsoever happens.
+		const body = html(UNUSABLE, { revealError: 'No such file or directory (os error 2)' });
+		expect(body).toContain('data-testid="boot-reveal-error"');
+		expect(visible(body)).toContain('No such file or directory (os error 2)');
+	});
+
+	it('shows no reveal error when nothing has failed', () => {
+		expect(html(UNUSABLE)).not.toContain('data-testid="boot-reveal-error"');
+	});
+
+	it('keeps the two action failures apart, so the message names the right one', () => {
+		// One shared slot would leave "the quit did not complete" on screen under a
+		// Reveal button, or the reverse.
+		const body = html(UNUSABLE, { quitError: 'quit failed', revealError: 'reveal failed' });
+		expect(body).toContain('data-testid="boot-quit-error"');
+		expect(body).toContain('data-testid="boot-reveal-error"');
+		expect(visible(body)).toContain('quit failed');
+		expect(visible(body)).toContain('reveal failed');
 	});
 });
 

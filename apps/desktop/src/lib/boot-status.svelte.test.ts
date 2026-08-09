@@ -12,6 +12,7 @@
 
 import { describe, expect, it, vi } from 'vitest';
 import {
+	appIsOnScreen,
 	bootRendering,
 	BootStatusStore,
 	type BootStatusApi,
@@ -97,6 +98,68 @@ describe('bootRendering', () => {
 			// the app already knows it cannot vouch for.
 			expect(bootRendering(RUN_DIR, FAILURE).kind).toBe('appDespiteFailedAsk');
 		});
+	});
+});
+
+describe('appIsOnScreen', () => {
+	// What gates anything that KEEPS running — today, the status bar's 2 s and
+	// 60 s polls. On a degraded boot those two commands can never answer, so an
+	// ungated interval is a permanently-failing timer behind a screen that exists
+	// to say the app never started.
+	//
+	// Vacuity, measured over the whole desktop suite, both directions:
+	//
+	//   * pinned to `true`: 12 of 1599 red. All four `stays off …` cases here plus
+	//     `agrees with the layout’s own render condition`, and all seven of the
+	//     layout's `the status-bar poll` group. `is on for a ready boot` and `is on
+	//     for a failed ask too …` stayed green — correctly, since a gate stuck open
+	//     really does leave the app's own case working.
+	//   * pinned to `false`: 7 red, and only ONE of them (`agrees with …`) overlaps
+	//     the first set. `is on for a ready boot`, `is on for a failed ask too …`,
+	//     and the layout's four "the app IS up" cases. Every `stays off` case
+	//     stayed green.
+	//
+	// The two survivor sets are near-disjoint, which is what says the on-branch and
+	// the off-branch are separately pinned rather than one assertion doing both.
+
+	it('is on for a ready boot', () => {
+		expect(appIsOnScreen(bootRendering(READY, null))).toBe(true);
+	});
+
+	it('is on for a failed ask too, because the app itself is on screen', () => {
+		// The one case where "the children are rendered" and "the boot said ready"
+		// disagree, and the disagreement is the point: `bootRendering` renders the
+		// app here precisely so an unanswered question does not blank a working
+		// machine, and a status bar frozen at "—" would be that same lie one layer
+		// down.
+		expect(appIsOnScreen(bootRendering(null, FAILURE))).toBe(true);
+	});
+
+	it.each([
+		['a boot answer that has not arrived yet', bootRendering(null, null)],
+		['alreadyRunning', bootRendering(ALREADY, null)],
+		['runDirUnusable', bootRendering(RUN_DIR, null)],
+		['homeUnresolvable', bootRendering(NO_HOME, null)]
+	] as const)('stays off for %s', (_name, rendering) => {
+		expect(appIsOnScreen(rendering)).toBe(false);
+	});
+
+	it('agrees with the layout’s own render condition, kind for kind', () => {
+		// The two encode the same predicate in two places — this function and the
+		// template's `{:else if rendering.kind === 'app' || … 'appDespiteFailedAsk'}`
+		// — so the pairing is stated here rather than left to drift. The layout DOM
+		// test then ties them at the seam: page rendered iff polled.
+		const renderedByLayout = (kind: string) => kind === 'app' || kind === 'appDespiteFailedAsk';
+		for (const rendering of [
+			bootRendering(null, null),
+			bootRendering(READY, null),
+			bootRendering(null, FAILURE),
+			bootRendering(ALREADY, null),
+			bootRendering(RUN_DIR, null),
+			bootRendering(NO_HOME, null)
+		]) {
+			expect(appIsOnScreen(rendering)).toBe(renderedByLayout(rendering.kind));
+		}
 	});
 });
 

@@ -22,7 +22,7 @@
 //! overwrite an existing value, so a "manage a placeholder early, the real value
 //! later" split would silently pin the placeholder.
 //!
-//! Three things live here rather than in `lib.rs` because they are the parts a
+//! Four things live here rather than in `lib.rs` because they are the parts a
 //! test can actually reach — `AppHandle<Wry>` cannot be constructed under
 //! `mock_builder`, so `bootstrap` itself is plumbing and only plumbing:
 //!
@@ -34,6 +34,10 @@
 //! 3. [`acquire_with_one_retry`] — D5's single retry, generic over the lock so
 //!    both directions are testable: a spurious contention is retried, and a
 //!    genuinely held lock is still reported held.
+//! 4. `reveal_run_dir_target` — which states have a folder worth revealing, for
+//!    the same reason as 1 and 2 and one more besides: [`reveal_run_dir`] takes
+//!    an `AppHandle` to reach the opener plugin, so its whole decision would
+//!    otherwise sit where no test can call it.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -599,6 +603,84 @@ pub async fn boot_status(boot: tauri::State<'_, BootState>) -> Result<BootStatus
     Ok(boot_dto(&boot))
 }
 
+/// The directory [`reveal_run_dir`] may reveal, or the refusal that says why
+/// this state has none.
+///
+/// Split out for the reason every `AppHandle`-taking command in this crate is
+/// split (see `open_site_url` and `reveal_log_folder_target`):
+/// `tauri::test::mock_builder()` only ever produces an `AppHandle<MockRuntime>`,
+/// a DIFFERENT concrete type than the `AppHandle<Wry>` that `OpenerExt::opener()`
+/// needs, so the command itself cannot be invoked from a test at all. Every way
+/// this can say no therefore lives here, where a test can call it.
+///
+/// **Exhaustive with no wildcard**, the third such match in this file. The other
+/// two guard against a fifth [`BootState`] inheriting a fourth's *words*; this
+/// one guards against it inheriting a fourth's *path*, which is worse — a `_ =>`
+/// arm falling through to [`BootState::RunDirUnusable`]'s directory would open a
+/// Finder window on a folder the live state never named.
+///
+/// One refusal per variant rather than one shared sentence, so a test can prove
+/// each arm was really taken. They are worded for a reader, not a parser: this
+/// error reaches the same screen the user is already stuck on.
+fn reveal_run_dir_target(boot: &BootState) -> Result<PathBuf, IpcError> {
+    let message = match boot {
+        BootState::RunDirUnusable { run_dir, .. } => return Ok(run_dir.clone()),
+        BootState::Ready => {
+            "OpenVHost started normally, so there is no unusable working folder to reveal"
+        }
+        BootState::AlreadyRunning { .. } => {
+            "another copy of OpenVHost holds this folder, and it is that copy's to open"
+        }
+        BootState::HomeUnresolvable { .. } => {
+            "OpenVHost could not work out where to keep its files, so there is no folder to reveal"
+        }
+    };
+    Err(IpcError::Core {
+        message: message.to_string(),
+    })
+}
+
+/// Show the unusable run directory in Finder — the other half of the run-dir
+/// takeover screen's action row (design D3), beside Quit.
+///
+/// **Zero arguments, and the path comes from managed state.** That is the whole
+/// security posture, and it is the same one `open_homebrew_site` and `open_site`
+/// are built on: granting the webview `opener:allow-open-url` (or
+/// `opener:allow-reveal-item-in-dir`) would hand the renderer a general "open any
+/// path" primitive, so `capabilities/default.json` grants no `opener:*` at all
+/// and every opener call in this app goes through the plugin's **Rust** API
+/// instead — which the ACL does not gate because the ACL gates the JS-to-plugin
+/// path. The renderer names nothing here: it can ask *"reveal the folder you
+/// already told me about"* and nothing else, so it gains no primitive it did not
+/// have.
+///
+/// `reveal_item_in_dir`, not `open_path`: this selects `run` **inside its
+/// parent**, which is where the fix usually is — the screen's own copy says the
+/// problem may be *"this folder, or the folder containing it"* — whereas opening
+/// the run directory itself would show the user an empty window.
+///
+/// **This can fail, and the screen must say so.** `reveal_item_in_dir`
+/// canonicalises first, and the commonest producer of
+/// [`BootState::RunDirUnusable`] is a `<home>/run` that could not be *created* —
+/// so on that path there is nothing on disk to reveal and this returns *No such
+/// file or directory (os error 2)*. That is honest and it is why the screen keeps
+/// the path as selectable text as well: the button is a convenience, and the text
+/// is the thing that always works.
+#[tauri::command]
+#[specta::specta]
+pub async fn reveal_run_dir(
+    app: tauri::AppHandle,
+    boot: tauri::State<'_, BootState>,
+) -> Result<(), IpcError> {
+    use tauri_plugin_opener::OpenerExt;
+    let run_dir = reveal_run_dir_target(&boot)?;
+    app.opener()
+        .reveal_item_in_dir(&run_dir)
+        .map_err(|e| IpcError::Core {
+            message: format!("could not show {} in Finder: {e}", run_dir.display()),
+        })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -998,5 +1080,110 @@ mod tests {
             "the command must carry the managed state's own facts, not a \
              generic 'something went wrong'"
         );
+    }
+
+    // ---- reveal_run_dir: the screen's other button -------------------------
+    //
+    // `reveal_run_dir` itself cannot be called from this harness — it takes an
+    // `AppHandle<Wry>` to reach `OpenerExt::opener()`, and `mock_builder` only
+    // produces an `AppHandle<MockRuntime>` — so what is exercised here is the
+    // whole of its decision: `reveal_run_dir_target`. The command's remaining
+    // body is one `reveal_item_in_dir` call whose failure is mapped to
+    // `IpcError::Core`, and the button reaching it at all is proven at the
+    // layout seam in `layout-boot-status.dom.test.ts`.
+    //
+    // VACUITY (neuter-and-watch-it-fail), measured in both directions:
+    //
+    // - `reveal_run_dir_target` pinned to `Ok(PathBuf::from("/Users/dev/
+    //   OpenVHost/run"))` for every input — the `_ =>` fall-through this match
+    //   exists to forbid, which would open Finder on a folder the live state
+    //   never named: 4 failed, 1 passed. The survivor was
+    //   `…_reveals_the_directory_the_boot_state_named`, which is exactly the
+    //   test whose fixture the pin was cut from — and
+    //   `…_carries_a_different_path_through_unchanged` is the one that catches
+    //   it, which is why that control exists.
+    // - Pinned to `Err(IpcError::Core { message: "no".to_string() })` instead:
+    //   3 failed, 2 passed — `…_reveals_the_directory…`,
+    //   `…_carries_a_different_path…`, and `…_refusals_are_per_variant…` (the
+    //   three refusals collapsing to one sentence).
+    //   `…_refuses_on_every_state_that_named_no_run_dir` and
+    //   `…_never_names_a_rust_api_at_the_user` survived, correctly: a blanket
+    //   refusal really does refuse, and really does not name a Rust API. They
+    //   pin the refusal's content, not that anything is ever revealed.
+    //
+    // Neither pinning is caught by the other's survivors.
+
+    #[test]
+    fn reveal_run_dir_target_reveals_the_directory_the_boot_state_named() {
+        assert_eq!(
+            reveal_run_dir_target(&run_dir_unusable()).unwrap(),
+            PathBuf::from("/Users/dev/OpenVHost/run"),
+            "the one state with a folder worth revealing is the one whose \
+             screen offers the button"
+        );
+    }
+
+    #[test]
+    fn reveal_run_dir_target_carries_a_different_path_through_unchanged() {
+        // The control: a target hardcoded to the fixture above would satisfy
+        // that test just as well.
+        let elsewhere = BootState::RunDirUnusable {
+            run_dir: PathBuf::from("/Volumes/Data/openvhost/run"),
+            reason: "Read-only file system (os error 30)".to_string(),
+        };
+        let target = reveal_run_dir_target(&elsewhere).unwrap();
+        assert_eq!(target, PathBuf::from("/Volumes/Data/openvhost/run"));
+        assert!(!target.starts_with("/Users/dev"));
+    }
+
+    #[test]
+    fn reveal_run_dir_target_refuses_on_every_state_that_named_no_run_dir() {
+        // Per variant, not as a set: the failure this guards is one state
+        // falling through to another's arm, which a loop asserting "some error"
+        // over the group would not distinguish from three correct refusals.
+        for state in [BootState::Ready, already_running(), home_unresolvable()] {
+            assert!(
+                reveal_run_dir_target(&state).is_err(),
+                "{state:?} named no run directory, so revealing anything at all \
+                 would be revealing a folder this boot never chose"
+            );
+        }
+    }
+
+    #[test]
+    fn reveal_run_dir_target_refusals_are_per_variant_rather_than_one_shared_sentence() {
+        let refusals: Vec<String> = [BootState::Ready, already_running(), home_unresolvable()]
+            .iter()
+            .map(|state| {
+                reveal_run_dir_target(state)
+                    .expect_err("this state has no run directory")
+                    .to_string()
+            })
+            .collect();
+
+        let mut unique = refusals.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            refusals.len(),
+            "two states shared a refusal, so nothing here can tell whether each \
+             took its own arm: {refusals:?}"
+        );
+    }
+
+    #[test]
+    fn reveal_run_dir_target_never_names_a_rust_api_at_the_user() {
+        // This error lands on the takeover screen — the one place in the app
+        // that exists because Tauri's own refusal reached a user verbatim. A
+        // refusal here must not put a different one back.
+        for state in [BootState::Ready, already_running(), home_unresolvable()] {
+            let message = reveal_run_dir_target(&state)
+                .expect_err("this state has no run directory")
+                .to_string();
+            assert!(!message.contains(".manage()"), "{message}");
+            assert!(!message.contains("reveal_run_dir_target"), "{message}");
+            assert!(!message.is_empty(), "a silent refusal is the worst outcome");
+        }
     }
 }

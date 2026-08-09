@@ -154,4 +154,56 @@ describe('every screen', () => {
 			expect(copy.details.length).toBeGreaterThan(0);
 		}
 	});
+
+	describe('who gets Reveal in Finder (design D3)', () => {
+		// Vacuity, measured, both directions, over the whole desktop suite.
+		//
+		// Flipping `revealsRunDir` to `true` on the `alreadyRunning` arm — a state
+		// inheriting an action pointed at a folder it never named — reddened 4 of
+		// 1599: `offers it on no other screen` and `gives every screen that offers
+		// the button a folder …` here, `offers Reveal in Finder on no other screen`
+		// in `BootTakeover.svelte.test.ts`, and `is absent on the screens that named
+		// no folder` at the layout seam. `offers it on the one screen …` stayed
+		// green.
+		//
+		// Flipping the `runDirUnusable` arm to `false` reddened 5, a disjoint set
+		// except for one: `offers it on the one screen …` and `gives every screen
+		// …` here, `offers Reveal in Finder beside Quit …` in the component file,
+		// and BOTH layout-seam tests (`reaches the backend …`, `says so when the
+		// reveal fails …`). Every `no other screen` case stayed green.
+		//
+		// `gives every screen …` reddens under both, which is what its explicit
+		// premise assertion is for: without it, the second mutation would leave it
+		// iterating an empty list and passing.
+
+		it('offers it on the one screen that named a folder', () => {
+			expect(
+				takeoverCopy({ kind: 'runDirUnusable', path: RUN_DIR, reason: ERRNO_13 })
+			).toMatchObject({ revealsRunDir: true });
+		});
+
+		it('offers it on no other screen, because there is nothing they could reveal', () => {
+			// `alreadyRunning` names a folder that is FINE — the other copy is using
+			// it — and `homeUnresolvable` resolved no path at all. A shared action
+			// here could only open some other state's directory.
+			expect(takeoverCopy({ kind: 'alreadyRunning', home: HOME }).revealsRunDir).toBe(false);
+			expect(
+				takeoverCopy({ kind: 'homeUnresolvable', reason: 'home directory unavailable' })
+					.revealsRunDir
+			).toBe(false);
+		});
+
+		it('gives every screen that offers the button a folder the user can also read', () => {
+			// The tie between the two halves: a screen offering Reveal without a
+			// `Folder` fact would be asking the user to trust a path they cannot see,
+			// which is what the copyable text exists to prevent.
+			const offering = all.map(takeoverCopy).filter((c) => c.revealsRunDir);
+			// The premise, asserted first: with no screen offering the button this
+			// test would otherwise claim to have proven something about all of them.
+			expect(offering.length).toBeGreaterThan(0);
+			for (const copy of offering) {
+				expect(copy.details.map((d) => d.label)).toContain('Folder');
+			}
+		});
+	});
 });

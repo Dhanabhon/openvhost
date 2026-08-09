@@ -40,6 +40,35 @@ export const commands = {
 	 *  extracts only [`BootState`], and `lib.rs` manages that outside every arm.
 	 */
 	bootStatus: () => typedError<BootStatusDto, IpcError>(__TAURI_INVOKE("boot_status")),
+	/**
+	 *  Show the unusable run directory in Finder — the other half of the run-dir
+	 *  takeover screen's action row (design D3), beside Quit.
+	 * 
+	 *  **Zero arguments, and the path comes from managed state.** That is the whole
+	 *  security posture, and it is the same one `open_homebrew_site` and `open_site`
+	 *  are built on: granting the webview `opener:allow-open-url` (or
+	 *  `opener:allow-reveal-item-in-dir`) would hand the renderer a general "open any
+	 *  path" primitive, so `capabilities/default.json` grants no `opener:*` at all
+	 *  and every opener call in this app goes through the plugin's **Rust** API
+	 *  instead — which the ACL does not gate because the ACL gates the JS-to-plugin
+	 *  path. The renderer names nothing here: it can ask *"reveal the folder you
+	 *  already told me about"* and nothing else, so it gains no primitive it did not
+	 *  have.
+	 * 
+	 *  `reveal_item_in_dir`, not `open_path`: this selects `run` **inside its
+	 *  parent**, which is where the fix usually is — the screen's own copy says the
+	 *  problem may be *"this folder, or the folder containing it"* — whereas opening
+	 *  the run directory itself would show the user an empty window.
+	 * 
+	 *  **This can fail, and the screen must say so.** `reveal_item_in_dir`
+	 *  canonicalises first, and the commonest producer of
+	 *  [`BootState::RunDirUnusable`] is a `<home>/run` that could not be *created* —
+	 *  so on that path there is nothing on disk to reveal and this returns *No such
+	 *  file or directory (os error 2)*. That is honest and it is why the screen keeps
+	 *  the path as selectable text as well: the button is a convenience, and the text
+	 *  is the thing that always works.
+	 */
+	revealRunDir: () => typedError<null, IpcError>(__TAURI_INVOKE("reveal_run_dir")),
 	listServices: () => typedError<ServiceStatus[], IpcError>(__TAURI_INVOKE("list_services")),
 	startService: (id: string) => typedError<null, IpcError>(__TAURI_INVOKE("start_service", { id })),
 	stopService: (id: string) => typedError<null, IpcError>(__TAURI_INVOKE("stop_service", { id })),

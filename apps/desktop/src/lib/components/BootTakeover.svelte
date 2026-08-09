@@ -20,11 +20,18 @@
 		boot,
 		quitting = false,
 		quitError = '',
+		revealError = '',
+		onReveal,
 		onQuit
 	}: {
 		boot: DegradedBoot;
 		quitting?: boolean;
 		quitError?: string;
+		/** Why the last Reveal in Finder did not open anything, or `''`. Its own
+		 *  slot rather than sharing `quitError`: two actions that can both fail on
+		 *  one screen need the message to say which one did. */
+		revealError?: string;
+		onReveal: () => void;
 		onQuit: () => void;
 	} = $props();
 
@@ -75,13 +82,33 @@
 				<!-- role="alert" HERE and not on the screen: this one really does
 				     arrive after the user pressed a button, and a Quit that silently
 				     did nothing is the failure mode to avoid. -->
-				<p class="quit-error" role="alert" data-testid="boot-quit-error">{quitError}</p>
+				<p class="action-error" role="alert" data-testid="boot-quit-error">{quitError}</p>
+			{/if}
+
+			{#if revealError !== ''}
+				<!-- The same reasoning as the quit error, and it matters MORE here:
+				     the commonest reason this screen exists is a run directory that
+				     was never created, and revealing a folder that is not there fails.
+				     A user already on an error screen pressing a button that does
+				     nothing visible is the worst outcome available. The `Folder` fact
+				     above stays selectable text so there is always a way through. -->
+				<p class="action-error" role="alert" data-testid="boot-reveal-error">{revealError}</p>
 			{/if}
 
 			<div class="actions">
+				<!-- Quit stays FIRST, and keeps `primary`. Reveal is a convenience on
+				     one of the two screens; quitting is the one thing every screen
+				     offers, so it must not move position between them. -->
 				<Button variant="primary" disabled={quitting} testId="boot-quit" onclick={onQuit}>
 					{quitting ? 'Stopping…' : 'Quit OpenVHost'}
 				</Button>
+				{#if copy.revealsRunDir}
+					<!-- Only where a folder was actually named (design D3), and that is
+					     `boot-takeover.derive.ts`'s call, not this template's — a
+					     `{#if boot.kind === 'runDirUnusable'}` here would let a fifth
+					     state inherit the button without failing to compile. -->
+					<Button variant="quiet" testId="boot-reveal" onclick={onReveal}>Reveal in Finder</Button>
+				{/if}
 			</div>
 		</div>
 	</main>
@@ -167,14 +194,18 @@
 		font-size: var(--vh-text-table);
 		line-height: 1.6;
 	}
-	.quit-error {
+	/* Shared by both action failures — a quit that did not complete and a reveal
+	   that opened nothing. One rule, two `data-testid`s: which action failed is
+	   carried by the message, not by a second colour. */
+	.action-error {
 		margin: var(--vh-space-3) 0 0;
 		color: var(--vh-fail);
 		font-size: var(--vh-text-table);
 	}
-	/* Left-aligned, unlike the dialog's right-aligned pair: there is one control
-	   and no cancel, so it belongs at the start of the reading column rather
-	   than parked in a corner. */
+	/* Left-aligned, unlike the dialog's right-aligned pair: this is the start of
+	   the reading column rather than a corner to park controls in — and on the
+	   run-dir screen the second button follows the first here, in reading order,
+	   instead of being pushed away from it. */
 	.actions {
 		display: flex;
 		gap: var(--vh-space-2);
