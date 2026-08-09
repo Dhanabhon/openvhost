@@ -59,6 +59,11 @@ mod stack;
 // menu-event router — see its own module docs for the breakdown.
 mod tray;
 
+// Executable fixtures that have already paid macOS's XProtect first-execution
+// cost, shared by every test module in this crate that writes one.
+#[cfg(all(test, unix))]
+mod tests_support;
+
 // Removing an installed PHP or MySQL major (package-uninstall design). Its own
 // module rather than more of `commands.rs`, which is already ~7,700 lines.
 mod uninstall;

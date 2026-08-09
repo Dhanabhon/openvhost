@@ -12,6 +12,8 @@ mod mariadb;
 mod mysql;
 mod phpruntime;
 pub mod settings;
+#[cfg(all(test, unix))]
+mod tests_support;
 mod validate;
 mod webserver;
 

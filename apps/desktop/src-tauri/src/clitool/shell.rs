@@ -385,7 +385,6 @@ pub(super) fn unprobed_status(
 mod tests {
     use super::*;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
 
     // --- group: PATH parsing -------------------------------------------
 
@@ -655,10 +654,18 @@ mod tests {
 
     /// Write an executable stand-in for a login shell. It ignores `-l -c` and
     /// does whatever `body` says, which is what lets us drive every branch.
+    ///
+    /// Warmed at creation, outside [`PROBE_TIMEOUT`] — see
+    /// [`crate::tests_support`]. This module's bound is 2 s rather than
+    /// `openvhost_conf`'s 5 s, so it has the least headroom in the workspace.
+    /// Two bodies here are also why the warm-up must not run the BODY:
+    /// `hangsh` sleeps 30 s (an unguarded warm-up would stall the suite for
+    /// that long and leak the grandchild the timeout test then hunts for) and
+    /// `floodsh` writes 300 KB. The guard line `write_exec_fixture` prepends
+    /// exits before either.
     fn fake_shell(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
-        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::tests_support::write_exec_fixture(&path, body);
         path
     }
 
