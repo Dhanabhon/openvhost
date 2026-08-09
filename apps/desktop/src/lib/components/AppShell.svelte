@@ -3,9 +3,11 @@
 	import TitleBar from './TitleBar.svelte';
 	import Rail from './Rail.svelte';
 	import ErrorBanner from './ErrorBanner.svelte';
+	import StoreUnavailableBanner from './StoreUnavailableBanner.svelte';
 	import StatusBar from './StatusBar.svelte';
 	import { servicesStore } from '$lib/services.shared.svelte';
 	import { statsStore } from '$lib/stats.shared.svelte';
+	import { storeStatusStore } from '$lib/store-status.shared.svelte';
 
 	// Defaults to 'sites', which is what `/` renders (routes/+page.svelte) — so the landing
 	// page needs no `active` of its own, and a new route that forgets the prop highlights the
@@ -36,6 +38,15 @@
 			     supervisor-derived state (`runningCount`), so this is the same coupling, not a
 			     new one, and routing it through a prop would let a new page forget it. -->
 			<ErrorBanner error={servicesStore.error} />
+			<!-- Rendered here for the same reason ErrorBanner is, and one more.
+			     The condition IS app-level — `state.db` is down everywhere, not on
+			     one page — and one banner covers Sites, Languages, Databases and
+			     Logs at once (optional-state.db design D5). It lives in AppShell
+			     rather than in `routes/+layout.svelte` itself because `.window` is
+			     a `height: 100%` grid and a sibling banner would push the titlebar
+			     and status strip out of the window; the LOAD is in the layout,
+			     which is the component that outlives navigation. -->
+			<StoreUnavailableBanner reason={storeStatusStore.reason} />
 			{@render children()}
 		</main>
 	</div>

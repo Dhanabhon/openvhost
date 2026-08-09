@@ -43,19 +43,11 @@
 use openvhost_pkg::{InstallRequest, InstalledPackage, PackagesRoot, Progress};
 
 use crate::error::CoreError;
-use crate::mysql::{InstallLedger, LedgerWrite};
+use crate::mysql::{InstallLedger, LedgerWrite, NO_LEDGER_REASON};
 use crate::php::PhpMajor;
 use crate::php::package::catalogue::{
     Availability, PHP_PACKAGE_NAME, PHP_WARMUP_BINARY, PhpPackage, php_package_for_host,
 };
-
-/// Why a [`LedgerWrite::Failed`] carries no database error: there was no
-/// database to ask. Declared once here, where the only `None` arm is, so the
-/// sentence a user could eventually read is not retyped at a call site.
-///
-/// Written in the register of the other `reason` values on this type, which are
-/// `CoreError::to_string()` — a fact, not a paragraph.
-const NO_LEDGER_REASON: &str = "state.db was unavailable, so nothing recorded this install";
 
 /// The result of installing one catalogued PHP build.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,16 +73,19 @@ pub struct PhpPackageInstall {
 /// a user should be able to distinguish — a download that was verified from one
 /// that merely arrived — are distinct variants, not log text.
 ///
-/// **`ledger` is optional, and PHP is the only install path where it is**
-/// (5C audit LOW-4). `state.db` is opened best-effort at startup, so a machine
-/// whose store is missing or unreadable has no [`InstallLedger`] to hand over —
-/// and refusing the install there would make a degraded `state.db` into "PHP
-/// cannot be installed", which is exactly what [`LedgerWrite`] exists to avoid
-/// saying. Pass `None` only for that: the package tree IS the inventory, so a
-/// skipped row costs provenance and never correctness, and it is reported as
-/// [`LedgerWrite::Failed`] rather than silently omitted. Every other engine's
-/// command takes a `State<Db>`, so Tauri refuses the whole call before their
-/// installers are reached and the question never arises for them.
+/// **`ledger` is optional** (5C audit LOW-4). `state.db` is opened best-effort
+/// at startup, so a machine whose store is missing or unreadable has no
+/// [`InstallLedger`] to hand over — and refusing the install there would make a
+/// degraded `state.db` into "PHP cannot be installed", which is exactly what
+/// [`LedgerWrite`] exists to avoid saying. Pass `None` only for that: the
+/// package tree IS the inventory, so a skipped row costs provenance and never
+/// correctness, and it is reported as [`LedgerWrite::Failed`] rather than
+/// silently omitted. This was PHP's alone until the optional-state.db design's
+/// D4 gave [`crate::mysql::install_mysql_package`] and
+/// [`crate::mariadb::install_mariadb_package`] the same signature for the same
+/// reason — their commands used to take a `State<Db>`, so Tauri refused the
+/// whole call before their installers were reached and the question never arose
+/// for them.
 ///
 /// **Cancellation.** As with the MySQL, MariaDB and nginx paths: dropping the
 /// returned future is the cancel. The staging directory is an RAII temporary
@@ -128,13 +123,14 @@ pub async fn install_php_package(
     }
 }
 
-/// The pipeline itself, split out from the catalogue lookup so tests can drive
-/// it against a loopback fixture — and so the live proof can install the real
-/// tarball from a local source while the release remains unpublished.
+/// The pipeline itself, split out from the catalogue lookup so the tests **in
+/// this module** can drive it against a loopback fixture.
 ///
 /// Private on purpose: taking a [`PhpPackage`] means taking a URL and a
 /// hash, and the whole point of the public signature above is that no caller
-/// can choose those. Nothing outside this module may name this function.
+/// can choose those. Nothing outside this module may name this function —
+/// including an out-of-tree live proof, which the deleted half of this sentence
+/// used to promise it could. The visibility is the deliberate half.
 async fn install_entry(
     entry: &PhpPackage,
     root: &PackagesRoot,
@@ -611,8 +607,8 @@ mod tests {
     /// over the same `state.db`, so a row appearing there would be visible.
     ///
     /// Vacuity: proven by mutation, twice, because the `None` arm has two ways
-    /// to be wrong. Returning `Err(CoreError::Internal(…))` from it failed at
-    /// the `unwrap()`; returning `LedgerWrite::Recorded { installed_at: … }`
+    /// to be wrong. Returning `Err(CoreError::Validation { … })` from it failed
+    /// at the `unwrap()`; returning `LedgerWrite::Recorded { installed_at: … }`
     /// failed the `Failed` match below. Neither mutation disturbed any other
     /// test in this module, which is what makes this test the only thing
     /// holding that arm.
@@ -629,7 +625,7 @@ mod tests {
         let entry = entry_for(url, sha_hex(&archive));
 
         // `None` is precisely what the desktop app passes when `state.db` never
-        // opened: `app.try_state::<Db>()` is `None` and there is no
+        // opened: `DbHandle::optional()` is `None` and there is no
         // `InstallLedger` to construct.
         let out = install_entry(&entry, &fx.root, None, |_| {}).await.unwrap();
 

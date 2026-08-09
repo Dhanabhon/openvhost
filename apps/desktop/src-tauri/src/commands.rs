@@ -20,6 +20,11 @@ use openvhost_core::{
 // home is the `site` submodule (Tasks 2-3), and it stays that way rather than
 // growing `lib.rs`'s re-export list for a type only this one command needs.
 use openvhost_core::site::scaffold::{ScaffoldOutcome, ScaffoldStep, scaffold, scaffold_path};
+// The managed store wrapper (optional-state.db design D1). Commands take
+// `State<'_, DbHandle>` and resolve through `require()`/`optional()`; the bare
+// `Db` above is still named here for the `&Db` those accessors hand back, but
+// it is never a managed type and never a command parameter.
+use crate::db_state::DbHandle;
 // The MySQL package surface lives in its own sibling module (this file is
 // already ~8 200 lines); only the two DTOs a `MysqlInstanceDto` embeds are
 // named here.
@@ -92,6 +97,106 @@ impl From<openvhost_core::CoreError> for IpcError {
             },
         }
     }
+}
+
+/// Manage the store on a mock app the way `lib.rs` does: as a [`DbHandle`],
+/// never a bare `Db`.
+///
+/// ONE helper rather than the ~21 `app.manage(...)` calls it replaces, so what
+/// a test app manages is decided in a single place — and so a test app cannot
+/// drift from production into managing something `lib.rs` does not.
+///
+/// A bare `Db` is managed nowhere now, in production or in tests, which is what
+/// makes design D6's property hold: a new `db: State<'_, Db>` parameter fails
+/// on every machine, including this harness, rather than only on one whose
+/// store is broken.
+#[cfg(test)]
+fn manage_db(app: &tauri::App<tauri::test::MockRuntime>, db: Db) {
+    use tauri::Manager;
+    app.manage(DbHandle::Ready(db));
+}
+
+/// The reason a test's store is down.
+///
+/// A sentinel no other string in the tree can collide with, so an assertion
+/// that finds it has found THIS refusal — not some other `IpcError::Core` that
+/// happens to be in flight. `os error 14` is sqlite's real "unable to open
+/// database file", the shape a genuine `Db::open` failure carries.
+#[cfg(test)]
+pub(crate) const STORE_DOWN_REASON: &str =
+    "openvhost-test-sentinel: unable to open database file (os error 14)";
+
+/// A handle for a store that failed to open — the arm `lib.rs` takes when
+/// `Db::open` returns `Err`.
+#[cfg(test)]
+pub(crate) fn store_down() -> DbHandle {
+    DbHandle::Unavailable {
+        reason: STORE_DOWN_REASON.to_string(),
+    }
+}
+
+/// Manage a store that is DOWN, exactly as `lib.rs` does on the failed arm:
+/// the handle, and **no** bare `Db` at all.
+#[cfg(test)]
+fn manage_store_down(app: &tauri::App<tauri::test::MockRuntime>) {
+    use tauri::Manager;
+    app.manage(store_down());
+}
+
+/// Assert `err` is a REFUSE command's typed store refusal.
+///
+/// Three claims, and all three are the point of the slice rather than
+/// incidental: it is the typed `IpcError` a page can render; it CARRIES THE
+/// REASON, so the user is told *unable to open database file* and not merely
+/// "unavailable"; and it never contains the string a user was previously shown
+/// — Tauri's own "you must call `.manage()` before using this command".
+///
+/// `what` names the command, so a group test that walks several of them says
+/// which one broke instead of pointing at a line number.
+///
+/// VACUITY, measured once here for every caller rather than restated at each
+/// of them. The group is the **13** tests `cargo test store_is_down` selects,
+/// which is deliberately not the same set as this function's callers — 10 of
+/// the 13 call it, both gate tests among them. Of the other three, two assert
+/// the same claims inline because they check a `Failed` DTO rather than an
+/// `IpcError`; the third reads `unavailable_reason()` and asserts only the
+/// reason, as the mutation below records. Three mutations, each run against
+/// all 13:
+///
+/// - `unavailable_message` reduced to `format!("{STORE_UNAVAILABLE}")` — the
+///   reason dropped: **12 of the 13 failed** on the "carries the reason" claim.
+///   The one that did not is `db_state`'s `state_store_status_reports_the_
+///   reason_when_the_store_is_down`, which reads `unavailable_reason()` and so
+///   never passes through `unavailable_message` — it guards the banner's
+///   sentence, not this one.
+/// - `unavailable_message` with ``". You must call `.manage()` before using
+///   this command."`` appended: **the same 12 failed**, on the third claim,
+///   with the first two still passing — so that claim is doing its own work.
+/// - `store_down()` changed to hand back a real `DbHandle::Ready` over an
+///   in-memory store: **all 13 failed**. This is the neuter that stands in for
+///   "the guard was removed" wherever removing it is not expressible —
+///   `require` is the only way to obtain a `&Db`, so for several of these
+///   commands there is no way to write the degraded version at all. That is
+///   design D6 holding, and it is why this mutation exists.
+///
+/// Each was reverted and re-run green.
+#[cfg(test)]
+pub(crate) fn assert_store_refusal(err: &IpcError, what: &str) {
+    let IpcError::Core { message } = err else {
+        panic!("{what}: expected IpcError::Core, got {err:?}");
+    };
+    assert!(
+        message.contains(STORE_DOWN_REASON),
+        "{what}: the refusal must carry the reason the store is unavailable, got {message:?}"
+    );
+    assert!(
+        message.contains("state.db"),
+        "{what}: the refusal must name what is unavailable, got {message:?}"
+    );
+    assert!(
+        !message.contains(".manage()"),
+        "{what}: a user must never be told to call a Rust API, got {message:?}"
+    );
 }
 
 #[tauri::command]
@@ -489,14 +594,17 @@ pub struct CreateSiteResult {
     pub scaffold: Option<ScaffoldOutcomeDto>,
 }
 
-// These commands build a repository per call from the managed `Db` (cheap —
-// cloning a pool handle) rather than managing a second type. If `state.db`
-// failed to open at startup, `Db` is not managed and Tauri's State extraction
-// fails; the frontend's normalizeError surfaces that in the error banner.
+// These commands build a repository per call from the managed store (cheap —
+// cloning a pool handle) rather than managing a second type. Every site lives
+// in state.db, so with no store there is no honest answer but a refusal:
+// `DbHandle::require` returns one that names why (design D2, REFUSE). What it
+// replaced was Tauri refusing the whole command with "you must call
+// `.manage()`", rendered verbatim to the user.
 #[tauri::command]
 #[specta::specta]
-pub async fn list_sites(db: tauri::State<'_, Db>) -> Result<Vec<SiteDto>, IpcError> {
-    let repo = SqliteSiteRepository::new(db.inner());
+pub async fn list_sites(db: tauri::State<'_, DbHandle>) -> Result<Vec<SiteDto>, IpcError> {
+    let db = db.require()?;
+    let repo = SqliteSiteRepository::new(db);
     Ok(repo.list().await?.into_iter().map(SiteDto::from).collect())
 }
 
@@ -513,17 +621,22 @@ pub async fn list_sites(db: tauri::State<'_, Db>) -> Result<Vec<SiteDto>, IpcErr
 #[tauri::command]
 #[specta::specta]
 pub async fn create_site(
-    db: tauri::State<'_, Db>,
+    db: tauri::State<'_, DbHandle>,
     input: SiteInput,
     create_folder: bool,
 ) -> Result<CreateSiteResult, IpcError> {
+    // FIRST, ahead of the ingress guard and the join: the order comment above
+    // is about not leaving a folder behind for a row that was never written,
+    // and "there is nowhere to write the row at all" is that case at its most
+    // extreme.
+    let db = db.require()?;
     let mut new: NewSite = input.try_into()?;
     if create_folder {
         // Re-parse of the JOINED path: over-length or bad-charset joins fail
         // here as a docroot field error, before any row or folder exists.
         new.docroot = scaffold_path(&new.docroot, &new.name)?;
     }
-    let repo = SqliteSiteRepository::new(db.inner());
+    let repo = SqliteSiteRepository::new(db);
     let site = repo.create(new).await?;
     let scaffold = create_folder.then(|| scaffold(&site.docroot, &site.name, &site.domain));
     Ok(CreateSiteResult {
@@ -535,12 +648,13 @@ pub async fn create_site(
 #[tauri::command]
 #[specta::specta]
 pub async fn update_site(
-    db: tauri::State<'_, Db>,
+    db: tauri::State<'_, DbHandle>,
     id: String,
     input: SiteInput,
 ) -> Result<SiteDto, IpcError> {
+    let db = db.require()?;
     let site_id = SiteId::parse(&id)?;
-    let repo = SqliteSiteRepository::new(db.inner());
+    let repo = SqliteSiteRepository::new(db);
     let existing = repo.get(&site_id).await?.ok_or_else(|| IpcError::Core {
         message: format!("site {id} not found"),
     })?;
@@ -580,17 +694,12 @@ pub async fn update_site(
 #[tauri::command]
 #[specta::specta]
 pub async fn open_site(
-    db: tauri::State<'_, Db>,
+    db: tauri::State<'_, DbHandle>,
     app: tauri::AppHandle,
     id: String,
 ) -> Result<(), IpcError> {
     use tauri_plugin_opener::OpenerExt;
-    let site_id = SiteId::parse(&id)?;
-    let repo = SqliteSiteRepository::new(db.inner());
-    let site = repo.get(&site_id).await?.ok_or_else(|| IpcError::Core {
-        message: format!("site {id} not found"),
-    })?;
-    let url = site_url(site.domain.as_str());
+    let url = open_site_url(&db, &id).await?;
     // `None` for `with`: let the OS pick the default handler rather than naming a
     // browser we would then have to keep a list of.
     app.opener()
@@ -598,6 +707,24 @@ pub async fn open_site(
         .map_err(|e| IpcError::Core {
             message: e.to_string(),
         })
+}
+
+/// Everything [`open_site`] decides before it opens anything: the store, the
+/// id, the stored row, and the URL built from it.
+///
+/// A named function rather than four lines inlined above, for the same reason
+/// [`initialize_mysql_gate`] exists — `open_site` takes an `AppHandle<Wry>`,
+/// which `tauri::test::mock_builder` cannot produce, so its body is
+/// unreachable from a test and a refusal written there is a decision **no test
+/// can see**. Every way this can say no now lives where a test can call it.
+async fn open_site_url(db: &DbHandle, id: &str) -> Result<String, IpcError> {
+    let db = db.require()?;
+    let site_id = SiteId::parse(id)?;
+    let repo = SqliteSiteRepository::new(db);
+    let site = repo.get(&site_id).await?.ok_or_else(|| IpcError::Core {
+        message: format!("site {id} not found"),
+    })?;
+    Ok(site_url(site.domain.as_str()))
 }
 
 /// Open Homebrew's install page in the user's browser.
@@ -642,9 +769,10 @@ fn site_url(domain: &str) -> String {
 
 #[tauri::command]
 #[specta::specta]
-pub async fn delete_site(db: tauri::State<'_, Db>, id: String) -> Result<bool, IpcError> {
+pub async fn delete_site(db: tauri::State<'_, DbHandle>, id: String) -> Result<bool, IpcError> {
+    let db = db.require()?;
     let site_id = SiteId::parse(&id)?;
-    let repo = SqliteSiteRepository::new(db.inner());
+    let repo = SqliteSiteRepository::new(db);
     Ok(repo.delete(&site_id).await?)
 }
 
@@ -771,10 +899,15 @@ async fn apply_input(
 #[tauri::command]
 #[specta::specta]
 pub async fn plan_config_apply(
-    db: tauri::State<'_, Db>,
+    db: tauri::State<'_, DbHandle>,
     runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
     paths: tauri::State<'_, Option<StackPaths>>,
 ) -> Result<ApplyPlanDto, IpcError> {
+    // Same fail-closed refusal `apply_config` makes, for the same reason: this
+    // is the SAME plan over the SAME config set, and with no store `apply_input`
+    // would build it from an empty site list — a plan whose changes are "remove
+    // every vhost". A pending-changes banner is not a safe place to show that.
+    let db = db.require()?;
     // Clone out of the guard and drop it before the `.await` below: holding a
     // `std::sync::RwLockReadGuard` across an await point makes this command's
     // future non-`Send`, which fails to compile.
@@ -784,7 +917,7 @@ pub async fn plan_config_apply(
             message: "runtime list is poisoned".into(),
         })?
         .clone();
-    let input = apply_input(db.inner(), &runtimes, paths.inner()).await?;
+    let input = apply_input(db, &runtimes, paths.inner()).await?;
     let p = openvhost_core::plan(&input)?;
     Ok(ApplyPlanDto {
         changes: p
@@ -807,12 +940,23 @@ pub async fn plan_config_apply(
 #[tauri::command]
 #[specta::specta]
 pub async fn apply_config(
-    db: tauri::State<'_, Db>,
+    db: tauri::State<'_, DbHandle>,
     runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
     paths: tauri::State<'_, Option<StackPaths>>,
     sup: tauri::State<'_, Arc<Supervisor>>,
     lock: tauri::State<'_, ApplyLock>,
 ) -> Result<ApplyOutcomeDto, IpcError> {
+    // FAIL CLOSED, and first — before the apply lock is even taken (design D2).
+    //
+    // This is the one REFUSE that is not merely about honesty. `apply_input`
+    // reads the sites FROM state.db; with no store, a degraded read would hand
+    // `plan` an EMPTY site list, which renders a valid config containing no
+    // vhosts at all — so the commit below would DELETE every vhost the user
+    // has, pass `nginx -t` (an empty config is valid), and never roll back.
+    // The refusal must therefore happen where no code path can reach the
+    // render, not inside `apply_input` where an `Ok(empty)` is still expressible.
+    let db = db.require()?;
+
     // A2: held across the whole plan -> commit -> validate -> restart
     // sequence below. The plan is recomputed HERE, from state.db, by
     // design — the frontend never supplies a plan for this command to run,
@@ -833,7 +977,7 @@ pub async fn apply_config(
         })?
         .clone();
 
-    let input = apply_input(db.inner(), &runtimes, paths.inner()).await?;
+    let input = apply_input(db, &runtimes, paths.inner()).await?;
     let Some(stack) = paths.inner().as_ref() else {
         return Err(IpcError::Core {
             message: "no web server stack is configured for this platform".into(),
@@ -1711,12 +1855,18 @@ async fn write_settings(
 
 /// The stored nginx settings, or the documented defaults when the user has
 /// never saved any.
+// Not a doc comment, deliberately: tauri-specta copies those into
+// `bindings.ts`, and this note is for a Rust reader, not a TS caller.
+//
+// REFUSES with no store rather than serving the defaults (design D3). Both are
+// defensible; the tiebreak is which side fails QUIETLY, and a populated,
+// editable form whose Save always fails is the quiet one.
 #[tauri::command]
 #[specta::specta]
 pub async fn web_server_settings(
-    db: tauri::State<'_, Db>,
+    db: tauri::State<'_, DbHandle>,
 ) -> Result<WebServerSettingsDto, IpcError> {
-    read_settings(db.inner()).await
+    read_settings(db.require()?).await
 }
 
 /// Validate and store the nginx settings. Does **not** apply them.
@@ -1736,10 +1886,13 @@ pub async fn web_server_settings(
 #[tauri::command]
 #[specta::specta]
 pub async fn save_web_server_settings(
-    db: tauri::State<'_, Db>,
+    db: tauri::State<'_, DbHandle>,
     paths: tauri::State<'_, Option<StackPaths>>,
     input: WebServerSettingsDto,
 ) -> Result<(), IpcError> {
+    // Before the `nginx -t` spawn below: there is nowhere to store the result,
+    // so checking first would burn a child process to reach the same refusal.
+    let db = db.require()?;
     // No stack, or a stack with no nginx binary resolved (design D3: neither
     // a packaged nor a Homebrew nginx was found) => no checker; see
     // `write_settings`.
@@ -1750,7 +1903,7 @@ pub async fn save_web_server_settings(
         })
     });
     write_settings(
-        db.inner(),
+        db,
         input,
         checker.as_ref().map(|c| c as &dyn SettingsChecker),
     )
@@ -2466,10 +2619,13 @@ async fn write_default_php(
 #[tauri::command]
 #[specta::specta]
 pub async fn set_default_php(
-    db: tauri::State<'_, Db>,
+    db: tauri::State<'_, DbHandle>,
     runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
     major: Option<String>,
 ) -> Result<(), IpcError> {
+    // Storing IS the whole command (see the doc above — it applies nothing), so
+    // with no store there is nothing left of it to degrade to.
+    let db = db.require()?;
     // Cloned out of the guard and dropped before the `.await`, like every other
     // command reading this lock: holding a `std::sync::RwLockReadGuard` across
     // an await point makes the future non-`Send`, which fails to compile.
@@ -2481,7 +2637,7 @@ pub async fn set_default_php(
         .as_ref()
         .map(|r| r.php.clone())
         .unwrap_or_default();
-    write_default_php(db.inner(), major, &installed).await
+    write_default_php(db, major, &installed).await
 }
 
 /// Read-only environment summary for the Languages page: whether Homebrew was
@@ -2495,8 +2651,14 @@ pub async fn set_default_php(
 /// is the one that actually probes.
 #[tauri::command]
 #[specta::specta]
+// DEGRADE (optional-state.db design D2): the rows, the Homebrew probe and the
+// search paths are all filesystem facts, so a store that never opened costs
+// this command exactly one field — a STORED default reads as "no preference"
+// (`read_default_php`'s own `None` arm). Refusing instead would empty a page
+// whose every other value is still true. D5's banner is what stops that one
+// silently-wrong field being dishonest.
 pub async fn php_environment(
-    db: tauri::State<'_, Db>,
+    db: tauri::State<'_, DbHandle>,
     runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
     paths: tauri::State<'_, Option<StackPaths>>,
 ) -> Result<PhpEnvironmentDto, IpcError> {
@@ -2521,7 +2683,7 @@ pub async fn php_environment(
         // so the major the page marks as default is always one of the rows it
         // rendered in the same response — the seam `render_set` keeps on its
         // own side by resolving against the very list its pool loop iterates.
-        default_php: read_default_php(Some(db.inner()), &installed).await?,
+        default_php: read_default_php(db.optional(), &installed).await?,
         runtimes: php_rows(&p.home, &installed, &[]),
     })
 }
@@ -2543,8 +2705,11 @@ pub async fn php_environment(
 /// the apply pipeline no longer knows the version exists.
 #[tauri::command]
 #[specta::specta]
+// DEGRADE, for the same reason and with the same one-field cost as
+// `php_environment` above — the probing this command adds needs no store at
+// all.
 pub async fn rescan_php_runtimes(
-    db: tauri::State<'_, Db>,
+    db: tauri::State<'_, DbHandle>,
     runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
     paths: tauri::State<'_, Option<StackPaths>>,
     sup: tauri::State<'_, Arc<Supervisor>>,
@@ -2572,7 +2737,7 @@ pub async fn rescan_php_runtimes(
         // (and the reverse) without a relaunch. Spec claim 5 — the preference
         // survives a rescan — is this line plus the fact that nothing on the
         // rescan path writes to `php_settings`.
-        default_php: read_default_php(Some(db.inner()), &installed.runtimes).await?,
+        default_php: read_default_php(db.optional(), &installed.runtimes).await?,
         runtimes: php_rows(&p.home, &installed.runtimes, &[]),
     })
 }
@@ -4106,7 +4271,7 @@ mod php_ipc_tests {
         // no preference row, which is what this test's machine looks like and
         // what every real machine looks like — the state under test here is
         // still the LOCK, not the preference.
-        app.manage(Db::open_in_memory().await.expect("in-memory db"));
+        manage_db(&app, Db::open_in_memory().await.expect("in-memory db"));
 
         // Hold the guard the way `install_php`'s `try_lock` would while a
         // build is running.
@@ -4116,7 +4281,7 @@ mod php_ipc_tests {
         let handle = app.handle().clone();
         let task = tokio::spawn(async move {
             rescan_php_runtimes(
-                handle.state::<Db>(),
+                handle.state::<DbHandle>(),
                 handle.state::<RwLock<Option<InstalledRuntimes>>>(),
                 handle.state::<Option<StackPaths>>(),
                 handle.state::<Arc<Supervisor>>(),
@@ -4138,6 +4303,186 @@ mod php_ipc_tests {
             .expect("rescan did not unblock after the install lock was released")
             .expect("rescan task panicked");
         assert!(result.is_ok(), "got {result:?}");
+    }
+
+    // ---- DEGRADE: the Languages page still has its data with no store ----
+    //
+    // Optional-state.db design D2. `php_environment` is what the Languages
+    // page mounts on, and it is where the slice's motivating screenshot came
+    // from: with the bare `Db` unmanaged, Tauri refused the whole command and
+    // the page rendered "You must call `.manage()` before using this command."
+    //
+    // Vacuity for this pair: `read_default_php`'s `None` arm is the ONLY
+    // difference between them, and the two tests disagree on `default_php`
+    // while agreeing on every other field. Proven by mutation — swapping
+    // `db.optional()` for `db.require()?` reddens the store-down test (an
+    // `IpcError::Core`, no rows at all) and leaves the stored-default one
+    // green; hardcoding `read_default_php(None, …)` does the reverse.
+
+    #[tokio::test]
+    async fn php_environment_still_lists_its_runtimes_with_the_store_down() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app");
+        manage_store_down(&app);
+        app.manage(Some(StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: Some(home.path().join("nginx")),
+            nginx_conf: home.path().join("nginx.conf"),
+        }));
+        app.manage(RwLock::new(Some(InstalledRuntimes {
+            nginx_bin: Some(home.path().join("nginx")),
+            php: vec![openvhost_core::PhpRuntime {
+                major: "8.3".into(),
+                fpm_bin: home.path().join("php-fpm"),
+                source: openvhost_core::PhpRuntimeSource::Homebrew,
+            }],
+        })));
+
+        let env = php_environment(
+            app.state::<DbHandle>(),
+            app.state::<RwLock<Option<InstalledRuntimes>>>(),
+            app.state::<Option<StackPaths>>(),
+        )
+        .await
+        .expect("a degraded store must not cost the page its rows");
+
+        // The real work, all of which is a filesystem fact rather than a
+        // stored one, and all of which survives.
+        assert_eq!(
+            env.runtimes.len(),
+            openvhost_core::CATALOGUE.len(),
+            "the page lost its rows: {:?}",
+            env.runtimes
+        );
+        let three = env
+            .runtimes
+            .iter()
+            .find(|r| r.major == "8.3")
+            .expect("a row for the installed major");
+        assert!(
+            three.installed,
+            "the installed runtime must still report as installed"
+        );
+        assert_eq!(
+            three.path.as_deref(),
+            Some(home.path().join("php-fpm").display().to_string().as_str())
+        );
+        assert!(
+            !env.brew_searched.is_empty(),
+            "the search paths are a probe"
+        );
+
+        // The one field a degraded store costs, and it costs it in the shape
+        // `read_default_php`'s own `None` arm documents: no preference, so the
+        // first installed major is what gets served. D5's banner is what makes
+        // that honest rather than quiet.
+        assert_eq!(
+            env.default_php,
+            DefaultPhpDto::Unset {
+                serving: "8.3".to_string()
+            }
+        );
+    }
+
+    /// The discriminating twin: the SAME command against a store that holds a
+    /// preference must report that preference, so the test above is measuring
+    /// the `None` arm rather than a `default_php` that never depended on the
+    /// store at all.
+    #[tokio::test]
+    async fn php_environment_reports_a_stored_default_when_the_store_is_up() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app");
+        let db = Db::open_in_memory().await.expect("in-memory db");
+        let php = vec![
+            openvhost_core::PhpRuntime {
+                major: "8.3".into(),
+                fpm_bin: home.path().join("php-fpm-8.3"),
+                source: openvhost_core::PhpRuntimeSource::Homebrew,
+            },
+            openvhost_core::PhpRuntime {
+                major: "8.4".into(),
+                fpm_bin: home.path().join("php-fpm-8.4"),
+                source: openvhost_core::PhpRuntimeSource::Homebrew,
+            },
+        ];
+        write_default_php(&db, Some("8.4".into()), &php)
+            .await
+            .expect("store a preference");
+        manage_db(&app, db);
+        app.manage(Some(StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: Some(home.path().join("nginx")),
+            nginx_conf: home.path().join("nginx.conf"),
+        }));
+        app.manage(RwLock::new(Some(InstalledRuntimes {
+            nginx_bin: Some(home.path().join("nginx")),
+            php,
+        })));
+
+        let env = php_environment(
+            app.state::<DbHandle>(),
+            app.state::<RwLock<Option<InstalledRuntimes>>>(),
+            app.state::<Option<StackPaths>>(),
+        )
+        .await
+        .expect("a healthy store answers");
+
+        assert_eq!(
+            env.default_php,
+            DefaultPhpDto::Preferred {
+                major: "8.4".to_string()
+            },
+            "the stored preference must reach the page when there IS a store"
+        );
+    }
+
+    /// The other one-line DEGRADE, and the one that actually probes. Asserts
+    /// nothing about WHICH runtimes are found — this test's machine may have
+    /// Homebrew PHP on it, which is why `rescan_blocks_while_an_install_holds_the_lock`
+    /// above asserts only `is_ok()` too. What it does assert is
+    /// machine-independent and is the whole claim: the command answers, it
+    /// answers with the catalogue, and with no store to read a preference from
+    /// it can never report one.
+    #[tokio::test]
+    async fn rescan_php_runtimes_still_answers_with_the_store_down() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app");
+        manage_store_down(&app);
+        app.manage(Some(StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: Some(home.path().join("nginx")),
+            nginx_conf: home.path().join("nginx.conf"),
+        }));
+        app.manage(RwLock::new(None::<InstalledRuntimes>));
+        app.manage(Arc::new(Supervisor::new(openvhost_proc::default_driver())));
+        app.manage(InstallLock::default());
+
+        let env = rescan_php_runtimes(
+            app.state::<DbHandle>(),
+            app.state::<RwLock<Option<InstalledRuntimes>>>(),
+            app.state::<Option<StackPaths>>(),
+            app.state::<Arc<Supervisor>>(),
+            app.state::<InstallLock>(),
+        )
+        .await
+        .expect("\"Check again\" must still work when the store is down");
+
+        assert!(
+            env.runtimes.len() >= openvhost_core::CATALOGUE.len(),
+            "every catalogued major must still get a row: {:?}",
+            env.runtimes
+        );
+        assert!(
+            !matches!(env.default_php, DefaultPhpDto::Preferred { .. }),
+            "with no store there is no preference to report, got {:?}",
+            env.default_php
+        );
     }
 
     /// A2 audit finding: `RunningInstallGuard::drop` used to clear
@@ -5840,8 +6185,23 @@ fn set_running_mysql_init(
 /// Datadir classification runs BEFORE any spawn, so `AlreadyInitialized`/
 /// `Foreign` are reported with zero side effects — no staging directory, no
 /// spawn, no log line (mandatory test).
-async fn initialize_mysql_gate(major: String, home: &Path) -> InitializeMysqlGate {
+///
+/// **The store check is first, and it lives HERE rather than inline in the
+/// command, for exactly the reason this function exists at all** (design D2):
+/// the command's body is unreachable from a test, so a refusal written there
+/// is a decision no test can see. It has to be a refusal and not a degrade —
+/// initializing without a store would leave a real datadir on disk whose
+/// generated root password was never persisted, and nobody can recover it
+/// afterwards. That is the hazard `verify_mysql_connection`'s "no stored root
+/// password" branch already documents having been reached the hard way.
+async fn initialize_mysql_gate(db: &DbHandle, major: String, home: &Path) -> InitializeMysqlGate {
     use InitializeMysqlGate::{Early, Proceed};
+
+    // Ahead of `MysqlMajor::parse`, and therefore ahead of every path this
+    // function derives: nothing below is reached, so nothing is created.
+    if let Err(e) = db.require() {
+        return Early(Err(e));
+    }
 
     let major = match openvhost_core::mysql::MysqlMajor::parse(&major) {
         Ok(m) => m,
@@ -5897,7 +6257,7 @@ async fn initialize_mysql_gate(major: String, home: &Path) -> InitializeMysqlGat
 pub async fn initialize_mysql(
     app: tauri::AppHandle,
     major: String,
-    db: tauri::State<'_, Db>,
+    db: tauri::State<'_, DbHandle>,
     paths: tauri::State<'_, Option<StackPaths>>,
     sup: tauri::State<'_, Arc<Supervisor>>,
     lock: tauri::State<'_, InstallLock>,
@@ -5910,10 +6270,16 @@ pub async fn initialize_mysql(
         });
     };
 
-    let ctx = match initialize_mysql_gate(major, &p.home).await {
+    let ctx = match initialize_mysql_gate(&db, major, &p.home).await {
         InitializeMysqlGate::Early(result) => return result,
         InitializeMysqlGate::Proceed(ctx) => ctx,
     };
+    // Resolved HERE, before the first spawn, and never again afterwards: the
+    // gate above has already refused an unavailable store, so this cannot fail
+    // — and it is written where a failure would still be harmless rather than
+    // down beside the upsert, where it would mean a live datadir with an
+    // unrecoverable password.
+    let store = db.require()?;
     let runtime_for_registration = ctx.runtime.clone();
     let major_for_upsert = ctx.major.clone();
     let major_for_log = ctx.major.as_str().to_string();
@@ -5948,7 +6314,7 @@ pub async fn initialize_mysql(
     if let (openvhost_core::mysql::MysqlInitOutcome::Initialized, Some(password)) =
         (&outcome, &password)
     {
-        openvhost_core::mysql::MysqlInstanceRepo::new(db.inner())
+        openvhost_core::mysql::MysqlInstanceRepo::new(store)
             .upsert(&major_for_upsert, password)
             .await?;
         sup.register(crate::stack::mysql_spec(&p.home, &runtime_for_registration));
@@ -5981,10 +6347,11 @@ pub async fn initialize_mysql(
 #[specta::specta]
 pub async fn mysql_root_password(
     major: String,
-    db: tauri::State<'_, Db>,
+    db: tauri::State<'_, DbHandle>,
 ) -> Result<String, IpcError> {
+    let db = db.require()?;
     let major = openvhost_core::mysql::MysqlMajor::parse(&major)?;
-    let repo = openvhost_core::mysql::MysqlInstanceRepo::new(db.inner());
+    let repo = openvhost_core::mysql::MysqlInstanceRepo::new(db);
     let instance = repo.get(&major).await?.ok_or_else(|| IpcError::Core {
         message: format!("no stored root password for MySQL {}", major.as_str()),
     })?;
@@ -6002,16 +6369,19 @@ pub async fn mysql_root_password(
 #[specta::specta]
 pub async fn reset_mysql_root_password(
     major: String,
-    db: tauri::State<'_, Db>,
+    db: tauri::State<'_, DbHandle>,
     paths: tauri::State<'_, Option<StackPaths>>,
     runtimes: tauri::State<'_, RwLock<Option<Vec<openvhost_core::mysql::MysqlRuntime>>>>,
 ) -> Result<MysqlResetOutcomeDto, IpcError> {
+    // First: a reset that cannot PERSIST the new password must not RUN the
+    // `ALTER USER` either, or the server ends up on a password nothing holds.
+    let db = db.require()?;
     let major = openvhost_core::mysql::MysqlMajor::parse(&major)?;
     let p = stack_paths(&paths)?;
     let runtime = find_mysql_runtime(runtimes.inner(), &major)?;
     let mp = openvhost_core::mysql::mysql_paths(&p.home, &major);
 
-    let repo = openvhost_core::mysql::MysqlInstanceRepo::new(db.inner());
+    let repo = openvhost_core::mysql::MysqlInstanceRepo::new(db);
     let current = repo.get(&major).await?.ok_or_else(|| IpcError::Core {
         message: format!("MySQL {} has no stored credential to reset", major.as_str()),
     })?;
@@ -6071,16 +6441,32 @@ pub async fn reset_mysql_root_password(
 #[specta::specta]
 pub async fn verify_mysql_connection(
     major: String,
-    db: tauri::State<'_, Db>,
+    db: tauri::State<'_, DbHandle>,
     paths: tauri::State<'_, Option<StackPaths>>,
     runtimes: tauri::State<'_, RwLock<Option<Vec<openvhost_core::mysql::MysqlRuntime>>>>,
 ) -> Result<MysqlConnectionProofDto, IpcError> {
+    // `Failed { detail }`, NOT `Err` — the shape this command already uses a
+    // few lines below for "there is no stored password to connect with", which
+    // is the same class of answer: the proof could not be attempted, and the
+    // Databases page has a place to render exactly that. Following the existing
+    // precedent rather than inventing a second one for the same page.
+    //
+    // First, because it is the one condition that makes every later step
+    // pointless — and it needs no stack, no runtime and no socket to decide.
+    let db = match db.require() {
+        Ok(db) => db,
+        Err(e) => {
+            return Ok(MysqlConnectionProofDto::Failed {
+                detail: e.to_string(),
+            });
+        }
+    };
     let major = openvhost_core::mysql::MysqlMajor::parse(&major)?;
     let p = stack_paths(&paths)?;
     let runtime = find_mysql_runtime(runtimes.inner(), &major)?;
     let mp = openvhost_core::mysql::mysql_paths(&p.home, &major);
 
-    let repo = openvhost_core::mysql::MysqlInstanceRepo::new(db.inner());
+    let repo = openvhost_core::mysql::MysqlInstanceRepo::new(db);
     let Some(instance) = repo.get(&major).await? else {
         // Review fix wave, minor 4: the old wording ("has never been
         // initialized") was true for only ONE of the two ways this branch is
@@ -6481,6 +6867,36 @@ mod default_php_ipc_tests {
             let json = serde_json::to_value(&dto).unwrap();
             assert_eq!(json.get("kind").and_then(|k| k.as_str()), Some(tag));
         }
+    }
+
+    /// `set_default_php` REFUSES with no store (design D2). Storing the
+    /// preference IS the command — it applies nothing — so there is no half of
+    /// it left to degrade to, and an `Ok` that stored nothing would leave the
+    /// Languages page showing a default the next Apply will not honour.
+    ///
+    /// Vacuity: with all 13 `let db = db.require()?;` guards replaced by
+    /// `let db = &Db::open_in_memory().await.unwrap();`, this test failed on
+    /// `unwrap_err`, which reported the `Ok(())` the command then returns.
+    /// Reverted and re-run green.
+    #[tokio::test]
+    async fn set_default_php_refuses_and_names_why_when_the_store_is_down() {
+        use tauri::Manager;
+
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        manage_store_down(&app);
+        app.manage(RwLock::new(Some(InstalledRuntimes {
+            nginx_bin: None,
+            php: installed(&["8.4"]),
+        })));
+
+        assert_store_refusal(
+            &set_default_php(app.state(), app.state(), Some("8.4".to_string()))
+                .await
+                .unwrap_err(),
+            "set_default_php",
+        );
     }
 }
 
@@ -7075,7 +7491,8 @@ esac
     #[tokio::test]
     async fn initialize_mysql_rejects_an_out_of_catalogue_major_server_side() {
         let unreached = PathBuf::from("/tmp/openvhost-test-unreached");
-        let gate = initialize_mysql_gate("9.7".to_string(), &unreached).await;
+        let ready = DbHandle::Ready(Db::open_in_memory().await.unwrap());
+        let gate = initialize_mysql_gate(&ready, "9.7".to_string(), &unreached).await;
         match gate {
             InitializeMysqlGate::Early(Err(IpcError::Validation { field, .. })) => {
                 assert_eq!(field, "mysql_version")
@@ -7098,7 +7515,8 @@ esac
         std::fs::create_dir_all(&major_dir).unwrap();
         std::fs::write(major_dir.join("some-note.txt"), b"do not touch").unwrap();
 
-        let gate = initialize_mysql_gate("8.4".to_string(), home.path()).await;
+        let ready = DbHandle::Ready(Db::open_in_memory().await.unwrap());
+        let gate = initialize_mysql_gate(&ready, "8.4".to_string(), home.path()).await;
 
         match gate {
             InitializeMysqlGate::Early(Ok(MysqlInitOutcomeDto::Foreign { detail })) => {
@@ -7118,6 +7536,195 @@ esac
             1,
             "no staging directory should ever have been created"
         );
+    }
+
+    // ---- REFUSE with no store (optional-state.db design D2) --------------
+
+    /// `initialize_mysql` must refuse PRE-FLIGHT, with the datadir untouched.
+    ///
+    /// This is the one REFUSE where degrading would destroy something that
+    /// cannot be rebuilt: an initialized datadir whose generated root password
+    /// was never persisted is a server nobody can log into, and
+    /// `reset_mysql_root_password` cannot help — it authenticates with the
+    /// stored credential it does not have. `verify_mysql_connection`'s "no
+    /// stored root password" branch documents that state being reached the
+    /// hard way already.
+    ///
+    /// Driven through the real gate, like the two tests above and for the same
+    /// reason: `initialize_mysql` takes an `AppHandle<Wry>` and cannot be
+    /// called from a test at all.
+    ///
+    /// VACUITY, measured, and one result is worth writing down because it is
+    /// NOT what it looks like:
+    ///
+    /// - Deleting the `db.require()` block from `initialize_mysql_gate`: this
+    ///   test failed on "an unavailable store must never reach Proceed — that
+    ///   is a datadir". So the refusal itself is pinned.
+    /// - MOVING that block to the very end of the gate, immediately before
+    ///   `Proceed`: this test still **passed**. The gate creates nothing
+    ///   anywhere in its body — `classify_datadir` reads and `mysql_paths`
+    ///   derives — so the four filesystem assertions below are not sensitive
+    ///   to ordering *within* the gate. What they pin is that the gate stays
+    ///   side-effect-free, which is the property the command depends on: the
+    ///   moment anything here starts creating a staging directory before
+    ///   deciding, they go red. They are not, and should not be read as,
+    ///   evidence about where in the gate the check sits — the deletion
+    ///   mutation above is what covers that.
+    ///
+    /// Both reverted and re-run green.
+    #[tokio::test]
+    async fn initialize_mysql_refuses_before_touching_the_datadir_when_the_store_is_down() {
+        let home = tempfile::tempdir().unwrap();
+
+        let gate = initialize_mysql_gate(&store_down(), "8.4".to_string(), home.path()).await;
+
+        match gate {
+            InitializeMysqlGate::Early(Err(e)) => assert_store_refusal(&e, "initialize_mysql"),
+            InitializeMysqlGate::Early(Ok(other)) => {
+                panic!("expected a refusal, got Early(Ok({other:?}))")
+            }
+            InitializeMysqlGate::Proceed(_) => {
+                panic!("an unavailable store must never reach Proceed — that is a datadir")
+            }
+        }
+
+        // Not "an error came back": nothing was created. `mysql_paths` derives
+        // every one of these from `home`, and the refusal happens before that
+        // derivation runs at all.
+        let paths = openvhost_core::mysql::mysql_paths(
+            home.path(),
+            &openvhost_core::mysql::MysqlMajor::parse("8.4").unwrap(),
+        );
+        assert!(!paths.datadir.exists(), "the datadir must not exist");
+        assert!(
+            !paths.staging_parent.exists(),
+            "no staging parent may have been created"
+        );
+        assert!(
+            !paths.my_cnf.exists(),
+            "no config may have been rendered for a refused initialization"
+        );
+        assert!(
+            !home.path().join("run").exists(),
+            "no run directory may have been created"
+        );
+    }
+
+    /// The three remaining MySQL credential commands, grouped: they share one
+    /// refusal, and each is named so a member that stops refusing is reported
+    /// by name. `verify_mysql_connection` is the odd one and is checked for its
+    /// own shape — see the test below it.
+    ///
+    /// Vacuity: with all 13 `let db = db.require()?;` guards replaced by
+    /// `let db = &Db::open_in_memory().await.unwrap();`, this test failed —
+    /// the commands then answer with their own "no stored root password"
+    /// errors, which `assert_store_refusal` rejects for not carrying the
+    /// sentinel reason. Reverted and re-run green.
+    #[tokio::test]
+    async fn the_mysql_credential_commands_refuse_and_name_why_when_the_store_is_down() {
+        let home = tempfile::tempdir().unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        manage_store_down(&app);
+        app.manage(Some(StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: None,
+            nginx_conf: home.path().join("nginx.conf"),
+        }));
+        // A runtime IS present, so nothing here is refused for lack of one —
+        // the refusal under test is the store's.
+        app.manage(RwLock::new(Some(vec![
+            openvhost_core::mysql::MysqlRuntime {
+                major: openvhost_core::mysql::MysqlMajor::parse("8.4").unwrap(),
+                mysqld: home.path().join("mysqld"),
+                mysql: home.path().join("mysql"),
+                mysqladmin: home.path().join("mysqladmin"),
+                source: openvhost_core::mysql::MysqlRuntimeSource::Homebrew,
+            },
+        ])));
+
+        assert_store_refusal(
+            &mysql_root_password("8.4".to_string(), app.state())
+                .await
+                .unwrap_err(),
+            "mysql_root_password",
+        );
+        assert_store_refusal(
+            &reset_mysql_root_password(
+                "8.4".to_string(),
+                app.state(),
+                app.state(),
+                app.state::<RwLock<Option<Vec<openvhost_core::mysql::MysqlRuntime>>>>(),
+            )
+            .await
+            .unwrap_err(),
+            "reset_mysql_root_password",
+        );
+        // Nothing may have been spawned or written on the way to that refusal:
+        // the ephemeral 0600 defaults-file is the only thing this command
+        // creates, and it must never have existed.
+        assert!(
+            !home.path().join("run").exists(),
+            "reset must not have written a credential file before refusing"
+        );
+    }
+
+    /// `verify_mysql_connection` refuses as `Failed { detail }`, **not** `Err`.
+    ///
+    /// It already answers exactly this way for "there is no stored password",
+    /// which is the same class of answer — the proof could not be attempted,
+    /// and the Databases page has a place to render that. Following the
+    /// existing precedent rather than inventing a second shape for one page.
+    ///
+    /// Vacuity: with the refusal rewritten as `let db = db.require()?;` —
+    /// i.e. an `Err` instead of a `Failed` — this test failed on `unwrap()`,
+    /// reporting the store refusal as an `Err(Core { .. })`. Reverted and
+    /// re-run green.
+    #[tokio::test]
+    async fn verify_mysql_connection_refuses_as_failed_not_err_when_the_store_is_down() {
+        let home = tempfile::tempdir().unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        manage_store_down(&app);
+        app.manage(Some(StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: None,
+            nginx_conf: home.path().join("nginx.conf"),
+        }));
+        app.manage(RwLock::new(Some(vec![
+            openvhost_core::mysql::MysqlRuntime {
+                major: openvhost_core::mysql::MysqlMajor::parse("8.4").unwrap(),
+                mysqld: home.path().join("mysqld"),
+                mysql: home.path().join("mysql"),
+                mysqladmin: home.path().join("mysqladmin"),
+                source: openvhost_core::mysql::MysqlRuntimeSource::Homebrew,
+            },
+        ])));
+
+        let proof = verify_mysql_connection(
+            "8.4".to_string(),
+            app.state(),
+            app.state(),
+            app.state::<RwLock<Option<Vec<openvhost_core::mysql::MysqlRuntime>>>>(),
+        )
+        .await
+        .unwrap();
+
+        match proof {
+            MysqlConnectionProofDto::Failed { detail } => {
+                assert!(
+                    detail.contains(STORE_DOWN_REASON),
+                    "the rendered detail must carry the reason: {detail:?}"
+                );
+                assert!(
+                    !detail.contains(".manage()"),
+                    "a user must never be told to call a Rust API: {detail:?}"
+                );
+            }
+            other => panic!("expected Failed (the no-stored-password precedent), got {other:?}"),
+        }
     }
 
     // ---- custom conf.d directory (review fix wave, Important 2) ----
@@ -7317,7 +7924,7 @@ esac
             .upsert(&major, &old_password)
             .await
             .unwrap();
-        app.manage(db);
+        manage_db(&app, db);
         app.manage(Some(StackPaths {
             home: home.path().to_path_buf(),
             nginx_bin: Some(home.path().join("nginx")),
@@ -7340,7 +7947,7 @@ esac
 
         let outcome = reset_mysql_root_password(
             "8.4".to_string(),
-            app.state::<Db>(),
+            app.state::<DbHandle>(),
             app.state::<Option<StackPaths>>(),
             app.state::<RwLock<Option<Vec<openvhost_core::mysql::MysqlRuntime>>>>(),
         )
@@ -7382,7 +7989,7 @@ esac
             .upsert(&major, &current_password)
             .await
             .unwrap();
-        app.manage(db);
+        manage_db(&app, db);
         app.manage(Some(StackPaths {
             home: home.path().to_path_buf(),
             nginx_bin: Some(home.path().join("nginx")),
@@ -7417,7 +8024,7 @@ exit 1
 
         let outcome = reset_mysql_root_password(
             "8.4".to_string(),
-            app.state::<Db>(),
+            app.state::<DbHandle>(),
             app.state::<Option<StackPaths>>(),
             app.state::<RwLock<Option<Vec<openvhost_core::mysql::MysqlRuntime>>>>(),
         )
@@ -7479,7 +8086,7 @@ exit 1
             .upsert(&major, &password)
             .await
             .unwrap();
-        app.manage(db);
+        manage_db(&app, db);
         app.manage(Some(StackPaths {
             home: home.path().to_path_buf(),
             nginx_bin: Some(home.path().join("nginx")),
@@ -7512,7 +8119,7 @@ exit 1
 
         let outcome = verify_mysql_connection(
             "8.4".to_string(),
-            app.state::<Db>(),
+            app.state::<DbHandle>(),
             app.state::<Option<StackPaths>>(),
             app.state::<RwLock<Option<Vec<openvhost_core::mysql::MysqlRuntime>>>>(),
         )
@@ -7902,6 +8509,29 @@ fn find_mariadb_runtime(
         })
 }
 
+/// Pre-flight for [`initialize_mariadb`]: the store, then the runtime.
+///
+/// Split out for the same reason [`initialize_mysql_gate`] is, and it is the
+/// MariaDB half of the same design-D2 requirement — the command takes an
+/// `AppHandle<Wry>`, which `tauri::test::mock_builder` cannot produce, so its
+/// body is unreachable from a test and a refusal written inline there is a
+/// decision **no test can see**.
+///
+/// The store check is FIRST, and this whole function runs before the command
+/// spawns anything or derives a single path (it takes no `home` at all), so an
+/// unavailable store is refused with the datadir untouched. Degrading instead
+/// would leave a real, initialized datadir whose generated root password was
+/// never persisted — unrecoverable, and the exact hazard
+/// `verify_mysql_connection` already documents.
+fn initialize_mariadb_gate<'a>(
+    db: &'a DbHandle,
+    runtimes: &RwLock<Option<Vec<openvhost_core::MariadbRuntime>>>,
+) -> Result<(&'a Db, openvhost_core::MariadbRuntime), IpcError> {
+    let store = db.require()?;
+    let runtime = find_mariadb_runtime(runtimes)?;
+    Ok((store, runtime))
+}
+
 /// Tag `InstallLock`'s shared slot as a MariaDB datadir initialization.
 ///
 /// A named function rather than an inlined `set_running` call inside
@@ -8032,7 +8662,7 @@ fn redact_mariadb_init_outcome(
 #[specta::specta]
 pub async fn initialize_mariadb(
     app: tauri::AppHandle,
-    db: tauri::State<'_, Db>,
+    db: tauri::State<'_, DbHandle>,
     runtimes: tauri::State<'_, RwLock<Option<Vec<openvhost_core::MariadbRuntime>>>>,
     paths: tauri::State<'_, Option<StackPaths>>,
     sup: tauri::State<'_, Arc<Supervisor>>,
@@ -8046,7 +8676,10 @@ pub async fn initialize_mariadb(
         });
     };
 
-    let runtime = find_mariadb_runtime(runtimes.inner())?;
+    // Both refusals in one pre-flight, ahead of the context and the spawn —
+    // see [`initialize_mariadb_gate`] for why the store check lives there and
+    // not inline here.
+    let (store, runtime) = initialize_mariadb_gate(&db, runtimes.inner())?;
     let ctx = openvhost_core::mariadb::MariadbInitCtx::new(&p.home, runtime.clone());
 
     let init_task = tokio::spawn(async move {
@@ -8083,7 +8716,7 @@ pub async fn initialize_mariadb(
     if let (openvhost_core::mariadb::MariadbInitOutcome::Initialized, Some(password)) =
         (&outcome, &password)
     {
-        openvhost_core::mariadb::MariadbInstanceRepo::new(db.inner())
+        openvhost_core::mariadb::MariadbInstanceRepo::new(store)
             .upsert(password)
             .await?;
         sup.register(crate::stack::mariadb_spec(&p.home, &runtime));
@@ -8099,8 +8732,9 @@ pub async fn initialize_mariadb(
 /// applies here too, unchanged — see that command's own doc comment.
 #[tauri::command]
 #[specta::specta]
-pub async fn mariadb_root_password(db: tauri::State<'_, Db>) -> Result<String, IpcError> {
-    let repo = openvhost_core::mariadb::MariadbInstanceRepo::new(db.inner());
+pub async fn mariadb_root_password(db: tauri::State<'_, DbHandle>) -> Result<String, IpcError> {
+    let db = db.require()?;
+    let repo = openvhost_core::mariadb::MariadbInstanceRepo::new(db);
     let instance = repo.get().await?.ok_or_else(|| IpcError::Core {
         message: format!(
             "no stored root password for MariaDB {}",
@@ -8125,15 +8759,18 @@ pub async fn mariadb_root_password(db: tauri::State<'_, Db>) -> Result<String, I
 #[tauri::command]
 #[specta::specta]
 pub async fn reset_mariadb_root_password(
-    db: tauri::State<'_, Db>,
+    db: tauri::State<'_, DbHandle>,
     paths: tauri::State<'_, Option<StackPaths>>,
     runtimes: tauri::State<'_, RwLock<Option<Vec<openvhost_core::MariadbRuntime>>>>,
 ) -> Result<MariadbResetOutcomeDto, IpcError> {
+    // First, exactly as in `reset_mysql_root_password`: a reset that cannot
+    // persist the new password must not run the SQL that sets it either.
+    let db = db.require()?;
     let p = stack_paths(&paths)?;
     let runtime = find_mariadb_runtime(runtimes.inner())?;
     let mp = openvhost_core::mariadb_paths(&p.home);
 
-    let repo = openvhost_core::mariadb::MariadbInstanceRepo::new(db.inner());
+    let repo = openvhost_core::mariadb::MariadbInstanceRepo::new(db);
     let current = repo.get().await?.ok_or_else(|| IpcError::Core {
         message: format!(
             "MariaDB {} has no stored credential to reset",
@@ -8197,15 +8834,26 @@ pub async fn reset_mariadb_root_password(
 #[tauri::command]
 #[specta::specta]
 pub async fn verify_mariadb_connection(
-    db: tauri::State<'_, Db>,
+    db: tauri::State<'_, DbHandle>,
     paths: tauri::State<'_, Option<StackPaths>>,
     runtimes: tauri::State<'_, RwLock<Option<Vec<openvhost_core::MariadbRuntime>>>>,
 ) -> Result<MariadbConnectionProofDto, IpcError> {
+    // `Failed { detail }` rather than `Err`, and first — the mirror of
+    // `verify_mysql_connection`'s own refusal, following the precedent its
+    // "no stored root password" branch below already sets for this page.
+    let db = match db.require() {
+        Ok(db) => db,
+        Err(e) => {
+            return Ok(MariadbConnectionProofDto::Failed {
+                detail: e.to_string(),
+            });
+        }
+    };
     let p = stack_paths(&paths)?;
     let runtime = find_mariadb_runtime(runtimes.inner())?;
     let mp = openvhost_core::mariadb_paths(&p.home);
 
-    let repo = openvhost_core::mariadb::MariadbInstanceRepo::new(db.inner());
+    let repo = openvhost_core::mariadb::MariadbInstanceRepo::new(db);
     let Some(instance) = repo.get().await? else {
         return Ok(MariadbConnectionProofDto::Failed {
             detail: format!(
@@ -8647,10 +9295,165 @@ mod mariadb_ipc_tests {
         let app = tauri::test::mock_builder()
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
-        app.manage(db);
+        manage_db(&app, db);
 
-        let returned = mariadb_root_password(app.state::<Db>()).await.unwrap();
+        let returned = mariadb_root_password(app.state::<DbHandle>())
+            .await
+            .unwrap();
         assert_eq!(returned, password.expose());
+    }
+
+    // ---- REFUSE with no store (optional-state.db design D2) --------------
+
+    /// The MariaDB mirror of the MySQL initialization refusal, and the same
+    /// stakes: an initialized datadir whose generated root password was never
+    /// persisted is unrecoverable. Driven through the real pre-flight, because
+    /// `initialize_mariadb` takes an `AppHandle<Wry>` and cannot be called
+    /// from a test at all — see [`initialize_mariadb_gate`].
+    ///
+    /// A runtime IS present in the lock below, so the gate would otherwise
+    /// return `Ok`: what this pins is that the STORE check comes first and
+    /// wins.
+    ///
+    /// VACUITY, and the honest form of it: `let store = db.require()?;` cannot
+    /// be *deleted* from this gate, because it is the only way to obtain the
+    /// `&'a Db` the signature returns — there is no degraded version of this
+    /// function to write. That is design D6 rather than a gap in the test. The
+    /// neuter used instead was `store_down()` handing back a real
+    /// `DbHandle::Ready`, under which this test failed on `expect`. Reverted
+    /// and re-run green. See `assert_store_refusal`'s doc comment.
+    #[tokio::test]
+    async fn initialize_mariadb_refuses_before_touching_the_datadir_when_the_store_is_down() {
+        let home = tempfile::tempdir().unwrap();
+        let runtimes = RwLock::new(Some(vec![openvhost_core::MariadbRuntime {
+            series: openvhost_core::MARIADB_SERIES,
+            version: "11.4.9".to_string(),
+            mariadbd: home.path().join("mariadbd"),
+            mariadb: home.path().join("mariadb"),
+            mariadb_admin: home.path().join("mariadb-admin"),
+        }]));
+
+        let err = initialize_mariadb_gate(&store_down(), &runtimes)
+            .err()
+            .expect("an unavailable store must refuse");
+        assert_store_refusal(&err, "initialize_mariadb");
+
+        // Not "an error came back": nothing was created. The gate takes no
+        // `home` at all, so it cannot have derived a path — these assertions
+        // pin that the refusal happens while that is still true.
+        let paths = openvhost_core::mariadb_paths(home.path());
+        assert!(!paths.datadir.exists(), "the datadir must not exist");
+        assert!(
+            !paths.staging_parent.exists(),
+            "no staging parent may have been created"
+        );
+        assert!(
+            !paths.my_cnf.exists(),
+            "no config may have been rendered for a refused initialization"
+        );
+        assert!(
+            !home.path().join("run").exists(),
+            "no run directory may have been created"
+        );
+    }
+
+    /// The two MariaDB credential commands that answer with `Err`, grouped and
+    /// named — the mirror of the MySQL group.
+    ///
+    /// Vacuity: with all 13 `let db = db.require()?;` guards replaced by
+    /// `let db = &Db::open_in_memory().await.unwrap();`, this test failed —
+    /// both commands then answer with their own "no stored credential" errors,
+    /// which `assert_store_refusal` rejects for not carrying the sentinel
+    /// reason. Reverted and re-run green.
+    #[tokio::test]
+    async fn the_mariadb_credential_commands_refuse_and_name_why_when_the_store_is_down() {
+        let home = tempfile::tempdir().unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        manage_store_down(&app);
+        app.manage(Some(StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: None,
+            nginx_conf: home.path().join("nginx.conf"),
+        }));
+        app.manage(RwLock::new(Some(vec![openvhost_core::MariadbRuntime {
+            series: openvhost_core::MARIADB_SERIES,
+            version: "11.4.9".to_string(),
+            mariadbd: home.path().join("mariadbd"),
+            mariadb: home.path().join("mariadb"),
+            mariadb_admin: home.path().join("mariadb-admin"),
+        }])));
+
+        assert_store_refusal(
+            &mariadb_root_password(app.state()).await.unwrap_err(),
+            "mariadb_root_password",
+        );
+        assert_store_refusal(
+            &reset_mariadb_root_password(
+                app.state(),
+                app.state(),
+                app.state::<RwLock<Option<Vec<openvhost_core::MariadbRuntime>>>>(),
+            )
+            .await
+            .unwrap_err(),
+            "reset_mariadb_root_password",
+        );
+        assert!(
+            !home.path().join("run").exists(),
+            "reset must not have written a credential file before refusing"
+        );
+    }
+
+    /// `verify_mariadb_connection` refuses as `Failed { detail }`, not `Err` —
+    /// the mirror of `verify_mysql_connection`, following the same
+    /// no-stored-password precedent this page already sets.
+    ///
+    /// Vacuity: with the refusal rewritten as `let db = db.require()?;` —
+    /// i.e. an `Err` instead of a `Failed` — this test failed on `unwrap()`,
+    /// reporting the store refusal as an `Err(Core { .. })`. Reverted and
+    /// re-run green.
+    #[tokio::test]
+    async fn verify_mariadb_connection_refuses_as_failed_not_err_when_the_store_is_down() {
+        let home = tempfile::tempdir().unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        manage_store_down(&app);
+        app.manage(Some(StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: None,
+            nginx_conf: home.path().join("nginx.conf"),
+        }));
+        app.manage(RwLock::new(Some(vec![openvhost_core::MariadbRuntime {
+            series: openvhost_core::MARIADB_SERIES,
+            version: "11.4.9".to_string(),
+            mariadbd: home.path().join("mariadbd"),
+            mariadb: home.path().join("mariadb"),
+            mariadb_admin: home.path().join("mariadb-admin"),
+        }])));
+
+        let proof = verify_mariadb_connection(
+            app.state(),
+            app.state(),
+            app.state::<RwLock<Option<Vec<openvhost_core::MariadbRuntime>>>>(),
+        )
+        .await
+        .unwrap();
+
+        match proof {
+            MariadbConnectionProofDto::Failed { detail } => {
+                assert!(
+                    detail.contains(STORE_DOWN_REASON),
+                    "the rendered detail must carry the reason: {detail:?}"
+                );
+                assert!(
+                    !detail.contains(".manage()"),
+                    "a user must never be told to call a Rust API: {detail:?}"
+                );
+            }
+            other => panic!("expected Failed (the no-stored-password precedent), got {other:?}"),
+        }
     }
 
     /// The mandated test: drive the REAL command, against a fake `mariadb`
@@ -8670,7 +9473,7 @@ mod mariadb_ipc_tests {
             .upsert(&old_password)
             .await
             .unwrap();
-        app.manage(db);
+        manage_db(&app, db);
         app.manage(Some(StackPaths {
             home: home.path().to_path_buf(),
             nginx_bin: Some(home.path().join("nginx")),
@@ -8688,7 +9491,7 @@ mod mariadb_ipc_tests {
         )])));
 
         let outcome = reset_mariadb_root_password(
-            app.state::<Db>(),
+            app.state::<DbHandle>(),
             app.state::<Option<StackPaths>>(),
             app.state::<RwLock<Option<Vec<openvhost_core::MariadbRuntime>>>>(),
         )
@@ -8720,7 +9523,7 @@ mod mariadb_ipc_tests {
             .upsert(&password)
             .await
             .unwrap();
-        app.manage(db);
+        manage_db(&app, db);
         app.manage(Some(StackPaths {
             home: home.path().to_path_buf(),
             nginx_bin: Some(home.path().join("nginx")),
@@ -8741,7 +9544,7 @@ mod mariadb_ipc_tests {
         )])));
 
         let outcome = verify_mariadb_connection(
-            app.state::<Db>(),
+            app.state::<DbHandle>(),
             app.state::<Option<StackPaths>>(),
             app.state::<RwLock<Option<Vec<openvhost_core::MariadbRuntime>>>>(),
         )
@@ -8971,7 +9774,7 @@ mod site_ipc_tests {
         let app = tauri::test::mock_builder()
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
-        app.manage(Db::open_in_memory().await.unwrap());
+        manage_db(&app, Db::open_in_memory().await.unwrap());
 
         let input = SiteInput {
             docroot: parent_dir.path().to_str().unwrap().to_string(),
@@ -9012,7 +9815,7 @@ mod site_ipc_tests {
         let app = tauri::test::mock_builder()
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
-        app.manage(Db::open_in_memory().await.unwrap());
+        manage_db(&app, Db::open_in_memory().await.unwrap());
 
         let first_root = tempfile::tempdir().unwrap();
         create_site(
@@ -9068,7 +9871,7 @@ mod site_ipc_tests {
         let app = tauri::test::mock_builder()
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
-        app.manage(Db::open_in_memory().await.unwrap());
+        manage_db(&app, Db::open_in_memory().await.unwrap());
 
         let docroot = parent_dir.path().join("never-created");
         let input = SiteInput {
@@ -9101,6 +9904,82 @@ mod site_ipc_tests {
             }
             other => panic!("expected Validation, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // REFUSE with no store (optional-state.db design D2). Every site command
+    // reads or writes state.db, so a degraded answer would be a wrong one: an
+    // empty list reads as "you have no sites", and a create that stored
+    // nothing would still have made a folder.
+    //
+    // Vacuity for the refusal itself is measured on `assert_store_refusal` —
+    // see its doc comment. What is measured HERE is the extra assertion this
+    // test makes on top of that, the one about the filesystem: with all 13
+    // `let db = db.require()?;` guards replaced by
+    // `let db = &Db::open_in_memory().await.unwrap();` (the shape a "degrade"
+    // regression takes) and the two `unwrap_err`s above it relaxed so the run
+    // reaches it, the folder assertion FAILED — "create_site refused, so it
+    // must not have scaffolded a folder", with `<parent>/myshop` on disk.
+    // Reverted and re-run green.
+    // -----------------------------------------------------------------------
+
+    /// All five site commands, in one test on purpose: they share one refusal
+    /// and one reason to have it, and a per-command test would be five copies
+    /// of the same three assertions. Each is named through
+    /// `assert_store_refusal`'s `what`, so a member that stops refusing is
+    /// reported by name rather than by line number — and no member can be
+    /// silently dropped, because every one of these calls must produce an
+    /// `Err` for the test to reach its end.
+    #[tokio::test]
+    async fn every_site_command_refuses_and_names_why_when_the_store_is_down() {
+        let parent_dir = tempfile::tempdir().unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        manage_store_down(&app);
+
+        assert_store_refusal(&list_sites(app.state()).await.unwrap_err(), "list_sites");
+
+        // `create_folder: true`, so this also pins the ORDER: the refusal beats
+        // the scaffold, and a rejected create leaves nothing on disk.
+        let input = SiteInput {
+            docroot: parent_dir.path().to_str().unwrap().to_string(),
+            ..valid_input()
+        };
+        assert_store_refusal(
+            &create_site(app.state(), input, true).await.unwrap_err(),
+            "create_site",
+        );
+        assert!(
+            !parent_dir.path().join("myshop").exists(),
+            "create_site refused, so it must not have scaffolded a folder"
+        );
+
+        assert_store_refusal(
+            &update_site(
+                app.state(),
+                SiteId::new().as_str().to_string(),
+                valid_input(),
+            )
+            .await
+            .unwrap_err(),
+            "update_site",
+        );
+        assert_store_refusal(
+            &delete_site(app.state(), SiteId::new().as_str().to_string())
+                .await
+                .unwrap_err(),
+            "delete_site",
+        );
+        // `open_site` itself takes an `AppHandle<Wry>` and cannot be called
+        // from a test at all; this is the function that holds every decision it
+        // makes before opening anything. See `open_site_url`'s doc comment.
+        assert_store_refusal(
+            &open_site_url(&store_down(), SiteId::new().as_str())
+                .await
+                .unwrap_err(),
+            "open_site (via open_site_url)",
+        );
     }
 
     /// The scheme is PREPENDED and fixed. A stored value must never be able to
@@ -9599,7 +10478,7 @@ mod apply_ipc_tests {
         let app = tauri::test::mock_builder()
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
-        app.manage(Db::open_in_memory().await.unwrap());
+        manage_db(&app, Db::open_in_memory().await.unwrap());
         app.manage(RwLock::new(Some(InstalledRuntimes {
             nginx_bin: None,
             php: vec![],
@@ -9613,7 +10492,7 @@ mod apply_ipc_tests {
         app.manage(ApplyLock::default());
 
         let err = apply_config(
-            app.state::<Db>(),
+            app.state::<DbHandle>(),
             app.state::<RwLock<Option<InstalledRuntimes>>>(),
             app.state::<Option<StackPaths>>(),
             app.state::<Arc<Supervisor>>(),
@@ -9628,6 +10507,165 @@ mod apply_ipc_tests {
             }
             other => panic!("expected Core, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // FAIL CLOSED with no store (optional-state.db design D2).
+    //
+    // These two tests are a pair and only mean something together: the first
+    // says Apply refuses and deletes nothing, the second says an empty site
+    // list really would have deleted something. Without the second, the first
+    // is a test that cannot distinguish a guard from an accident.
+    // -----------------------------------------------------------------------
+
+    /// A home with one already-generated vhost, and no store.
+    ///
+    /// `<home>/config/generated/nginx/sites/<domain>.conf` is the tree Apply
+    /// owns: a `.conf` in there that the desired render does not contain is
+    /// classified `Removed` and deleted. So an empty site list does not
+    /// produce a smaller config — it produces a config with no vhosts, and
+    /// `nginx -t` ACCEPTS that, which is why nothing downstream would roll it
+    /// back.
+    ///
+    /// The stand-in nginx below exits 0 on purpose: with a validator that
+    /// cannot spawn, an unguarded Apply would fail and restore the file
+    /// anyway, and this assertion would pass for the wrong reason.
+    ///
+    /// VACUITY, measured. With `let db = db.require()?;` replaced by
+    /// `let db = &Db::open_in_memory().await.unwrap();` — the exact shape a
+    /// "degrade to an empty site list" regression takes — this test failed
+    /// first on `unwrap_err`, which reported
+    /// `Ok(ApplyOutcomeDto { applied: 3, not_started: ["nginx"], .. })`. With
+    /// that `unwrap_err` relaxed so the run continues, it then failed on
+    /// "apply_config refused, so the existing vhost must still be on disk":
+    /// **the vhost was deleted**. Reverted and re-run green.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_fails_closed_and_deletes_no_vhost_when_the_store_is_down() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let vhost = home
+            .path()
+            .join("config/generated/nginx/sites/shop.localhost.conf");
+        std::fs::create_dir_all(vhost.parent().unwrap()).unwrap();
+        std::fs::write(
+            &vhost,
+            "server { listen 8080; server_name shop.localhost; }\n",
+        )
+        .unwrap();
+
+        let nginx = home.path().join("nginx");
+        std::fs::write(&nginx, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&nginx, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        manage_store_down(&app);
+        app.manage(RwLock::new(Some(InstalledRuntimes {
+            nginx_bin: Some(nginx.clone()),
+            php: vec![],
+        })));
+        app.manage(Some(StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: Some(nginx),
+            nginx_conf: home.path().join("config/generated/nginx/nginx.conf"),
+        }));
+        app.manage(Arc::new(Supervisor::new(openvhost_proc::default_driver())));
+        app.manage(ApplyLock::default());
+
+        assert_store_refusal(
+            &apply_config(
+                app.state::<DbHandle>(),
+                app.state::<RwLock<Option<InstalledRuntimes>>>(),
+                app.state::<Option<StackPaths>>(),
+                app.state::<Arc<Supervisor>>(),
+                app.state::<ApplyLock>(),
+            )
+            .await
+            .unwrap_err(),
+            "apply_config",
+        );
+        assert!(
+            vhost.exists(),
+            "apply_config refused, so the existing vhost must still be on disk"
+        );
+
+        // The read-only half of the same pipeline, over the same config set:
+        // it feeds the pending-changes banner, so degrading it would light that
+        // banner up with "remove every vhost" as a normal state.
+        assert_store_refusal(
+            &plan_config_apply(
+                app.state::<DbHandle>(),
+                app.state::<RwLock<Option<InstalledRuntimes>>>(),
+                app.state::<Option<StackPaths>>(),
+            )
+            .await
+            .unwrap_err(),
+            "plan_config_apply",
+        );
+    }
+
+    /// The other half: with a store that is PRESENT and simply has no sites,
+    /// the very same home plans the REMOVAL of that vhost.
+    ///
+    /// This is what "fails closed" is protecting against, stated as a fact
+    /// about this code rather than an assertion in a design document — and it
+    /// is why the test above is a real guard and not a formality.
+    /// `plan_config_apply` rather than `apply_config`, because the claim is
+    /// about what the plan SAYS; nothing needs to be deleted twice to make it.
+    ///
+    /// Vacuity: with the fixture vhost not written, the plan came back as two
+    /// `added` entries (the main config and the catch-all) and no `removed` at
+    /// all, so this assertion failed — it is driven by the file on disk, not
+    /// by something every plan contains. Reverted and re-run green.
+    #[tokio::test]
+    async fn an_empty_site_list_plans_the_removal_of_an_existing_vhost() {
+        let home = tempfile::tempdir().unwrap();
+        let vhost = home
+            .path()
+            .join("config/generated/nginx/sites/shop.localhost.conf");
+        std::fs::create_dir_all(vhost.parent().unwrap()).unwrap();
+        std::fs::write(
+            &vhost,
+            "server { listen 8080; server_name shop.localhost; }\n",
+        )
+        .unwrap();
+
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        manage_db(&app, Db::open_in_memory().await.unwrap());
+        app.manage(RwLock::new(Some(InstalledRuntimes {
+            nginx_bin: Some(home.path().join("nginx")),
+            php: vec![],
+        })));
+        app.manage(Some(StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: Some(home.path().join("nginx")),
+            nginx_conf: home.path().join("config/generated/nginx/nginx.conf"),
+        }));
+
+        let plan = plan_config_apply(
+            app.state::<DbHandle>(),
+            app.state::<RwLock<Option<InstalledRuntimes>>>(),
+            app.state::<Option<StackPaths>>(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            plan.changes
+                .iter()
+                .any(|c| c.kind == "removed" && c.path.contains("shop.localhost")),
+            "an empty site list must plan the vhost's REMOVAL — that is the \
+             destructive answer `apply_config`'s refusal exists to prevent; got {:?}",
+            plan.changes
+                .iter()
+                .map(|c| (&c.kind, &c.path))
+                .collect::<Vec<_>>()
+        );
     }
 }
 
@@ -10388,7 +11426,7 @@ mod web_server_settings_ipc_tests {
         let app = tauri::test::mock_builder()
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
-        app.manage(Db::open_in_memory().await.unwrap());
+        manage_db(&app, Db::open_in_memory().await.unwrap());
         app.manage(Some(StackPaths {
             home: home.path().to_path_buf(),
             nginx_bin: None,
@@ -10396,15 +11434,18 @@ mod web_server_settings_ipc_tests {
         }));
 
         save_web_server_settings(
-            app.state::<Db>(),
+            app.state::<DbHandle>(),
             app.state::<Option<StackPaths>>(),
             valid_dto(),
         )
         .await
         .unwrap();
 
+        // Bound rather than inlined: `require()` borrows the handle, so the
+        // `State` guard has to outlive the read.
+        let handle = app.state::<DbHandle>();
         assert_eq!(
-            read_settings(app.state::<Db>().inner()).await.unwrap(),
+            read_settings(handle.require().unwrap()).await.unwrap(),
             valid_dto(),
             "design D3: with no nginx binary, the save must go through unchecked, not be blocked"
         );
@@ -10515,6 +11556,45 @@ mod web_server_settings_ipc_tests {
             "nginx rejected this value: no line reference here"
         );
     }
+
+    /// Both settings commands REFUSE with no store — design D3's decision,
+    /// pinned so a later "just serve the defaults" edit has to argue with a
+    /// test rather than slip through. The read is the one that matters: a
+    /// populated, editable form whose Save can only ever fail is the quiet
+    /// wrong answer this project keeps getting burned by.
+    ///
+    /// The save is checked against a stack with no nginx binary, so the
+    /// `nginx -t` pre-check is skipped and this is genuinely reaching the
+    /// store's refusal rather than a validator's.
+    ///
+    /// Vacuity: with all 13 `let db = db.require()?;` guards and
+    /// `web_server_settings`' own `read_settings(db.require()?)` replaced by
+    /// `Db::open_in_memory()`, this test failed on `unwrap_err`. Reverted and
+    /// re-run green.
+    #[tokio::test]
+    async fn both_settings_commands_refuse_and_name_why_when_the_store_is_down() {
+        let home = tempfile::tempdir().unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        manage_store_down(&app);
+        app.manage(Some(StackPaths {
+            home: home.path().to_path_buf(),
+            nginx_bin: None,
+            nginx_conf: home.path().join("config/generated/nginx/nginx.conf"),
+        }));
+
+        assert_store_refusal(
+            &web_server_settings(app.state()).await.unwrap_err(),
+            "web_server_settings",
+        );
+        assert_store_refusal(
+            &save_web_server_settings(app.state(), app.state(), valid_dto())
+                .await
+                .unwrap_err(),
+            "save_web_server_settings",
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -10591,9 +11671,34 @@ impl TryFrom<LogSourceDto> for LogSource {
 /// through unconditionally too: it is rejected later, structurally, by
 /// `derive_path` (it has no on-disk path at all), not by a catalogue rule
 /// here.
+///
+/// **`db` is [`DbHandle::Unavailable`] when `state.db` did not open, and only
+/// the site arm fails closed** (optional-state.db design D2's SPLIT). That
+/// asymmetry is the whole decision, so it is stated rather than left to be read
+/// out of the arms:
+///
+/// - nginx's globals, a php-fpm pool and a ring are all named by a catalogue
+///   that does not live in `state.db`, so a missing store tells us nothing
+///   about them and they **proceed**. Failing the whole function closed would
+///   look safer and produce the opposite of the design — the nginx error log
+///   would become unreadable exactly when the app is broken, which is the one
+///   thing a user needs then.
+/// - the site arm **refuses**, because for a site this check IS the
+///   path-confinement gate: the domain arrives over IPC, and `state.db` is the
+///   only thing that says which domains exist. With no store there is nothing
+///   to check it against, and degrading would derive
+///   `<home>/logs/sites/<domain>/…` for a domain nothing vetted.
+///
+/// The whole [`DbHandle`] rather than an `Option<&Db>`, so this refusal can
+/// carry the REASON the store is missing — *unable to open database file* —
+/// which is the entire point of [`DbHandle::Unavailable`]'s `reason` field. An
+/// `Option` throws that away at the call site, and the inline refusal is what a
+/// user reads at the moment they are blocked; deferring the detail to the
+/// app-level banner is the same "a reader could infer it" reasoning this
+/// codebase keeps rejecting.
 async fn check_catalogue(
     source: &LogSource,
-    db: &Db,
+    db: &DbHandle,
     runtimes: &RwLock<Option<InstalledRuntimes>>,
 ) -> Result<(), IpcError> {
     match source {
@@ -10616,6 +11721,28 @@ async fn check_catalogue(
             }
         }
         LogSource::SiteAccess(domain) | LogSource::SiteError(domain) => {
+            // Fail closed. `IpcError::Core`, not `Validation` on `domain`: the
+            // domain is not what is wrong, and a page that renders this must
+            // not read it as "no such site".
+            //
+            // Matched exhaustively rather than routed through
+            // `DbHandle::require()`, for the one thing `require` cannot do: keep
+            // the clause that says why THIS refusal follows from the store being
+            // down. The shared sentence and the reason still come from
+            // `unavailable_message`, so only the trailing clause is local — and a
+            // third `DbHandle` variant would fail to compile here rather than
+            // fall into a wildcard.
+            let db = match db {
+                DbHandle::Ready(db) => db,
+                DbHandle::Unavailable { reason } => {
+                    return Err(IpcError::Core {
+                        message: format!(
+                            "{}, so no site's log can be confirmed as one of yours",
+                            crate::db_state::unavailable_message(reason)
+                        ),
+                    });
+                }
+            };
             let repo = SqliteSiteRepository::new(db);
             let known = repo
                 .list()
@@ -10693,7 +11820,7 @@ fn derive_path(source: &LogSource, paths: &openvhost_core::LogPaths) -> Result<P
 /// PHP major is rejected without a single filesystem call.
 async fn resolve_log_path(
     dto: LogSourceDto,
-    db: &Db,
+    db: &DbHandle,
     runtimes: &RwLock<Option<InstalledRuntimes>>,
     paths: &openvhost_core::LogPaths,
 ) -> Result<PathBuf, IpcError> {
@@ -10915,8 +12042,13 @@ async fn file_row(
 /// (spec D7).
 #[tauri::command]
 #[specta::specta]
+// DEGRADE (optional-state.db design D2): with no store the catalogue keeps
+// every row `state.db` was not the source of — nginx's globals, one per
+// installed php-fpm major, one per supervised service — and loses only the
+// per-site pairs. A shorter list is indistinguishable from "you have no sites",
+// which is why D5's banner is what makes this honest rather than quiet.
 pub async fn list_log_sources(
-    db: tauri::State<'_, Db>,
+    db: tauri::State<'_, DbHandle>,
     runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
     stack: tauri::State<'_, Option<StackPaths>>,
     sup: tauri::State<'_, Arc<Supervisor>>,
@@ -10970,29 +12102,34 @@ pub async fn list_log_sources(
         }
     }
 
-    let repo = SqliteSiteRepository::new(db.inner());
-    for site in repo.list().await? {
-        let domain = site.domain.as_str().to_string();
-        rows.push(
-            file_row(
-                LogSourceDto::SiteAccess {
-                    domain: domain.clone(),
-                },
-                format!("{domain} access log"),
-                log_paths.site_access(&site.domain),
-            )
-            .await,
-        );
-        rows.push(
-            file_row(
-                LogSourceDto::SiteError {
-                    domain: domain.clone(),
-                },
-                format!("{domain} error log"),
-                log_paths.site_error(&site.domain),
-            )
-            .await,
-        );
+    // The only rows `state.db` is the source of, and so the only ones a
+    // degraded store costs. Every other row above and below is a filesystem or
+    // supervisor fact and is unaffected.
+    if let Some(db) = db.optional() {
+        let repo = SqliteSiteRepository::new(db);
+        for site in repo.list().await? {
+            let domain = site.domain.as_str().to_string();
+            rows.push(
+                file_row(
+                    LogSourceDto::SiteAccess {
+                        domain: domain.clone(),
+                    },
+                    format!("{domain} access log"),
+                    log_paths.site_access(&site.domain),
+                )
+                .await,
+            );
+            rows.push(
+                file_row(
+                    LogSourceDto::SiteError {
+                        domain: domain.clone(),
+                    },
+                    format!("{domain} error log"),
+                    log_paths.site_error(&site.domain),
+                )
+                .await,
+            );
+        }
     }
 
     for status in sup.snapshot() {
@@ -11016,8 +12153,10 @@ pub async fn list_log_sources(
 /// path is derived or any filesystem call is made.
 #[tauri::command]
 #[specta::specta]
+// SPLIT (optional-state.db design D2): the store reaches only `check_catalogue`,
+// which refuses a site source and lets the other three through — see its doc.
 pub async fn read_log_window(
-    db: tauri::State<'_, Db>,
+    db: tauri::State<'_, DbHandle>,
     runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
     stack: tauri::State<'_, Option<StackPaths>>,
     input: LogWindowQuery,
@@ -11070,7 +12209,7 @@ pub async fn read_log_window(
 /// the derived path's parent — stays directly testable.
 async fn reveal_log_folder_target(
     source: LogSourceDto,
-    db: &Db,
+    db: &DbHandle,
     runtimes: &RwLock<Option<InstalledRuntimes>>,
     paths: &openvhost_core::LogPaths,
 ) -> Result<PathBuf, IpcError> {
@@ -11092,9 +12231,11 @@ async fn reveal_log_folder_target(
 /// `open_site`/`open_homebrew_site` above.
 #[tauri::command]
 #[specta::specta]
+// SPLIT, through the same `check_catalogue` seam `read_log_window` goes
+// through — see its doc for which arms proceed with no store and which refuses.
 pub async fn reveal_log_folder(
     app: tauri::AppHandle,
-    db: tauri::State<'_, Db>,
+    db: tauri::State<'_, DbHandle>,
     runtimes: tauri::State<'_, RwLock<Option<InstalledRuntimes>>>,
     stack: tauri::State<'_, Option<StackPaths>>,
     source: LogSourceDto,
@@ -11181,12 +12322,12 @@ mod log_ipc_tests {
         let app = tauri::test::mock_builder()
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
-        app.manage(Db::open_in_memory().await.unwrap());
+        manage_db(&app, Db::open_in_memory().await.unwrap());
         app.manage(stack(home.path()));
         app.manage(RwLock::new(None::<InstalledRuntimes>));
 
         let err = read_log_window(
-            app.state::<Db>(),
+            app.state::<DbHandle>(),
             app.state::<RwLock<Option<InstalledRuntimes>>>(),
             app.state::<Option<StackPaths>>(),
             query(
@@ -11216,12 +12357,12 @@ mod log_ipc_tests {
         let repo = SqliteSiteRepository::new(&db);
         let id = repo.list().await.unwrap()[0].id.clone();
         assert!(repo.delete(&id).await.unwrap());
-        app.manage(db);
+        manage_db(&app, db);
         app.manage(stack(home.path()));
         app.manage(RwLock::new(None::<InstalledRuntimes>));
 
         let err = read_log_window(
-            app.state::<Db>(),
+            app.state::<DbHandle>(),
             app.state::<RwLock<Option<InstalledRuntimes>>>(),
             app.state::<Option<StackPaths>>(),
             query(
@@ -11246,7 +12387,7 @@ mod log_ipc_tests {
         let app = tauri::test::mock_builder()
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
-        app.manage(Db::open_in_memory().await.unwrap());
+        manage_db(&app, Db::open_in_memory().await.unwrap());
         app.manage(stack(home.path()));
         app.manage(RwLock::new(Some(InstalledRuntimes {
             nginx_bin: Some(home.path().join("nginx")),
@@ -11254,7 +12395,7 @@ mod log_ipc_tests {
         })));
 
         let err = read_log_window(
-            app.state::<Db>(),
+            app.state::<DbHandle>(),
             app.state::<RwLock<Option<InstalledRuntimes>>>(),
             app.state::<Option<StackPaths>>(),
             query(
@@ -11291,12 +12432,12 @@ mod log_ipc_tests {
         let app = tauri::test::mock_builder()
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
-        app.manage(Db::open_in_memory().await.unwrap());
+        manage_db(&app, Db::open_in_memory().await.unwrap());
         app.manage(stack(home.path()));
         app.manage(RwLock::new(None::<InstalledRuntimes>));
 
         let err = read_log_window(
-            app.state::<Db>(),
+            app.state::<DbHandle>(),
             app.state::<RwLock<Option<InstalledRuntimes>>>(),
             app.state::<Option<StackPaths>>(),
             query(LogSourceDto::ServiceRing { id: "nginx".into() }, None),
@@ -11319,7 +12460,7 @@ mod log_ipc_tests {
 
         let err = reveal_log_folder_target(
             LogSourceDto::ServiceRing { id: "nginx".into() },
-            &db,
+            &DbHandle::Ready(db),
             &runtimes,
             &log_paths,
         )
@@ -11347,7 +12488,7 @@ mod log_ipc_tests {
             .unwrap();
         let db = Db::open_in_memory().await.unwrap();
         site_in(&db, "shop.localhost").await;
-        app.manage(db);
+        manage_db(&app, db);
         app.manage(stack(home.path()));
         app.manage(RwLock::new(None::<InstalledRuntimes>));
 
@@ -11358,7 +12499,7 @@ mod log_ipc_tests {
         std::os::unix::fs::symlink(&victim, site_dir.join("access.log")).unwrap();
 
         let err = read_log_window(
-            app.state::<Db>(),
+            app.state::<DbHandle>(),
             app.state::<RwLock<Option<InstalledRuntimes>>>(),
             app.state::<Option<StackPaths>>(),
             query(
@@ -11392,12 +12533,12 @@ mod log_ipc_tests {
         let app = tauri::test::mock_builder()
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
-        app.manage(Db::open_in_memory().await.unwrap());
+        manage_db(&app, Db::open_in_memory().await.unwrap());
         app.manage(stack(home.path()));
         app.manage(RwLock::new(None::<InstalledRuntimes>));
 
         let err = read_log_window(
-            app.state::<Db>(),
+            app.state::<DbHandle>(),
             app.state::<RwLock<Option<InstalledRuntimes>>>(),
             app.state::<Option<StackPaths>>(),
             LogWindowQuery {
@@ -11458,7 +12599,7 @@ mod log_ipc_tests {
             .unwrap();
         let db = Db::open_in_memory().await.unwrap();
         site_in(&db, "shop.localhost").await;
-        app.manage(db);
+        manage_db(&app, db);
         app.manage(stack(home.path()));
         app.manage(RwLock::new(Some(InstalledRuntimes {
             nginx_bin: Some(home.path().join("nginx")),
@@ -11485,7 +12626,7 @@ mod log_ipc_tests {
         app.manage(sup);
 
         let rows = list_log_sources(
-            app.state::<Db>(),
+            app.state::<DbHandle>(),
             app.state::<RwLock<Option<InstalledRuntimes>>>(),
             app.state::<Option<StackPaths>>(),
             app.state::<Arc<Supervisor>>(),
@@ -11537,7 +12678,7 @@ mod log_ipc_tests {
         let app = tauri::test::mock_builder()
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
-        app.manage(Db::open_in_memory().await.unwrap());
+        manage_db(&app, Db::open_in_memory().await.unwrap());
         app.manage(stack(home.path()));
         app.manage(RwLock::new(None::<InstalledRuntimes>));
         app.manage(Arc::new(Supervisor::new(openvhost_proc::default_driver())));
@@ -11548,7 +12689,7 @@ mod log_ipc_tests {
         std::fs::write(log_dir.join("nginx.error.log"), contents).unwrap();
 
         let rows = list_log_sources(
-            app.state::<Db>(),
+            app.state::<DbHandle>(),
             app.state::<RwLock<Option<InstalledRuntimes>>>(),
             app.state::<Option<StackPaths>>(),
             app.state::<Arc<Supervisor>>(),
@@ -11575,7 +12716,7 @@ mod log_ipc_tests {
         let app = tauri::test::mock_builder()
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
-        app.manage(Db::open_in_memory().await.unwrap());
+        manage_db(&app, Db::open_in_memory().await.unwrap());
         app.manage(stack(home.path()));
         app.manage(RwLock::new(None::<InstalledRuntimes>));
 
@@ -11584,7 +12725,7 @@ mod log_ipc_tests {
         std::fs::write(log_dir.join("nginx.error.log"), b"line one\n").unwrap();
 
         let first = read_log_window(
-            app.state::<Db>(),
+            app.state::<DbHandle>(),
             app.state::<RwLock<Option<InstalledRuntimes>>>(),
             app.state::<Option<StackPaths>>(),
             query(LogSourceDto::NginxError, None),
@@ -11603,7 +12744,7 @@ mod log_ipc_tests {
         drop(f);
 
         let second = read_log_window(
-            app.state::<Db>(),
+            app.state::<DbHandle>(),
             app.state::<RwLock<Option<InstalledRuntimes>>>(),
             app.state::<Option<StackPaths>>(),
             query(LogSourceDto::NginxError, Some(cursor)),
@@ -11638,7 +12779,7 @@ mod log_ipc_tests {
             LogSourceDto::SiteError {
                 domain: "ghost.localhost".into(),
             },
-            &db,
+            &DbHandle::Ready(db),
             &runtimes,
             &log_paths,
         )
@@ -11663,7 +12804,7 @@ mod log_ipc_tests {
             LogSourceDto::SiteAccess {
                 domain: "shop.localhost".into(),
             },
-            &db,
+            &DbHandle::Ready(db),
             &runtimes,
             &log_paths,
         )
@@ -11671,5 +12812,310 @@ mod log_ipc_tests {
         .unwrap();
 
         assert_eq!(folder, home.path().join("logs/sites/shop.localhost"));
+    }
+
+    // ---- SPLIT: which arms survive a store that never opened --------------
+    //
+    // Optional-state.db design D2. `check_catalogue` is NOT uniform, and that
+    // is the whole decision: making all of it fail closed looks safer and
+    // produces the opposite of the design — the nginx error log would become
+    // unreadable exactly when the app is broken, which is the one thing a user
+    // needs then. Every test in this group would still pass under that
+    // mistake, so the two directions are proven separately and explicitly.
+    //
+    // Vacuity, measured by mutation on the ONE arm that decides it:
+    //
+    //  * `check_catalogue`'s site arm returning `Ok(())` on an `Unavailable`
+    //    handle instead of refusing reddens `a_site_log_is_refused_…` and
+    //    `reveal_log_folder_target_refuses_a_site_…` (the read then SUCCEEDS
+    //    and hands back the planted file's contents, which is precisely the
+    //    leak the gate exists to stop) and leaves this group's other three
+    //    tests green.
+    //  * Making the whole function refuse when the store is down — the
+    //    plausible over-correction — reddens
+    //    `the_nginx_error_log_is_still_readable_…`,
+    //    `a_php_pool_log_is_still_readable_…` and
+    //    `a_ring_source_is_still_rejected_…` and leaves the two site tests
+    //    green. Neither mutation is detectable by the group's other half,
+    //    which is why both halves are here.
+    //  * Building the refusal from `STORE_UNAVAILABLE` instead of
+    //    `unavailable_message(reason)` — i.e. going back to what an
+    //    `Option<&Db>` could carry — reddens exactly the two `STORE_DOWN_REASON`
+    //    assertions in `a_site_log_is_refused_…` and
+    //    `reveal_log_folder_target_refuses_a_site_…`, and nothing else. Measured.
+
+    /// The store's own fixture: down, with the log files a user would want to
+    /// read at that exact moment already on disk.
+    fn store_down_app(home: &Path) -> tauri::App<tauri::test::MockRuntime> {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        manage_store_down(&app);
+        app.manage(stack(home));
+        app.manage(RwLock::new(Some(InstalledRuntimes {
+            nginx_bin: Some(home.join("nginx")),
+            php: vec![openvhost_core::PhpRuntime {
+                major: "8.3".into(),
+                fpm_bin: home.join("php-fpm"),
+                source: openvhost_core::PhpRuntimeSource::Homebrew,
+            }],
+        })));
+        app
+    }
+
+    #[tokio::test]
+    async fn the_nginx_error_log_is_still_readable_with_no_store() {
+        let home = tempfile::tempdir().unwrap();
+        let app = store_down_app(home.path());
+
+        let log_dir = home.path().join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("nginx.error.log"),
+            b"2026/08/09 10:00:00 [emerg] the app is broken\n",
+        )
+        .unwrap();
+
+        let window = read_log_window(
+            app.state::<DbHandle>(),
+            app.state::<RwLock<Option<InstalledRuntimes>>>(),
+            app.state::<Option<StackPaths>>(),
+            query(LogSourceDto::NginxError, None),
+        )
+        .await
+        .expect("nginx's error log must stay readable when the store is down");
+
+        assert!(window.exists);
+        assert_eq!(window.rows.len(), 1, "got {:?}", window.rows);
+        assert!(window.rows[0].text.contains("the app is broken"));
+
+        // …and the same source through the OTHER command, which reaches the
+        // same gate. `reveal_log_folder` itself takes an `AppHandle<Wry>` and
+        // cannot be invoked from this harness at all (see
+        // `reveal_log_folder_target`'s doc); this is its whole decision minus
+        // the OS call.
+        let log_paths = openvhost_core::LogPaths::new(home.path());
+        let folder = reveal_log_folder_target(
+            LogSourceDto::NginxError,
+            app.state::<DbHandle>().inner(),
+            app.state::<RwLock<Option<InstalledRuntimes>>>().inner(),
+            &log_paths,
+        )
+        .await
+        .expect("revealing nginx's log folder must not need the store either");
+        assert_eq!(folder, log_dir);
+    }
+
+    /// The second arm that needs no store: an installed php-fpm major is named
+    /// by the managed runtime list, not by `state.db`.
+    #[tokio::test]
+    async fn a_php_pool_log_is_still_readable_with_no_store() {
+        let home = tempfile::tempdir().unwrap();
+        let app = store_down_app(home.path());
+
+        let pool_dir = home.path().join("logs/services/php-fpm-8.3");
+        std::fs::create_dir_all(&pool_dir).unwrap();
+        std::fs::write(pool_dir.join("error.log"), b"[09-Aug-2026] NOTICE: ready\n").unwrap();
+
+        let window = read_log_window(
+            app.state::<DbHandle>(),
+            app.state::<RwLock<Option<InstalledRuntimes>>>(),
+            app.state::<Option<StackPaths>>(),
+            query(
+                LogSourceDto::PhpFpm {
+                    major: "8.3".into(),
+                },
+                None,
+            ),
+        )
+        .await
+        .expect("an installed pool's log must stay readable when the store is down");
+
+        assert!(window.exists);
+        assert_eq!(window.rows.len(), 1, "got {:?}", window.rows);
+        assert!(window.rows[0].text.contains("NOTICE: ready"));
+    }
+
+    /// The third arm: a ring source passes the catalogue check with or without
+    /// a store and is rejected one step later by `derive_path`. The assertion
+    /// is that the store being down changes NOTHING here — same refusal, same
+    /// field — rather than that the source is somehow readable.
+    #[tokio::test]
+    async fn a_ring_source_is_still_rejected_by_derive_path_with_no_store() {
+        let home = tempfile::tempdir().unwrap();
+        let app = store_down_app(home.path());
+
+        let err = read_log_window(
+            app.state::<DbHandle>(),
+            app.state::<RwLock<Option<InstalledRuntimes>>>(),
+            app.state::<Option<StackPaths>>(),
+            query(LogSourceDto::ServiceRing { id: "nginx".into() }, None),
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            IpcError::Validation { field, .. } => assert_eq!(
+                field, "source",
+                "a ring source must still be refused by derive_path, not by the store gate"
+            ),
+            other => panic!("expected Validation on source, got {other:?}"),
+        }
+    }
+
+    /// The direction that must NOT degrade. `state.db` is the only thing that
+    /// says which domains are the user's, so with no store there is nothing to
+    /// check an IPC-supplied domain against — and this check is the
+    /// path-confinement gate that stands between that domain and
+    /// `<home>/logs/sites/<domain>/…`.
+    ///
+    /// The planted file is what makes the assertion discriminating rather than
+    /// decorative: if the gate degraded open, the derived path would exist and
+    /// this call would return its contents instead of an error.
+    #[tokio::test]
+    async fn a_site_log_is_refused_with_no_store_by_the_confinement_gate() {
+        let home = tempfile::tempdir().unwrap();
+        let app = store_down_app(home.path());
+
+        let site_dir = home.path().join("logs/sites/ghost.localhost");
+        std::fs::create_dir_all(&site_dir).unwrap();
+        std::fs::write(site_dir.join("access.log"), b"a line nothing vetted\n").unwrap();
+
+        let err = read_log_window(
+            app.state::<DbHandle>(),
+            app.state::<RwLock<Option<InstalledRuntimes>>>(),
+            app.state::<Option<StackPaths>>(),
+            query(
+                LogSourceDto::SiteAccess {
+                    domain: "ghost.localhost".into(),
+                },
+                None,
+            ),
+        )
+        .await
+        .unwrap_err();
+
+        // `Core`, and specifically NOT `Validation { field: "domain" }`: the
+        // domain is not what is wrong, and a page that read this as "no such
+        // site" would be told a second untruth on top of the first.
+        match err {
+            IpcError::Core { message } => {
+                assert!(
+                    message.contains(crate::db_state::STORE_UNAVAILABLE),
+                    "the refusal must name the store, got {message:?}"
+                );
+                // The reason, in the message the user is shown at the moment
+                // they are blocked — not left to be inferred from the banner.
+                // Reddens the instant `check_catalogue` goes back to an
+                // `Option<&Db>`, which cannot carry it.
+                assert!(
+                    message.contains(STORE_DOWN_REASON),
+                    "the refusal must carry the reason the store is missing: {message:?}"
+                );
+                assert!(
+                    !message.contains(".manage()"),
+                    "the user must never be told to call a Rust API: {message:?}"
+                );
+            }
+            other => panic!("expected the store refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reveal_log_folder_target_refuses_a_site_with_no_store() {
+        let home = tempfile::tempdir().unwrap();
+        let runtimes = RwLock::new(None::<InstalledRuntimes>);
+        let log_paths = openvhost_core::LogPaths::new(home.path());
+
+        let err = reveal_log_folder_target(
+            LogSourceDto::SiteError {
+                domain: "ghost.localhost".into(),
+            },
+            &store_down(),
+            &runtimes,
+            &log_paths,
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            IpcError::Core { message } => {
+                assert!(
+                    message.contains(crate::db_state::STORE_UNAVAILABLE),
+                    "the refusal must name the store, got {message:?}"
+                );
+                assert!(
+                    message.contains(STORE_DOWN_REASON),
+                    "and it must carry the reason, not only the shared sentence: {message:?}"
+                );
+            }
+            other => panic!("expected the store refusal, got {other:?}"),
+        }
+    }
+
+    // ---- DEGRADE: list_log_sources keeps every non-site row ---------------
+    //
+    // Vacuity: swapping `db.optional()` for `db.require()?` makes this test's
+    // call return `Err` and reddens it, while
+    // `list_log_sources_enumerates_every_kind_for_a_fixture_home` — which
+    // manages a healthy store — stays green. That pair is what separates
+    // "degrades" from "refuses", and the positive assertions below are what
+    // separate "degrades" from "returns an empty list".
+
+    #[tokio::test]
+    async fn list_log_sources_degrades_to_the_rows_the_store_was_not_the_source_of() {
+        let home = tempfile::tempdir().unwrap();
+        let app = store_down_app(home.path());
+        let sup = Arc::new(Supervisor::new(openvhost_proc::default_driver()));
+        sup.register(openvhost_proc::ServiceSpec {
+            id: "nginx".into(),
+            display_name: "nginx".into(),
+            endpoint: None,
+            spawn: openvhost_proc::SpawnSpec {
+                program: PathBuf::from("/usr/bin/true"),
+                args: vec![],
+                cwd: None,
+                env: vec![],
+            },
+            readiness: openvhost_proc::ReadinessProbe::default(),
+            grace: openvhost_proc::DEFAULT_GRACE,
+        });
+        app.manage(sup);
+
+        let rows = list_log_sources(
+            app.state::<DbHandle>(),
+            app.state::<RwLock<Option<InstalledRuntimes>>>(),
+            app.state::<Option<StackPaths>>(),
+            app.state::<Arc<Supervisor>>(),
+        )
+        .await
+        .expect("a degraded store must shorten the catalogue, not error it");
+
+        assert!(
+            rows.iter().any(|r| r.source == LogSourceDto::NginxError),
+            "got {:?}",
+            rows.iter().map(|r| &r.source).collect::<Vec<_>>()
+        );
+        assert!(rows.iter().any(|r| r.source == LogSourceDto::NginxAccess));
+        assert!(
+            rows.iter().any(
+                |r| matches!(&r.source, LogSourceDto::PhpFpm { major } if major.as_str() == "8.3")
+            ),
+            "an installed pool row comes from the runtime list, not the store"
+        );
+        assert!(
+            rows.iter().any(|r| matches!(
+                &r.source,
+                LogSourceDto::ServiceRing { id } if id.as_str() == "nginx"
+            )),
+            "a ring row comes from the supervisor, not the store"
+        );
+        assert!(
+            !rows.iter().any(|r| matches!(
+                r.source,
+                LogSourceDto::SiteAccess { .. } | LogSourceDto::SiteError { .. }
+            )),
+            "a site row can only come from state.db, so none can be listed"
+        );
     }
 }

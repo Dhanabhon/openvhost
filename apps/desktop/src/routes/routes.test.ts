@@ -22,7 +22,11 @@ import { render } from 'svelte/server';
 import SitesPage from './+page.svelte';
 import ServicesPage from './services/+page.svelte';
 import WebServerPage from './web-server/+page.svelte';
+import LanguagesPage from './languages/+page.svelte';
+import DatabasesPage from './databases/+page.svelte';
+import LogsPage from './logs/+page.svelte';
 import { servicesStore } from '$lib/services.shared.svelte';
+import { storeStatusStore } from '$lib/store-status.shared.svelte';
 import { webServersStore } from '$lib/webservers.svelte';
 import type { ServiceStatus } from '$lib/ipc';
 
@@ -68,6 +72,8 @@ function railLink(
 beforeEach(() => {
 	servicesStore.services = [];
 	servicesStore.error = null;
+	storeStatusStore.reason = null;
+	storeStatusStore.lastError = null;
 	webServersStore.servers = [];
 	webServersStore.error = null;
 	webServersStore.configText = {};
@@ -110,6 +116,71 @@ describe('a supervisor failure', () => {
 	it('shows no banner when nothing has failed', () => {
 		const { body } = render(SitesPage);
 		expect(body).not.toContain('data-testid="error-banner"');
+	});
+});
+
+// A `state.db` that never opened is an APP-level condition, not a page-level
+// one: `list_log_sources` comes back without its site rows, a stored default PHP
+// reads as "no preference", and every write refuses. Design D5 answers it with
+// ONE banner rather than a notice per page, so what has to be proven is that
+// every route renders it — and, just as importantly, that no route renders it on
+// a healthy machine. Both directions, on every route the design names.
+//
+// `onMount` does not run under SSR, so nothing here reaches Tauri IPC; the
+// shared store is seeded directly, which is exactly why it is a shared module
+// singleton (see `store-status.shared.svelte.ts`). The ASK itself — that the
+// layout ever sets this — is `layout-store-status.dom.test.ts`, which cannot be
+// done here.
+//
+// Vacuity, measured by mutation on the one line that wires them together:
+// changing AppShell's `reason={storeStatusStore.reason}` to `reason={null}` —
+// the banner mounted but reading nothing, which is exactly how UI glue goes
+// missing here — reddened all six `is announced on …`, the count test and the
+// coexistence test, and left all six `is silent on …` green. Making the banner
+// render unconditionally reddened those six instead. Neither half detects the
+// other's mutation, which is why both are here.
+describe('an unopened state.db', () => {
+	const REASON = 'unable to open database file (os error 14)';
+	const routes: Array<[string, typeof SitesPage]> = [
+		['/', SitesPage],
+		['/services', ServicesPage],
+		['/web-server', WebServerPage],
+		['/languages', LanguagesPage],
+		['/databases', DatabasesPage],
+		['/logs', LogsPage]
+	];
+
+	it.each(routes)('is announced on %s', (_route, page) => {
+		storeStatusStore.reason = REASON;
+		const { body } = render(page);
+		expect(body).toContain('data-testid="store-unavailable-banner"');
+		// The REASON, on the page itself — not just the shared sentence. A banner
+		// that could only say "unavailable" leaves the user nothing to act on.
+		expect(body).toContain(REASON);
+	});
+
+	it.each(routes)('is silent on %s when the store opened fine', (_route, page) => {
+		const { body } = render(page);
+		expect(body).not.toContain('data-testid="store-unavailable-banner"');
+	});
+
+	it('renders exactly once per page, never once per panel', () => {
+		storeStatusStore.reason = REASON;
+		for (const [, page] of routes) {
+			const { body } = render(page);
+			expect(body.match(/data-testid="store-unavailable-banner"/g)).toHaveLength(1);
+		}
+	});
+
+	// The two app-level banners are independent conditions and must be able to
+	// coexist: a broken store does not imply a broken supervisor, and suppressing
+	// either would hide a real failure behind an unrelated one.
+	it('sits alongside the supervisor banner rather than replacing it', () => {
+		storeStatusStore.reason = REASON;
+		servicesStore.error = { kind: 'core', message: 'supervisor unreachable' };
+		const { body } = render(SitesPage);
+		expect(body).toContain('data-testid="error-banner"');
+		expect(body).toContain('data-testid="store-unavailable-banner"');
 	});
 });
 

@@ -43,8 +43,8 @@ use crate::commands::{
     InstallLock, IpcError, MYSQL_INSTALL_RUN, RunningInstallGuard, now_ms, rescan_mysql_into_state,
     stack_paths,
 };
+use crate::db_state::DbHandle;
 use crate::stack::StackPaths;
-use openvhost_core::Db;
 
 /// Where a listed runtime's binaries came from — the wire copy of
 /// `openvhost_core::mysql::MysqlRuntimeSource`.
@@ -453,10 +453,15 @@ impl ProgressThrottle {
 /// there would be no way to make either happen.
 #[tauri::command]
 #[specta::specta]
+// DEGRADE (optional-state.db design D2): a store that never opened costs the
+// ledger row, never the install — `MysqlInstallResultDto` reports that as
+// `ledger: Failed { reason }`, which is the state that type was built for. This
+// is `php_pkg::run_package_install`'s §8.6 argument and its audit-LOW-4 note,
+// applied to the engine those were written against.
 pub async fn install_mysql(
     app: tauri::AppHandle,
     major: String,
-    db: tauri::State<'_, Db>,
+    db: tauri::State<'_, DbHandle>,
     runtimes: tauri::State<'_, RwLock<Option<Vec<openvhost_core::mysql::MysqlRuntime>>>>,
     paths: tauri::State<'_, Option<StackPaths>>,
     sup: tauri::State<'_, Arc<Supervisor>>,
@@ -499,12 +504,16 @@ async fn run_install(
     app: &tauri::AppHandle,
     major: &openvhost_core::mysql::MysqlMajor,
     home: &Path,
-    db: &Db,
+    db: &DbHandle,
     lock: &InstallLock,
     runtimes: &RwLock<Option<Vec<openvhost_core::mysql::MysqlRuntime>>>,
     sup: &Supervisor,
 ) -> Result<MysqlInstallOutcomeDto, IpcError> {
-    let ledger = openvhost_core::mysql::InstallLedger::new(db);
+    // `None` when the store never opened. `DbHandle::install_ledger` is the one
+    // named place that decision is made — nothing here may reach for `require`
+    // — and `install_mysql_package` owns the reason it reports for the missing
+    // row, so nothing is retyped here either.
+    let ledger = db.install_ledger();
     let emitter = app.clone();
     let for_event = major.as_str().to_string();
     let spawn_major = major.clone();
@@ -524,7 +533,7 @@ async fn run_install(
         openvhost_core::mysql::install_mysql_package(
             &spawn_major,
             &spawn_root,
-            &ledger,
+            ledger.as_ref(),
             move |progress| {
                 for progress in throttle.admit(progress, std::time::Instant::now()) {
                     let _ = MysqlInstallProgressEvent {

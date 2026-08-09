@@ -41,7 +41,7 @@ use crate::mariadb::package::catalogue::{
     Availability, MARIADB_PACKAGE_NAME, MARIADB_WARMUP_BINARY, MariadbPackage,
     mariadb_package_for_host,
 };
-use crate::mysql::{InstallLedger, LedgerWrite};
+use crate::mysql::{InstallLedger, LedgerWrite, NO_LEDGER_REASON};
 
 /// The result of installing one catalogued MariaDB build.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +70,16 @@ pub struct MariadbPackageInstall {
 /// a user should be able to distinguish — a download that was verified from one
 /// that merely arrived — are distinct variants, not log text.
 ///
+/// **`ledger` is optional** (5C audit LOW-4, generalized by the optional-state.db
+/// design's D4). `state.db` is opened best-effort at startup, so a machine whose
+/// store is missing or unreadable has no [`InstallLedger`] to hand over — and
+/// refusing the install there would make a degraded `state.db` into "MariaDB
+/// cannot be installed", which is exactly what [`LedgerWrite`] exists to avoid
+/// saying. Pass `None` only for that: the package tree IS the inventory, so a
+/// skipped row costs provenance and never correctness, and it is reported as
+/// [`LedgerWrite::Failed`] carrying [`NO_LEDGER_REASON`] rather than silently
+/// omitted.
+///
 /// **Cancellation.** As with the MySQL path: dropping the returned future is
 /// the cancel. The staging directory is an RAII temporary removed as the future
 /// unwinds, and the process-wide install permit is released with it.
@@ -81,9 +91,11 @@ pub struct MariadbPackageInstall {
 ///   This is the state today.
 /// - [`CoreError::NoPackageForTarget`] — before any network or filesystem work,
 ///   if this build publishes no artifact for this host's architecture.
+///
+/// A ledger that cannot be written is **not** an error: see `ledger` above.
 pub async fn install_mariadb_package(
     root: &PackagesRoot,
-    ledger: &InstallLedger,
+    ledger: Option<&InstallLedger>,
     progress: impl FnMut(Progress) + Send,
 ) -> Result<MariadbPackageInstall, CoreError> {
     let entry = mariadb_package_for_host()?;
@@ -100,17 +112,18 @@ pub async fn install_mariadb_package(
     }
 }
 
-/// The pipeline itself, split out from the catalogue lookup so tests can drive
-/// it against a loopback fixture — and so the live proof can install the real
-/// tarball from a local source while the release remains unpublished.
+/// The pipeline itself, split out from the catalogue lookup so the tests **in
+/// this module** can drive it against a loopback fixture.
 ///
 /// Private on purpose: taking a [`MariadbPackage`] means taking a URL and a
 /// hash, and the whole point of the public signature above is that no caller
-/// can choose those. Nothing outside this module may name this function.
+/// can choose those. Nothing outside this module may name this function —
+/// including an out-of-tree live proof, which the deleted half of this sentence
+/// used to promise it could. The visibility is the deliberate half.
 async fn install_entry(
     entry: &MariadbPackage,
     root: &PackagesRoot,
-    ledger: &InstallLedger,
+    ledger: Option<&InstallLedger>,
     progress: impl FnMut(Progress) + Send,
 ) -> Result<MariadbPackageInstall, CoreError> {
     // Every component below is a compiled-in `&'static str` from the catalogue,
@@ -130,21 +143,39 @@ async fn install_entry(
     // MySQL-from-tarball design D4: we asked for this version, so we know it.
     // Recorded only after the tree is on disk — a failed install must leave no
     // phantom row.
-    let ledger_write = match ledger
-        .record(&package.name, &package.major, &package.version)
-        .await
-    {
-        Ok(installed_at) => LedgerWrite::Recorded { installed_at },
-        Err(e) => {
-            tracing::error!(
+    //
+    // The `None` arm is 5C audit LOW-4: no store to write to is the same
+    // OUTCOME as a write that failed — the tree is installed, the row is not
+    // there — so it reports as one rather than as a second, quieter kind of
+    // nothing. See this module's public entry point for who passes `None`.
+    let ledger_write = match ledger {
+        Some(ledger) => match ledger
+            .record(&package.name, &package.major, &package.version)
+            .await
+        {
+            Ok(installed_at) => LedgerWrite::Recorded { installed_at },
+            Err(e) => {
+                tracing::error!(
+                    name = %package.name,
+                    version = %package.version,
+                    dir = %package.dir.display(),
+                    error = %e,
+                    "MariaDB is installed but its ledger row could not be written"
+                );
+                LedgerWrite::Failed {
+                    reason: e.to_string(),
+                }
+            }
+        },
+        None => {
+            tracing::warn!(
                 name = %package.name,
                 version = %package.version,
                 dir = %package.dir.display(),
-                error = %e,
-                "MariaDB is installed but its ledger row could not be written"
+                "MariaDB is installed but state.db was unavailable, so nothing recorded it"
             );
             LedgerWrite::Failed {
-                reason: e.to_string(),
+                reason: NO_LEDGER_REASON.to_string(),
             }
         }
     };
@@ -465,7 +496,7 @@ mod tests {
         let url = serve_once(archive.clone());
         let entry = entry_for(url, sha_hex(&archive));
 
-        let out = install_entry(&entry, &fx.root, &fx.ledger, |_| {})
+        let out = install_entry(&entry, &fx.root, Some(&fx.ledger), |_| {})
             .await
             .unwrap();
 
@@ -501,7 +532,7 @@ mod tests {
         let url = serve_once(archive.clone());
         let entry = entry_for(url, sha_hex(&archive));
 
-        install_entry(&entry, &fx.root, &fx.ledger, |_| {})
+        install_entry(&entry, &fx.root, Some(&fx.ledger), |_| {})
             .await
             .unwrap();
 
@@ -528,7 +559,7 @@ mod tests {
         let url = serve_once(archive.clone());
         let entry = entry_for(url, sha_hex(&archive));
 
-        let out = install_entry(&entry, &fx.root, &fx.ledger, |_| {})
+        let out = install_entry(&entry, &fx.root, Some(&fx.ledger), |_| {})
             .await
             .unwrap();
 
@@ -554,6 +585,91 @@ mod tests {
         assert!(fx.ledger.list("mysql").await.unwrap().is_empty());
     }
 
+    /// The counterpart to the test above, and the reason `ledger` became an
+    /// `Option` (optional-state.db design D4, generalizing 5C audit LOW-4):
+    /// **a degraded `state.db` costs provenance, never correctness.** With no
+    /// ledger to write to, the install must still land in full — tree, warm-up
+    /// and `current` link — and the missing row must surface as
+    /// [`LedgerWrite::Failed`] carrying [`NO_LEDGER_REASON`], not as an error
+    /// and not as a silent success.
+    ///
+    /// The row count is the half that makes this discriminating. Without it the
+    /// test could not tell "reported failed" from "reported failed and wrote a
+    /// row anyway", which is exactly what a `None` arm bolted onto a working
+    /// writer would do. The fixture's own [`InstallLedger`] is a live writer
+    /// over the same `state.db`, so a row appearing there would be visible.
+    ///
+    /// Vacuity: proven by mutation, twice, because the `None` arm has two ways
+    /// to be wrong. Returning `Err(CoreError::Validation { .. })` from it —
+    /// i.e. refusing the install rather than degrading it — failed at the
+    /// `unwrap()`; returning `LedgerWrite::Recorded { installed_at: 0 }` failed
+    /// the `Failed` match below. Neither mutation disturbed any other test in
+    /// this module, which is what makes this test the only thing holding that
+    /// arm.
+    #[tokio::test]
+    async fn an_install_with_no_ledger_still_lands_and_reports_the_missing_row() {
+        let fx = Fixture::new().await;
+        let sanctuary = Sanctuary::snapshot(&fx).await;
+        let warmed = fx.evidence.join("mariadbd-ran");
+        let archive = mariadb_shaped_targz(
+            &script(&format!("/usr/bin/touch {}", warmed.display())),
+            &script("exit 0"),
+        );
+        let url = serve_once(archive.clone());
+        let entry = entry_for(url, sha_hex(&archive));
+
+        // `None` is precisely what the desktop app passes when `state.db` never
+        // opened: `DbHandle::optional()` is `None` and there is no
+        // `InstallLedger` to construct.
+        let out = install_entry(&entry, &fx.root, None, |_| {}).await.unwrap();
+
+        // The install landed, in full. Asserted first, because every conclusion
+        // below is worthless if nothing ran.
+        assert_eq!(out.package.dir, fx.version_dir());
+        assert_eq!(out.package.version, "11.4.9");
+        assert!(
+            fx.version_dir().join("bin/mariadbd").is_file(),
+            "a missing ledger cost the package tree, which is the one thing it must never cost"
+        );
+        assert!(
+            warmed.is_file(),
+            "the warm-up was skipped, so macOS's first-execution check lands on the user's Start"
+        );
+        assert_eq!(
+            std::fs::read_link(fx.current_link()).unwrap(),
+            PathBuf::from("11.4.9"),
+            "`current` must point at the version we just installed"
+        );
+        assert!(
+            fx.staging_dirs().is_empty(),
+            "staging survived a ledger-less success"
+        );
+
+        // …and it said so, in the state that exists to say it.
+        match &out.ledger {
+            LedgerWrite::Failed { reason } => assert_eq!(
+                reason.as_str(),
+                NO_LEDGER_REASON,
+                "the missing row must carry the no-database reason, not a database error"
+            ),
+            LedgerWrite::Recorded { .. } => panic!(
+                "no ledger was handed over, so nothing can have recorded this: {:?}",
+                out.ledger
+            ),
+        }
+
+        // "Reported failed" and "recorded it anyway" are different facts, and
+        // only this assertion separates them.
+        assert_eq!(
+            fx.ledger_rows().await,
+            0,
+            "a row appeared for an install that was handed no ledger"
+        );
+        sanctuary
+            .assert_untouched(&fx, "after a ledger-less install")
+            .await;
+    }
+
     /// Golden rule 6, made observable: the bytes are verified BEFORE anything
     /// unpacks them, and a user watching progress can tell a verified download
     /// from one that merely arrived.
@@ -565,7 +681,7 @@ mod tests {
         let entry = entry_for(url, sha_hex(&archive));
         let (seen, sink) = recorder();
 
-        install_entry(&entry, &fx.root, &fx.ledger, sink)
+        install_entry(&entry, &fx.root, Some(&fx.ledger), sink)
             .await
             .unwrap();
 
@@ -617,7 +733,7 @@ mod tests {
         // the release asset" case.
         let entry = entry_for(url, sha_hex(b"not the bytes we pinned"));
 
-        let err = install_entry(&entry, &fx.root, &fx.ledger, |_| {})
+        let err = install_entry(&entry, &fx.root, Some(&fx.ledger), |_| {})
             .await
             .unwrap_err();
 
@@ -644,7 +760,7 @@ mod tests {
         let url = serve_once(archive.clone());
         let entry = entry_for(url, sha_hex(&archive));
 
-        install_entry(&entry, &fx.root, &fx.ledger, |_| {})
+        install_entry(&entry, &fx.root, Some(&fx.ledger), |_| {})
             .await
             .unwrap();
 
@@ -678,7 +794,7 @@ mod tests {
         let fx = Fixture::new().await;
         let sanctuary = Sanctuary::snapshot(&fx).await;
 
-        let err = install_mariadb_package(&fx.root, &fx.ledger, |_| {})
+        let err = install_mariadb_package(&fx.root, Some(&fx.ledger), |_| {})
             .await
             .unwrap_err();
 
@@ -752,7 +868,7 @@ mod tests {
         // pair is otherwise handled exactly as production would.
         let entry = entry_for(serve_once(bytes), sha);
 
-        let out = install_entry(&entry, &fx.root, &fx.ledger, |_| {})
+        let out = install_entry(&entry, &fx.root, Some(&fx.ledger), |_| {})
             .await
             .unwrap();
 

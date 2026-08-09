@@ -6,6 +6,27 @@ import * as __TAURI_EVENT from "@tauri-apps/api/event";
 /** Commands */
 export const commands = {
 	coreInfo: (simulateError: boolean | null) => typedError<CoreInfo, IpcError>(__TAURI_INVOKE("core_info", { simulateError })),
+	/**
+	 *  Whether `state.db` opened this run, and if it did not, why (D5).
+	 * 
+	 *  The honesty half of DEGRADE. A command that degrades returns a *shorter*
+	 *  answer — `list_log_sources` drops every site row, `php_environment` reports
+	 *  no chosen default — and a shorter answer is indistinguishable from "you have
+	 *  no sites" or "you have no preference". Those are quiet wrong answers, which
+	 *  is the failure mode this project keeps getting burned by, so the app asks
+	 *  this once and says so.
+	 * 
+	 *  **`Some(reason)` is the whole payload**, not a bare boolean: the banner is
+	 *  there to tell a user *permission denied* or *unable to open database file*
+	 *  rather than a generic sentence they can do nothing with.
+	 * 
+	 *  `Result` with an error that never occurs, like `pending_install` next door:
+	 *  this is a status read with nothing to fail, and every command on this surface
+	 *  shares the one envelope the frontend's `unwrap` understands. Zero-arg — there
+	 *  is nothing to validate, and a caller can learn only what the app already
+	 *  renders.
+	 */
+	stateStoreStatus: () => typedError<string | null, IpcError>(__TAURI_INVOKE("state_store_status")),
 	listServices: () => typedError<ServiceStatus[], IpcError>(__TAURI_INVOKE("list_services")),
 	startService: (id: string) => typedError<null, IpcError>(__TAURI_INVOKE("start_service", { id })),
 	stopService: (id: string) => typedError<null, IpcError>(__TAURI_INVOKE("stop_service", { id })),

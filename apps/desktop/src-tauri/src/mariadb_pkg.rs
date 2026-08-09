@@ -47,9 +47,9 @@ use crate::commands::{
     IpcError, MARIADB_INSTALL_RUN, RunningInstallGuard, now_ms, rescan_mariadb_into_state,
     stack_paths,
 };
+use crate::db_state::DbHandle;
 pub(crate) use crate::mysql_pkg::ProgressThrottle;
 use crate::stack::StackPaths;
-use openvhost_core::Db;
 
 /// Whether this build can install MariaDB on THIS host, and what it would
 /// install — the MariaDB counterpart of `mysql_pkg::MysqlPackageOfferDto`,
@@ -296,9 +296,13 @@ pub(crate) fn install_failure(e: openvhost_core::CoreError) -> MariadbInstallRes
 /// recorded — mirrors `install_mysql`'s identical reasoning.
 #[tauri::command]
 #[specta::specta]
+// DEGRADE (optional-state.db design D2), for the same reason and with the same
+// cost as `mysql_pkg::install_mysql`: a store that never opened costs the
+// ledger row, never the install, and `MariadbInstallResultDto` reports that as
+// `ledger: Failed { reason }`.
 pub async fn install_mariadb(
     app: tauri::AppHandle,
-    db: tauri::State<'_, Db>,
+    db: tauri::State<'_, DbHandle>,
     runtimes: tauri::State<'_, RwLock<Option<Vec<openvhost_core::MariadbRuntime>>>>,
     paths: tauri::State<'_, Option<StackPaths>>,
     sup: tauri::State<'_, Arc<Supervisor>>,
@@ -333,12 +337,16 @@ pub async fn install_mariadb(
 async fn run_install(
     app: &tauri::AppHandle,
     home: &Path,
-    db: &Db,
+    db: &DbHandle,
     lock: &crate::commands::InstallLock,
     runtimes: &RwLock<Option<Vec<openvhost_core::MariadbRuntime>>>,
     sup: &Supervisor,
 ) -> Result<MariadbInstallOutcomeDto, IpcError> {
-    let ledger = openvhost_core::mysql::InstallLedger::new(db);
+    // `None` when the store never opened, through the one named seam
+    // `mysql_pkg::run_install` uses — see `DbHandle::install_ledger`.
+    // `install_mariadb_package` owns the reason it reports for the missing row;
+    // nothing is retyped here.
+    let ledger = db.install_ledger();
     let emitter = app.clone();
     let spawn_root = openvhost_core::PackagesRoot::from_home(home);
 
@@ -347,7 +355,7 @@ async fn run_install(
         // reused directly rather than a second copy — see this module's own
         // `use` of `ProgressThrottle`.
         let mut throttle = ProgressThrottle::new();
-        openvhost_core::install_mariadb_package(&spawn_root, &ledger, move |progress| {
+        openvhost_core::install_mariadb_package(&spawn_root, ledger.as_ref(), move |progress| {
             for progress in throttle.admit(progress, std::time::Instant::now()) {
                 let _ = MariadbInstallProgressEvent {
                     ts_ms: now_ms(),

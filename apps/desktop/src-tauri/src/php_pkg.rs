@@ -58,7 +58,7 @@
 use std::sync::RwLock;
 
 use openvhost_core::php::Availability;
-use openvhost_core::{Db, InstalledRuntimes, PackageTarget};
+use openvhost_core::{InstalledRuntimes, PackageTarget};
 use openvhost_proc::Supervisor;
 use tauri::Manager;
 use tauri_specta::Event;
@@ -66,6 +66,7 @@ use tauri_specta::Event;
 use crate::commands::{
     InstallLock, IpcError, PHP_INSTALL_RUN, RunningInstallGuard, now_ms, rescan_into_state,
 };
+use crate::db_state::DbHandle;
 use crate::mysql_pkg::ProgressThrottle;
 use crate::stack::StackPaths;
 
@@ -506,9 +507,20 @@ pub(crate) async fn run_package_install(
     // runs with `None` and reports `ledger: Failed`, which is the state that
     // type was built for. `openvhost_core::install_php_package` owns the
     // reason; nothing is retyped here.
-    let ledger = app
-        .try_state::<Db>()
-        .map(|db| openvhost_core::mysql::InstallLedger::new(&db));
+    //
+    // Reads the managed HANDLE, not a bare `Db` (optional-state.db design D1).
+    // `Db` itself is no longer managed by anything, so a `try_state::<Db>()`
+    // here would now be `None` on EVERY machine — silently turning "the ledger
+    // row is written unless the store is down" into "the ledger row is never
+    // written". `optional()` is the DEGRADE accessor, and the `None` it can
+    // return is the same `None` this code already handled.
+    //
+    // Through `DbHandle::install_ledger`, the one named seam the MySQL and
+    // MariaDB installs also go through: this line is unreachable from any test
+    // (`run_package_install` takes an `AppHandle<Wry>`), so the DEGRADE decision
+    // lives where a test can hold it instead of being restated here.
+    let handle = app.try_state::<DbHandle>();
+    let ledger = handle.as_deref().and_then(DbHandle::install_ledger);
     let emitter = app.clone();
     let for_event = major.as_str().to_string();
     let spawn_major = major.clone();

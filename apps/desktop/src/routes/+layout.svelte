@@ -17,6 +17,7 @@
 	import { errorMessage } from '$lib/errors';
 	import { servicesStore } from '$lib/services.shared.svelte';
 	import { statsStore } from '$lib/stats.shared.svelte';
+	import { storeStatusStore } from '$lib/store-status.shared.svelte';
 	import { pendingServiceNames } from '$lib/services.derive';
 	import QuitDialog from '$lib/components/QuitDialog.svelte';
 
@@ -128,6 +129,22 @@
 			for (const stop of unlistens) stop();
 			unlistens = [];
 		};
+	});
+
+	// Whether `state.db` opened this run — asked HERE, once, for the same reason the
+	// supervisor snapshot is: the answer is app-level rather than page-level (the
+	// store is down everywhere, not on one route), and the layout is the one
+	// component that outlives navigation, so the banner AppShell renders from this
+	// cannot flash back in on every move between Sites and Logs.
+	//
+	// Asked once and never re-asked: `Db::open` runs at startup and the handle is
+	// managed exactly once, so the answer cannot change while the app is running.
+	// Its own `onMount` rather than a line inside the supervisor block above,
+	// matching the quit listener's separation: neither failure may take the other
+	// down. `load()` resolves rather than rejects — the store keeps a failed ask as
+	// silence, never as a fabricated reason.
+	onMount(() => {
+		void storeStatusStore.load();
 	});
 
 	// Separate from the supervisor subscription above: that one must not tear this
