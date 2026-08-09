@@ -357,6 +357,14 @@ RECIPE_LAST_CHECKED=""
 RECIPE_SOURCE_URL=""
 RECIPE_SOURCE_SHA256=""
 RECIPE_CONFIGURE_FLAGS=()
+# Every file this recipe is assembled from, digested into the manifest's
+# "pipeline" block. Defaulted to the entry file and APPENDED to by a recipe that
+# sources another one: php.sh sources _php-pins.sh, where all 41 of its pins
+# live, so a digest over the entry file alone would name none of them — the
+# single most important thing this block records. Absolute paths only; the
+# default already is one, and a relative path would resolve against whatever
+# directory the manifest stage happens to be standing in.
+RECIPE_SOURCE_FILES=("$RECIPE_FILE")
 
 # A recipe is sourced, not executed: at source time it may only set variables
 # and define functions. Anything it runs would run before the environment has
@@ -376,6 +384,17 @@ done
 if [ "$(type -t recipe_normalize 2>/dev/null || true)" != "function" ]; then
 	recipe_normalize() { :; }
 fi
+# A recipe that ASSIGNS RECIPE_SOURCE_FILES instead of appending to it drops the
+# entry file, and the manifest then records a set of inputs missing the one file
+# that is certainly an input. Nothing downstream could tell: the block would be
+# present, well-formed and short by one. Checked rather than left to the
+# convention the line above states.
+recipe_source_seen=0
+for src in ${RECIPE_SOURCE_FILES[@]+"${RECIPE_SOURCE_FILES[@]}"}; do
+	if [ "$src" = "$RECIPE_FILE" ]; then recipe_source_seen=1; fi
+done
+[ "$recipe_source_seen" -eq 1 ] ||
+	bp_die "recipe $RECIPE_FILE removed itself from RECIPE_SOURCE_FILES: append to that array, never assign it"
 
 # ---------------------------------------------------------- recipe helpers ---
 
@@ -962,6 +981,97 @@ json_dependencies() {
 	printf '}'
 }
 
+# Where the manifest names a file of this pipeline. Relative to the directory
+# that holds build/ — the repository checkout in every real invocation — so two
+# builds of the same bytes from two checkouts record the same path, and a
+# manifest committed under build/manifests/ does not carry the builder's home
+# directory. A file outside that tree (`--recipe` pointing elsewhere) is
+# recorded absolute, as what it is, rather than mangled into looking local.
+pipeline_path() {
+	local file="$1" root
+	root="$(dirname -- "$BUILD_DIR")"
+	case "$file" in
+	"$root"/*) printf '%s' "${file#"$root"/}" ;;
+	*) printf '%s' "$file" ;;
+	esac
+}
+
+# `[{"path": …, "sha256": …}, …]` over the files named, in the order named.
+#
+# There is no delimited stream anywhere in here, which is how it meets
+# prefix_digest's rule that no field may contain the byte separating its own
+# records: each path goes straight into its own JSON string with its digest
+# beside it, and is never accumulated into a `path<sep>digest` list that
+# something later splits. A path may hold any byte but NUL — including the
+# newline that forged a collision in prefix_digest's symlink stream — so the
+# cheapest way to keep one out of a separator is to have no separator.
+#
+# `$what` names the caller's category so a failure says which declaration is
+# wrong, since one of the two lists is the recipe's and the other is not.
+json_file_digests() {
+	local what="$1" first=1 file digest
+	shift
+	printf '['
+	for file in "$@"; do
+		case "$file" in
+		/*) ;;
+		*) bp_die "$what must be an absolute path, got: $file" ;;
+		esac
+		# Fails the whole run rather than recording a sentinel. A block that says
+		# "these are the inputs" with one entry standing in for a file it could not
+		# read is the shape this pipeline keeps rejecting — see json_dependencies
+		# on the string "unknown". Because json_pipeline is called into a variable
+		# BEFORE stage_manifest's redirect opens the file, this abort leaves the
+		# previous manifest whole instead of truncating a new one mid-write.
+		[ -f "$file" ] && [ -r "$file" ] ||
+			bp_die "$what is not a readable file: $file"
+		digest="$(shasum -a 256 -- "$file" | cut -d' ' -f1)"
+		if [ "$first" -eq 1 ]; then first=0; else printf ', '; fi
+		printf '{"path": "%s", "sha256": "%s"}' \
+			"$(json_string "$(pipeline_path "$file")")" "$(json_string "$digest")"
+	done
+	printf ']'
+}
+
+# The "pipeline" object: the digest of every file the recipe was assembled from
+# ("sources", recipe-declared) and of the driver and audit gate that ran it
+# ("driver"). Two lists rather than one, so which entries a recipe chose and
+# which the driver added is stated rather than inferred from the paths.
+#
+# RECORDED, NEVER ENFORCED. Nothing compares these digests against anything —
+# not here, not in audit.sh, not in the Rust catalogues — and that is the
+# design's central decision rather than an omission. If you are here to add the
+# comparison, read this first:
+#
+#   nginx.sh mixes ~30 declarable pins with ~600 lines of stage code and prose,
+#   so editing a COMMENT moves its whole-file digest. An alarm that fires on
+#   comment edits is one people learn to override, and an overridden alarm is
+#   worse than none. This project refused a gate that could not fail (PR #68);
+#   a gate that cries wolf fails the same standard from the other side.
+#
+# What it is for is a human reading a diff that changes a pin: the manifest of
+# record beside the artifact says which bytes of which files that artifact was
+# made from, so the question "was this recipe edited after these bytes were
+# cut?" has an answer in committed evidence instead of in memory. The
+# mechanically enforceable version — pins split into their own file, whose
+# digest a catalogue test may hard-assert because it changes only when a pin
+# changes — is designed and deferred (design §6, D4).
+#
+# So: editing a comment in a recipe changes what this records and fails no test.
+# That is the property. It is not an oversight, and turning it into an alarm
+# undoes the decision.
+json_pipeline() {
+	printf '{"driver": '
+	# $BUILD_SELF may be relative to the caller's cwd; $BUILD_DIR is this file's
+	# own physical directory, resolved before anything could chdir.
+	json_file_digests 'a driver file' \
+		"$BUILD_DIR/$(basename -- "$BUILD_SELF")" "$BUILD_DIR/audit.sh"
+	printf ', "sources": '
+	json_file_digests 'a RECIPE_SOURCE_FILES entry' \
+		${RECIPE_SOURCE_FILES[@]+"${RECIPE_SOURCE_FILES[@]}"}
+	printf '}'
+}
+
 tool_version() {
 	local tool path
 	tool="$1"
@@ -974,7 +1084,7 @@ stage_manifest() {
 	# §7. Single-builder trust (D1) is only acceptable because the inputs are
 	# recorded; this file is the whole of that acceptability.
 	local manifest="$OUT_DIR/$BUILD_NAME-$BUILD_VERSION-macos-$BUILD_ARCH.manifest.json"
-	local versions=() tool line dependencies
+	local versions=() tool line dependencies pipeline
 	bp_assert_under "$manifest" "$OUT_DIR" "write"
 	if [ -z "$TARBALL_SHA" ] && [ -f "$TARBALL" ]; then
 		TARBALL_SHA="$(shasum -a 256 -- "$TARBALL" | cut -d' ' -f1)"
@@ -987,12 +1097,14 @@ stage_manifest() {
 	versions[${#versions[@]}]="macos-sdk: $(xcrun --show-sdk-version 2>/dev/null || echo unknown)"
 	versions[${#versions[@]}]="macos: $(sw_vers -productVersion 2>/dev/null || echo unknown)"
 
-	# Hashing whole trees is the one thing here that can fail on its own, so it
-	# happens BEFORE the redirect below opens the manifest. Inside that group an
-	# abort under set -e truncates the file mid-write, which would leave a
-	# half-written manifest next to a finished tarball; out here it leaves the
-	# previous one untouched.
+	# Hashing trees and files is what can fail on its own, so it happens BEFORE
+	# the redirect below opens the manifest. Inside that group an abort under
+	# set -e truncates the file mid-write, which would leave a half-written
+	# manifest next to a finished tarball; out here it leaves the previous one
+	# untouched. Both assignments are plain, never `local x="$(...)"`, whose exit
+	# status is `local`'s and would swallow the failure this ordering exists for.
 	dependencies="$(json_dependencies)"
+	pipeline="$(json_pipeline)"
 
 	{
 		printf '{\n'
@@ -1015,6 +1127,7 @@ stage_manifest() {
 			"$(json_array ${RECIPE_CONFIGURE_FLAGS[@]+"${RECIPE_CONFIGURE_FLAGS[@]}"})"
 		printf '  "toolchain": %s,\n' "$(json_array ${versions[@]+"${versions[@]}"})"
 		printf '  "dependencies": %s,\n' "$dependencies"
+		printf '  "pipeline": %s,\n' "$pipeline"
 		printf '  "output": {\n'
 		printf '    "file": "%s",\n' "$(json_string "$(basename -- "$TARBALL")")"
 		printf '    "sha256": "%s"\n' "$(json_string "$TARBALL_SHA")"

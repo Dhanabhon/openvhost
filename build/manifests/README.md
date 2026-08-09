@@ -115,6 +115,44 @@ that a consumer testing `tree_sha256 is not None` takes the string for a digest.
 must treat `sha256_on_disk` as possibly the four-character string `unknown` where
 a 64-hex digest belongs — the field is not yet fail-safe the way `tree_sha256` is.
 
+## `pipeline`: the files the run was assembled from, recorded and never enforced
+
+Every manifest the driver writes from now on carries a `pipeline` block:
+
+```json
+"pipeline": {
+  "driver":  [{"path": "build/build.sh",             "sha256": "…"},
+              {"path": "build/audit.sh",             "sha256": "…"}],
+  "sources": [{"path": "build/recipes/php.sh",       "sha256": "…"},
+              {"path": "build/recipes/_php-pins.sh", "sha256": "…"}]
+}
+```
+
+`sources` is **recipe-declared** (`RECIPE_SOURCE_FILES`), not merely the entry
+file: `php.sh` sources `_php-pins.sh`, so a digest over the entry file alone
+would name none of PHP's 41 pins — the single most important thing this block
+records. `driver` is the two files the driver adds itself. Paths are relative to
+the repository root for a file inside the checkout, absolute for one outside it,
+so two builds of the same bytes from two checkouts record the same paths.
+
+**Nothing compares these digests against anything, and that is the design
+decision.** `build/recipes/nginx.sh` mixes ~30 declarable pins with ~600 lines of
+stage code and prose, so editing a *comment* moves its whole-file digest — an
+alarm that fires on comment edits is one people learn to override, and this
+project has already refused a gate that could not fail (PR #68). The block is
+evidence for a human reading a diff that changes a pin: the manifest of record
+says which bytes of which files the artifact was made from, so *"was this recipe
+edited after these bytes were cut?"* has an answer in committed evidence rather
+than in memory. The enforceable version — pins in their own file, whose digest a
+catalogue test may hard-assert because it moves only when a pin does — is
+designed and deferred (design §6, D4). Do not turn this into an alarm.
+
+**The three manifests committed here predate the block and do not carry it.**
+That is correct and needs no repair, for the reason in *Copied, not regenerated*
+above: a `pipeline` block written into them today would digest today's recipes,
+not the ones those bytes came out of. No test requires the key. The next
+artifact built carries it.
+
 ## Adding one
 
 Copy the manifest the driver wrote next to the artifact, unmodified, name it after
