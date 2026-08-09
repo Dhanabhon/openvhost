@@ -964,11 +964,17 @@ json_dependencies() {
 			reason_key='prefix_missing'
 			reason="$vanished"
 		else
-			# Assigned, never inlined into printf's argument list: under `set -e`
-			# a failed command substitution aborts an assignment, but as an
-			# argument it is printf's own success that decides, and an empty
-			# digest would be written instead.
-			digest="$(prefix_digest "$prefix")"
+			# Assigned rather than inlined into printf's argument list, AND
+			# re-arming `-e` inside the substitution. The assignment alone is
+			# not enough here and the comment that claimed it was is what this
+			# line replaces: `json_dependencies` is only ever reached through
+			# `dependencies="$(json_dependencies)"` below, and bash 3.2 clears
+			# errexit on entering a command substitution — so a `prefix_digest`
+			# that failed part-way through its own `find`/`stat`/`xargs` would
+			# hand back a well-formed 64-hex digest over a PARTIAL tree, and the
+			# run would exit 0. A confident wrong provenance value is the exact
+			# thing this field was added to prevent, so it must abort instead.
+			digest="$(set -e; prefix_digest "$prefix")"
 			printf ', "tree_sha256": "%s"}' "$(json_string "$digest")"
 			continue
 		fi
@@ -1140,13 +1146,25 @@ stage_manifest() {
 	# on to its printf, and without this the driver recorded `{"x": ""}` and
 	# exited 0. That is a worse outcome than the truncation this hoist removes:
 	# the run looks clean and the manifest carries a confident, wrong value,
-	# which is the exact failure this whole file keeps being fixed for. Re-arming
-	# restores both `-e` and `-o pipefail` for the recipe's own code.
+	# which is the exact failure this whole file keeps being fixed for.
+	#
+	# `set -e` restores errexit ONLY. `pipefail` is never cleared by a command
+	# substitution and is inherited from this script's own `set -euo pipefail`
+	# at the top — which matters, because a recipe hook shaped like nginx's
+	# `shasum … | cut` is caught by pipefail, not by errexit. Delete `-o
+	# pipefail` up there and that shape goes silent again while this comment
+	# still says it is covered.
 	dependencies="$(json_dependencies)"
 	pipeline="$(json_pipeline)"
 	if [ "$(type -t recipe_manifest_extra 2>/dev/null || true)" = "function" ]; then
 		has_extra=1
 		extra="$(set -e; recipe_manifest_extra)"
+		# A hook that exits 0 having printed nothing writes `"recipe": ` and
+		# nothing else — invalid JSON, driver exit 0. Cheap to refuse now that
+		# the hoist put the value in a variable; impossible while it streamed
+		# straight into the redirect.
+		[ -n "$extra" ] ||
+			bp_die "recipe_manifest_extra produced no output; the manifest would be invalid JSON"
 	fi
 
 	{

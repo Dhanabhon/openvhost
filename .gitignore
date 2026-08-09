@@ -42,8 +42,9 @@ apps/desktop/src-tauri/gen/
 # Carved back out: the manifest of record for each pinned artifact. This is the
 # one exception, and it is not a hole in the rule above — an artifact is 2.7 MB
 # to 125 MB of bytes we must never ship in git (golden rule 6), while the three
-# committed records of *how* one was made are 1.7 KB, 3.7 KB and 10.1 KB (php's
-# is the large one: 34 pinned library sources) and are the provenance the pins
+# committed records of *how* one was made are 1.7, 3.6 and 10.1 KiB (php's is the
+# large one: 34 pinned sources, 33 libraries by digest plus phpmicro by commit)
+# and are the provenance the pins
 # otherwise rest on in prose alone. `/build/out/` stays excluded outright, so a
 # manifest sitting in the driver's own output directory is still ignored; only
 # the curated directory is tracked. The four artifact patterns above are an

@@ -29,7 +29,7 @@ every recorded digest below is the original run's.
 **Artifacts stay out of git.** `.gitignore` carves `/build/manifests/*.manifest.json`
 back out of the artifact exclusions; `/build/out/` remains ignored outright, so a
 manifest in the driver's own output directory is still untracked. A 2.7 MB–125 MB
-tarball is what golden rule 6 forbids; a 1.7–10.1 KB JSON record of how one was
+tarball is what golden rule 6 forbids; a 1.7–10.1 KiB JSON record of how one was
 made is a different thing.
 
 The exclusions this directory sits inside are an **enumeration of four
@@ -74,8 +74,10 @@ sentinel:
   URL of the OpenVHost release, and the recipe tripwire binds the source digest
   and the signing key — but nothing ties the manifest's record of *where
   upstream's tarball came from* to the recipe that fetched it.
-* **`recipe.pinned_sources[*]` is unbound**, and for PHP that is 34 library
-  digests: the single largest provenance claim in this repository, with nothing
+* **`recipe.pinned_sources[*]` is unbound**, and for PHP that is 34 entries — 33
+  libraries pinned by digest, plus phpmicro pinned by git commit
+  (`verified: "git-commit"`): the single largest provenance claim in this
+  repository, with nothing
   connecting it to `build/recipes/_php-pins.sh`. The mechanically enforceable
   version is the same deferred work as `pipeline` (design §6, D4) — a pins-only
   file whose digest a test may hard-assert because it moves only when a pin
