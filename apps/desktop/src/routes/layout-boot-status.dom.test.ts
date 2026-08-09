@@ -68,7 +68,19 @@ const children = createRawSnippet(() => ({ render: () => '<div data-testid="page
 let host: HTMLElement;
 let instance: object | null = null;
 
-beforeEach(() => {
+beforeEach(async () => {
+	// Discard `ServicesStore`'s memoized snapshot FIRST. `loadServices()` dedupes
+	// on a module singleton (`this.snapshot ??= …`) that nothing here resets, so
+	// without this only the very first test in the file would ever see
+	// `list_services` on the wire — and every `asked` assertion about it,
+	// including the negative ones that prove the degraded gate, would be reading
+	// the memo rather than the layout. Driven through the public API with no
+	// handler registered, because a rejected fetch is exactly what clears the memo
+	// (`fetchServices`'s catch sets `snapshot = null`); everything it dirties is
+	// reset immediately below.
+	handlers = {};
+	await servicesStore.reload();
+
 	asked = [];
 	// `list_services` succeeds so a supervisor failure can never be the reason
 	// something below is or is not true. Everything else is left unhandled on
@@ -201,11 +213,25 @@ describe('each degraded state renders its own screen', () => {
 	// Vacuity, measured: changing the layout's `{:else if rendering.kind ===
 	// 'takeover'}` branch to render `{@render children()}` reddened all three
 	// screens and all three gating tests here, and left `a ready boot` green.
+	//
+	// Each screen assertion binds `takeover()` and asserts THAT first, for the
+	// reason spelled out at `keeps the window movable …` below: written as
+	// `expect(takeover()?.querySelector(…)).not.toBeNull()`, optional chaining on
+	// a missing takeover yields `undefined` and `expect(undefined).not.toBeNull()`
+	// PASSES, so the first assertion of each test was dead weight. (Only the
+	// first: the `.textContent` assertions that follow do fail on `undefined`, so
+	// no regression was ever going unseen — review fix wave, Medium 1.)
+	//
+	// Measured after the change: under the mutation above, all three now fail on
+	// `expect(screen).not.toBeNull()` — the premise itself — rather than several
+	// lines later on a stringified `undefined`.
 
 	it('says another instance holds the lock, and names the folder', async () => {
 		answer({ kind: 'alreadyRunning', home: HOME });
 		await mountLayout();
-		expect(takeover()?.querySelector('[data-testid="boot-already-running"]')).not.toBeNull();
+		const screen = takeover();
+		expect(screen).not.toBeNull();
+		expect(screen?.querySelector('[data-testid="boot-already-running"]')).not.toBeNull();
 		expect(host.textContent).toContain('OpenVHost is already running');
 		expect(host.textContent).toContain(HOME);
 	});
@@ -213,7 +239,9 @@ describe('each degraded state renders its own screen', () => {
 	it('names the run directory and the OS error, verbatim', async () => {
 		answer({ kind: 'runDirUnusable', path: RUN_DIR, reason: ERRNO_13 });
 		await mountLayout();
-		expect(takeover()?.querySelector('[data-testid="boot-run-dir-unusable"]')).not.toBeNull();
+		const screen = takeover();
+		expect(screen).not.toBeNull();
+		expect(screen?.querySelector('[data-testid="boot-run-dir-unusable"]')).not.toBeNull();
 		expect(host.querySelector('[data-testid="boot-run-dir"]')?.textContent).toBe(RUN_DIR);
 		expect(host.querySelector('[data-testid="boot-reason"]')?.textContent).toBe(ERRNO_13);
 	});
@@ -241,7 +269,9 @@ describe('each degraded state renders its own screen', () => {
 	it('says where the files should go when the home would not resolve', async () => {
 		answer({ kind: 'homeUnresolvable', reason: 'home directory unavailable' });
 		await mountLayout();
-		expect(takeover()?.querySelector('[data-testid="boot-home-unresolvable"]')).not.toBeNull();
+		const screen = takeover();
+		expect(screen).not.toBeNull();
+		expect(screen?.querySelector('[data-testid="boot-home-unresolvable"]')).not.toBeNull();
 		expect(host.querySelector('[data-testid="boot-reason"]')?.textContent).toBe(
 			'home directory unavailable'
 		);
@@ -399,6 +429,108 @@ describe('the Reveal in Finder button', () => {
 			bootStatusStore.status = null;
 			bootStatusStore.askFailed = null;
 		}
+	});
+});
+
+describe('the app-level asks', () => {
+	// The other half of "no page shows Tauri's `.manage()` string", and the half
+	// that was left to luck. `list_services` extracts `State<Arc<Supervisor>>` and
+	// `state_store_status` extracts a `DbHandle` — both managed inside the ONE
+	// boot arm that succeeded (`db_state.rs`'s module header says so of the
+	// second) — so on a degraded boot both really do come back as *"…You must call
+	// `.manage()` before using this command"*, and `normalizeError` puts that
+	// verbatim into `IpcError.message`. Neither reached a user only because the
+	// stores that render them (the Services page's banner, AppShell's
+	// store-unavailable banner) live inside `children`, which the takeover removes
+	// from the DOM. That made spec §9.1 a property of what happens to be rendered.
+	// These gate it in the code, the same way the status-bar poll below is gated.
+	//
+	// Vacuity, measured over the whole desktop suite. Two mutations:
+	//
+	//   * gate deleted (`if (servicesWired) return;` / `if (storeStatusAsked)
+	//     return;` — the effect then fires on its first run, at mount, exactly as
+	//     the `onMount` this replaced did): the three `asks neither on a degraded
+	//     boot` cases plus `asks neither before the boot answer arrives …` went
+	//     red — 4 of 1607.
+	//   * gate inverted (`|| appIsOnScreen(rendering)`): the same four, plus three
+	//     in `layout-store-status.dom.test.ts` — 7 of 1607.
+	//
+	// Read the survivors honestly, because they are the point. An inverted gate
+	// asks BOTH commands — during `pending`, at mount — so `asks both once the app
+	// is on screen`, `asks both anyway when the ask itself failed` and `asks each
+	// exactly once` all still found them in `asked` and passed. Only `asks neither
+	// before the boot answer arrives …` distinguishes "asked at the right time"
+	// from "asked at all", which is why it is written holding the answer back
+	// rather than asserting against a settled mount — the same trap the poll group
+	// below documents, and the same shape of answer.
+	//
+	// The positive tests are not thereby redundant, and a third mutation is what
+	// shows it: `appIsOnScreen` pinned to `false` — a gate that never opens —
+	// reddened all four of them and left all three `asks neither on a degraded
+	// boot` cases green (15 of 1607 across the suite, the rest of them the poll
+	// group below and `layout-store-status.dom.test.ts`). The two halves fail on
+	// opposite mutations and neither covers the other.
+
+	/** Every app-level ask that cannot answer on a degraded boot. */
+	function appAsks(): string[] {
+		return asked.filter((c) => c === 'list_services' || c === 'state_store_status');
+	}
+
+	it('asks both once the app is on screen', async () => {
+		answer({ kind: 'ready' });
+		await mountLayout();
+		expect(pageIsRendered()).toBe(true);
+		expect(asked).toContain('list_services');
+		expect(asked).toContain('state_store_status');
+	});
+
+	it.each([
+		['alreadyRunning', { kind: 'alreadyRunning', home: HOME }],
+		['runDirUnusable', { kind: 'runDirUnusable', path: RUN_DIR, reason: ERRNO_13 }],
+		['homeUnresolvable', { kind: 'homeUnresolvable', reason: 'home directory unavailable' }]
+	] as Array<[string, BootStatusDto]>)('asks neither on a degraded boot (%s)', async (_n, dto) => {
+		answer(dto);
+		await mountLayout();
+		// The premise: this must be the degraded path, not a layout that rendered
+		// nothing and therefore asked for nothing.
+		expect(takeover()).not.toBeNull();
+		expect(appAsks()).toEqual([]);
+	});
+
+	it('asks neither before the boot answer arrives, and both once it does', async () => {
+		let release: (dto: BootStatusDto) => void = () => {};
+		handlers.boot_status = () =>
+			new Promise<BootStatusDto>((resolve) => {
+				release = resolve;
+			});
+		await mountLayout();
+		expect(asked).toContain('boot_status');
+		expect(appAsks()).toEqual([]);
+
+		// …and it is WAITING, not permanently off: without this half the assertion
+		// above would also pass on a layout that never asks at all.
+		release({ kind: 'ready' });
+		await settle();
+		expect(asked).toContain('list_services');
+		expect(asked).toContain('state_store_status');
+	});
+
+	it('asks both anyway when the ask itself failed, rather than crippling a healthy app', async () => {
+		// No handler for `boot_status`, so the ask rejects and the children render.
+		// The machine underneath is probably fine, and a titlebar count stuck at
+		// zero would be a second lie about it — the same reasoning `appIsOnScreen`
+		// gives for tying the gate to "are the children rendered".
+		await mountLayout();
+		expect(pageIsRendered()).toBe(true);
+		expect(asked).toContain('list_services');
+		expect(asked).toContain('state_store_status');
+	});
+
+	it('asks each exactly once, not once per settle turn', async () => {
+		answer({ kind: 'ready' });
+		await mountLayout();
+		expect(asked.filter((c) => c === 'list_services')).toHaveLength(1);
+		expect(asked.filter((c) => c === 'state_store_status')).toHaveLength(1);
 	});
 });
 

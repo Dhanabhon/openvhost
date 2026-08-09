@@ -65,6 +65,51 @@ describe('when the boot check itself failed', () => {
 		expect(visible(body)).not.toContain('undefined');
 	});
 
+	// Audit LOW / live-proof: this component renders an arbitrary `IpcError`
+	// verbatim, and on the one path where `BootState` could go unmanaged that
+	// string is Tauri's own *"…You must call `.manage()` before using this
+	// command"* — the pre-branch failure plus a banner, in the slice built to
+	// delete it. Unreachable today (`lib.rs:406` manages it unconditionally,
+	// `bootstrap` returns no `Result`, and setup blocks the main thread), but that
+	// is a chain of reasoning rather than a test, and Tauri creates the webview
+	// before setup runs. `boot.rs` pins the same property for `reveal_run_dir`'s
+	// refusals; this is its other half.
+	//
+	// VACUITY, measured over the whole desktop suite, in both directions:
+	//
+	//   * substitution dropped (`return message;`): `never puts Tauri's own
+	//     unmanaged-state refusal on screen` failed ALONE — 1 of 1607 — and every
+	//     other test in this file stayed green, which is what shows it is not
+	//     carried by one of them.
+	//   * substitution inverted (applied to EVERY message): `carries the
+	//     transport's own words`, `passes a different failure through unchanged`
+	//     and `renders something readable even for a failure that carries no
+	//     message` failed, plus the six `is announced on …` route cases in
+	//     `routes.test.ts` — 9 of 1607 — and the new test stayed green.
+	//
+	// Neither pinning is caught by the other's survivors: the floor and the
+	// verbatim rule are two properties, and this component must hold both.
+
+	it('never puts Tauri’s own unmanaged-state refusal on screen', () => {
+		const { body } = render(BootCheckFailedBanner, {
+			props: {
+				error: {
+					kind: 'core',
+					message:
+						'state not managed for field `boot` on command `boot_status`. ' +
+						'You must call `.manage()` before using this command.'
+				} satisfies IpcError
+			}
+		});
+		expect(body).not.toContain('.manage()');
+		expect(visible(body)).toContain(
+			'OpenVHost did not get far enough through startup to record how the launch went.'
+		);
+		// The headline still runs, so the banner says something rather than
+		// swallowing the failure it could not quote.
+		expect(visible(body)).toContain('OpenVHost could not check how far this launch got');
+	});
+
 	it('says the app below is still showing, and why that is deliberate', () => {
 		const { body } = render(BootCheckFailedBanner, { props: { error: FAILURE } });
 		expect(visible(body)).toContain(

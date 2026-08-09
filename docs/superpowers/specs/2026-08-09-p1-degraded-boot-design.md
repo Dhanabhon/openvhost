@@ -125,12 +125,22 @@ a *bundle* and could launch a third process into a relaunch loop.
 
 **The second instance must never take over the lock.**
 
-## 7. D5 — Retry the lock once, because this repo documents the race
+## 7. D5 — Retry the lock once, because a probe really does hold it
 
-`lock.rs:147-149` records that between `fork` and `exec` a child transiently duplicates every open
-descriptor, this lock file's included, and `O_CLOEXEC` clears it at `exec`. This app spawns nginx,
-php-fpm and mysqld continuously, so a launch that races a spawn can observe a **spurious `Ok(None)`
-for milliseconds**.
+**Corrected in the fix wave, and the truth is better than the claim.** This section originally cited
+`lock.rs:147-149`'s fork/exec window. That citation was wrong twice over: it is a `#[cfg(test)]` doc
+comment whose own last line reads *"Not a production concern: the CLI process that probes spawns
+nothing"*, and mechanically a live holder that forks still genuinely holds the lock, so that window
+cannot produce a *spurious* `Ok(None)` at all.
+
+The real producer is in this product. `InstanceLock::probe` (`lock.rs:105-117`) acquires the lock and
+**immediately drops it** to answer "is a supervisor live?", and `openvhost status` calls it — so for
+the microseconds a probe holds the `flock`, a launch racing it reads `Ok(None)` and would conclude
+another instance owns this home.
+
+Measured against the real `InstanceLock`, one thread probing while another launched repeatedly:
+**27 spurious `Ok(None)` in 27,000 launches** over 195,981 probes without the retry, **0 with it**,
+and **0 in 9,000 launches with no prober running** — the control that ties the two together.
 
 Retry `acquire` once after ~100 ms before concluding `AlreadyRunning`. Cheap, and it removes a
 false takeover screen that would be maddening precisely because it disappears on the next try.
@@ -159,7 +169,8 @@ false takeover screen that would be maddening precisely because it disappears on
 ## 10. Confidence, and what the gate should second-guess
 
 This design rests on **one** independent analysis plus my own verification of its two load-bearing
-claims (the `Reopen` handling at `lib.rs:701`, and the fork window at `lock.rs:147-149`). A second
+claims (the `Reopen` handling at `lib.rs:701`, and the fork window at `lock.rs:147-149` — the second
+of which the gate then measured and **falsified**; see §7). A second
 opinion was commissioned twice and both runs died on a tooling timeout, so the usual two-take
 protocol for an app-lifecycle decision did **not** complete. One partial signal from the incomplete
 run agreed with §4.

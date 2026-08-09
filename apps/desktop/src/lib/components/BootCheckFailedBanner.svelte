@@ -21,6 +21,36 @@
 	import type { IpcError } from '$lib/ipc';
 
 	let { error }: { error: IpcError | null } = $props();
+
+	/** Tauri's own refusal for a command whose state was never managed — the
+	 *  sentence this entire line of work exists to stop showing a user. */
+	const UNMANAGED_STATE = '.manage()';
+	/** What to say instead. It claims strictly less than the string it replaces
+	 *  and nothing that is not true of every way this could arise. */
+	const UNMANAGED_STATE_SUBSTITUTE =
+		'OpenVHost did not get far enough through startup to record how the launch went.';
+
+	// The ONE place a message may be replaced rather than rendered verbatim, and
+	// it is a floor rather than a paraphrase: every other transport error still
+	// goes through untouched, which the tests pin from both sides.
+	//
+	// Unreachable today, and deliberately guarded anyway. `error` is whatever
+	// `boot_status` threw, and the one path on which that could be Tauri's
+	// unmanaged-state string is `BootState` itself going unmanaged — which
+	// `lib.rs:406` makes impossible: the `app.manage(boot)` there is
+	// unconditional, `bootstrap` returns no `Result` to bail out of, and the main
+	// thread is blocked inside `setup` so no invoke can dispatch before it runs.
+	// But that is a chain of three reasons, not a test; Tauri creates the window
+	// and the webview BEFORE running setup, and bootstrap measures 270-390 ms. If
+	// any link ever breaks, the failure mode is this banner rendering
+	// *"…You must call `.manage()` before using this command"* beside a
+	// fully-mounted app — the pre-branch bug plus a banner, in the slice built to
+	// delete it. `boot.rs`'s `reveal_run_dir_target_never_names_a_rust_api_at_the_user`
+	// pins the same property for that command's refusals; this is its other half.
+	const detail = $derived.by(() => {
+		const message = errorMessage(error);
+		return message.includes(UNMANAGED_STATE) ? UNMANAGED_STATE_SUBSTITUTE : message;
+	});
 </script>
 
 {#if error !== null}
@@ -35,7 +65,7 @@
 		<!-- The transport's own words first, for the same reason
 		     StoreUnavailableBanner leads with its reason: it is the only line that
 		     can point at a cause. -->
-		<span class="detail" data-testid="boot-check-failed-reason">{errorMessage(error)}</span>
+		<span class="detail" data-testid="boot-check-failed-reason">{detail}</span>
 		<span class="line">
 			The rest of this window is showing as usual, because hiding a working app over one unanswered
 			question would be the worse mistake.

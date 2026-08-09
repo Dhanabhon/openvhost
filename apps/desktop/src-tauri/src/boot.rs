@@ -57,12 +57,24 @@ use crate::db_state;
 
 /// How long [`bootstrap`] waits before re-trying a contended run lock (D5).
 ///
-/// `lock.rs:147-149` records that between `fork` and `exec` a child transiently
-/// duplicates every open descriptor, this lock file's included, and `O_CLOEXEC`
-/// clears it at `exec`. This app spawns nginx, php-fpm and mysqld continuously,
-/// so a launch that races a spawn can observe a **spurious `Ok(None)` for
-/// milliseconds** — and would then show a takeover screen that disappears on the
+/// **[`InstanceLock::probe`] is the producer** (`lock.rs:105-117`): it acquires
+/// the lock and immediately drops it again to answer *"is a supervisor live?"*,
+/// and `openvhost status` calls it. For the microseconds a probe holds the
+/// `flock`, a launch racing it reads a **spurious `Ok(None)`** and would conclude
+/// another instance owns this home — a takeover screen that disappears on the
 /// next try, which is the most maddening kind of wrong.
+///
+/// This originally cited `lock.rs`'s fork/exec note instead, and that citation
+/// was wrong twice over: it lives in a `#[cfg(test)]` doc comment whose own last
+/// line reads *"Not a production concern: the CLI process that probes spawns
+/// nothing"*, and a live holder that forks still genuinely holds the lock, so
+/// that window cannot produce a *spurious* `Ok(None)` at all. The retry is
+/// better justified than the design claimed, not worse.
+///
+/// Measured against the real [`InstanceLock`], one thread probing while another
+/// launched repeatedly: **27 spurious `Ok(None)` in 27,000 launches** across
+/// 195,981 probes without the retry, and **0 with it**. The control that ties
+/// the two: 0 in 9,000 launches with no prober running at all.
 ///
 /// Paid **only** on contention: [`acquire_with_one_retry`] does not wait when
 /// the first attempt settles the question, so an ordinary launch is not 100 ms
@@ -237,17 +249,27 @@ pub fn hides_on_close(boot: Option<&BootState>) -> bool {
 ///
 /// Generic over the lock and the error rather than written against
 /// [`InstanceLock`] directly, because **both directions have to be reachable
-/// from a test**: a fake `acquire` can produce the transient `Ok(None)` that the
-/// fork/exec window produces in production, and the real `InstanceLock` can
-/// produce a genuinely held lock. A retry that eventually succeeded regardless
-/// would silently defeat single-instance protection, which is the half that
-/// matters.
+/// from a test**: a fake `acquire` can produce the transient `Ok(None)` that a
+/// concurrent [`InstanceLock::probe`] produces in production (see
+/// [`LOCK_RETRY_DELAY`]), and the real `InstanceLock` can produce a genuinely
+/// held lock. A retry that eventually succeeded regardless would silently defeat
+/// single-instance protection, which is the half that matters.
 ///
-/// **`Ok(None)` only.** An `Err` is not retried: the documented race makes
-/// `flock` report the lock *held* (`EWOULDBLOCK`), never fail, so retrying an
-/// error would delay every unusable run dir by the wait for no reason. And a
+/// **`Ok(None)` only.** An `Err` is not retried: the probe race makes `flock`
+/// report the lock *held* (`EWOULDBLOCK`), never fail, so retrying an error
+/// would delay every unusable run dir by the wait for no reason. And a
 /// first-try `Ok(Some(_))` does not wait at all, so an ordinary launch pays
 /// nothing.
+///
+/// **A degraded boot is not write-free, and the retry does it twice.**
+/// `InstanceLock::acquire` (`lock.rs:24-38`) runs `create_dir_all`, then
+/// `set_permissions(0o700)`, then an `O_CREAT` open of `lock`, all **before** the
+/// `flock` that decides the answer — so a second instance performs those three
+/// inside the *running* instance's `<home>/run`, once per attempt. Every one is
+/// idempotent and tightening-only (`truncate(false)`; measured: a live holder's
+/// run dir loosened to 0755 came back 0700), and all three predate this
+/// function — but "a degraded boot writes nothing" is not true, so it is not
+/// claimed here.
 fn acquire_with_one_retry<T, E>(
     mut acquire: impl FnMut() -> Result<Option<T>, E>,
     wait: impl FnOnce(),
@@ -281,8 +303,10 @@ pub fn bootstrap(app: &tauri::App) -> BootState {
     let boot = match openvhost_core::resolve_home() {
         Ok(home) => {
             let run_dir = home.join("run");
-            // D5: one retry on contention, because this repo documents the
-            // fork/exec window that makes a spurious `Ok(None)` possible. See
+            // D5: one retry on contention, because `InstanceLock::probe` —
+            // which `openvhost status` runs — acquires and immediately drops
+            // this same lock, so a launch racing one reads a spurious
+            // `Ok(None)`. See `LOCK_RETRY_DELAY` for the measurement and
             // `acquire_with_one_retry` for why an `Err` is not retried.
             match acquire_with_one_retry(
                 || InstanceLock::acquire(&run_dir),
@@ -659,26 +683,52 @@ fn reveal_run_dir_target(boot: &BootState) -> Result<PathBuf, IpcError> {
 /// problem may be *"this folder, or the folder containing it"* — whereas opening
 /// the run directory itself would show the user an empty window.
 ///
-/// **This can fail, and the screen must say so.** `reveal_item_in_dir`
-/// canonicalises first, and the commonest producer of
-/// [`BootState::RunDirUnusable`] is a `<home>/run` that could not be *created* —
-/// so on that path there is nothing on disk to reveal and this returns *No such
-/// file or directory (os error 2)*. That is honest and it is why the screen keeps
-/// the path as selectable text as well: the button is a convenience, and the text
-/// is the thing that always works.
+/// **This can fail, and the screen must say so — but it does not always fail,
+/// and an earlier draft of this comment implied it did.** Measured against the
+/// plugin's own source: on macOS `reveal_item_in_dir`'s ONLY fallible step is
+/// `std::fs::canonicalize`; the AppKit call it then makes
+/// (`NSWorkspace::activateFileViewerSelectingURLs`) returns `Ok(())`
+/// unconditionally. So the route that produced [`BootState::RunDirUnusable`]
+/// decides, and the two measured routes differ:
+///
+/// - A read-only `<home>` with `run` **absent** — *Permission denied (os error
+///   13)* — leaves nothing on disk, `canonicalize` fails, and this returns
+///   *could not show `<home>/run` in Finder: No such file or directory (os error
+///   2)*. A dangling symlink at the `run` path — *File exists (os error 17)* —
+///   fails the same way.
+/// - A **plain file** at the `run` path — also *File exists (os error 17)* —
+///   canonicalises fine, so the button **succeeds and opens Finder** with `run`
+///   selected beside its siblings, which is exactly where the fix is.
+///
+/// Either way the screen keeps the path as selectable text: the button is a
+/// convenience, and the text is the thing that always works.
 #[tauri::command]
 #[specta::specta]
 pub async fn reveal_run_dir(
     app: tauri::AppHandle,
     boot: tauri::State<'_, BootState>,
 ) -> Result<(), IpcError> {
-    use tauri_plugin_opener::OpenerExt;
     let run_dir = reveal_run_dir_target(&boot)?;
-    app.opener()
-        .reveal_item_in_dir(&run_dir)
-        .map_err(|e| IpcError::Core {
-            message: format!("could not show {} in Finder: {e}", run_dir.display()),
-        })
+    // On `spawn_blocking` rather than inline on the command's own worker:
+    // `reveal_item_in_dir` runs a synchronous `std::fs::canonicalize` before it
+    // reaches AppKit, and this repo already routes command-level filesystem work
+    // off the tokio workers for exactly that reason — `home_disk_usage` is the
+    // precedent, and `read_log_window` and `read_web_server_config` cite the same
+    // rule. The case it protects is an `OPENVHOST_HOME` on a stalled mount, where
+    // `canonicalize` blocks in the kernel; pinning a worker there would be worst
+    // on the very screen this button lives on.
+    let target = run_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        use tauri_plugin_opener::OpenerExt;
+        app.opener().reveal_item_in_dir(&target)
+    })
+    .await
+    .map_err(|e| IpcError::Core {
+        message: format!("the reveal task failed to run: {e}"),
+    })?
+    .map_err(|e| IpcError::Core {
+        message: format!("could not show {} in Finder: {e}", run_dir.display()),
+    })
 }
 
 #[cfg(test)]
@@ -910,8 +960,9 @@ mod tests {
     // retry that always eventually succeeded would silently defeat
     // single-instance protection, so a real held lock must survive it. It uses
     // the real `InstanceLock`; the other three drive the helper with fakes,
-    // because the transient `Ok(None)` the fork/exec window produces cannot be
-    // staged on demand with a real one.
+    // because the transient `Ok(None)` a concurrent `InstanceLock::probe`
+    // produces cannot be staged on demand with a real one — it is a race, and
+    // the measurement in `LOCK_RETRY_DELAY` needed 27,000 launches to see 27.
     //
     // VACUITY, measured in both directions:
     //
@@ -951,8 +1002,8 @@ mod tests {
 
     #[test]
     fn a_spurious_contention_is_retried_once_and_the_lock_is_taken() {
-        // Exactly what the fork/exec window produces: the lock reads held, then
-        // moments later it does not (`lock.rs:147-149`).
+        // Exactly what a concurrent `InstanceLock::probe` produces: the lock
+        // reads held, then moments later it does not (`lock.rs:105-117`).
         let mut tries = 0;
         let mut waited = false;
         let taken: Result<Option<&str>, std::io::Error> = acquire_with_one_retry(

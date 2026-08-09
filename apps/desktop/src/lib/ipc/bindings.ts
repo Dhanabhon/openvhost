@@ -60,13 +60,25 @@ export const commands = {
 	 *  problem may be *"this folder, or the folder containing it"* — whereas opening
 	 *  the run directory itself would show the user an empty window.
 	 * 
-	 *  **This can fail, and the screen must say so.** `reveal_item_in_dir`
-	 *  canonicalises first, and the commonest producer of
-	 *  [`BootState::RunDirUnusable`] is a `<home>/run` that could not be *created* —
-	 *  so on that path there is nothing on disk to reveal and this returns *No such
-	 *  file or directory (os error 2)*. That is honest and it is why the screen keeps
-	 *  the path as selectable text as well: the button is a convenience, and the text
-	 *  is the thing that always works.
+	 *  **This can fail, and the screen must say so — but it does not always fail,
+	 *  and an earlier draft of this comment implied it did.** Measured against the
+	 *  plugin's own source: on macOS `reveal_item_in_dir`'s ONLY fallible step is
+	 *  `std::fs::canonicalize`; the AppKit call it then makes
+	 *  (`NSWorkspace::activateFileViewerSelectingURLs`) returns `Ok(())`
+	 *  unconditionally. So the route that produced [`BootState::RunDirUnusable`]
+	 *  decides, and the two measured routes differ:
+	 * 
+	 *  - A read-only `<home>` with `run` **absent** — *Permission denied (os error
+	 *    13)* — leaves nothing on disk, `canonicalize` fails, and this returns
+	 *    *could not show `<home>/run` in Finder: No such file or directory (os error
+	 *    2)*. A dangling symlink at the `run` path — *File exists (os error 17)* —
+	 *    fails the same way.
+	 *  - A **plain file** at the `run` path — also *File exists (os error 17)* —
+	 *    canonicalises fine, so the button **succeeds and opens Finder** with `run`
+	 *    selected beside its siblings, which is exactly where the fix is.
+	 * 
+	 *  Either way the screen keeps the path as selectable text: the button is a
+	 *  convenience, and the text is the thing that always works.
 	 */
 	revealRunDir: () => typedError<null, IpcError>(__TAURI_INVOKE("reveal_run_dir")),
 	listServices: () => typedError<ServiceStatus[], IpcError>(__TAURI_INVOKE("list_services")),

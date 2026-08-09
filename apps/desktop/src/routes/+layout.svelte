@@ -82,11 +82,15 @@
 		try {
 			await revealRunDir();
 		} catch (e) {
-			// The likeliest failure by far, and the reason this is rendered rather
-			// than swallowed: the commonest `runDirUnusable` is a run directory that
-			// could not be CREATED, so there is nothing on disk to reveal and this
-			// comes back "No such file or directory (os error 2)". A dead-looking
-			// button on an error screen is the outcome to avoid.
+			// Whether this fails depends on WHICH route produced `runDirUnusable`,
+			// and both were measured (see `reveal_run_dir`'s doc comment). A
+			// read-only home with `run` absent, or a dangling symlink at the `run`
+			// path, leaves nothing for `canonicalize` to resolve and comes back
+			// "could not show <home>/run in Finder: No such file or directory (os
+			// error 2)". A plain FILE at the `run` path resolves fine and the button
+			// simply works. Rendering the failure rather than swallowing it is what
+			// keeps the first case from looking like a dead button on an error
+			// screen.
 			revealError = errorMessage(e);
 		}
 	}
@@ -115,9 +119,48 @@
 	// `onServiceUnregistered` is its mirror, for the same reason in reverse:
 	// an uninstalled version's row must DISAPPEAR everywhere, not linger
 	// offering Start for a binary that is gone.
+	//
+	// GATED on the app being on screen, exactly like the status-bar poll at the
+	// bottom of this file and for a sharper version of the same reason:
+	// `list_services` extracts `State<Arc<Supervisor>>`, which is managed inside
+	// the ONE boot arm that succeeded, so on a degraded boot it really does come
+	// back as Tauri's *"You must call `.manage()`"* string and `normalizeError`
+	// puts that verbatim into `IpcError.message`. Nothing renders it today —
+	// `servicesStore.error` is drawn by the Services page, which the takeover
+	// removes from the DOM — so §9.1 ("no page shows Tauri's `.manage()` string")
+	// held only because of what happens to be rendered. Gating makes it a property
+	// of the code.
+	//
+	// The whole block moves, not just the ask, so the *subscribe BEFORE the
+	// snapshot* ordering below survives intact — and a boot with no supervisor
+	// registers no supervisor listeners either, which is the honest outcome
+	// rather than a bonus.
+	//
+	// An `$effect` and not an `onMount`, for the reason the poll's gate gives:
+	// `onMount` runs while the boot ask is still in flight, so a gate evaluated
+	// there would read `pending` and never wire up a healthy launch either. The
+	// effect re-runs when `boot_status` answers.
+	//
+	// `servicesWired` makes it run at most once — the ask is asked once and never
+	// re-asked, but a one-shot snapshot must not depend on that. Teardown stays in
+	// its own `onMount` below rather than being returned from the effect: an
+	// effect cleanup fires on every re-run, so the guard and a returned cleanup
+	// together could drop the listeners and then decline to re-register them.
+	let serviceListeners: Array<() => void> = [];
+	let serviceWiringDisposed = false;
+	let servicesWired = false;
+
 	onMount(() => {
-		let unlistens: Array<() => void> = [];
-		let disposed = false;
+		return () => {
+			serviceWiringDisposed = true;
+			for (const stop of serviceListeners) stop();
+			serviceListeners = [];
+		};
+	});
+
+	$effect(() => {
+		if (servicesWired || !appIsOnScreen(rendering)) return;
+		servicesWired = true;
 
 		void (async () => {
 			// Accumulated as each subscription resolves, so a failure registering
@@ -139,11 +182,11 @@
 				stops.push(await onServiceUnregistered((ev) => servicesStore.applyUnregistered(ev.id)));
 				// `await` means teardown may already have run (dev HMR disposes this layout).
 				// Drop every listener immediately rather than leaking them past the cleanup.
-				if (disposed) {
+				if (serviceWiringDisposed) {
 					for (const stop of stops) stop();
 					return;
 				}
-				unlistens = stops;
+				serviceListeners = stops;
 				// Resolves rather than rejects — the store captures load failures on
 				// `error`, which the Services page's banner renders.
 				await servicesStore.loadServices();
@@ -155,12 +198,6 @@
 				servicesStore.fail(e as IpcError);
 			}
 		})();
-
-		return () => {
-			disposed = true;
-			for (const stop of unlistens) stop();
-			unlistens = [];
-		};
 	});
 
 	// How far this launch got — asked HERE, once, and it is the question that
@@ -189,11 +226,23 @@
 	//
 	// Asked once and never re-asked: `Db::open` runs at startup and the handle is
 	// managed exactly once, so the answer cannot change while the app is running.
-	// Its own `onMount` rather than a line inside the supervisor block above,
+	// Its own effect rather than a line inside the supervisor block above,
 	// matching the quit listener's separation: neither failure may take the other
 	// down. `load()` resolves rather than rejects — the store keeps a failed ask as
 	// silence, never as a fabricated reason.
-	onMount(() => {
+	//
+	// GATED, and `state_store_status` is the sharpest case of all: PR #69 built it
+	// precisely so a broken store could refuse in the user's words instead of
+	// Tauri's — but it extracts a `DbHandle`, which is managed inside the ONE boot
+	// arm that succeeded. So on a degraded boot Tauri refuses this command before
+	// its body ever runs, with the very sentence PR #69 deleted. `db_state.rs`'s
+	// own module header says so in as many words. Same `$effect` + once-guard
+	// shape as the supervisor block above; no cleanup, because a one-shot read has
+	// nothing to tear down.
+	let storeStatusAsked = false;
+	$effect(() => {
+		if (storeStatusAsked || !appIsOnScreen(rendering)) return;
+		storeStatusAsked = true;
 		void storeStatusStore.load();
 	});
 

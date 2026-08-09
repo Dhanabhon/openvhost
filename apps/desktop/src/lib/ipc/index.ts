@@ -255,11 +255,16 @@ export async function bootStatus(): Promise<BootStatusDto> {
  * renderer gained — it can only ask for the folder it was already told about.
  * The same reason `openHomebrewSite` takes no URL.
  *
- * **Rejects, and the caller must render it.** The commonest `runDirUnusable`
- * is a `<home>/run` that could not be created, in which case there is nothing
- * on disk to reveal and this comes back *No such file or directory (os error
- * 2)*. The screen shows the path as copyable text regardless — that half never
- * fails.
+ * **Can reject, and the caller must render it — but it does not always.** On
+ * macOS the only fallible step is the `canonicalize` `reveal_item_in_dir` does
+ * first; the AppKit call after it returns `Ok(())` unconditionally. So the route
+ * that produced `runDirUnusable` decides, and both were measured: a read-only
+ * `<home>` with `run` absent, or a dangling symlink at the `run` path, leaves
+ * nothing to resolve and comes back *could not show `<home>/run` in Finder: No
+ * such file or directory (os error 2)*, while a plain FILE at the `run` path
+ * resolves fine and the button simply opens Finder. See `reveal_run_dir`'s own
+ * doc comment for the errnos. The screen shows the path as copyable text
+ * regardless — that half never fails.
  */
 export async function revealRunDir(): Promise<void> {
 	await unwrap(commands.revealRunDir());

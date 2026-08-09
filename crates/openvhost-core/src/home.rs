@@ -6,6 +6,13 @@ use std::path::{Path, PathBuf};
 
 use crate::error::CoreError;
 
+/// The verb [`resolve_home_from`]'s one [`CoreError::Io`] reports under.
+///
+/// A named constant so its wording can be asserted against the value the code
+/// actually uses rather than against a copy of it — see
+/// `the_one_io_error_a_user_can_see_names_no_internal_operation`.
+const ABSOLUTIZE_OP: &str = "could not work out the full path of";
+
 /// Resolve the OpenVHost home directory: `OPENVHOST_HOME` env override wins,
 /// otherwise `<user home>/.openvhost`. The override is what makes tests and
 /// the future integration harness hermetic.
@@ -27,13 +34,25 @@ pub fn resolve_home() -> Result<PathBuf, CoreError> {
 /// rather than silently reaching some other real file, but absolutizing
 /// here closes the whole class cheaply and lexically — no filesystem access,
 /// so this is safe to call before `home` exists at all (a first run).
+///
+/// **The `op` here is prose, not a syscall name, and that is deliberate.** Every
+/// other [`CoreError::Io`] in this crate names the libc call it wrapped
+/// (`create_dir_all`, `rename`, `symlink_metadata`) because every other one is
+/// read by a developer. This one is not: when it fires, `resolve_home` has
+/// failed, so the desktop app has no home, shows the degraded-boot takeover
+/// screen, and prints this string to a **user** as the only line they can act on.
+/// The old `op: "absolutize"` rendered live as *"absolutize relhome: No such file
+/// or directory (os error 2)"* — an internal operation name at a user, which is
+/// a milder instance of the exact class the degraded-boot slice exists to remove.
+/// The path and the errno are what make it actionable and they are untouched;
+/// only the verb changed.
 pub(crate) fn resolve_home_from(
     override_val: Option<&OsStr>,
     home_dir: Option<&Path>,
 ) -> Result<PathBuf, CoreError> {
     if let Some(v) = override_val.filter(|v| !v.is_empty()) {
         return std::path::absolute(v).map_err(|source| CoreError::Io {
-            op: "absolutize",
+            op: ABSOLUTIZE_OP,
             path: PathBuf::from(v),
             source,
         });
@@ -149,6 +168,50 @@ mod tests {
                 .unwrap()
                 .join("relative-openvhost-home")
         );
+    }
+
+    /// The one `CoreError::Io` in this crate that a **user** reads.
+    ///
+    /// When it fires there is no home, so the desktop app shows the degraded-boot
+    /// takeover screen and prints this string as the only actionable line on it.
+    /// Measured live on the one route that reaches it — a deleted working
+    /// directory plus a relative `OPENVHOST_HOME` — it read *"absolutize relhome:
+    /// No such file or directory (os error 2)"*, putting an internal operation
+    /// name in front of a user: a milder instance of the class the degraded-boot
+    /// slice exists to remove.
+    ///
+    /// **Honest about what this is: hygiene on the wording, not a proof of the
+    /// failure path.** `std::path::absolute` fails only when `getcwd` does, which
+    /// needs a deleted working directory, and this crate never mutates process
+    /// cwd or env in tests. So the assertion is made against `ABSOLUTIZE_OP`
+    /// itself — the same constant the construction site uses, which is what keeps
+    /// it from being cut from its own fixture. What it does NOT catch is a future
+    /// edit that inlines some other `op:` at that call site instead of using the
+    /// constant; that is a different construction site and nothing here can see
+    /// it.
+    ///
+    /// VACUITY (neuter-and-watch-it-fail): `ABSOLUTIZE_OP` set back to
+    /// `"absolutize"` failed this test and only this test (1 of 32 in
+    /// `cargo test -p openvhost-core --lib home`); restoring it passed.
+    #[test]
+    fn the_one_io_error_a_user_can_see_names_no_internal_operation() {
+        assert!(
+            ABSOLUTIZE_OP.contains(' '),
+            "a user-facing verb is prose, not an identifier: {ABSOLUTIZE_OP}"
+        );
+        assert!(!ABSOLUTIZE_OP.contains("absolutize"), "{ABSOLUTIZE_OP}");
+        assert!(!ABSOLUTIZE_OP.contains('_'), "{ABSOLUTIZE_OP}");
+
+        // …and the actionable half survives the rewording: the path and the errno
+        // are the whole reason this error is worth rendering.
+        let rendered = CoreError::Io {
+            op: ABSOLUTIZE_OP,
+            path: PathBuf::from("relhome"),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        }
+        .to_string();
+        assert!(rendered.contains("relhome"), "{rendered}");
+        assert!(rendered.contains("entity not found"), "{rendered}");
     }
 
     #[test]
