@@ -437,7 +437,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_non_zero_validator_exit_is_a_rejection_on_the_named_field() {
-        use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
         let settings = gzip_on();
 
@@ -460,8 +459,7 @@ mod tests {
         let msg =
             format!("nginx: [emerg] value must be between 1 and 9 in /h/nginx.conf:{line_no}");
         let bin = root.path().join("fake-nginx");
-        std::fs::write(&bin, format!("#!/bin/sh\necho '{msg}' >&2\nexit 1\n")).unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::tests_support::write_exec_fixture(&bin, &format!("echo '{msg}' >&2\nexit 1"));
 
         let got = check_settings(&bin, root.path(), &settings).await.unwrap();
         assert_eq!(

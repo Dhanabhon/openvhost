@@ -250,11 +250,12 @@ mod tests {
 
     use super::*;
 
+    /// Warmed at creation, outside the `run_bounded` calls these tests then
+    /// time — see [`crate::tests_support`] for what that costs and why every
+    /// fixture helper in this workspace does it.
     fn fake_bin(dir: &Path, name: &str, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let p = dir.join(name);
-        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::tests_support::write_exec_fixture(&p, body);
         p
     }
 

@@ -1250,11 +1250,51 @@ mod tests {
             .unwrap()
     }
 
+    /// Set by [`sh`] on the warm-up child alone, never on this process.
+    /// `openvhost_conf::run_bounded` — which every bounded child below goes
+    /// through — `env_clear()`s before each spawn, so a real call cannot see
+    /// it even by accident.
+    const WARMUP_ENV: &str = "OPENVHOST_FIXTURE_WARMUP";
+
+    /// Write `body` as an executable fixture, then exec it once and discard
+    /// the result so macOS's XProtect first-execution check is paid HERE
+    /// rather than inside `openvhost_conf::PROBE_TIMEOUT`'s 5 s window.
+    ///
+    /// The measurements are in
+    /// docs/superpowers/specs/2026-08-09-p1-validator-timeout-design.md: a
+    /// never-before-seen file costs ~396 ms to exec, XProtect serializes, and
+    /// ~13 concurrent first-execs (ordinary build churn in another worktree)
+    /// push a probe past the bound. The evaluation is keyed to the inode and
+    /// the second exec costs 5.6 ms, so paying it once here takes it out of
+    /// the timed window entirely.
+    ///
+    /// The guard line is not optional here of all places: `bin/mariadbd`'s
+    /// body is `sleep 300`, another spins for 30 s waiting on a file, and
+    /// `bin/mariadb-admin` CREATES that file — an unguarded warm-up would
+    /// hang the suite and pre-trip the shutdown handshake
+    /// `fake_runtime_that_completes` exists to sequence. With the guard the
+    /// extra exec runs no body at all.
+    ///
+    /// Blocking `std::process`, never `tokio::process`: nothing here may
+    /// `.await`, or a paused-clock test elsewhere in the workspace would
+    /// auto-advance virtual time while the runtime parked.
     fn sh(path: &Path, body: &str) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::write(
+            path,
+            format!("#!/bin/sh\nif [ -n \"${{{WARMUP_ENV}:-}}\" ]; then exit 0; fi\n{body}\n"),
+        )
+        .unwrap();
+        // After the mode change, never before: the warm-up can only pay the
+        // first-execution cost once the file is actually executable.
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::process::Command::new(path)
+            .env(WARMUP_ENV, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
     }
 
     /// A complete fake package tree whose `mariadb-install-db` runs `body`.

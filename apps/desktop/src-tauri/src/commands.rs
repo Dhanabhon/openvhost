@@ -6907,8 +6907,10 @@ mod mysql_ipc_tests {
 
     use super::*;
 
+    /// Warmed at creation, outside the `PROBE_TIMEOUT`-bounded calls these
+    /// tests then time — see [`crate::tests_support`] for what that costs and
+    /// why every fixture helper in this workspace does it.
     fn fake_cli(dir: &Path, name: &str, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         // `<dir>/bin/<name>`, alongside the `lib/plugin` and `share/mysql/…`
         // directories a real install has — NOT a bare `<dir>/<name>`.
         //
@@ -6926,8 +6928,7 @@ mod mysql_ipc_tests {
         std::fs::create_dir_all(dir.join("share/mysql/charsets")).unwrap();
         std::fs::create_dir_all(dir.join("share/mysql/english")).unwrap();
         let p = bin.join(name);
-        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::tests_support::write_exec_fixture(&p, body);
         p
     }
 
@@ -8929,11 +8930,12 @@ mod mariadb_ipc_tests {
     use super::*;
     use openvhost_proc::{Supervisor, default_driver};
 
+    /// Warmed at creation, outside the `PROBE_TIMEOUT`-bounded calls these
+    /// tests then time — see [`crate::tests_support`] for what that costs and
+    /// why every fixture helper in this workspace does it.
     fn fake_cli(dir: &Path, name: &str, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let p = dir.join(name);
-        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::tests_support::write_exec_fixture(&p, body);
         p
     }
 
@@ -10686,18 +10688,24 @@ mod list_web_servers_tests {
     /// A stand-in nginx that records its argv and prints a banner on STDERR, where
     /// real nginx writes it. NOT a mock of the probe: `probe_nginx_version` really
     /// spawns this, so the argv file is evidence about the actual invocation.
+    /// Warmed at creation, outside the `PROBE_TIMEOUT`-bounded probe these
+    /// tests then time — see [`crate::tests_support`].
+    ///
+    /// This fixture is exactly why the warm-up must not run the BODY:
+    /// `a_packaged_source_reports_the_tree_version_and_never_spawns_a_probe`
+    /// reads `!argv_out.exists()` as "nothing spawned me", so a warm-up that
+    /// reached the redirection below would create that file and turn a real
+    /// tripwire into a permanent false alarm. The guard line
+    /// `write_exec_fixture` prepends exits first, so it does not.
     fn fake_nginx(dir: &Path, argv_out: &Path, version: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let p = dir.join("nginx");
-        std::fs::write(
+        crate::tests_support::write_exec_fixture(
             &p,
-            format!(
-                "#!/bin/sh\necho \"$@\" > \"{}\"\necho 'nginx version: nginx/{version}' 1>&2\n",
+            &format!(
+                "echo \"$@\" > \"{}\"\necho 'nginx version: nginx/{version}' 1>&2",
                 argv_out.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         p
     }
 

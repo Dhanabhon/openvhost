@@ -74,7 +74,32 @@ use crate::error::ConfError;
 
 /// Both probes are short-lived local process launches; 5s is far beyond a
 /// healthy `nginx -v`/`-t` and short enough that a wedged binary surfaces as an
-/// error instead of a spinner that never resolves.
+/// error instead of a spinner that never resolves. Measured against real
+/// binaries under heavy first-exec pressure: `nginx -v` 16-way concurrent is
+/// p50 2.7 ms, max 17 ms, and the whole `check_settings` render-and-validate
+/// path is 10–20 ms. The bound has 300–1800× of headroom.
+///
+/// BUT IT IS NOT UNCONDITIONAL, and the exception is golden rule 6's own
+/// model. macOS charges the FIRST exec of a newly created inode an XProtect
+/// signature evaluation, and that evaluation serializes through one XPC
+/// service: measured, a freshly extracted nginx (6.1 MB) costs 463 ms at its
+/// new inode and mariadbd (28.4 MB) 586 ms, but twelve such first-execs
+/// running AT ONCE cost the slowest of them 3.23 s — and the cost keeps
+/// climbing ~390 ms per additional concurrent first-exec, so it is unbounded
+/// in the number of them, not in their size.
+///
+/// It is safe today only because production probes a freshly extracted package
+/// SEQUENTIALLY — `block_on` per binary in `stack.rs` and `commands.rs` — so
+/// just the ~0.5 s figure ever applies. Parallelising discovery probes across a
+/// package that has only just been extracted is what makes this reachable, and
+/// it would surface as `ValidatorTimeout` on a perfectly good binary. If you
+/// are here to do that, warm each binary once outside this bound first (the
+/// installer already does exactly this for the package's main binary —
+/// `openvhost-pkg`'s `warm_up`), rather than raising this number: raising it
+/// degrades the contract this constant exists for, and cannot be done
+/// correctly anyway against a requirement that grows with concurrency.
+/// Measurements and the rejected alternatives:
+/// docs/superpowers/specs/2026-08-09-p1-validator-timeout-design.md.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The environment a probe's child runs in: this list and nothing else. Condition
@@ -495,11 +520,13 @@ mod tests {
     /// A fake "binary": a shell script that writes fixed text and exits with a
     /// fixed code. Lets these tests assert real spawn behaviour without needing
     /// nginx installed, which CI and most dev machines cannot assume.
+    ///
+    /// Warmed at creation, outside the bounded call these tests then time —
+    /// see [`crate::tests_support`] for what that costs and why every fixture
+    /// helper in this workspace does it.
     fn fake_bin(dir: &Path, name: &str, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let p = dir.join(name);
-        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::tests_support::write_exec_fixture(&p, body);
         p
     }
 
