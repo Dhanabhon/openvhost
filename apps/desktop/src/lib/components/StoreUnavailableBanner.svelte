@@ -38,7 +38,7 @@
 		<span class="line">
 			Your sites, web server settings and database passwords are kept in it, so anything that reads
 			or changes them refuses until it opens — and lists that draw on it, such as per-site logs, are
-			short without saying so.
+			short without saying so, while your chosen default PHP reads as no preference.
 		</span>
 		<span class="line">
 			Starting and stopping services, installing versions, and the nginx and PHP logs are

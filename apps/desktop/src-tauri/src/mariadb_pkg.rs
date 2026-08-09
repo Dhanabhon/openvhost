@@ -50,7 +50,6 @@ use crate::commands::{
 use crate::db_state::DbHandle;
 pub(crate) use crate::mysql_pkg::ProgressThrottle;
 use crate::stack::StackPaths;
-use openvhost_core::Db;
 
 /// Whether this build can install MariaDB on THIS host, and what it would
 /// install — the MariaDB counterpart of `mysql_pkg::MysqlPackageOfferDto`,
@@ -323,7 +322,7 @@ pub async fn install_mariadb(
     let outcome = run_install(
         &app,
         &p.home,
-        db.optional(),
+        db.inner(),
         lock.inner(),
         runtimes.inner(),
         sup.inner(),
@@ -338,14 +337,16 @@ pub async fn install_mariadb(
 async fn run_install(
     app: &tauri::AppHandle,
     home: &Path,
-    db: Option<&Db>,
+    db: &DbHandle,
     lock: &crate::commands::InstallLock,
     runtimes: &RwLock<Option<Vec<openvhost_core::MariadbRuntime>>>,
     sup: &Supervisor,
 ) -> Result<MariadbInstallOutcomeDto, IpcError> {
-    // `None` when the store never opened. `install_mariadb_package` owns the
-    // reason it reports for the missing row; nothing is retyped here.
-    let ledger = db.map(openvhost_core::mysql::InstallLedger::new);
+    // `None` when the store never opened, through the one named seam
+    // `mysql_pkg::run_install` uses — see `DbHandle::install_ledger`.
+    // `install_mariadb_package` owns the reason it reports for the missing row;
+    // nothing is retyped here.
+    let ledger = db.install_ledger();
     let emitter = app.clone();
     let spawn_root = openvhost_core::PackagesRoot::from_home(home);
 

@@ -123,13 +123,14 @@ pub async fn install_php_package(
     }
 }
 
-/// The pipeline itself, split out from the catalogue lookup so tests can drive
-/// it against a loopback fixture — and so the live proof can install the real
-/// tarball from a local source while the release remains unpublished.
+/// The pipeline itself, split out from the catalogue lookup so the tests **in
+/// this module** can drive it against a loopback fixture.
 ///
 /// Private on purpose: taking a [`PhpPackage`] means taking a URL and a
 /// hash, and the whole point of the public signature above is that no caller
-/// can choose those. Nothing outside this module may name this function.
+/// can choose those. Nothing outside this module may name this function —
+/// including an out-of-tree live proof, which the deleted half of this sentence
+/// used to promise it could. The visibility is the deliberate half.
 async fn install_entry(
     entry: &PhpPackage,
     root: &PackagesRoot,

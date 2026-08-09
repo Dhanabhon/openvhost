@@ -66,6 +66,11 @@ describe('when the store is down', () => {
 		expect(text).toContain(
 			'lists that draw on it, such as per-site logs, are short without saying so'
 		);
+		// D5's OTHER named degradation, and not covered by the line above: the
+		// stored default PHP is a scalar, not a list, and its read degrades to
+		// "no preference" rather than refusing. A banner that enumerated only the
+		// lists would leave that one reading as a deliberate choice.
+		expect(text).toContain('your chosen default PHP reads as no preference');
 	});
 
 	it('says what still works, and how to try again', () => {

@@ -514,11 +514,13 @@ pub(crate) async fn run_package_install(
     // row is written unless the store is down" into "the ledger row is never
     // written". `optional()` is the DEGRADE accessor, and the `None` it can
     // return is the same `None` this code already handled.
+    //
+    // Through `DbHandle::install_ledger`, the one named seam the MySQL and
+    // MariaDB installs also go through: this line is unreachable from any test
+    // (`run_package_install` takes an `AppHandle<Wry>`), so the DEGRADE decision
+    // lives where a test can hold it instead of being restated here.
     let handle = app.try_state::<DbHandle>();
-    let ledger = handle
-        .as_deref()
-        .and_then(DbHandle::optional)
-        .map(openvhost_core::mysql::InstallLedger::new);
+    let ledger = handle.as_deref().and_then(DbHandle::install_ledger);
     let emitter = app.clone();
     let for_event = major.as_str().to_string();
     let spawn_major = major.clone();

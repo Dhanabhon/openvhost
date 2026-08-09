@@ -374,13 +374,27 @@ pub fn run() {
                             // read it, so the failed arm is a real state this
                             // app has to render, not a footnote.
                             //
-                            // The HANDLE is managed on BOTH arms — unconditionally,
+                            // The HANDLE is managed on BOTH arms OF THE OPEN —
                             // exactly once, the same shape `stack_paths` uses below
                             // and for the same `Manager::manage`-never-overwrites
-                            // reason. Extraction therefore always succeeds and each
-                            // command answers for itself (`DbHandle::require` /
-                            // `optional`), instead of Tauri refusing the whole
-                            // command and telling a USER to call `.manage()`.
+                            // reason. Extraction therefore succeeds whichever way
+                            // the open went, and each command answers for itself
+                            // (`DbHandle::require` / `optional`) instead of Tauri
+                            // refusing the whole command and telling a USER to
+                            // call `.manage()`.
+                            //
+                            // Both arms of the OPEN, not unconditionally: this
+                            // line sits inside `resolve_home() == Ok(home)` and
+                            // `InstanceLock::acquire() == Ok(Some(lock))`. On a
+                            // second instance, a lock error, or an unresolvable
+                            // home, setup still returns `Ok(())`, the window is
+                            // still created, and NOTHING is managed — so every
+                            // command that extracts state, `state_store_status`
+                            // included, gets Tauri's `.manage()` string back and
+                            // the banner stays silent, because a failed ask
+                            // renders as silence by design. Closing that is a separate
+                            // slice: what a second instance's window should show
+                            // is a design question, not a fix to make here.
                             //
                             // The bare `Db` is deliberately NOT managed anywhere,
                             // on either arm: that is what makes a future

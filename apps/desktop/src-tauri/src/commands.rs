@@ -155,21 +155,27 @@ fn manage_store_down(app: &tauri::App<tauri::test::MockRuntime>) {
 /// which one broke instead of pointing at a line number.
 ///
 /// VACUITY, measured once here for every caller rather than restated at each
-/// of them. Three mutations, each run against every test that uses this
-/// function (13 of them, `store_down`/`uninstall_gate` filters):
+/// of them. The group is the **13** tests `cargo test store_is_down` selects,
+/// which is deliberately not the same set as this function's callers — 10 of
+/// the 13 call it, and the other three assert the same claims inline because
+/// they are checking a `Failed` DTO or a gate rather than an `IpcError`. Three
+/// mutations, each run against all 13:
 ///
 /// - `unavailable_message` reduced to `format!("{STORE_UNAVAILABLE}")` — the
-///   reason dropped: **all 13 failed** on the "carries the reason" claim.
+///   reason dropped: **12 of the 13 failed** on the "carries the reason" claim.
+///   The one that did not is `db_state`'s `state_store_status_reports_the_
+///   reason_when_the_store_is_down`, which reads `unavailable_reason()` and so
+///   never passes through `unavailable_message` — it guards the banner's
+///   sentence, not this one.
 /// - `unavailable_message` with ``". You must call `.manage()` before using
-///   this command."`` appended: **all 13 failed** on the third claim, with the
-///   first two still passing — so that claim is doing its own work.
+///   this command."`` appended: **the same 12 failed**, on the third claim,
+///   with the first two still passing — so that claim is doing its own work.
 /// - `store_down()` changed to hand back a real `DbHandle::Ready` over an
-///   in-memory store: **all 12 command-level tests failed** (the 13th is
-///   `db_state`'s own unit test, which builds its handle inline). This is the
-///   neuter that stands in for "the guard was removed" wherever removing it is
-///   not expressible — `require` is the only way to obtain a `&Db`, so for
-///   several of these commands there is no way to write the degraded version
-///   at all. That is design D6 holding, and it is why this mutation exists.
+///   in-memory store: **all 13 failed**. This is the neuter that stands in for
+///   "the guard was removed" wherever removing it is not expressible —
+///   `require` is the only way to obtain a `&Db`, so for several of these
+///   commands there is no way to write the degraded version at all. That is
+///   design D6 holding, and it is why this mutation exists.
 ///
 /// Each was reverted and re-run green.
 #[cfg(test)]

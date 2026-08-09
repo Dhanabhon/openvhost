@@ -45,7 +45,6 @@ use crate::commands::{
 };
 use crate::db_state::DbHandle;
 use crate::stack::StackPaths;
-use openvhost_core::Db;
 
 /// Where a listed runtime's binaries came from — the wire copy of
 /// `openvhost_core::mysql::MysqlRuntimeSource`.
@@ -485,7 +484,7 @@ pub async fn install_mysql(
         &app,
         &major,
         &p.home,
-        db.optional(),
+        db.inner(),
         lock.inner(),
         runtimes.inner(),
         sup.inner(),
@@ -505,14 +504,16 @@ async fn run_install(
     app: &tauri::AppHandle,
     major: &openvhost_core::mysql::MysqlMajor,
     home: &Path,
-    db: Option<&Db>,
+    db: &DbHandle,
     lock: &InstallLock,
     runtimes: &RwLock<Option<Vec<openvhost_core::mysql::MysqlRuntime>>>,
     sup: &Supervisor,
 ) -> Result<MysqlInstallOutcomeDto, IpcError> {
-    // `None` when the store never opened. `install_mysql_package` owns the
-    // reason it reports for the missing row; nothing is retyped here.
-    let ledger = db.map(openvhost_core::mysql::InstallLedger::new);
+    // `None` when the store never opened. `DbHandle::install_ledger` is the one
+    // named place that decision is made — nothing here may reach for `require`
+    // — and `install_mysql_package` owns the reason it reports for the missing
+    // row, so nothing is retyped here either.
+    let ledger = db.install_ledger();
     let emitter = app.clone();
     let for_event = major.as_str().to_string();
     let spawn_major = major.clone();

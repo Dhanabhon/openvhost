@@ -9,9 +9,20 @@
 //! reached a **user**, in a page that had lost all its rows and controls.
 //!
 //! [`DbHandle`] is what replaces it. **Both** arms of the open manage one, so
-//! extraction always succeeds and each command answers for itself — a typed,
-//! renderable refusal ([`DbHandle::require`]) or a degraded but real result
-//! ([`DbHandle::optional`]).
+//! extraction succeeds whichever way the open went and each command answers for
+//! itself — a typed, renderable refusal ([`DbHandle::require`]) or a degraded
+//! but real result ([`DbHandle::optional`]).
+//!
+//! **"Both arms of the open" is the whole claim, and it is narrower than
+//! "unconditionally".** `lib.rs`'s `app.manage` for this sits inside
+//! `resolve_home() == Ok(home)` *and* `InstanceLock::acquire() == Ok(Some(_))`.
+//! A second instance, a lock error, or a home that will not resolve all return
+//! `Ok(())` from setup with the window already created and **nothing at all
+//! managed** — so every command, `state_store_status` included, gets Tauri's own
+//! `.manage()` string back, and the banner stays silent because a failed ask
+//! renders as silence by design. That boot path is a separate slice's; this
+//! module only promises what it can, which is that opening the store cannot be
+//! the reason extraction fails.
 //!
 //! Two properties are load-bearing rather than incidental:
 //!
@@ -24,6 +35,7 @@
 //!    developer's, on the first invocation — it cannot reach a user (D6).
 
 use openvhost_core::Db;
+use openvhost_core::mysql::InstallLedger;
 
 use crate::commands::IpcError;
 
@@ -44,12 +56,15 @@ pub fn unavailable_message(reason: &str) -> String {
 
 /// The managed store: open, or absent with the reason it is absent.
 ///
-/// Managed **unconditionally and exactly once** — `Manager::manage` does not
-/// overwrite an existing value (its own doc example asserts
+/// Managed on **both arms of the open, and exactly once** — `Manager::manage`
+/// does not overwrite an existing value (its own doc example asserts
 /// `assert!(!app.manage(MyInt(1)))`), so a "manage `Unavailable` early, the
 /// real one later" split would silently pin every user to `Unavailable`.
 /// `Manager::unmanage` exists; it is deliberately not used to fake a
 /// re-manage.
+///
+/// Not *unconditionally*: the boot arms around that call can still leave this
+/// and every other managed value absent — see this module's header.
 pub enum DbHandle {
     /// `Db::open` succeeded at startup.
     Ready(Db),
@@ -83,6 +98,26 @@ impl DbHandle {
             DbHandle::Ready(db) => Some(db),
             DbHandle::Unavailable { .. } => None,
         }
+    }
+
+    /// DEGRADE, for the packaged installs: a ledger over the store, or `None`.
+    ///
+    /// The same decision [`optional`](Self::optional) expresses, named once for
+    /// the three callers that all make it — `mysql_pkg`, `mariadb_pkg` and
+    /// `php_pkg` each turned a handle into an [`InstallLedger`] inline, inside a
+    /// function taking `tauri::AppHandle` (= `AppHandle<Wry>`, which
+    /// `mock_builder` cannot construct). Nothing could reach that line, so an
+    /// edit putting [`require`](Self::require) where `optional` was — silently
+    /// turning a DEGRADE command back into a REFUSE — would first have shown up
+    /// on a real machine with a broken store. Here it is one function, tested on
+    /// both arms.
+    ///
+    /// What that does **not** cover, said plainly: the call sites still pass the
+    /// handle in, and no test can construct the `AppHandle<Wry>` needed to drive
+    /// them end to end. This moves the *decision* somewhere a test can reach it;
+    /// it does not move the wiring.
+    pub fn install_ledger(&self) -> Option<InstallLedger> {
+        self.optional().map(InstallLedger::new)
     }
 
     /// Why the store is unavailable, for a DEGRADE path that wants to say so.
@@ -183,6 +218,38 @@ mod tests {
         assert_eq!(handle.unavailable_reason(), Some("disk I/O error"));
     }
 
+    // ---- install_ledger: the one DEGRADE line with no other seam ----------
+    //
+    // Both directions, because either alone is satisfiable by a constant: a body
+    // hardcoded to `None` keeps `…_yields_no_ledger…` green while reddening
+    // `…_hands_the_install_paths_a_ledger`, and there is no way to hardcode
+    // `Some` at all — an `InstallLedger` cannot be built without a `&Db`, which
+    // is design D6 holding at the type level rather than by assertion.
+
+    #[tokio::test]
+    async fn a_ready_handle_hands_the_install_paths_a_ledger() {
+        let handle = DbHandle::Ready(Db::open_in_memory().await.expect("in-memory db"));
+
+        assert!(
+            handle.install_ledger().is_some(),
+            "a working store must produce the ledger the installs record into"
+        );
+    }
+
+    #[test]
+    fn an_unavailable_handle_yields_no_ledger_rather_than_refusing() {
+        let handle = DbHandle::Unavailable {
+            reason: "unable to open database file (os error 14)".into(),
+        };
+
+        // The whole D2/D4 point: `None`, not an error. The install still runs and
+        // reports `LedgerWrite::Failed`; it is not refused.
+        assert!(
+            handle.install_ledger().is_none(),
+            "a store that never opened must cost the ledger row, never the install"
+        );
+    }
+
     // ---- state_store_status: the banner's one input ----------------------
     //
     // Both directions, because a status command that answers the same thing
@@ -238,19 +305,64 @@ mod tests {
     // This is the cheap tripwire that says so at `cargo test` time instead of at
     // first click, and the design (§7) asks for exactly it.
     //
-    // Honest about its reach: it is a textual scan, so `State<'_, openvhost_
-    // core::Db>` or a type alias would slip past it. That is acceptable because
-    // it is the SECOND line of defence, not the first.
+    // Honest about its reach, measured by building each of these as a real
+    // registered command and watching the guard pass:
+    //
+    // - `State<'_, openvhost_core::Db>` — a fully qualified path. Still slips
+    //   past; it is a textual scan.
+    // - `use openvhost_core::Db as Store;` or a type alias — likewise.
+    // - `State<'a, Db>` on a command declared `fn f<'a>(…)`. This one used to
+    //   slip past and no longer does: the scan matches the SHAPE, any lifetime
+    //   name, not the literal `'_`. It was the cheapest of the three to close,
+    //   and the only one where the evading code looks entirely ordinary.
+    //
+    // The two that remain are acceptable because this is the SECOND line of
+    // defence, not the first.
 
-    /// Written split so that scanning this very file does not find the scanner.
-    /// `db_state.rs` is in the list on purpose — it defines a command now — and
-    /// the needle is compared against whitespace-stripped code, so a single
-    /// literal here would match itself and fail forever.
-    const BARE_DB_STATE: &str = concat!("State<'_,", "Db>");
+    /// Whether a whitespace-stripped line declares `State<'…, T>`, where `tail`
+    /// is the `,T>` being looked for — for **any** lifetime, `'_` included.
+    ///
+    /// A shape match rather than one literal, because `'_` is not the only
+    /// lifetime that compiles in that position (see the note above). The pieces
+    /// are spelled with `concat!` here and at the call sites so that scanning
+    /// this very file does not find the scanner: `db_state.rs` is in
+    /// `COMMAND_FILES` on purpose — it defines a command now — and a single
+    /// literal would match itself and fail forever.
+    fn declares_state(squeezed: &str, tail: &str) -> bool {
+        let head = concat!("State", "<'");
+        let mut rest = squeezed;
+        while let Some(at) = rest.find(head) {
+            let after = &rest[at + head.len()..];
+            // The lifetime's own name: `_`, or an identifier.
+            let name_end = after
+                .find(|c: char| !c.is_alphanumeric() && c != '_')
+                .unwrap_or(after.len());
+            if name_end > 0 && after[name_end..].starts_with(tail) {
+                return true;
+            }
+            rest = after;
+        }
+        false
+    }
+
+    /// The `,T>` tail of the parameter no command may take.
+    fn bare_db_tail() -> &'static str {
+        concat!(",", "Db>")
+    }
+
+    /// The `,T>` tail of the parameter every command takes instead.
+    fn db_handle_tail() -> &'static str {
+        concat!(",", "DbHandle>")
+    }
 
     /// Every file in this crate that defines a `#[tauri::command]`, plus
     /// `lib.rs` (which defines none today, but holds `collect_commands!` and is
     /// where a stray one would most plausibly land).
+    ///
+    /// **Hand-maintained, and that is this guard's widest gap** — a brand new
+    /// `*_pkg.rs` full of commands would simply not be scanned, and nothing here
+    /// would say so. `every_registered_command_lives_in_a_scanned_file` below is
+    /// what notices, by tying this list's attribute count to `collect_commands!`.
     const COMMAND_FILES: &[(&str, &str)] = &[
         ("commands.rs", include_str!("commands.rs")),
         ("db_state.rs", include_str!("db_state.rs")),
@@ -261,14 +373,16 @@ mod tests {
         ("lib.rs", include_str!("lib.rs")),
     ];
 
-    /// `(file, line number, line)` for every CODE line containing `needle`.
+    /// `(file, line number, line)` for every CODE line `matches` accepts, the
+    /// line being whitespace-stripped before it is offered.
     ///
-    /// Whole-line comments are skipped and nothing else is: four `//` lines in
-    /// this crate document the very property being guarded, and deleting them to
-    /// make a test easier would be the wrong trade. A trailing comment on a code
-    /// line would still trip the scan — deliberately, since that is the failing
-    /// direction that is safe to be wrong in.
-    fn code_hits(needle: &str) -> Vec<(&'static str, usize, String)> {
+    /// Whole-line comments are skipped and nothing else is: six `//` lines
+    /// across three files in this crate document the very property being
+    /// guarded, and deleting them to make a test easier would be the wrong
+    /// trade. A trailing comment on a code line would still trip the scan —
+    /// deliberately, since that is the failing direction that is safe to be
+    /// wrong in.
+    fn code_hits(matches: impl Fn(&str) -> bool) -> Vec<(&'static str, usize, String)> {
         let mut hits = Vec::new();
         for (name, src) in COMMAND_FILES {
             for (i, line) in src.lines().enumerate() {
@@ -276,7 +390,7 @@ mod tests {
                     continue;
                 }
                 let squeezed: String = line.chars().filter(|c| !c.is_whitespace()).collect();
-                if squeezed.contains(needle) {
+                if matches(&squeezed) {
                     hits.push((*name, i + 1, line.trim().to_string()));
                 }
             }
@@ -286,7 +400,7 @@ mod tests {
 
     #[test]
     fn no_command_takes_a_bare_db_as_managed_state() {
-        let hits = code_hits(BARE_DB_STATE);
+        let hits = code_hits(|line| declares_state(line, bare_db_tail()));
         assert!(
             hits.is_empty(),
             "a command took `Db` as managed state again — `Db` is managed nowhere, \
@@ -299,16 +413,18 @@ mod tests {
     ///
     /// Without this, `no_command_takes_a_bare_db_as_managed_state` would pass
     /// just as happily if `code_hits` were looking at nothing — a mis-joined
-    /// path, an over-eager comment filter, a needle whose spacing never matches.
-    /// So: the SAME scanner, on the SAME files, must find the parameter the
-    /// commands actually take.
+    /// path, an over-eager comment filter, a shape match whose lifetime rule
+    /// never fires. So: the SAME scanner, on the SAME files, must find the
+    /// parameter the commands actually take.
     #[test]
     fn the_scan_reads_real_code_rather_than_finding_nothing_everywhere() {
-        let handles = code_hits(concat!("State<'_,", "DbHandle>"));
+        let handles = code_hits(|line| declares_state(line, db_handle_tail()));
         assert!(
             handles.len() > 20,
-            "the scan should see every `State<'_, DbHandle>` parameter (27 of them \
-             when this was written); it found {}: {handles:#?}",
+            "the scan should see every `State<'_, DbHandle>` parameter — 28 when this \
+             was written, the 27 migrated commands plus `state_store_status`'s own, and \
+             it reports 30 because two of this test module's own assertion strings spell \
+             the parameter out. It found {}: {handles:#?}",
             handles.len()
         );
         assert!(
@@ -319,10 +435,10 @@ mod tests {
 
     /// The prose stays, and does not defeat the scan.
     ///
-    /// Four comment lines in this crate spell out `State<'_, Db>` while
-    /// explaining why no command may take one. They are the documentation of the
-    /// property; a guard that could be satisfied by deleting them would be
-    /// guarding the wrong thing.
+    /// Six comment lines across three files in this crate spell out
+    /// `State<'_, Db>` while explaining why no command may take one — this very
+    /// line among them. They are the documentation of the property; a guard that
+    /// could be satisfied by deleting them would be guarding the wrong thing.
     #[test]
     fn the_scan_is_not_fooled_by_comments_that_name_the_forbidden_parameter() {
         let spaced = concat!("State<'_, ", "Db>");
@@ -337,8 +453,63 @@ mod tests {
              either they were deleted, or this test is no longer proving anything"
         );
         assert!(
-            code_hits(BARE_DB_STATE).is_empty(),
+            code_hits(|line| declares_state(line, bare_db_tail())).is_empty(),
             "…and yet the scan reported a hit, so it is counting prose as code"
+        );
+    }
+
+    /// The scanned list is the registered list.
+    ///
+    /// `COMMAND_FILES` is hand-maintained, which makes every guard above only as
+    /// complete as it is: a new `*_pkg.rs` full of commands is not scanned, and
+    /// nothing else notices — the likeliest way this whole block quietly stops
+    /// covering the command surface. So tie it to the one place a command must
+    /// ALSO appear to exist at all, `lib.rs`'s `collect_commands!`: a registered
+    /// command in an unscanned file makes these two counts disagree.
+    ///
+    /// Equality, not `>=`, so it fails in both directions — a command defined
+    /// but never registered is dead code, and worth hearing about too.
+    ///
+    /// `db_state.rs` scans itself, so both needles are split across `concat!`
+    /// and the failure message interpolates `attribute` rather than spelling it:
+    /// a literal in either place counts as one more definition, which is exactly
+    /// how this test first failed at 51 against 50.
+    #[test]
+    fn every_registered_command_lives_in_a_scanned_file() {
+        let attribute = concat!("#[tauri::", "command]");
+        let defined: usize = COMMAND_FILES
+            .iter()
+            .map(|(_, src)| {
+                src.lines()
+                    .filter(|l| !l.trim_start().starts_with("//") && l.contains(attribute))
+                    .count()
+            })
+            .sum();
+
+        let lib = COMMAND_FILES
+            .iter()
+            .find(|(name, _)| *name == "lib.rs")
+            .expect("lib.rs is scanned")
+            .1;
+        let at = lib
+            .find(concat!("collect_", "commands!["))
+            .expect("lib.rs must register the command surface");
+        let registered = lib[at..]
+            .lines()
+            .skip(1)
+            .take_while(|l| !l.trim_start().starts_with("])"))
+            .filter(|l| {
+                let t = l.trim();
+                !t.is_empty() && !t.starts_with("//")
+            })
+            .count();
+
+        assert_eq!(
+            defined, registered,
+            "{defined} `{attribute}` definitions across COMMAND_FILES but \
+             {registered} entries in `collect_commands!`. Either a command lives in a \
+             file COMMAND_FILES does not list — in which case none of the guards above \
+             are looking at it — or one is defined and never registered."
         );
     }
 }

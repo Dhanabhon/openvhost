@@ -103,6 +103,12 @@ that reads wrong in use.
 Four signatures. The alternative is making the two installs REFUSE, which is a real regression
 against `php_pkg`'s own stated principle — accepted rather than silently dropped.
 
+**Fix wave, +2 signatures: nginx as well.** `install_nginx_package`/`install_entry` were the one
+packaged engine left on `&InstallLedger`. No desktop command reaches them today, so this changes no
+behaviour — it is widened *with* the other three rather than after, because the day an
+`install_nginx` command lands, the narrow signature would make it the only install that refuses on a
+degraded store, contradicting the principle this section is written to defend.
+
 ## 6. D5 — DEGRADE is dishonest without one app-level banner
 
 A shorter `list_log_sources` result is indistinguishable from *"you have no sites"*. That is a quiet
