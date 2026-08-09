@@ -376,6 +376,21 @@ mod tests {
     /// production build has no dependency on `build/`.
     const RECIPE: &str = include_str!("../../../../../build/recipes/nginx.sh");
 
+    /// The build manifest the driver wrote beside the tarball this entry pins,
+    /// committed under `build/manifests/` and read at compile time. The recipe
+    /// above says what a build *would* do; this says what one *did*, and it is
+    /// the only thing in the repository that ties `sha256` below to an account
+    /// of how those bytes were produced. Test-only, like `RECIPE`.
+    const MANIFEST: &str =
+        include_str!("../../../../../build/manifests/nginx-1.30.4-macos-arm64.manifest.json");
+
+    /// nginx's release-signing key primary fingerprint, restated here so it can
+    /// be checked rather than merely stated in the PROVENANCE prose above. At
+    /// module scope because both the recipe tripwire and the manifest agreement
+    /// test check it: two literals of one fact is the drift this group exists
+    /// to catch.
+    const SIGNING_KEY_FPR: &str = "43387825DDB1BB97EC36BA5D007C8D7C15D87369";
+
     // ------------------------------------------------------------------
     // Group 1 — the pinned entry, byte for byte.
     //
@@ -513,9 +528,6 @@ mod tests {
     #[test]
     fn the_tripwire_dates_agree_with_the_recipe_that_built_the_bytes() {
         let e = &NGINX_PACKAGES[0];
-        // nginx's release-signing key primary fingerprint, restated here so it
-        // can be checked rather than merely stated in the PROVENANCE prose above.
-        const SIGNING_KEY_FPR: &str = "43387825DDB1BB97EC36BA5D007C8D7C15D87369";
         for (field, want) in [
             (
                 "RECIPE_UPSTREAM_RELEASE_DATE",
@@ -549,6 +561,63 @@ mod tests {
         assert!(RECIPE.len() > 1000, "recipe read as {} bytes", RECIPE.len());
         assert!(!RECIPE.contains("RECIPE_UPSTREAM_RELEASE_DATE=\"1970-01-01\""));
         assert!(RECIPE.contains("nginx"), "that is not the nginx recipe");
+    }
+
+    /// The committed manifest is the record of how the pinned bytes were made,
+    /// and `output.sha256` is what ties that record to them — every other
+    /// assertion here is secondary to it. Until `build/manifests/` existed, no
+    /// file in this repository named this digest except the entry below, so the
+    /// account of its provenance was prose. This makes a pin bumped without its
+    /// manifest, or a manifest swapped for another build's, a test failure.
+    ///
+    /// Vacuity: `serde_json::from_str` is a real parse, so a truncated or
+    /// malformed manifest fails here rather than quietly satisfying a substring
+    /// search, and a missing key deserialises to `Value::Null`, whose `as_str()`
+    /// is `None` and never equals the `Some(_)` expected. No separate
+    /// non-vacuity twin is written: there is no way for this test to pass
+    /// without a real manifest for this artifact, so a twin asserting that
+    /// would be a check whose passing is guaranteed by the same fact that makes
+    /// its failure invisible.
+    #[test]
+    fn the_committed_manifest_describes_the_bytes_this_entry_pins() {
+        let e = &NGINX_PACKAGES[0];
+        let m: serde_json::Value = serde_json::from_str(MANIFEST)
+            .expect("build/manifests/nginx-1.30.4-macos-arm64.manifest.json is not valid JSON");
+        assert_eq!(
+            m["output"]["sha256"].as_str(),
+            Some(e.sha256),
+            "the committed manifest records output.sha256 {:?}, but this entry pins {:?}; \
+             either the pin moved without its manifest, or the manifest is another \
+             build's",
+            m["output"]["sha256"].as_str(),
+            e.sha256
+        );
+        for (field, got, want) in [
+            ("name", m["name"].as_str(), NGINX_PACKAGE_NAME),
+            ("version", m["version"].as_str(), e.version),
+            (
+                "upstream.release_date",
+                m["upstream"]["release_date"].as_str(),
+                e.upstream_released_on,
+            ),
+            (
+                "upstream.last_checked",
+                m["upstream"]["last_checked"].as_str(),
+                e.last_checked_on,
+            ),
+            (
+                "upstream.signing_key_fingerprint",
+                m["upstream"]["signing_key_fingerprint"].as_str(),
+                SIGNING_KEY_FPR,
+            ),
+        ] {
+            assert_eq!(
+                got,
+                Some(want),
+                "the committed manifest and this catalogue disagree about {field}: \
+                 manifest {got:?}, catalogue {want:?}"
+            );
+        }
     }
 
     // ------------------------------------------------------------------

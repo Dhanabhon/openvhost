@@ -38,3 +38,14 @@ apps/desktop/src-tauri/gen/
 /build/**/*.tgz
 /build/**/*.sha256
 /build/**/*.manifest.json
+
+# Carved back out: the manifest of record for each pinned artifact. This is the
+# one exception, and it is not a hole in the rule above — an artifact is 2.7 MB
+# to 125 MB of bytes we must never ship in git (golden rule 6), while a 3.6 KB
+# JSON record of *how* one was made is the provenance the pin otherwise rests on
+# in prose alone. `/build/out/` stays excluded outright, so a manifest sitting in
+# the driver's own output directory is still ignored; only the curated directory
+# is tracked. The negation works because no parent directory of it is excluded —
+# git cannot re-include a file under an excluded directory — verified with
+# `git check-ignore -v`, not assumed.
+!/build/manifests/*.manifest.json

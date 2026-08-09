@@ -357,6 +357,28 @@ mod tests {
     /// production build has no dependency on `build/`.
     const RECIPE: &str = include_str!("../../../../../build/recipes/mariadb.sh");
 
+    /// The build manifest the driver wrote beside the tarball this entry pins,
+    /// committed under `build/manifests/` and read at compile time. The recipe
+    /// above says what a build *would* do; this says what one *did*, and it is
+    /// the only thing in the repository that ties `sha256` below to an account
+    /// of how those bytes were produced. Test-only, like `RECIPE`.
+    ///
+    /// This one is a repack (`resumed_from: "pack"`, `configure_flags: []`, no
+    /// `dependencies` block) — how PR #67 re-cut this pin, and a true account
+    /// of that run rather than a degraded copy of a better file. See
+    /// `build/manifests/README.md`.
+    const MANIFEST: &str =
+        include_str!("../../../../../build/manifests/mariadb-11.4.9-macos-arm64.manifest.json");
+
+    /// MariaDB's release-signing key primary fingerprint and the pinned digest
+    /// of upstream's source tarball, restated here so they are checked rather
+    /// than merely stated in the PROVENANCE prose above. Both are facts the
+    /// recipe and the manifest each record independently, and until now this
+    /// catalogue bound neither — only the two dates — while nginx's twin bound
+    /// its key and PHP's bound version, digest and key together.
+    const SIGNING_KEY_FPR: &str = "177F4010FE56CA3336300305F1656F24C74CD1D8";
+    const SOURCE_SHA256: &str = "8e481ca29b5a740444d45451c8ea2d93711cf525d6fa5d27bc9512cf8973b075";
+
     // ------------------------------------------------------------------
     // Group 1 — the pinned entry, byte for byte.
     //
@@ -486,6 +508,15 @@ mod tests {
     /// that produced the bytes — and two records of one fact drift. Reading the
     /// recipe makes that drift a test failure instead of a discrepancy nobody
     /// notices during a CVE response.
+    ///
+    /// Levelled 2026-08-09 to bind what the other two catalogues bind. It
+    /// checked the two dates and nothing else, while nginx's twin also bound
+    /// its signing-key fingerprint and PHP's bound version, source digest and
+    /// key fingerprint together — so a MariaDB key rotation or a re-pinned
+    /// source tarball could move in the recipe with this test staying green,
+    /// which is precisely the drift it exists to refuse. The fingerprint
+    /// matters more than either date: it is what `bp_gpg_verify_signature`
+    /// actually verified the source against.
     #[test]
     fn the_tripwire_dates_agree_with_the_recipe_that_built_the_bytes() {
         let e = &MARIADB_PACKAGES[0];
@@ -500,6 +531,14 @@ mod tests {
             (
                 "RECIPE_LAST_CHECKED",
                 format!("RECIPE_LAST_CHECKED=\"{}\"", e.last_checked_on),
+            ),
+            (
+                "RECIPE_SIGNING_KEY_FPR",
+                format!("RECIPE_SIGNING_KEY_FPR=\"{SIGNING_KEY_FPR}\""),
+            ),
+            (
+                "RECIPE_SOURCE_SHA256",
+                format!("RECIPE_SOURCE_SHA256=\"{SOURCE_SHA256}\""),
             ),
         ] {
             assert!(
@@ -518,6 +557,72 @@ mod tests {
         assert!(RECIPE.len() > 1000, "recipe read as {} bytes", RECIPE.len());
         assert!(!RECIPE.contains("RECIPE_UPSTREAM_RELEASE_DATE=\"1970-01-01\""));
         assert!(RECIPE.contains("mariadb"), "that is not the MariaDB recipe");
+    }
+
+    /// The committed manifest is the record of how the pinned bytes were made,
+    /// and `output.sha256` is what ties that record to them — every other
+    /// assertion here is secondary to it. Until `build/manifests/` existed, no
+    /// file in this repository named this digest except the entry below, so the
+    /// account of its provenance was prose. This makes a pin bumped without its
+    /// manifest, or a manifest swapped for another build's, a test failure.
+    ///
+    /// `upstream.sha256` is checked too: this manifest is a repack and so
+    /// carries no `configure_flags`, which leaves the source digest as the
+    /// strongest statement it makes about what went *into* the artifact.
+    ///
+    /// Vacuity: `serde_json::from_str` is a real parse, so a truncated or
+    /// malformed manifest fails here rather than quietly satisfying a substring
+    /// search, and a missing key deserialises to `Value::Null`, whose `as_str()`
+    /// is `None` and never equals the `Some(_)` expected. No separate
+    /// non-vacuity twin is written: there is no way for this test to pass
+    /// without a real manifest for this artifact, so a twin asserting that
+    /// would be a check whose passing is guaranteed by the same fact that makes
+    /// its failure invisible.
+    #[test]
+    fn the_committed_manifest_describes_the_bytes_this_entry_pins() {
+        let e = &MARIADB_PACKAGES[0];
+        let m: serde_json::Value = serde_json::from_str(MANIFEST)
+            .expect("build/manifests/mariadb-11.4.9-macos-arm64.manifest.json is not valid JSON");
+        assert_eq!(
+            m["output"]["sha256"].as_str(),
+            Some(e.sha256),
+            "the committed manifest records output.sha256 {:?}, but this entry pins {:?}; \
+             either the pin moved without its manifest, or the manifest is another \
+             build's",
+            m["output"]["sha256"].as_str(),
+            e.sha256
+        );
+        for (field, got, want) in [
+            ("name", m["name"].as_str(), MARIADB_PACKAGE_NAME),
+            ("version", m["version"].as_str(), e.version),
+            (
+                "upstream.release_date",
+                m["upstream"]["release_date"].as_str(),
+                e.upstream_released_on,
+            ),
+            (
+                "upstream.last_checked",
+                m["upstream"]["last_checked"].as_str(),
+                e.last_checked_on,
+            ),
+            (
+                "upstream.signing_key_fingerprint",
+                m["upstream"]["signing_key_fingerprint"].as_str(),
+                SIGNING_KEY_FPR,
+            ),
+            (
+                "upstream.sha256",
+                m["upstream"]["sha256"].as_str(),
+                SOURCE_SHA256,
+            ),
+        ] {
+            assert_eq!(
+                got,
+                Some(want),
+                "the committed manifest and this catalogue disagree about {field}: \
+                 manifest {got:?}, catalogue {want:?}"
+            );
+        }
     }
 
     // ------------------------------------------------------------------
