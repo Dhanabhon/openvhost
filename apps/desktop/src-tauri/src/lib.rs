@@ -3,6 +3,12 @@
 //! and events. The supervisor lives here as managed state; openvhost-proc
 //! stays tauri-free and this crate owns the bridge.
 
+/// How far the boot got (degraded-boot design D1): the `BootState` this crate
+/// manages exactly once — outside every arm — the `bootstrap` that produces one
+/// on every path, and the pure rendering decision behind the takeover screen.
+/// See its own module doc for why the three bail arms stopped being
+/// `eprintln!`-and-fall-through.
+mod boot;
 // Putting the `openvhost` CLI on the user's PATH (P1 CLI-install design):
 // resolve the sibling binary, classify what is already at
 // `<candidate>/openvhost`, and install a symlink atomically. `pub` because
@@ -64,15 +70,14 @@ mod uninstall;
 // targets.
 #[cfg(debug_assertions)]
 use std::ffi::OsString;
-use std::sync::Arc;
 
 #[cfg(debug_assertions)]
 use openvhost_proc::{DEFAULT_GRACE, ReadinessProbe, ServiceSpec, SpawnSpec};
-use openvhost_proc::{
-    FileRegistry, InstanceLock, Supervisor, SupervisorEvent, default_driver, default_reaper,
-};
 use tauri::Manager;
-use tauri_specta::{Builder, Event, collect_commands, collect_events};
+// No `Event`: the trait's `emit` had exactly one caller in this file, the
+// supervisor-event pump, and that moved to `boot::bootstrap` with the rest of
+// the supervisor bootstrap. `collect_events!` names the types, not the trait.
+use tauri_specta::{Builder, collect_commands, collect_events};
 
 /// Build the specta command collection shared by `run()` (dev-time export)
 /// and the `export_bindings` test (committed-bindings regeneration) — kept
@@ -85,6 +90,11 @@ fn specta_builder() -> Builder<tauri::Wry> {
             // question — "what is true of this app right now?" — for every
             // route at once, rather than for a page (optional-state.db D5).
             db_state::state_store_status,
+            // Sits beside `state_store_status` for the same reason it sits
+            // beside `core_info`, one question wider again: how far the app
+            // got before any page asked anything (degraded-boot D1). The only
+            // command on this surface that answers on EVERY boot path.
+            boot::boot_status,
             commands::list_services,
             commands::start_service,
             commands::stop_service,
@@ -178,8 +188,14 @@ fn specta_builder() -> Builder<tauri::Wry> {
 /// so this stays registered for tests and ordinary `cargo run`/`tauri dev`
 /// and disappears ONLY from a `--release` build — exactly the one profile
 /// real users run.
+///
+/// `pub(crate)` rather than private: the one caller is `boot::bootstrap`, which
+/// took the supervisor bootstrap out of this file (degraded-boot D1). The spec
+/// itself stays here because everything it names — the sibling CLI binary, the
+/// dev-only profile gate — is about this executable, not about how far the boot
+/// got.
 #[cfg(debug_assertions)]
-fn demo_ticker_spec() -> ServiceSpec {
+pub(crate) fn demo_ticker_spec() -> ServiceSpec {
     let cli = std::env::current_exe()
         .ok()
         .and_then(|p| {
@@ -279,8 +295,23 @@ pub fn run() {
                 // the zombie process keeps holding the single-instance run
                 // lock forever, so every later launch attempt boots
                 // permanently degraded instead of replacing it.
+                //
+                // `Ready`-ONLY (degraded-boot design D6), and for the same
+                // class of reason: the tray is built inside `bootstrap`'s
+                // `Ready` arm alone, so a closed DEGRADED window that hid
+                // itself would be a hidden zombie with nothing left to reveal
+                // it — the takeover screen the user was reading would simply
+                // vanish, and the process would go on holding whatever it
+                // holds. `boot::hides_on_close` fails closed on an unmanaged
+                // state, which cannot happen here (`setup` runs before the
+                // event loop) but is the non-trapping direction to be wrong in.
                 #[cfg(target_os = "macos")]
-                if let Err(e) =
+                if boot::hides_on_close(
+                    window
+                        .app_handle()
+                        .try_state::<boot::BootState>()
+                        .as_deref(),
+                ) && let Err(e) =
                     quit::hide_instead_of_close(|| window.hide(), || api.prevent_close())
                 {
                     eprintln!(
@@ -355,309 +386,18 @@ pub fn run() {
             // can reach it.
             app.manage(quit::Quitting::default());
 
-            // Single-instance lock (design spec §7): reap MUST run only
-            // while this is held, otherwise a second live instance would
-            // reap the first's HEALTHY services (identity matches — it
-            // really is their process — but the "orphan" premise is false).
-            match openvhost_core::resolve_home() {
-                Ok(home) => {
-                    let run_dir = home.join("run");
-                    match InstanceLock::acquire(&run_dir) {
-                        Ok(Some(lock)) => {
-                            // Keep the lock alive for the app's lifetime — dropping
-                            // it releases the flock and lets a later instance
-                            // acquire it.
-                            app.manage(lock);
-                            // Open the persistent state store best-effort: a
-                            // missing/unreadable state.db must never stop the
-                            // supervisor from starting. Twenty-seven commands
-                            // read it, so the failed arm is a real state this
-                            // app has to render, not a footnote.
-                            //
-                            // The HANDLE is managed on BOTH arms OF THE OPEN —
-                            // exactly once, the same shape `stack_paths` uses below
-                            // and for the same `Manager::manage`-never-overwrites
-                            // reason. Extraction therefore succeeds whichever way
-                            // the open went, and each command answers for itself
-                            // (`DbHandle::require` / `optional`) instead of Tauri
-                            // refusing the whole command and telling a USER to
-                            // call `.manage()`.
-                            //
-                            // Both arms of the OPEN, not unconditionally: this
-                            // line sits inside `resolve_home() == Ok(home)` and
-                            // `InstanceLock::acquire() == Ok(Some(lock))`. On a
-                            // second instance, a lock error, or an unresolvable
-                            // home, setup still returns `Ok(())`, the window is
-                            // still created, and nothing beyond the six values
-                            // managed above this match is managed. So every
-                            // command that extracts state managed INSIDE this
-                            // arm fails with Tauri's `.manage()` string — every
-                            // `DbHandle`, `Arc<Supervisor>`, `Option<StackPaths>`
-                            // and runtime-cache reader — while the four that
-                            // extract only the unconditional `InstallLock`
-                            // (`pending_install` and the three
-                            // `cancel_*_install`) still answer normally.
-                            // `state_store_status` is a `DbHandle` reader, so it
-                            // refuses too and the banner stays silent, because a
-                            // failed ask renders as silence by design. Closing
-                            // that is a separate slice: what a second instance's
-                            // window should show is a design question, not a fix
-                            // to make here.
-                            //
-                            // The bare `Db` is deliberately NOT managed anywhere,
-                            // on either arm: that is what makes a future
-                            // `State<'_, Db>` parameter fail on every machine
-                            // rather than only on a broken one (design D6).
-                            let db = match tauri::async_runtime::block_on(
-                                openvhost_core::Db::open(&home),
-                            ) {
-                                Ok(db) => db_state::DbHandle::Ready(db),
-                                Err(e) => {
-                                    let reason = e.to_string();
-                                    // Kept for the developer running from a
-                                    // terminal, and worded from the same shared
-                                    // sentence the refusals and the banner use —
-                                    // one condition, one wording.
-                                    eprintln!(
-                                        "openvhost: {}",
-                                        db_state::unavailable_message(&reason)
-                                    );
-                                    db_state::DbHandle::Unavailable { reason }
-                                }
-                            };
-                            app.manage(db);
-                            let registry = Arc::new(FileRegistry::new(&run_dir));
-                            let supervisor = Arc::new(Supervisor::with_orphan_cleanup(
-                                default_driver(),
-                                registry,
-                                default_reaper(),
-                            ));
-                            #[cfg(debug_assertions)]
-                            supervisor.register(demo_ticker_spec());
-                            #[cfg(target_os = "macos")]
-                            let (stack_paths, stack_runtimes, mysql_runtimes, mariadb_runtimes, nginx_source) = {
-                                let stack = stack::macos_stack();
-                                for spec in stack.specs {
-                                    supervisor.register(spec);
-                                }
-                                (
-                                    stack.paths,
-                                    stack.runtimes,
-                                    stack.mysql_runtimes,
-                                    stack.mariadb_runtimes,
-                                    stack.nginx_source,
-                                )
-                            };
-                            // No stack builder for this target yet, so `None` is the
-                            // NORMAL state here — the home resolved fine, there is
-                            // simply nothing to point the Web Server page at. See
-                            // `commands::stack_paths` for the message that renders.
-                            #[cfg(not(target_os = "macos"))]
-                            let (stack_paths, stack_runtimes, mysql_runtimes, mariadb_runtimes, nginx_source): (
-                                Option<stack::StackPaths>,
-                                Option<openvhost_core::InstalledRuntimes>,
-                                Option<Vec<openvhost_core::mysql::MysqlRuntime>>,
-                                Option<Vec<openvhost_core::mariadb::MariadbRuntime>>,
-                                Option<openvhost_core::nginx::NginxRuntimeSource>,
-                            ) = (None, None, None, None, None);
-                            // Manage the Option ITSELF, unconditionally. Tauri implements
-                            // `CommandArg` only for `State<'r, T>` — there is no impl for
-                            // `Option<State<'r, T>>` — so a command cannot take an
-                            // optionally-managed state. Making `Option<StackPaths>` the
-                            // managed type is what lets a command distinguish "no stack on
-                            // this platform" from "not wired up", while always having
-                            // something to extract.
-                            //
-                            // Exactly ONE `manage` call per state type: `Manager::manage`
-                            // does NOT overwrite an existing value (its own doc example
-                            // asserts `assert!(!app.manage(MyInt(1)))`), so a "manage None
-                            // early, the real value later" split would silently pin every
-                            // user to `None`.
-                            app.manage(stack_paths);
-                            // Nginx source design D2: managed the same "bare `Option`,
-                            // exactly once" shape as `stack_paths` above rather than the
-                            // `RwLock`-wrapped shape the three lists below use — nothing in
-                            // this slice rescans or reinstalls nginx after launch, so unlike
-                            // those three there is no later writer to guard against.
-                            // `list_web_servers` reads this instead of re-discovering, for
-                            // the same reason `stack_paths` itself exists: a fresh walk could
-                            // disagree with the binary the supervisor actually registered if
-                            // `current` moved after launch.
-                            app.manage(nginx_source);
-                            // Same `Option<T>`-managed-unconditionally shape as `stack_paths`
-                            // above, for the same reason: `Manager::manage` never overwrites,
-                            // so every arm must yield a value rather than some arms skipping
-                            // the call. `None` on a target with no stack builder, or when the
-                            // php-fpm version could not be probed (see `stack::macos_stack`'s
-                            // doc comment) — either way a later command that reads this state
-                            // sees an honest absence rather than a stale value from a call
-                            // that never happened.
-                            //
-                            // Wrapped in an `RwLock` (unlike `stack_paths` above): Tauri's
-                            // managed state cannot be replaced once set, but the installed PHP
-                            // runtimes CAN change after launch — the Languages page installs a
-                            // version at runtime, and the apply pipeline must see it without a
-                            // relaunch. The lock is the seam a later rescan/install writes
-                            // through; every reader here just takes the read side.
-                            app.manage(std::sync::RwLock::new(stack_runtimes));
-                            // Same reasoning as `stack_runtimes` above, for MySQL's own
-                            // runtime list (P1 MySQL lifecycle design): `install_mysql`/
-                            // `rescan_mysql` write through this after launch, and
-                            // `initialize_mysql`/`reset_mysql_root_password`/
-                            // `verify_mysql_connection` read it rather than re-probing.
-                            app.manage(std::sync::RwLock::new(mysql_runtimes));
-                            // Same reasoning again, for MariaDB's own runtime list (P1
-                            // MariaDB UI design D7): `install_mariadb`/`rescan_mariadb`
-                            // write through this after launch, and
-                            // `initialize_mariadb`/`reset_mariadb_root_password`/
-                            // `verify_mariadb_connection` read it rather than re-probing.
-                            app.manage(std::sync::RwLock::new(mariadb_runtimes));
-                            let mut rx = supervisor.subscribe();
-                            let handle = app.handle().clone();
-                            tauri::async_runtime::spawn(async move {
-                                loop {
-                                    match rx.recv().await {
-                                        Ok(SupervisorEvent::StateChanged { id, state, detail }) => {
-                                            let _ = commands::ServiceStateEvent { id, state, detail }
-                                                .emit(&handle);
-                                        }
-                                        Ok(SupervisorEvent::Log {
-                                            id,
-                                            ts_ms,
-                                            level,
-                                            line,
-                                        }) => {
-                                            let _ = commands::ServiceLogEvent {
-                                                id,
-                                                ts_ms,
-                                                level,
-                                                line,
-                                            }
-                                            .emit(&handle);
-                                        }
-                                        Ok(SupervisorEvent::Registered { status }) => {
-                                            let _ = commands::ServiceRegisteredEvent { status }
-                                                .emit(&handle);
-                                        }
-                                        Ok(SupervisorEvent::Unregistered { id }) => {
-                                            let _ = commands::ServiceUnregisteredEvent { id }
-                                                .emit(&handle);
-                                        }
-                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                                            continue;
-                                        }
-                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                                    }
-                                }
-                            });
-                            // Best-effort, like the state.db open above: a
-                            // menu-bar tray is a quality-of-life feature, not
-                            // a boot-blocking one, so a failure here is
-                            // logged and the app continues without it rather
-                            // than aborting the whole bootstrap. Gated to
-                            // macOS only (P1 tray design, spec D10 — Windows
-                            // is out for this slice; see `tray`'s own module
-                            // docs for what a Windows-enablement slice still
-                            // needs to do). `Arc::clone`, not a move: `Db`
-                            // was NOT similarly needed again, but `supervisor`
-                            // itself is moved into `app.manage` on the very
-                            // next line.
-                            #[cfg(target_os = "macos")]
-                            if let Err(e) = tray::build(app.handle(), Arc::clone(&supervisor)) {
-                                eprintln!(
-                                    "openvhost: failed to build the tray icon ({e}); continuing without it"
-                                );
-                            }
-
-                            // The local control socket the `openvhost` CLI
-                            // connects to (P1 CLI design, spec D1). Bound
-                            // INSIDE this arm on purpose: the socket must
-                            // exist if and only if a supervisor does, so the
-                            // degraded-boot arms below — instance lock held
-                            // elsewhere, or no resolvable home — deliberately
-                            // do NOT bind, and a CLI meeting no socket
-                            // correctly reports "the app is not running"
-                            // rather than reaching a second, supervisor-less
-                            // instance.
-                            //
-                            // Best-effort, exactly like the state.db open and
-                            // the tray above: a control socket is how a
-                            // terminal drives this app, not how the app
-                            // works. A bind failure (a stale non-socket file
-                            // at the path, an over-long OPENVHOST_HOME, a
-                            // non-unix target) is logged and the GUI carries
-                            // on.
-                            //
-                            // `bind` deliberately returns a wrapper around a
-                            // STD listener: this closure is not running
-                            // inside a tokio runtime, and
-                            // `tokio::net::UnixListener::bind` panics there.
-                            // `serve` — spawned onto tauri's runtime below —
-                            // is what converts it. `std::future::pending()`
-                            // means "serve for the process lifetime": there
-                            // is no orderly-shutdown event, only a quit.
-                            //
-                            // Which is exactly why the socket's IDENTITY is
-                            // managed here, before `serve` consumes the
-                            // listener (A1 audit fix). `serve`'s own unlink
-                            // sits after a loop this future never lets break,
-                            // so it does not run in this app — and a unix
-                            // socket is not unlinked when its process exits.
-                            // Left behind, the path outlives the app and the
-                            // next `openvhost status` gets ECONNREFUSED and
-                            // reports "not accepting control connections"
-                            // (exit 69) instead of the truthful "not running"
-                            // (exit 0). `quit::perform_quit` removes it
-                            // through this managed handle, first thing.
-                            match openvhost_proc::control::bind(&home) {
-                                Ok(listener) => {
-                                    app.manage(listener.socket());
-                                    let handler: Arc<
-                                        dyn openvhost_proc::control::ControlHandler,
-                                    > = Arc::new(control::DesktopHandler::new(
-                                        app.handle().clone(),
-                                        Arc::clone(&supervisor),
-                                    ));
-                                    tauri::async_runtime::spawn(
-                                        openvhost_proc::control::serve(
-                                            listener,
-                                            handler,
-                                            std::future::pending::<()>(),
-                                        ),
-                                    );
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                        "openvhost: control socket unavailable ({e}); the openvhost CLI cannot reach this instance"
-                                    );
-                                }
-                            }
-                            app.manage(supervisor);
-                        }
-                        Ok(None) => {
-                            eprintln!(
-                                "openvhost: another instance holds the run lock; not starting the supervisor"
-                            );
-                        }
-                        Err(e) => {
-                            eprintln!("openvhost: failed to acquire the run lock: {e}");
-                        }
-                    }
-                }
-                Err(e) => {
-                    // Fail CLOSED (P0-8 merge-gate fix wave C5): no
-                    // cwd-relative "./run" fallback. A relative run dir would
-                    // lock/reap against whatever directory the OS happened to
-                    // launch us from instead of the real OPENVHOST_HOME —
-                    // silently wrong identity for both the single-instance
-                    // lock and the orphan registry. Same posture as the
-                    // lock-contended arm above: skip the supervisor bootstrap
-                    // entirely rather than proceed on a guessed path.
-                    eprintln!(
-                        "openvhost: cannot resolve OPENVHOST_HOME ({e}); not starting the supervisor"
-                    );
-                }
-            }
+            // How far the boot actually got (degraded-boot design D1).
+            // `bootstrap` returns a `BootState` on EVERY path — its return type
+            // is what enforces that, not a comment: there is no `Result` to `?`
+            // out of, so an early return would still have to carry one.
+            let boot = boot::bootstrap(app);
+            // Exactly ONE `manage`, at the top level, OUTSIDE every arm. The
+            // same `Manager::manage`-never-overwrites reason `db_state` and
+            // `stack_paths` both give: a "manage a placeholder early, the real
+            // value later" split would silently pin the placeholder, and here
+            // that would mean a healthy app permanently showing the takeover
+            // screen for a state it left behind milliseconds after launch.
+            app.manage(boot);
             Ok(())
         })
         .build(tauri::generate_context!())

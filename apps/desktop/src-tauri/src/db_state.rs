@@ -369,6 +369,7 @@ mod tests {
     /// would say so. `every_registered_command_lives_in_a_scanned_file` below is
     /// what notices, by tying this list's attribute count to `collect_commands!`.
     const COMMAND_FILES: &[(&str, &str)] = &[
+        ("boot.rs", include_str!("boot.rs")),
         ("commands.rs", include_str!("commands.rs")),
         ("db_state.rs", include_str!("db_state.rs")),
         ("php_pkg.rs", include_str!("php_pkg.rs")),
