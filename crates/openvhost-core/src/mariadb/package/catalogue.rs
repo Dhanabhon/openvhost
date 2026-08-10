@@ -62,7 +62,13 @@
 //! `recipe.vendored_on_disk` is `[]` for the same reason: that block records
 //! the digests of the pcre2 and fmt archives *as the build read them*, and
 //! the work tree holding them was cleaned up long ago, so there is nothing
-//! left to hash. And `recipe.bison.path` / `.version` — which bison actually
+//! left to hash. **Read that as a fact about this one frozen manifest, not as
+//! a rule** — `[]` was ambiguous precisely because it is also what a walk that
+//! looked and found nothing prints, and the recipe no longer emits it for a
+//! directory it never opened. A `--from pack` run cut today writes
+//! `"vendored_on_disk": null` with a `vendored_on_disk_not_observed` sentence
+//! beside it; the `[]` above predates that and still needs this paragraph.
+//! And `recipe.bison.path` / `.version` — which bison actually
 //! built the parser — are both `""`, because bison is discovered inside
 //! `recipe_configure` too. **Which plugins exist in the shipped server is
 //! security-relevant configuration**, so none of this is cosmetic.

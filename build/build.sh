@@ -478,8 +478,9 @@ bp_verify_sha256() {
 # records at length: with a filename on the line `shasum` escapes the WHOLE line
 # with a leading backslash whenever the path holds a backslash or a newline, so
 # `cut -d' ' -f1` came away with `\<digest>` — 65 characters, still valid JSON,
-# and not a SHA-256. Measured through this driver at three call sites: an
-# artifact basename is built from charset-validated parts, but the directory in
+# and not a SHA-256. Measured through this driver at four call sites, over the
+# three path provenances they draw on: an artifact basename is built from
+# charset-validated parts, but the directory in
 # front of it comes from `--out`, and a recipe's archive paths hang off
 # $BUILD_OBJ/$BUILD_DOWNLOADS, which descend from OPENVHOST_BUILD_ROOT — checked
 # for being absolute and for nothing else. None of these three values is ever
@@ -489,10 +490,16 @@ bp_verify_sha256() {
 # name says sha256 is a false provenance record, which is the failure this
 # pipeline keeps being fixed for.
 #
-# One helper rather than the same six lines at three call sites — prefix_digest's
-# comment states the rule, that three copies of one digest is three chances to
-# disagree about it. `$what` names the caller's category so a failure says which
-# digest could not be read.
+# One helper rather than the same six lines at four call sites — `stage_pack`
+# and `stage_manifest` here, `nginx.sh`'s and `mariadb.sh`'s manifest hooks in
+# recipes. prefix_digest's comment states the rule, that four copies of one
+# digest is four chances to disagree about it. `$what` names the caller's
+# category so a failure says which digest could not be read.
+#
+# It refuses by `bp_die`, and a caller has to know how far that reaches: it exits
+# THIS substitution, so a call one level deep under errexit — nginx.sh's — fails
+# the run, and a call nested deeper does not unless the assignment around it is
+# read. `mariadb.sh`'s is nested and reads it.
 bp_file_sha256() {
 	local file="$1" what="$2" digest
 	digest="$(shasum -a 256 <"$file")"
@@ -1063,6 +1070,23 @@ json_dependencies() {
 			# field exists to keep out of a manifest.
 			reason_key='digest_failed'
 			reason="$undigestible"
+			# Said out loud, and it is the only one of the three reasons that
+			# is. `not_observed` and `prefix_missing` describe how this run was
+			# invoked or what it found; a walk that failed PART-WAY over a
+			# prefix still standing is the signature of something mutating the
+			# shared build root while this run reads it — /opt/openvhost-build
+			# is shared across engines and `stage_install` removes a prefix
+			# before recreating it. That is worth seeing in the run, not only in
+			# a file someone reads next week.
+			#
+			# To STDERR, and that is load-bearing rather than tidy: this
+			# function's STDOUT *is* the manifest's "dependencies" value,
+			# captured by `dependencies="$(json_dependencies)"` below, so a
+			# `bp_log` written the ordinary way is spliced into the JSON.
+			# Measured with the `>&2` removed and nothing else changed: the
+			# `==> [...]` line landed between `"prefix": "…"` and the comma that
+			# follows it, the value stopped parsing, and the run still exited 0.
+			bp_log "no tree_sha256 for $name $version: the walk over $prefix failed part-way; the shared build root may be being written by another run" >&2
 		fi
 		# null rather than a sentinel string: no hex digest can equal it, and a
 		# reader that expects one gets a type error instead of a false match. The

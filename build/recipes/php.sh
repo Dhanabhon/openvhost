@@ -1533,26 +1533,50 @@ recipe_serve_probe() {
 # For every other package in this fleet that is one upstream tarball; here it
 # is ~37 of them plus a git commit, and a manifest that recorded only php-src
 # would describe a fraction of what the artifact is made of.
+#
+# Every value in a JSON STRING position goes through json_string, the same
+# treatment mariadb.sh's `vendored` block was given and for the same reason. This
+# hook has by far the most raw values of any recipe in the fleet: one
+# static-php-cli URL, plus a `url` out of each of the 33 PHP_PINS_LIBS rows and
+# the one PHP_PINS_GIT row, plus their 33 `filename` fields, plus
+# PHP_PINS_KNOWN_GAPS, which is free prose. An upstream URL is a plausible place
+# for a `"` or a `\` — a query string alone will do it — and hand-escaping cannot
+# be the answer here, because the escaping would have to be got right 176 times.
+#
+# Calibrated, so this is not read as more than it is: **0 of the 41 pins carry
+# either character today** (checked across PHP_PINS_LIBS, PHP_PINS_GIT and the
+# scalars), `_php-pins-refresh.sh` only reports drift rather than writing it, and
+# a recipe is already arbitrary code in the driver's process. This is a trap
+# being removed, not a live bug. What it costs if it fires is what the other
+# recipes cost: a manifest that no longer parses, emitted beside a packed and
+# audited tarball, with the driver exiting 0.
+#
+# nginx.sh is deliberately NOT given the same treatment: it interpolates no URL
+# at all, and its one external value is `pcre2_actual`, which is 64 lowercase hex
+# or the run aborts. There is nothing there for json_string to defend.
 recipe_manifest_extra() {
 	local row name version sha256 filename url commit first=1
 	printf '{"static_php_cli": {"tag": "%s", "commit": "%s", "url": "%s", "pins_derived_on": "%s"}, ' \
-		"$PHP_PINS_SPC_TAG" "$PHP_PINS_SPC_COMMIT" "$PHP_PINS_SPC_URL" "$PHP_PINS_DERIVED_ON"
+		"$(json_string "$PHP_PINS_SPC_TAG")" "$(json_string "$PHP_PINS_SPC_COMMIT")" \
+		"$(json_string "$PHP_PINS_SPC_URL")" "$(json_string "$PHP_PINS_DERIVED_ON")"
 	printf '"extensions": {"static": "%s", "shared": "%s", "known_gaps": "%s"}, ' \
-		"$_PHP_SPC_STATIC_EXTS" "$_PHP_SPC_SHARED_EXTS" "$PHP_PINS_KNOWN_GAPS"
-	printf '"suggested_libs": "%s", ' "$_PHP_SPC_LIBS"
+		"$(json_string "$_PHP_SPC_STATIC_EXTS")" "$(json_string "$_PHP_SPC_SHARED_EXTS")" \
+		"$(json_string "$PHP_PINS_KNOWN_GAPS")"
+	printf '"suggested_libs": "%s", ' "$(json_string "$_PHP_SPC_LIBS")"
 	printf '"network_during_build": "denied (sandbox-exec, deny network*)", '
 	printf '"pinned_sources": ['
 	for row in "${PHP_PINS_LIBS[@]}"; do
 		read -r name version sha256 filename url <<<"$row"
 		if [ "$first" -eq 1 ]; then first=0; else printf ', '; fi
 		printf '{"name": "%s", "version": "%s", "sha256": "%s", "file": "%s", "url": "%s", "verified": "sha256"}' \
-			"$name" "$version" "$sha256" "$filename" "$url"
+			"$(json_string "$name")" "$(json_string "$version")" "$(json_string "$sha256")" \
+			"$(json_string "$filename")" "$(json_string "$url")"
 	done
 	for row in "${PHP_PINS_GIT[@]}"; do
 		read -r name commit url <<<"$row"
 		if [ "$first" -eq 1 ]; then first=0; else printf ', '; fi
 		printf '{"name": "%s", "commit": "%s", "url": "%s", "verified": "git-commit"}' \
-			"$name" "$commit" "$url"
+			"$(json_string "$name")" "$(json_string "$commit")" "$(json_string "$url")"
 	done
 	printf ']}'
 }

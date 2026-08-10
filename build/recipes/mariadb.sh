@@ -686,10 +686,22 @@ recipe_manifest_extra() {
 	# manifest and the run exited 0, with the outer guard doing nothing at all.
 	#
 	# `bp_die` rather than another `set -e`, because it is the only one of the two
-	# that composes: its `exit` guarantees a nonzero status at the `extra=`
-	# boundary however many errexit-clearing layers sit in between, and does not
-	# depend on how this hook happens to be called. Plain assignments, never
-	# `local x="$(…)"`, whose exit status is `local`'s.
+	# that composes OUT OF THIS SHELL: its `exit` leaves the `$(set -e;
+	# recipe_manifest_extra)` substitution nonzero at the `extra=` boundary
+	# whether or not errexit happens to be armed here, and does not depend on how
+	# this hook happens to be called.
+	#
+	# What it does NOT do — stated because the first version of this comment
+	# claimed it did, and the fix below shipped with the bug this hook was being
+	# fixed for. A `bp_die` reached from inside a FURTHER `"$(…)"` unwinds only
+	# that inner subshell; its status then sits in an assignment, and if nothing
+	# reads that assignment the run continues with a partial value. `bp_die`
+	# crosses exactly as many errexit-clearing layers as there are checked
+	# assignments between it and here. So every nested substitution in this file
+	# has its status read where it is produced — the two below, and the two
+	# inside `_mariadb_vendored_on_disk`'s loop.
+	#
+	# Plain assignments, never `local x="$(…)"`, whose exit status is `local`'s.
 	local vendored vendored_on_disk
 	vendored="$(_mariadb_vendored)" ||
 		bp_die "_mariadb_vendored failed: the manifest would carry a truncated vendored block"
@@ -773,11 +785,27 @@ _mariadb_vendored() {
 # than the expected missing directory should say so in the build log. `find |
 # sort` in one substitution leans on the inherited `pipefail` to carry find's
 # status past sort, the same inheritance stage_manifest documents.
+#
+# Every shape this can emit, listed for the reason json_dependencies lists its
+# own: so a consumer can be written against the set rather than against the case
+# it happened to see first.
+#
+#   "vendored_on_disk": [{"file": …, "sha256": "<64 hex>"}, …]     walked
+#   "vendored_on_disk": [{"file": …, "sha256": null, "digest_failed": "…"}, …]
+#   "vendored_on_disk": null, "vendored_on_disk_not_observed": "…"
+#   "vendored_on_disk": null, "vendored_on_disk_scan_failed": "…"
+#
+# An entry's `sha256` is therefore either 64 hex characters or `null`, never a
+# word or an empty string standing in for one, and a `null` at either level
+# always arrives with exactly one sentence beside it saying which way the digest
+# was not produced. An empty ARRAY now means only what it says: the walk ran and
+# the directory held nothing.
 _mariadb_vendored_on_disk() {
 	local first=1 archive name digest listing dir="$BUILD_OBJ/extra"
 	# Fixed text, never interpolated, so the string can be grepped for.
 	local unopened='this run did not have the work tree these archives live in: it was resumed past the stages that create it, so nothing was read and this is not a report that nothing was vendored'
 	local unwalked='the work tree these archives live in was present and the walk over it failed: any list from it would be short by an unknown number of entries, so none is recorded'
+	local undigested='this archive was on disk when the walk listed it and no digest of it could be read moments later: it was not readable, or what came back was not a digest, so nothing stands in for its bytes'
 	if [ ! -d "$dir" ]; then
 		printf '"vendored_on_disk": null, "vendored_on_disk_not_observed": "%s"' "$unopened"
 		return 0
@@ -791,16 +819,62 @@ _mariadb_vendored_on_disk() {
 	while IFS= read -r archive; do
 		[ -n "$archive" ] || continue
 		[ -f "$archive" ] || continue
-		name="$(basename -- "$archive" | tr -cd 'A-Za-z0-9._+-')"
+		# CHECKED, because this substitution is the entry's KEY. json_dependencies
+		# draws the same line: its name, version and prefix are emitted
+		# unconditionally and only `tree_sha256` may go null, because a record
+		# whose identity could not be produced is not a degraded record — there is
+		# nothing left for a later auditor to look up. An unchecked failure here
+		# wrote `"file": ""`, which names no file at all. The `bp_die` composes
+		# from here: `done <<<"$listing"` is a here-string, so this loop runs in
+		# THIS function's shell rather than a pipeline subshell, and the `exit`
+		# leaves `vendored_on_disk="$(_mariadb_vendored_on_disk)"` nonzero, where
+		# its own `|| bp_die` is read.
+		name="$(basename -- "$archive" | tr -cd 'A-Za-z0-9._+-')" ||
+			bp_die "could not name a vendored archive the walk listed: $archive"
+		if [ "$first" -eq 1 ]; then first=0; else printf ', '; fi
 		# bp_file_sha256, not a bare `shasum … | cut`: $archive hangs off
 		# $BUILD_OBJ, which descends from OPENVHOST_BUILD_ROOT — checked for
 		# being absolute and for nothing else — so a backslash anywhere in it
 		# made shasum escape its whole output line and put 65 characters into a
 		# field named sha256, recorded and compared against nothing. The name
 		# beside it is charset-filtered for the same reason one line up.
-		digest="$(bp_file_sha256 "$archive" "a vendored archive")"
-		if [ "$first" -eq 1 ]; then first=0; else printf ', '; fi
-		printf '{"file": "%s", "sha256": "%s"}' "$name" "$digest"
+		#
+		# And its STATUS IS READ, which is the half the swap left out and the
+		# defect this file was being edited to remove. bp_file_sha256 refuses a
+		# non-digest by `bp_die` — but that `bp_die` runs two substitutions deep,
+		# inside `"$(bp_file_sha256 …)"` inside `"$(_mariadb_vendored_on_disk)"`,
+		# so its `exit` unwinds only the inner subshell and nothing above ever saw
+		# it. Measured on bash 3.2.57 against an existing-but-unreadable archive:
+		# the refusal printed on stderr, the field got the EMPTY string instead of
+		# 65 characters, the block stayed valid JSON, and the run exited 0. The
+		# check exists and does fire; what was missing was anything reading it.
+		#
+		# `-r` and not just the `-f` above, as json_file_digests tests it:
+		# existence is not readability, and this walk lists files it may no longer
+		# be able to open. Both routes to no-digest converge on ONE printf below,
+		# so `null` means exactly "no digest" whichever way it was reached.
+		#
+		# Recorded rather than fatal, which is D2 and the same trade the two arms
+		# above already take: by the time this hook runs the artifact is packed and
+		# audited, and a manifest that does not exist is worse than one that says
+		# it does not know. `null` rather than "" or "unknown" for the reason
+		# tree_sha256 gives — no digest can equal it, so a reader expecting one
+		# gets a type error instead of a false match — and the same `digest_failed`
+		# key, because it is the same fact about the same kind of value.
+		#
+		# `$undigested` goes in raw, like the two arms above and for their reason:
+		# it is fixed text declared three lines up, not an interpolated value, so
+		# there is nothing for json_string to defend and wrapping it would add the
+		# one thing this file is being edited to remove — an unchecked
+		# substitution.
+		if [ -r "$archive" ]; then
+			if digest="$(bp_file_sha256 "$archive" "a vendored archive")"; then
+				printf '{"file": "%s", "sha256": "%s"}' "$name" "$digest"
+				continue
+			fi
+		fi
+		printf '{"file": "%s", "sha256": null, "digest_failed": "%s"}' \
+			"$name" "$undigested"
 	done <<<"$listing"
 	printf ']'
 }
