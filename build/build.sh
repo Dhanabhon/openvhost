@@ -1273,8 +1273,20 @@ stage_manifest() {
 	# READ by something — which is why the two lines below carry no `set -e;`.
 	# They are not exceptions to a discipline; the discipline does not reach
 	# them. `json_dependencies` and `json_pipeline` are fail-closed in their own
-	# bodies instead, by an explicit check and by `bp_die`, and that composes at
-	# any depth because it does not depend on who called them or how.
+	# bodies instead, by an explicit check and by `bp_die`.
+	#
+	# That is true HERE, and it is worth stating precisely rather than as a
+	# rule, because the loose version is what this sweep is repairing. `bp_die`
+	# is an `exit`, so it unwinds the substitution subshell it runs in — no
+	# further. It reaches an errexit-armed context only when nothing in between
+	# swallows the status, and both lines below satisfy that by being bare
+	# assignments at top level, exactly ONE substitution deep.
+	#
+	# It does NOT hold at two. `mariadb.sh`'s vendored-archive loop reached
+	# `bp_file_sha256` through a second `$( )`, and its `bp_die` — which fired,
+	# and printed — died with that inner subshell while the caller recorded
+	# `"sha256": ""` and returned 0. Count the layers between the `exit` and the
+	# nearest read status; do not assume `bp_die` travels.
 	dependencies="$(json_dependencies)"
 	pipeline="$(json_pipeline)"
 	if [ "$(type -t recipe_manifest_extra 2>/dev/null || true)" = "function" ]; then
