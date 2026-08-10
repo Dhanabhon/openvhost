@@ -675,13 +675,36 @@ recipe_manifest_extra() {
 	# Which OpenSSL, how it is linked, which bison built the parser, and what went
 	# into the two libraries that are compiled in and therefore invisible to every
 	# contract check. All of it is audit fact, not detail.
-	printf '{"openssl": {"version": "%s", "linkage": "static"}, "bison": {"path": "%s", "version": "%s"}, "vendored_last_checked": "%s", "vendored": %s, "vendored_on_disk": %s}' \
+	#
+	# Both helpers are called into a CHECKED variable here and never inlined into
+	# the printf's argument list, which is where they used to sit. build.sh
+	# reaches this hook through `extra="$(set -e; recipe_manifest_extra)"`, and
+	# that `set -e` arms THIS function's shell and nothing deeper: a helper
+	# invoked as `"$(_helper)"` inside an argument list enters a fresh command
+	# substitution, which clears errexit again — measured on bash 3.2.57. So a
+	# helper that died half-way handed its partial output straight into the
+	# manifest and the run exited 0, with the outer guard doing nothing at all.
+	#
+	# `bp_die` rather than another `set -e`, because it is the only one of the two
+	# that composes: its `exit` guarantees a nonzero status at the `extra=`
+	# boundary however many errexit-clearing layers sit in between, and does not
+	# depend on how this hook happens to be called. Plain assignments, never
+	# `local x="$(…)"`, whose exit status is `local`'s.
+	local vendored vendored_on_disk
+	vendored="$(_mariadb_vendored)" ||
+		bp_die "_mariadb_vendored failed: the manifest would carry a truncated vendored block"
+	vendored_on_disk="$(_mariadb_vendored_on_disk)" ||
+		bp_die "_mariadb_vendored_on_disk failed: the manifest would carry a truncated on-disk block"
+	# The second `%s` supplies its own key, and sometimes a reason key beside it,
+	# exactly as json_dependencies' tree_sha256 does — see below for why it cannot
+	# always be an array.
+	printf '{"openssl": {"version": "%s", "linkage": "static"}, "bison": {"path": "%s", "version": "%s"}, "vendored_last_checked": "%s", "vendored": %s, %s}' \
 		"$RECIPE_OPENSSL_VERSION" \
 		"$(printf '%s' "$RECIPE_BISON_PATH" | tr -cd 'A-Za-z0-9@_/.+-')" \
 		"$RECIPE_BISON_VERSION" \
 		"$RECIPE_VENDORED_LAST_CHECKED" \
-		"$(_mariadb_vendored)" \
-		"$(_mariadb_vendored_on_disk)"
+		"$vendored" \
+		"$vendored_on_disk"
 }
 
 # What we pinned, and how far the verification of each actually goes. "verified"
@@ -704,9 +727,47 @@ _mariadb_vendored() {
 # auditor can check against the artifact. They should agree — the seeding is what
 # makes them agree — and the point of printing both is that a disagreement is
 # visible rather than assumed away.
+#
+# Which is why an EMPTY ARRAY is not a value this may print unless it looked. The
+# archives live under $BUILD_OBJ, part of the work tree, which is created by the
+# stages a resumed run skips and removed at the end of the ones it does not: a
+# `--from pack` run reaches this hook with the directory simply not there. The
+# `find` that read it used to run in a PROCESS SUBSTITUTION — `done < <(find …)`
+# — whose failure is unobservable however armed errexit is, and its stderr went
+# to /dev/null on top. So every such run printed `[]`: the same two characters a
+# run that looked and found nothing prints, over a directory it never opened.
+#
+# That is the observed-empty versus never-looked ambiguity `tree_sha256` grew a
+# `null` and one sentence to remove, reintroduced one field over, and this is the
+# same removal: an ARRAY only when the walk actually happened, `null` plus
+# exactly one sentence naming which way it did not otherwise. `null` rather than
+# a sentinel entry for the same reason it gives — no list of digests can equal
+# it, so a reader expecting one gets a type error instead of a false match. The
+# cost of leaving it was measured, not supposed: the committed
+# mariadb-11.4.9 manifest carries `"vendored_on_disk": []` from a `--from pack`
+# repack, and a human had to write a paragraph into catalogue.rs explaining that
+# those two characters do not mean what they say.
+#
+# The walk therefore happens into a variable, where its status can be read at
+# all, and `2>/dev/null` is gone with it: a walk that fails for some reason other
+# than the expected missing directory should say so in the build log. `find |
+# sort` in one substitution leans on the inherited `pipefail` to carry find's
+# status past sort, the same inheritance stage_manifest documents.
 _mariadb_vendored_on_disk() {
-	local first=1 archive name digest
-	printf '['
+	local first=1 archive name digest listing dir="$BUILD_OBJ/extra"
+	# Fixed text, never interpolated, so the string can be grepped for.
+	local unopened='this run did not have the work tree these archives live in: it was resumed past the stages that create it, so nothing was read and this is not a report that nothing was vendored'
+	local unwalked='the work tree these archives live in was present and the walk over it failed: any list from it would be short by an unknown number of entries, so none is recorded'
+	if [ ! -d "$dir" ]; then
+		printf '"vendored_on_disk": null, "vendored_on_disk_not_observed": "%s"' "$unopened"
+		return 0
+	fi
+	if ! listing="$(find "$dir" -maxdepth 3 -type f \
+		\( -name '*.zip' -o -name '*.tar.gz' \) -print | LC_ALL=C sort)"; then
+		printf '"vendored_on_disk": null, "vendored_on_disk_scan_failed": "%s"' "$unwalked"
+		return 0
+	fi
+	printf '"vendored_on_disk": ['
 	while IFS= read -r archive; do
 		[ -n "$archive" ] || continue
 		[ -f "$archive" ] || continue
@@ -714,7 +775,6 @@ _mariadb_vendored_on_disk() {
 		digest="$(shasum -a 256 -- "$archive" | cut -d' ' -f1)"
 		if [ "$first" -eq 1 ]; then first=0; else printf ', '; fi
 		printf '{"file": "%s", "sha256": "%s"}' "$name" "$digest"
-	done < <(find "$BUILD_OBJ/extra" -maxdepth 3 -type f \
-		\( -name '*.zip' -o -name '*.tar.gz' \) -print 2>/dev/null | sort)
+	done <<<"$listing"
 	printf ']'
 }
