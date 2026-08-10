@@ -659,8 +659,15 @@ recipe_manifest_extra() {
 	# (It no longer truncates the manifest: build.sh calls this into a variable
 	# before the `>"$manifest"` redirect opens. The guard is still the point —
 	# that fix decides what a failure costs, this decides whether there is one.)
+	# bp_file_sha256, not a bare `shasum … | cut`: this value is RECORDED as
+	# pcre2.sha256_on_disk and compared against nothing, and $BUILD_DOWNLOADS
+	# descends from OPENVHOST_BUILD_ROOT, which is checked for being absolute and
+	# for nothing else — so a backslash anywhere in it made shasum escape its
+	# whole output line and put 65 characters into a field named sha256. The
+	# guard above is untouched and still decides whether a digest is attempted at
+	# all; this decides that an attempted one is a digest.
 	if [ -f "$pcre2_archive" ]; then
-		pcre2_actual="$(shasum -a 256 -- "$pcre2_archive" | cut -d' ' -f1)"
+		pcre2_actual="$(bp_file_sha256 "$pcre2_archive" "the pcre2 source archive")"
 	else
 		pcre2_actual=""
 	fi

@@ -297,6 +297,15 @@ bp_assert_under() {
 	*) bp_die "refusing to $what outside $root: $path" ;;
 	esac
 	real_root="$(bp_deepest_existing "$root")"
+	# Fails CLOSED on an empty resolution. With real_root="" the pattern below
+	# reads `"" | /*`, which matches every absolute path there is — so the check
+	# would wave through precisely what it exists to refuse, and say nothing.
+	# (real_path needs no such guard: empty matches neither arm of a non-empty
+	# real_root, so it already falls through to the refusal.) Defence in depth and
+	# billed as nothing more — the driver's own flow cannot reach it, since the
+	# root is asserted to exist and be ours before any of this runs.
+	[ -n "$real_root" ] ||
+		bp_die "refusing to $what: $root did not resolve to an existing directory"
 	real_path="$(bp_deepest_existing "$path")"
 	case "$real_path" in
 	"$real_root" | "$real_root"/*) return 0 ;;
@@ -443,12 +452,69 @@ bp_download() {
 	mv -- "$dest.part" "$dest"
 }
 
+# Deliberately still reads shasum's `<digest>  <path>` output, where its
+# siblings were changed to read stdin. It is safe HERE and only here because
+# this digest is COMPARED against a pin and never recorded: `shasum` prefixes
+# the whole line with a backslash when the path holds a backslash or a newline,
+# and a `\<digest>` of 65 characters can only fail to equal `$want`. Everything
+# it can do is refuse a file it should have accepted. Its siblings record
+# instead — see bp_file_sha256 below — and there the same 65 characters become a
+# provenance value nothing ever compares. That difference is the whole reason
+# the two functions read the digest differently, so it is written down rather
+# than left for the next sweep to re-derive.
 bp_verify_sha256() {
 	local file="$1" want="$2" got
 	got="$(shasum -a 256 -- "$file" | cut -d' ' -f1)"
 	[ "$got" = "$want" ] ||
 		bp_die "sha256 mismatch for $file: expected $want, got $got"
 	bp_log "sha256 verified: $(basename -- "$file")"
+}
+
+# A file's SHA-256, read where nothing can dress up as one. For every digest
+# that gets RECORDED — the artifact's, and the two a recipe writes into its
+# manifest block.
+#
+# On STDIN, not `shasum -a 256 -- "$file"`, for the reason json_file_digests
+# records at length: with a filename on the line `shasum` escapes the WHOLE line
+# with a leading backslash whenever the path holds a backslash or a newline, so
+# `cut -d' ' -f1` came away with `\<digest>` — 65 characters, still valid JSON,
+# and not a SHA-256. Measured through this driver at four call sites, over the
+# three path provenances they draw on: an artifact basename is built from
+# charset-validated parts, but the directory in
+# front of it comes from `--out`, and a recipe's archive paths hang off
+# $BUILD_OBJ/$BUILD_DOWNLOADS, which descend from OPENVHOST_BUILD_ROOT — checked
+# for being absolute and for nothing else. None of these three values is ever
+# compared, so a wrong one subverts nothing, and that was the argument that let
+# the shape survive after it was fixed one function over. It is not an argument
+# this file takes a second time: a 65-character string sitting in a field whose
+# name says sha256 is a false provenance record, which is the failure this
+# pipeline keeps being fixed for.
+#
+# One helper rather than the same six lines at four call sites — `stage_pack`
+# and `stage_manifest` here, `nginx.sh`'s and `mariadb.sh`'s manifest hooks in
+# recipes. `json_dependencies`' own header states the rule, that four copies of
+# one digest is four chances to disagree about it. `$what` names the caller's
+# category so a failure says which digest could not be read.
+#
+# It refuses by `bp_die`, and a caller has to know how far that reaches: it exits
+# THIS substitution, so a call one level deep under errexit — nginx.sh's — fails
+# the run, and a call nested deeper does not unless the assignment around it is
+# read. `mariadb.sh`'s is nested and reads it.
+bp_file_sha256() {
+	local file="$1" what="$2" digest
+	digest="$(shasum -a 256 <"$file")"
+	# Parameter expansion, not `cut -d' '`: the redirect means the only thing
+	# after the digest is shasum's own `-` for stdin, so there is no
+	# attacker-influenced text left on the line to split on.
+	digest="${digest%% *}"
+	# Both halves, as json_file_digests checks them: 65 characters of otherwise
+	# lowercase hex was exactly the shape that got through before.
+	[ "${#digest}" -eq 64 ] ||
+		bp_die "$what did not hash to 64 characters (got ${#digest}): $file"
+	case "$digest" in
+	*[!0-9a-f]*) bp_die "$what did not hash to lowercase hex: $file" ;;
+	esac
+	printf '%s' "$digest"
 }
 
 # --------------------------------------------------- GPG import-and-verify ---
@@ -757,7 +823,7 @@ stage_pack() {
 	# has measured it.
 	COPYFILE_DISABLE=1 tar --options gzip:'!timestamp' -czf "$TARBALL" \
 		-C "$BUILD_ROOT" "$BUILD_NAME-$BUILD_VERSION"
-	TARBALL_SHA="$(shasum -a 256 -- "$TARBALL" | cut -d' ' -f1)"
+	TARBALL_SHA="$(bp_file_sha256 "$TARBALL" "the artifact")"
 	printf '%s  %s\n' "$TARBALL_SHA" "$(basename -- "$TARBALL")" >"$TARBALL.sha256"
 	bp_log "packed $(basename -- "$TARBALL") ($TARBALL_SHA)"
 }
@@ -924,6 +990,7 @@ prefix_digest() {
 #   {"<name>": {version, prefix, tree_sha256: "<64 hex>"}}          observed
 #   {"<name>": {version, prefix, tree_sha256: null, not_observed: "…"}}
 #   {"<name>": {version, prefix, tree_sha256: null, prefix_missing: "…"}}
+#   {"<name>": {version, prefix, tree_sha256: null, digest_failed: "…"}}
 #
 # `tree_sha256` is therefore either a 64-character hex string or `null`, never a
 # word standing in for one, and `null` always arrives with exactly one sentence
@@ -934,6 +1001,7 @@ json_dependencies() {
 	# its dependencies says it the same way and the string can be grepped for.
 	local unobserved='this run did not execute the build stage: this prefix is as it stands now, which is not necessarily what the artifact was built against'
 	local vanished='this prefix was present when the build began and is gone now: it was removed mid-run, so there is nothing left to digest'
+	local undigestible='this prefix was walked and the walk failed part-way: the only value it could yield describes a truncated read of the tree rather than the tree, so no digest is recorded'
 	printf '{'
 	for dep in ${RECIPE_DEPENDS[@]+"${RECIPE_DEPENDS[@]}"}; do
 		name="${dep%%:*}"
@@ -964,19 +1032,61 @@ json_dependencies() {
 			reason_key='prefix_missing'
 			reason="$vanished"
 		else
-			# Assigned rather than inlined into printf's argument list, AND
-			# re-arming `-e` inside the substitution. The assignment alone is
-			# not enough here and the comment that claimed it was is what this
-			# line replaces: `json_dependencies` is only ever reached through
-			# `dependencies="$(json_dependencies)"` below, and bash 3.2 clears
-			# errexit on entering a command substitution — so a `prefix_digest`
-			# that failed part-way through its own `find`/`stat`/`xargs` would
-			# hand back a well-formed 64-hex digest over a PARTIAL tree, and the
-			# run would exit 0. A confident wrong provenance value is the exact
-			# thing this field was added to prevent, so it must abort instead.
-			digest="$(set -e; prefix_digest "$prefix")"
-			printf ', "tree_sha256": "%s"}' "$(json_string "$digest")"
-			continue
+			# TWO things, and neither works without the other.
+			#
+			# `set -e` INSIDE the substitution is what makes a mid-function
+			# failure nonzero AT ALL: bash 3.2 clears errexit on entering `$( )`,
+			# so without it a `prefix_digest` whose middle streams failed runs on
+			# through the rest and hands back a well-formed 64-hex digest over a
+			# tree it only partly read. (Its LAST stream failing is caught by
+			# inherited pipefail either way; the middle ones are errexit's.)
+			#
+			# And the status is then CHECKED HERE, because re-arming alone was
+			# measured NOT to be enough — the comment this replaces asserted an
+			# abort that does not happen. Its premise was right and its
+			# conclusion backwards: `json_dependencies` is only ever reached
+			# through `dependencies="$(json_dependencies)"` below, which clears
+			# errexit again, so the nonzero status of this assignment was
+			# DISCARDED and the truncated digest printed anyway, run exit 0. That
+			# fact is why the inner `set -e` cannot abort, not why it can.
+			#
+			# Measured on bash 3.2.57 against this exact text, one case per
+			# process and no AND-OR list around it: inner `set -e` and no check
+			# recorded a 64-hex digest of a stream truncated at the first failure
+			# and exited 0. An explicit check is fail-closed whatever the
+			# caller's errexit state is, and cannot be silently defeated by a
+			# future change to how this function is called — which is the whole
+			# reason it is not another `set -e` somewhere. `if` does not suppress
+			# the inner `set -e`; also measured. It suppresses the INHERITED
+			# setting, and inheritance is not what arms this.
+			if digest="$(set -e; prefix_digest "$prefix")"; then
+				printf ', "tree_sha256": "%s"}' "$(json_string "$digest")"
+				continue
+			fi
+			# Recorded rather than fatal, for the same reason as the arm above
+			# and at the same point in the run. `$digest` holds the partial value
+			# here and is deliberately printed NOWHERE: a truncated digest is a
+			# well-formed 64 hex characters, which is precisely the shape this
+			# field exists to keep out of a manifest.
+			reason_key='digest_failed'
+			reason="$undigestible"
+			# Said out loud, and it is the only one of the three reasons that
+			# is. `not_observed` and `prefix_missing` describe how this run was
+			# invoked or what it found; a walk that failed PART-WAY over a
+			# prefix still standing is the signature of something mutating the
+			# shared build root while this run reads it — /opt/openvhost-build
+			# is shared across engines and `stage_install` removes a prefix
+			# before recreating it. That is worth seeing in the run, not only in
+			# a file someone reads next week.
+			#
+			# To STDERR, and that is load-bearing rather than tidy: this
+			# function's STDOUT *is* the manifest's "dependencies" value,
+			# captured by `dependencies="$(json_dependencies)"` below, so a
+			# `bp_log` written the ordinary way is spliced into the JSON.
+			# Measured with the `>&2` removed and nothing else changed: the
+			# `==> [...]` line landed between `"prefix": "…"` and the comma that
+			# follows it, the value stopped parsing, and the run still exited 0.
+			bp_log "no tree_sha256 for $name $version: the walk over $prefix failed part-way; the shared build root may be being written by another run" >&2
 		fi
 		# null rather than a sentinel string: no hex digest can equal it, and a
 		# reader that expects one gets a type error instead of a false match. The
@@ -1116,7 +1226,7 @@ stage_manifest() {
 	local versions=() tool line dependencies pipeline extra has_extra=0
 	bp_assert_under "$manifest" "$OUT_DIR" "write"
 	if [ -z "$TARBALL_SHA" ] && [ -f "$TARBALL" ]; then
-		TARBALL_SHA="$(shasum -a 256 -- "$TARBALL" | cut -d' ' -f1)"
+		TARBALL_SHA="$(bp_file_sha256 "$TARBALL" "the artifact")"
 	fi
 	for tool in ${RECIPE_BUILD_TOOLS[@]+"${RECIPE_BUILD_TOOLS[@]}"}; do
 		line="$(tool_version "$tool")"
@@ -1154,6 +1264,29 @@ stage_manifest() {
 	# `shasum … | cut` is caught by pipefail, not by errexit. Delete `-o
 	# pipefail` up there and that shape goes silent again while this comment
 	# still says it is covered.
+	#
+	# What `set -e;` here does NOT do, stated because believing otherwise has
+	# already shipped a broken fix from this file. It arms the substitution
+	# subshell and nothing deeper: a hook that does its work inside `"$(helper)"`
+	# runs that helper with errexit cleared again, so the guard stops at the
+	# first nesting level. And a function it arms still has to have its status
+	# READ by something — which is why the two lines below carry no `set -e;`.
+	# They are not exceptions to a discipline; the discipline does not reach
+	# them. `json_dependencies` and `json_pipeline` are fail-closed in their own
+	# bodies instead, by an explicit check and by `bp_die`.
+	#
+	# That is true HERE, and it is worth stating precisely rather than as a
+	# rule, because the loose version is what this sweep is repairing. `bp_die`
+	# is an `exit`, so it unwinds the substitution subshell it runs in — no
+	# further. It reaches an errexit-armed context only when nothing in between
+	# swallows the status, and both lines below satisfy that by being bare
+	# assignments at top level, exactly ONE substitution deep.
+	#
+	# It does NOT hold at two. `mariadb.sh`'s vendored-archive loop reached
+	# `bp_file_sha256` through a second `$( )`, and its `bp_die` — which fired,
+	# and printed — died with that inner subshell while the caller recorded
+	# `"sha256": ""` and returned 0. Count the layers between the `exit` and the
+	# nearest read status; do not assume `bp_die` travels.
 	dependencies="$(json_dependencies)"
 	pipeline="$(json_pipeline)"
 	if [ "$(type -t recipe_manifest_extra 2>/dev/null || true)" = "function" ]; then
