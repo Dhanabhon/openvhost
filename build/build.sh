@@ -492,8 +492,8 @@ bp_verify_sha256() {
 #
 # One helper rather than the same six lines at four call sites — `stage_pack`
 # and `stage_manifest` here, `nginx.sh`'s and `mariadb.sh`'s manifest hooks in
-# recipes. prefix_digest's comment states the rule, that four copies of one
-# digest is four chances to disagree about it. `$what` names the caller's
+# recipes. `json_dependencies`' own header states the rule, that four copies of
+# one digest is four chances to disagree about it. `$what` names the caller's
 # category so a failure says which digest could not be read.
 #
 # It refuses by `bp_die`, and a caller has to know how far that reaches: it exits

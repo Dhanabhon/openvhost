@@ -698,8 +698,11 @@ recipe_manifest_extra() {
 	# reads that assignment the run continues with a partial value. `bp_die`
 	# crosses exactly as many errexit-clearing layers as there are checked
 	# assignments between it and here. So every nested substitution in this file
-	# has its status read where it is produced — the two below, and the two
-	# inside `_mariadb_vendored_on_disk`'s loop.
+	# **that can `bp_die`** has its status read where it is produced — the two
+	# below, and the two inside `_mariadb_vendored_on_disk`'s loop. The others
+	# are `json_string` and `printf | tr`, which cannot. The qualifier is not
+	# pedantry: an unqualified universal about composition is the idiom that
+	# produced this branch.
 	#
 	# Plain assignments, never `local x="$(…)"`, whose exit status is `local`'s.
 	local vendored vendored_on_disk
@@ -863,7 +866,8 @@ _mariadb_vendored_on_disk() {
 		# key, because it is the same fact about the same kind of value.
 		#
 		# `$undigested` goes in raw, like the two arms above and for their reason:
-		# it is fixed text declared three lines up, not an interpolated value, so
+		# it is fixed text, declared with `unopened` and `unwalked` at the top of
+		# this function, not an interpolated value, so
 		# there is nothing for json_string to defend and wrapping it would add the
 		# one thing this file is being edited to remove — an unchecked
 		# substitution.
