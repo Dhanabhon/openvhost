@@ -698,11 +698,19 @@ recipe_manifest_extra() {
 	# The second `%s` supplies its own key, and sometimes a reason key beside it,
 	# exactly as json_dependencies' tree_sha256 does — see below for why it cannot
 	# always be an array.
+	# Every value in a JSON STRING position is defended, by one of two mechanisms
+	# and never by neither. The bison pair is charset-filtered — the path here,
+	# the version where recipe_configure assigns it out of `bison --version`, the
+	# one genuinely external string in this block — so `"` and `\` cannot reach
+	# either. The rest go through the driver's json_string, which is the general
+	# answer and the one to reach for by default. Both are cheap; a raw value is
+	# what is not affordable, because a quote in any of these emits a manifest
+	# that no longer parses, and the run still exits 0.
 	printf '{"openssl": {"version": "%s", "linkage": "static"}, "bison": {"path": "%s", "version": "%s"}, "vendored_last_checked": "%s", "vendored": %s, %s}' \
-		"$RECIPE_OPENSSL_VERSION" \
+		"$(json_string "$RECIPE_OPENSSL_VERSION")" \
 		"$(printf '%s' "$RECIPE_BISON_PATH" | tr -cd 'A-Za-z0-9@_/.+-')" \
 		"$RECIPE_BISON_VERSION" \
-		"$RECIPE_VENDORED_LAST_CHECKED" \
+		"$(json_string "$RECIPE_VENDORED_LAST_CHECKED")" \
 		"$vendored" \
 		"$vendored_on_disk"
 }
@@ -711,14 +719,26 @@ recipe_manifest_extra() {
 # is spelled out per entry precisely because it differs: PCRE2 publishes a
 # detached signature and fmt publishes none, and a manifest that flattened both
 # to "verified" would be worse than one that said nothing.
+#
+# Every value through json_string. These ten are recipe-authored constants, so
+# nothing hostile reaches them and this fixes no live bug — it removes a trap
+# that fires long after anyone remembers the block was hand-escaped. A single
+# quote or backslash in a future pin (an upstream URL is a plausible place for
+# one) emitted a manifest that no longer parses, with the driver exiting 0 and
+# the tarball already packed and audited beside it. The same value costs one
+# call to say it safely, and the driver has had the function all along.
 _mariadb_vendored() {
 	printf '['
 	printf '{"name": "pcre2", "version": "%s", "url": "%s", "sha256": "%s", "release_date": "%s", "verified": "gpg+sha256", "signing_key_fingerprint": "%s"}, ' \
-		"$RECIPE_PCRE2_VERSION" "$RECIPE_PCRE2_URL" "$RECIPE_PCRE2_SHA256" \
-		"$RECIPE_PCRE2_UPSTREAM_RELEASE_DATE" "$RECIPE_PCRE2_SIGNING_KEY_FPR"
+		"$(json_string "$RECIPE_PCRE2_VERSION")" "$(json_string "$RECIPE_PCRE2_URL")" \
+		"$(json_string "$RECIPE_PCRE2_SHA256")" \
+		"$(json_string "$RECIPE_PCRE2_UPSTREAM_RELEASE_DATE")" \
+		"$(json_string "$RECIPE_PCRE2_SIGNING_KEY_FPR")"
 	printf '{"name": "fmt", "version": "%s", "url": "%s", "sha256": "%s", "release_date": "%s", "verified": "sha256", "signature": "%s"}' \
-		"$RECIPE_FMT_VERSION" "$RECIPE_FMT_URL" "$RECIPE_FMT_SHA256" \
-		"$RECIPE_FMT_UPSTREAM_RELEASE_DATE" "$RECIPE_FMT_SIGNATURE"
+		"$(json_string "$RECIPE_FMT_VERSION")" "$(json_string "$RECIPE_FMT_URL")" \
+		"$(json_string "$RECIPE_FMT_SHA256")" \
+		"$(json_string "$RECIPE_FMT_UPSTREAM_RELEASE_DATE")" \
+		"$(json_string "$RECIPE_FMT_SIGNATURE")"
 	printf ']'
 }
 
@@ -772,7 +792,13 @@ _mariadb_vendored_on_disk() {
 		[ -n "$archive" ] || continue
 		[ -f "$archive" ] || continue
 		name="$(basename -- "$archive" | tr -cd 'A-Za-z0-9._+-')"
-		digest="$(shasum -a 256 -- "$archive" | cut -d' ' -f1)"
+		# bp_file_sha256, not a bare `shasum … | cut`: $archive hangs off
+		# $BUILD_OBJ, which descends from OPENVHOST_BUILD_ROOT — checked for
+		# being absolute and for nothing else — so a backslash anywhere in it
+		# made shasum escape its whole output line and put 65 characters into a
+		# field named sha256, recorded and compared against nothing. The name
+		# beside it is charset-filtered for the same reason one line up.
+		digest="$(bp_file_sha256 "$archive" "a vendored archive")"
 		if [ "$first" -eq 1 ]; then first=0; else printf ', '; fi
 		printf '{"file": "%s", "sha256": "%s"}' "$name" "$digest"
 	done <<<"$listing"

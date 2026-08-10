@@ -452,12 +452,62 @@ bp_download() {
 	mv -- "$dest.part" "$dest"
 }
 
+# Deliberately still reads shasum's `<digest>  <path>` output, where its
+# siblings were changed to read stdin. It is safe HERE and only here because
+# this digest is COMPARED against a pin and never recorded: `shasum` prefixes
+# the whole line with a backslash when the path holds a backslash or a newline,
+# and a `\<digest>` of 65 characters can only fail to equal `$want`. Everything
+# it can do is refuse a file it should have accepted. Its siblings record
+# instead — see bp_file_sha256 below — and there the same 65 characters become a
+# provenance value nothing ever compares. That difference is the whole reason
+# the two functions read the digest differently, so it is written down rather
+# than left for the next sweep to re-derive.
 bp_verify_sha256() {
 	local file="$1" want="$2" got
 	got="$(shasum -a 256 -- "$file" | cut -d' ' -f1)"
 	[ "$got" = "$want" ] ||
 		bp_die "sha256 mismatch for $file: expected $want, got $got"
 	bp_log "sha256 verified: $(basename -- "$file")"
+}
+
+# A file's SHA-256, read where nothing can dress up as one. For every digest
+# that gets RECORDED — the artifact's, and the two a recipe writes into its
+# manifest block.
+#
+# On STDIN, not `shasum -a 256 -- "$file"`, for the reason json_file_digests
+# records at length: with a filename on the line `shasum` escapes the WHOLE line
+# with a leading backslash whenever the path holds a backslash or a newline, so
+# `cut -d' ' -f1` came away with `\<digest>` — 65 characters, still valid JSON,
+# and not a SHA-256. Measured through this driver at three call sites: an
+# artifact basename is built from charset-validated parts, but the directory in
+# front of it comes from `--out`, and a recipe's archive paths hang off
+# $BUILD_OBJ/$BUILD_DOWNLOADS, which descend from OPENVHOST_BUILD_ROOT — checked
+# for being absolute and for nothing else. None of these three values is ever
+# compared, so a wrong one subverts nothing, and that was the argument that let
+# the shape survive after it was fixed one function over. It is not an argument
+# this file takes a second time: a 65-character string sitting in a field whose
+# name says sha256 is a false provenance record, which is the failure this
+# pipeline keeps being fixed for.
+#
+# One helper rather than the same six lines at three call sites — prefix_digest's
+# comment states the rule, that three copies of one digest is three chances to
+# disagree about it. `$what` names the caller's category so a failure says which
+# digest could not be read.
+bp_file_sha256() {
+	local file="$1" what="$2" digest
+	digest="$(shasum -a 256 <"$file")"
+	# Parameter expansion, not `cut -d' '`: the redirect means the only thing
+	# after the digest is shasum's own `-` for stdin, so there is no
+	# attacker-influenced text left on the line to split on.
+	digest="${digest%% *}"
+	# Both halves, as json_file_digests checks them: 65 characters of otherwise
+	# lowercase hex was exactly the shape that got through before.
+	[ "${#digest}" -eq 64 ] ||
+		bp_die "$what did not hash to 64 characters (got ${#digest}): $file"
+	case "$digest" in
+	*[!0-9a-f]*) bp_die "$what did not hash to lowercase hex: $file" ;;
+	esac
+	printf '%s' "$digest"
 }
 
 # --------------------------------------------------- GPG import-and-verify ---
@@ -735,40 +785,6 @@ stage_audit() {
 		--execute-artifact "$BUILD_PREFIX"
 }
 
-# The packed artifact's SHA-256, read where nothing can dress up as one.
-#
-# On STDIN, not `shasum -a 256 -- "$TARBALL"`, for the reason json_file_digests
-# records at length: with a filename on the line `shasum` escapes the WHOLE line
-# with a leading backslash whenever the path holds a backslash or a newline, so
-# `cut -d' ' -f1` came away with `\<digest>` — 65 characters, still valid JSON,
-# and not a SHA-256. The basename here is built from $BUILD_NAME, $BUILD_VERSION
-# and $BUILD_ARCH, all charset-validated; the directory in front of it comes from
-# `--out` and nothing validates that at all. This value is recorded and never
-# compared, so a wrong one subverts nothing — which is the argument that let the
-# shape survive here after it was fixed one function over, and is not an argument
-# this file takes twice.
-#
-# One helper for the two call sites rather than the same six lines written out
-# twice: stage_pack computes it, and stage_manifest recomputes it for a run that
-# resumed past the pack. prefix_digest's comment states the rule — three copies
-# of one digest is three chances to disagree about it.
-tarball_sha256() {
-	local digest
-	digest="$(shasum -a 256 <"$TARBALL")"
-	# Parameter expansion, not `cut -d' '`: the redirect means the only thing
-	# after the digest is shasum's own `-` for stdin, so there is no
-	# attacker-influenced text left on the line to split on.
-	digest="${digest%% *}"
-	# Both halves, as json_file_digests checks them: 65 characters of otherwise
-	# lowercase hex was exactly the shape that got through before.
-	[ "${#digest}" -eq 64 ] ||
-		bp_die "the artifact did not hash to 64 characters (got ${#digest}): $TARBALL"
-	case "$digest" in
-	*[!0-9a-f]*) bp_die "the artifact did not hash to lowercase hex: $TARBALL" ;;
-	esac
-	printf '%s' "$digest"
-}
-
 stage_pack() {
 	bp_assert_under "$TARBALL" "$OUT_DIR" "write"
 	rm -f -- "$TARBALL" "$TARBALL.sha256"
@@ -800,7 +816,7 @@ stage_pack() {
 	# has measured it.
 	COPYFILE_DISABLE=1 tar --options gzip:'!timestamp' -czf "$TARBALL" \
 		-C "$BUILD_ROOT" "$BUILD_NAME-$BUILD_VERSION"
-	TARBALL_SHA="$(tarball_sha256)"
+	TARBALL_SHA="$(bp_file_sha256 "$TARBALL" "the artifact")"
 	printf '%s  %s\n' "$TARBALL_SHA" "$(basename -- "$TARBALL")" >"$TARBALL.sha256"
 	bp_log "packed $(basename -- "$TARBALL") ($TARBALL_SHA)"
 }
@@ -1186,7 +1202,7 @@ stage_manifest() {
 	local versions=() tool line dependencies pipeline extra has_extra=0
 	bp_assert_under "$manifest" "$OUT_DIR" "write"
 	if [ -z "$TARBALL_SHA" ] && [ -f "$TARBALL" ]; then
-		TARBALL_SHA="$(tarball_sha256)"
+		TARBALL_SHA="$(bp_file_sha256 "$TARBALL" "the artifact")"
 	fi
 	for tool in ${RECIPE_BUILD_TOOLS[@]+"${RECIPE_BUILD_TOOLS[@]}"}; do
 		line="$(tool_version "$tool")"

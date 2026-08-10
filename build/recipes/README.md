@@ -91,6 +91,7 @@ socket has. It must leave no process running when it returns, on either path.
 | `bp_tool <name>` | absolute path of a tool declared in `RECIPE_BUILD_TOOLS`. **Never call a build tool by bare name** — ServBay's `bison` was on `PATH`, could not run at all, and broke the reference build (spec §2). |
 | `bp_download <url> <dest>` | fetch to `<dest>` via a `.part` file, skipping work already done. |
 | `bp_verify_sha256 <file> <sha256>` | abort unless the digest matches. |
+| `bp_file_sha256 <file> <what>` | print a file's SHA-256, aborting unless it is 64 lowercase hex. **Use this for any digest a recipe RECORDS** — never `shasum … \| cut -d' ' -f1`, which reads a line `shasum` escapes with a leading backslash when the path holds one, yielding 65 characters into a field named sha256. `<what>` names the digest in the failure message. |
 | `bp_gnupg_home` | path of the one gnupg homedir for this build, under `$BUILD_WORK`. |
 | `bp_gpg_init_home` | wipe and recreate `bp_gnupg_home` at mode 700. Call once per build, before any import. |
 | `bp_gpg <args>...` | run gpg with `--batch --no-tty --quiet --homedir "$(bp_gnupg_home)"` — never an ambient `GNUPGHOME` or `gpg.conf`. |
